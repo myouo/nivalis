@@ -16,6 +16,7 @@ These numbers are machine- and viewport-specific. Software framebuffer memory gr
 ## Configuration
 
 - Measurement date and host: 2026-07-18, Linux 7.1.2-zen3-1-zen x86_64, Rust 1.96.1.
+- Measurement revision: `0d19797`, schema v1, before transactional mutations; later schemas require a fresh run before release gating.
 - Build: stripped `cargo build --release`, 18.4MiB executable, `opt-level = "s"`.
 - UI state: light theme, three-pane inbox, ten local demo messages.
 - Backend state: active single-connection SQLite actor, empty private database, WAL mode, 1MiB page cache limit.

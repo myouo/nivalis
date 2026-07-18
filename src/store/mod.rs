@@ -7,7 +7,7 @@
 mod memory;
 mod path;
 // Persistence is active behind the core while the controller remains on one
-// consistent in-memory repository until the mutation API is complete.
+// consistent repository until remote journaling, statistics, and search reach parity.
 #[allow(dead_code)]
 pub(crate) mod sqlite;
 
