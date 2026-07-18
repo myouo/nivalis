@@ -2,7 +2,7 @@ use std::{error::Error, fmt};
 
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(crate) const LATEST_SCHEMA_VERSION: u32 = 1;
+pub(crate) const LATEST_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -10,10 +10,16 @@ struct Migration {
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: include_str!("../../../migrations/0001_init.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: include_str!("../../../migrations/0001_init.sql"),
+    },
+    Migration {
+        version: 2,
+        sql: include_str!("../../../migrations/0002_mail_mutations.sql"),
+    },
+];
 
 const _: () = {
     let mut index = 0;
@@ -119,20 +125,24 @@ mod tests {
     use rusqlite::{Connection, ErrorCode, params};
 
     use super::{
-        LATEST_SCHEMA_VERSION, Migration, MigrationError, enable_foreign_keys, migrate,
+        LATEST_SCHEMA_VERSION, MIGRATIONS, Migration, MigrationError, enable_foreign_keys, migrate,
         migrate_with,
     };
 
     const TABLES: &[&str] = &[
         "accounts",
         "attachments",
+        "file_gc",
         "folders",
         "message_content",
         "message_folders",
+        "message_tombstones",
         "messages",
         "outbox",
         "outbox_recipients",
         "sync_state",
+        "trash_undo",
+        "trash_undo_folders",
     ];
 
     fn memory_connection() -> Connection {
@@ -156,12 +166,18 @@ mod tests {
             .expect("insert account");
     }
 
-    fn insert_folder(connection: &Connection, id: i64, account_id: i64, remote_key: &str) {
+    fn insert_folder(
+        connection: &Connection,
+        id: i64,
+        account_id: i64,
+        remote_key: &str,
+        role: &str,
+    ) {
         connection
             .execute(
                 "INSERT INTO folders (id, account_id, remote_key, name, role)
-                 VALUES (?1, ?2, ?3, 'Folder', 'inbox')",
-                params![id, account_id, remote_key],
+                 VALUES (?1, ?2, ?3, 'Folder', ?4)",
+                params![id, account_id, remote_key, role],
             )
             .expect("insert folder");
     }
@@ -218,7 +234,10 @@ mod tests {
             indexes,
             BTreeSet::from([
                 "idx_folders_account".to_owned(),
+                "idx_folders_system_role".to_owned(),
+                "idx_file_gc_queued".to_owned(),
                 "idx_message_folders_folder".to_owned(),
+                "idx_message_tombstones_deleted".to_owned(),
                 "idx_messages_account_time".to_owned(),
                 "idx_messages_global_time".to_owned(),
                 "idx_messages_starred".to_owned(),
@@ -233,7 +252,7 @@ mod tests {
         let mut connection = memory_connection();
         migrate(&mut connection).expect("apply initial migration");
         insert_account(&connection, 1, "user@example.test");
-        insert_folder(&connection, 10, 1, "inbox");
+        insert_folder(&connection, 10, 1, "inbox", "inbox");
         insert_message(&connection, 100, 1, "message-1");
         connection
             .execute(
@@ -274,6 +293,77 @@ mod tests {
     }
 
     #[test]
+    fn upgrades_v1_data_and_enforces_unique_system_roles() {
+        let mut connection = memory_connection();
+        enable_foreign_keys(&connection).expect("enable foreign keys");
+        migrate_with(&mut connection, &MIGRATIONS[..1], 1).expect("create v1 schema");
+        insert_account(&connection, 1, "user@example.test");
+        insert_folder(&connection, 10, 1, "inbox", "inbox");
+        insert_folder(&connection, 11, 1, "label-a", "label");
+        insert_folder(&connection, 12, 1, "inbox-legacy", "inbox");
+        insert_message(&connection, 100, 1, "message-1");
+        connection
+            .execute(
+                "INSERT INTO message_folders (message_id, folder_id, account_id)
+                 VALUES (100, 10, 1), (100, 11, 1)",
+                [],
+            )
+            .expect("seed v1 memberships");
+
+        migrate(&mut connection).expect("upgrade v1 schema");
+
+        let membership_count: i64 = connection
+            .query_row("SELECT count(*) FROM message_folders", [], |row| row.get(0))
+            .expect("count preserved memberships");
+        assert_eq!(membership_count, 2);
+        assert_eq!(schema_version(&connection), 2);
+
+        let legacy_inbox_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM folders WHERE account_id = 1 AND role = 'inbox'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count preserved legacy system folders");
+        assert_eq!(legacy_inbox_count, 2);
+
+        connection
+            .execute(
+                "INSERT INTO folders (id, account_id, remote_key, name, role)
+                 VALUES (10, 1, 'inbox', 'Refreshed Inbox', 'inbox')
+                 ON CONFLICT (account_id, remote_key) DO UPDATE
+                 SET name = excluded.name, role = excluded.role",
+                [],
+            )
+            .expect("an existing system folder can be refreshed with UPSERT");
+        let inbox_name: String = connection
+            .query_row("SELECT name FROM folders WHERE id = 10", [], |row| {
+                row.get(0)
+            })
+            .expect("read refreshed folder");
+        assert_eq!(inbox_name, "Refreshed Inbox");
+
+        let duplicate_system_role = connection
+            .execute(
+                "INSERT INTO folders (id, account_id, remote_key, name, role)
+                 VALUES (13, 1, 'inbox-2', 'Inbox duplicate', 'inbox')",
+                [],
+            )
+            .expect_err("system roles must be unique per account");
+        assert_eq!(
+            duplicate_system_role.sqlite_error_code(),
+            Some(ErrorCode::ConstraintViolation)
+        );
+        connection
+            .execute(
+                "INSERT INTO folders (id, account_id, remote_key, name, role)
+                 VALUES (14, 1, 'label-b', 'Second label', 'label')",
+                [],
+            )
+            .expect("custom roles may repeat");
+    }
+
+    #[test]
     fn rejects_schema_from_a_newer_application() {
         let mut connection = memory_connection();
         connection
@@ -285,7 +375,7 @@ mod tests {
         assert!(matches!(
             error,
             MigrationError::FutureSchema {
-                found: 2,
+                found: 3,
                 supported: LATEST_SCHEMA_VERSION,
             }
         ));
@@ -322,9 +412,9 @@ mod tests {
         migrate(&mut connection).expect("apply initial migration");
         insert_account(&connection, 1, "one@example.test");
         insert_account(&connection, 2, "two@example.test");
-        insert_folder(&connection, 10, 1, "inbox");
-        insert_folder(&connection, 11, 1, "important");
-        insert_folder(&connection, 20, 2, "inbox");
+        insert_folder(&connection, 10, 1, "inbox", "inbox");
+        insert_folder(&connection, 11, 1, "important", "label");
+        insert_folder(&connection, 20, 2, "inbox", "inbox");
         insert_message(&connection, 100, 1, "message-1");
         insert_message(&connection, 200, 2, "message-1");
 
