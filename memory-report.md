@@ -16,8 +16,9 @@ These numbers are machine- and viewport-specific. Software framebuffer memory gr
 ## Configuration
 
 - Measurement date and host: 2026-07-18, Linux 7.1.2-zen3-1-zen x86_64, Rust 1.96.1.
-- Measurement revision: `0d19797`, schema v1, before transactional mutations; later schemas require a fresh run before release gating.
+- Measurement revision: `0d19797`, schema v1, before transactional mutations; the current schema-v6 build requires a fresh run before release gating.
 - Build: stripped `cargo build --release`, 18.4MiB executable, `opt-level = "s"`.
+- Current unmeasured build: schema v6 at `257a533`, 19,342,200-byte stripped release executable.
 - UI state: light theme, three-pane inbox, ten local demo messages.
 - Backend state: active single-connection SQLite actor, empty private database, WAL mode, 1MiB page cache limit.
 - Default renderer: `winit` + `skia-software` (Skia CPU rasterization and partial rendering).
@@ -106,6 +107,7 @@ NIVALIS_MEMORY_SAMPLES="3 7 12 20" \
 - Page rows, totals, navigation counts, and account unread counts are produced in one Store pass. Stable presentation text uses shared handles, and only count changes update account rows.
 - The production binary excludes the benchmark timers. Local cache content renders on the first normal frame; the loading state remains available for real asynchronous I/O.
 - Core-to-UI mailbox and reader projections use independent latest-value slots. The 128-slot event channel contains only lightweight control values and at most one notification per projection class.
+- SQLite mailbox replies retain one 50-row page plus persistent counters and at most 64 per-account unread values. Statistic rebuilds aggregate in SQLite and do not materialize mailbox-wide Rust collections.
 - The measured database directory was mode `0700`; SQLite, WAL, and shared-memory files were mode `0600`. Thread inspection showed `nivalis-core` and `nivalis-sqlite` without an additional reply-bridge thread.
 - A 280-character list preview and a 16,384-character reader shaping boundary prevent a malformed single-line body from multiplying text layout work. The full reader body remains available through explicit progressive loading.
 - A production IMAP/JMAP adapter must keep the page boundary, store message bodies and attachments on disk, and bound rendered quoted history. Loading arbitrary multi-megabyte bodies into one text paragraph cannot satisfy a fixed process-memory ceiling.
