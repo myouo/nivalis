@@ -1,3 +1,4 @@
+use crate::core::{CoreHandle, Event, EventReceiver, OperationId, SubmitError};
 use crate::presentation::{
     apply_view, refresh_account, refresh_folder, refresh_selection, refresh_stats, show_snackbar,
     show_snackbar_after_event, update_mail_row,
@@ -5,9 +6,17 @@ use crate::presentation::{
 use crate::store::MailStore;
 use crate::{AccountItem, AppWindow, MailSummary};
 use slint::{ComponentHandle, ModelRc, Timer, TimerMode, VecModel};
-use std::{cell::RefCell, rc::Rc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    time::Duration,
+};
 
-pub(crate) fn install(ui: &AppWindow) {
+pub(crate) fn install(
+    ui: &AppWindow,
+    core: CoreHandle,
+    mut core_events: EventReceiver,
+) -> Result<slint::JoinHandle<()>, slint::EventLoopError> {
     let store = Rc::new(RefCell::new(MailStore::demo()));
     let (initial_view, initial_accounts) = {
         let store = store.borrow();
@@ -19,7 +28,8 @@ pub(crate) fn install(ui: &AppWindow) {
     let account_model = Rc::new(VecModel::<AccountItem>::from(initial_accounts));
     let snackbar_timer = Rc::new(Timer::default());
     let search_timer = Rc::new(Timer::default());
-    let sync_timer = Rc::new(Timer::default());
+    let active_sync = Rc::new(Cell::new(None));
+    let next_operation_id = Rc::new(Cell::new(1_u64));
     ui.set_mails(ModelRc::from(mail_model.clone()));
     ui.set_accounts(ModelRc::from(account_model.clone()));
     {
@@ -282,30 +292,72 @@ pub(crate) fn install(ui: &AppWindow) {
 
     {
         let ui_weak = ui.as_weak();
-        let sync_timer = sync_timer.clone();
+        let active_sync = active_sync.clone();
+        let next_operation_id = next_operation_id.clone();
         let snackbar_timer = snackbar_timer.clone();
         ui.on_sync(move || {
-            if let Some(ui) = ui_weak.upgrade() {
-                if ui.get_syncing() {
-                    return;
-                }
-                ui.set_syncing(true);
-                ui.set_status_text("Syncing mail...".into());
+            let Some(ui) = ui_weak.upgrade() else {
+                return;
+            };
+            if ui.get_syncing() {
+                return;
             }
 
-            let ui_weak = ui_weak.clone();
-            let snackbar_timer = snackbar_timer.clone();
-            sync_timer.start(
-                TimerMode::SingleShot,
-                Duration::from_millis(900),
-                move || {
-                    if let Some(ui) = ui_weak.upgrade() {
-                        ui.set_syncing(false);
-                        ui.set_status_text("Synced just now".into());
-                        show_snackbar(&ui, "Mailbox is up to date", false, &snackbar_timer);
-                    }
-                },
-            );
+            let operation_id = OperationId::new(next_operation_id.get());
+            next_operation_id.set(next_operation_id.get().wrapping_add(1).max(1));
+            ui.set_syncing(true);
+            ui.set_status_text("Syncing mail...".into());
+
+            match core.try_send_sync(operation_id) {
+                Ok(()) => active_sync.set(Some(operation_id)),
+                Err(error) => {
+                    active_sync.set(None);
+                    ui.set_syncing(false);
+                    let (status, message) = match error {
+                        SubmitError::Busy => (
+                            "Sync queue is busy",
+                            "Sync is already queued. Try again shortly.",
+                        ),
+                        SubmitError::Closed => (
+                            "Sync service unavailable",
+                            "Sync service stopped. Restart Nivalis Mail.",
+                        ),
+                    };
+                    ui.set_status_text(status.into());
+                    show_snackbar(&ui, message, false, &snackbar_timer);
+                }
+            }
         });
     }
+
+    let ui_weak = ui.as_weak();
+    slint::spawn_local(async move {
+        while let Some(event) = core_events.recv().await {
+            let Some(ui) = ui_weak.upgrade() else {
+                return;
+            };
+            match event {
+                Event::SyncFinished { operation_id } if active_sync.get() == Some(operation_id) => {
+                    active_sync.set(None);
+                    ui.set_syncing(false);
+                    ui.set_status_text("Synced just now".into());
+                    show_snackbar(&ui, "Mailbox is up to date", false, &snackbar_timer);
+                }
+                Event::SyncFinished { .. } => {}
+            }
+        }
+
+        if active_sync.take().is_some()
+            && let Some(ui) = ui_weak.upgrade()
+        {
+            ui.set_syncing(false);
+            ui.set_status_text("Sync service unavailable".into());
+            show_snackbar(
+                &ui,
+                "Sync service stopped. Restart Nivalis Mail.",
+                false,
+                &snackbar_timer,
+            );
+        }
+    })
 }
