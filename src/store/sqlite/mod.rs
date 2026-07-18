@@ -8,7 +8,9 @@ pub(crate) use actor::{
     SubmitError as DatabaseSubmitError,
 };
 pub(crate) use domain::{AccountScope, FolderScope};
-pub(crate) use domain::{DbReply, Generation, MailboxPage, PageSpec, RequestId, Tagged};
+pub(crate) use domain::{
+    DbReply, Generation, MailboxPage, MessageDetail, MessageId, PageSpec, RequestId, Tagged,
+};
 
 pub(crate) fn spawn(
     path: impl Into<std::path::PathBuf>,

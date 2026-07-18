@@ -344,7 +344,10 @@ pub(crate) fn install(
                     show_snackbar(&ui, "Mailbox is up to date", false, &snackbar_timer);
                 }
                 Event::SyncFinished { .. } => {}
-                Event::MailboxLoaded(_) | Event::MailboxLoadRejected { .. } => {}
+                Event::MailboxLoaded(_)
+                | Event::MailboxLoadRejected { .. }
+                | Event::MessageLoaded(_)
+                | Event::MessageLoadRejected { .. } => {}
             }
         }
 

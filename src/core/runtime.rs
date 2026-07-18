@@ -1,6 +1,7 @@
 use super::message::{
     COMMAND_CAPACITY, Command, CoreHandle, EVENT_CAPACITY, Event, EventReceiver, EventSender,
-    MailboxLoadError, MailboxQuery, MailboxRequestKey, event_channel,
+    MailboxLoadError, MailboxQuery, MailboxRequestKey, MessageLoadError, MessageQuery,
+    MessageRequestKey, event_channel,
 };
 use crate::store::sqlite::{
     self, DatabaseClient, DatabaseInfo, DatabaseReplies, DatabaseRuntime, DatabaseSubmitError,
@@ -118,6 +119,7 @@ async fn run_core(
     let mut active_sync: Option<(super::OperationId, Pin<Box<time::Sleep>>)> = None;
     let mut pending_sync = None;
     let mut mailbox = MailboxSchedule::default();
+    let mut message = MessageSchedule::default();
     let mut command_streak = 0_u8;
 
     loop {
@@ -157,6 +159,14 @@ async fn run_core(
                     return Ok(());
                 }
             }
+            CoreInput::Command(Command::OpenMessage(query)) => {
+                if let Some(query) = message.enqueue(query)
+                    && let Some(event) = submit_message(&database, &mut message, query)
+                    && !send_event(&events, &mut shutdown, event).await
+                {
+                    return Ok(());
+                }
+            }
             CoreInput::Database(DbReply::Mailbox(reply)) => {
                 let key = MailboxRequestKey {
                     request_id: reply.request_id,
@@ -178,7 +188,27 @@ async fn run_core(
                     }
                 }
             }
-            CoreInput::Database(DbReply::Message(_)) => {}
+            CoreInput::Database(DbReply::Message(reply)) => {
+                let key = MessageRequestKey {
+                    request_id: reply.request_id,
+                    generation: reply.generation,
+                };
+                match message.complete(key) {
+                    MessageCompletion::Ignore => {}
+                    MessageCompletion::Publish => {
+                        if !send_event(&events, &mut shutdown, Event::MessageLoaded(reply)).await {
+                            return Ok(());
+                        }
+                    }
+                    MessageCompletion::Dispatch(query) => {
+                        if let Some(event) = submit_message(&database, &mut message, query)
+                            && !send_event(&events, &mut shutdown, event).await
+                        {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
             CoreInput::SyncElapsed => {
                 let Some((operation_id, _)) = active_sync.take() else {
                     continue;
@@ -328,6 +358,70 @@ fn submit_mailbox(
     })
 }
 
+#[derive(Default)]
+struct MessageSchedule {
+    active: Option<MessageRequestKey>,
+    pending: Option<MessageQuery>,
+}
+
+impl MessageSchedule {
+    fn enqueue(&mut self, query: MessageQuery) -> Option<MessageQuery> {
+        if self.active.is_some() {
+            self.pending = Some(query);
+            None
+        } else {
+            self.active = Some(query.key());
+            Some(query)
+        }
+    }
+
+    fn complete(&mut self, key: MessageRequestKey) -> MessageCompletion {
+        if self.active != Some(key) {
+            return MessageCompletion::Ignore;
+        }
+
+        self.active = None;
+        if let Some(query) = self.pending.take() {
+            self.active = Some(query.key());
+            MessageCompletion::Dispatch(query)
+        } else {
+            MessageCompletion::Publish
+        }
+    }
+
+    fn submission_failed(&mut self, key: MessageRequestKey) {
+        if self.active == Some(key) {
+            self.active = None;
+        }
+    }
+}
+
+enum MessageCompletion {
+    Ignore,
+    Publish,
+    Dispatch(MessageQuery),
+}
+
+fn submit_message(
+    database: &DatabaseClient,
+    schedule: &mut MessageSchedule,
+    query: MessageQuery,
+) -> Option<Event> {
+    let key = query.key();
+    let result = database.try_open_message(query.request_id, query.generation, query.message_id);
+    let reason = match result {
+        Ok(()) => return None,
+        Err(DatabaseSubmitError::Busy) => MessageLoadError::Busy,
+        Err(DatabaseSubmitError::Closed) => MessageLoadError::Unavailable,
+    };
+    schedule.submission_failed(key);
+    Some(Event::MessageLoadRejected {
+        request_id: key.request_id,
+        generation: key.generation,
+        reason,
+    })
+}
+
 pub(crate) struct CoreRuntime {
     shutdown: Option<oneshot::Sender<()>>,
     worker: Option<thread::JoinHandle<Result<(), RuntimeError>>>,
@@ -421,7 +515,8 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> Arc<str> {
 mod tests {
     use super::*;
     use crate::core::{
-        AccountScope, FolderScope, Generation, MailboxQuery, OperationId, PageSpec, RequestId,
+        AccountScope, FolderScope, Generation, MailboxQuery, MessageId, MessageQuery, OperationId,
+        PageSpec, RequestId,
     };
     use std::time::Instant;
 
@@ -434,6 +529,14 @@ mod tests {
             RequestId::new(request_id).unwrap(),
             Generation::new(generation),
             PageSpec::new(AccountScope::All, FolderScope::Inbox, None, None, 50).unwrap(),
+        )
+    }
+
+    fn message_query(request_id: u64, generation: u64, message_id: i64) -> MessageQuery {
+        MessageQuery::new(
+            RequestId::new(request_id).unwrap(),
+            Generation::new(generation),
+            MessageId::new(message_id).unwrap(),
         )
     }
 
@@ -539,6 +642,21 @@ mod tests {
     }
 
     #[test]
+    fn message_query_round_trip_preserves_request_identity() {
+        let (core, mut events, runtime) = spawn_with_delay(Duration::from_millis(1)).unwrap();
+
+        core.try_open_message(message_query(8, 4, 1)).unwrap();
+
+        let Some(Event::MessageLoaded(reply)) = events.blocking_recv() else {
+            panic!("expected message detail");
+        };
+        assert_eq!(reply.request_id, RequestId::new(8).unwrap());
+        assert_eq!(reply.generation, Generation::new(4));
+        assert_eq!(reply.result.unwrap(), None);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
     fn mailbox_schedule_replaces_obsolete_pending_query() {
         let mut schedule = MailboxSchedule::default();
         let first = mailbox_query(1, 1);
@@ -558,6 +676,29 @@ mod tests {
         assert!(matches!(
             schedule.complete(latest_key),
             MailboxCompletion::Publish
+        ));
+    }
+
+    #[test]
+    fn message_schedule_replaces_obsolete_pending_query() {
+        let mut schedule = MessageSchedule::default();
+        let first = message_query(1, 1, 1);
+        let first_key = first.key();
+        let obsolete = message_query(2, 2, 2);
+        let latest = message_query(3, 3, 3);
+        let latest_key = latest.key();
+
+        assert!(schedule.enqueue(first).is_some());
+        assert!(schedule.enqueue(obsolete).is_none());
+        assert!(schedule.enqueue(latest).is_none());
+
+        let MessageCompletion::Dispatch(next) = schedule.complete(first_key) else {
+            panic!("latest pending detail should be dispatched");
+        };
+        assert_eq!(next.key(), latest_key);
+        assert!(matches!(
+            schedule.complete(latest_key),
+            MessageCompletion::Publish
         ));
     }
 

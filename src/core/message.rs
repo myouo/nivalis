@@ -1,4 +1,6 @@
-use crate::store::sqlite::{Generation, MailboxPage, PageSpec, RequestId, Tagged};
+use crate::store::sqlite::{
+    Generation, MailboxPage, MessageDetail, MessageId, PageSpec, RequestId, Tagged,
+};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::mpsc;
 
@@ -21,6 +23,8 @@ pub(super) enum Command {
     },
     #[cfg_attr(not(test), allow(dead_code))]
     QueryMailbox(MailboxQuery),
+    #[cfg_attr(not(test), allow(dead_code))]
+    OpenMessage(MessageQuery),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -33,6 +37,12 @@ pub(crate) enum Event {
         request_id: RequestId,
         generation: Generation,
         reason: MailboxLoadError,
+    },
+    MessageLoaded(Tagged<Option<MessageDetail>>),
+    MessageLoadRejected {
+        request_id: RequestId,
+        generation: Generation,
+        reason: MessageLoadError,
     },
 }
 
@@ -67,8 +77,49 @@ pub(super) struct MailboxRequestKey {
     pub(super) generation: Generation,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MessageQuery {
+    pub(super) request_id: RequestId,
+    pub(super) generation: Generation,
+    pub(super) message_id: MessageId,
+}
+
+impl MessageQuery {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn new(
+        request_id: RequestId,
+        generation: Generation,
+        message_id: MessageId,
+    ) -> Self {
+        Self {
+            request_id,
+            generation,
+            message_id,
+        }
+    }
+
+    pub(super) fn key(&self) -> MessageRequestKey {
+        MessageRequestKey {
+            request_id: self.request_id,
+            generation: self.generation,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct MessageRequestKey {
+    pub(super) request_id: RequestId,
+    pub(super) generation: Generation,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MailboxLoadError {
+    Busy,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MessageLoadError {
     Busy,
     Unavailable,
 }
@@ -76,17 +127,19 @@ pub(crate) enum MailboxLoadError {
 enum EventEnvelope {
     Control(Event),
     MailboxReady,
+    MessageReady,
 }
 
 #[derive(Default)]
-struct LatestMailboxEvent {
+struct LatestEvent {
     event: Option<Event>,
     notification_queued: bool,
 }
 
 pub(super) struct EventSender {
     events: mpsc::Sender<EventEnvelope>,
-    mailbox: Arc<Mutex<LatestMailboxEvent>>,
+    mailbox: Arc<Mutex<LatestEvent>>,
+    message: Arc<Mutex<LatestEvent>>,
 }
 
 impl EventSender {
@@ -95,15 +148,18 @@ impl EventSender {
             &event,
             Event::MailboxLoaded(_) | Event::MailboxLoadRejected { .. }
         ) {
-            let mut mailbox = lock_mailbox(&self.mailbox);
-            mailbox.event = Some(event);
-            if mailbox.notification_queued {
-                return Ok(());
-            }
-            mailbox.notification_queued = true;
-            EventEnvelope::MailboxReady
+            replace_latest(&self.mailbox, event, EventEnvelope::MailboxReady)
+        } else if matches!(
+            &event,
+            Event::MessageLoaded(_) | Event::MessageLoadRejected { .. }
+        ) {
+            replace_latest(&self.message, event, EventEnvelope::MessageReady)
         } else {
-            EventEnvelope::Control(event)
+            Some(EventEnvelope::Control(event))
+        };
+
+        let Some(envelope) = envelope else {
+            return Ok(());
         };
 
         self.events.send(envelope).await.map_err(|_| ())
@@ -112,7 +168,8 @@ impl EventSender {
 
 pub(crate) struct EventReceiver {
     events: mpsc::Receiver<EventEnvelope>,
-    mailbox: Arc<Mutex<LatestMailboxEvent>>,
+    mailbox: Arc<Mutex<LatestEvent>>,
+    message: Arc<Mutex<LatestEvent>>,
 }
 
 impl EventReceiver {
@@ -121,9 +178,12 @@ impl EventReceiver {
             match self.events.recv().await? {
                 EventEnvelope::Control(event) => return Some(event),
                 EventEnvelope::MailboxReady => {
-                    let mut mailbox = lock_mailbox(&self.mailbox);
-                    mailbox.notification_queued = false;
-                    if let Some(event) = mailbox.event.take() {
+                    if let Some(event) = take_latest(&self.mailbox) {
+                        return Some(event);
+                    }
+                }
+                EventEnvelope::MessageReady => {
+                    if let Some(event) = take_latest(&self.message) {
                         return Some(event);
                     }
                 }
@@ -137,9 +197,12 @@ impl EventReceiver {
             match self.events.blocking_recv()? {
                 EventEnvelope::Control(event) => return Some(event),
                 EventEnvelope::MailboxReady => {
-                    let mut mailbox = lock_mailbox(&self.mailbox);
-                    mailbox.notification_queued = false;
-                    if let Some(event) = mailbox.event.take() {
+                    if let Some(event) = take_latest(&self.mailbox) {
+                        return Some(event);
+                    }
+                }
+                EventEnvelope::MessageReady => {
+                    if let Some(event) = take_latest(&self.message) {
                         return Some(event);
                     }
                 }
@@ -160,21 +223,45 @@ impl EventReceiver {
 
 pub(super) fn event_channel(capacity: usize) -> (EventSender, EventReceiver) {
     let (sender, receiver) = mpsc::channel(capacity);
-    let mailbox = Arc::new(Mutex::new(LatestMailboxEvent::default()));
+    let mailbox = Arc::new(Mutex::new(LatestEvent::default()));
+    let message = Arc::new(Mutex::new(LatestEvent::default()));
     (
         EventSender {
             events: sender,
             mailbox: mailbox.clone(),
+            message: message.clone(),
         },
         EventReceiver {
             events: receiver,
             mailbox,
+            message,
         },
     )
 }
 
-fn lock_mailbox(mailbox: &Mutex<LatestMailboxEvent>) -> MutexGuard<'_, LatestMailboxEvent> {
-    mailbox.lock().unwrap_or_else(|poison| poison.into_inner())
+fn replace_latest(
+    slot: &Mutex<LatestEvent>,
+    event: Event,
+    notification: EventEnvelope,
+) -> Option<EventEnvelope> {
+    let mut slot = lock_latest(slot);
+    slot.event = Some(event);
+    if slot.notification_queued {
+        None
+    } else {
+        slot.notification_queued = true;
+        Some(notification)
+    }
+}
+
+fn take_latest(slot: &Mutex<LatestEvent>) -> Option<Event> {
+    let mut slot = lock_latest(slot);
+    slot.notification_queued = false;
+    slot.event.take()
+}
+
+fn lock_latest(slot: &Mutex<LatestEvent>) -> MutexGuard<'_, LatestEvent> {
+    slot.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
 #[derive(Clone)]
@@ -197,6 +284,13 @@ impl CoreHandle {
     pub(crate) fn try_query_mailbox(&self, query: MailboxQuery) -> Result<(), SubmitError> {
         self.commands
             .try_send(Command::QueryMailbox(query))
+            .map_err(SubmitError::from)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn try_open_message(&self, query: MessageQuery) -> Result<(), SubmitError> {
+        self.commands
+            .try_send(Command::OpenMessage(query))
             .map_err(SubmitError::from)
     }
 }
@@ -274,5 +368,37 @@ mod tests {
             })
         );
         assert!(receiver.is_empty());
+    }
+
+    #[test]
+    fn mailbox_and_message_results_use_independent_slots() {
+        let (sender, mut receiver) = event_channel(4);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(sender.send(Event::MailboxLoadRejected {
+                request_id: RequestId::new(1).unwrap(),
+                generation: Generation::new(1),
+                reason: MailboxLoadError::Busy,
+            }))
+            .unwrap();
+        runtime
+            .block_on(sender.send(Event::MessageLoadRejected {
+                request_id: RequestId::new(2).unwrap(),
+                generation: Generation::new(2),
+                reason: MessageLoadError::Busy,
+            }))
+            .unwrap();
+
+        assert_eq!(receiver.len(), 2);
+        assert!(matches!(
+            receiver.blocking_recv(),
+            Some(Event::MailboxLoadRejected { .. })
+        ));
+        assert!(matches!(
+            receiver.blocking_recv(),
+            Some(Event::MessageLoadRejected { .. })
+        ));
     }
 }

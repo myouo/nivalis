@@ -43,7 +43,7 @@ impl MessageId {
         Self(value)
     }
 
-    pub(super) fn get(self) -> i64 {
+    pub(crate) fn get(self) -> i64 {
         self.0
     }
 }
