@@ -6,6 +6,14 @@ This document fixes the production architecture for Nivalis Mail. Components des
 
 The primary constraints are predictable UI latency, safe processing of untrusted mail, reliable offline behavior, and a release idle resident set below 90 MiB, preferably below 50 MiB. Memory growth after representative synchronization must stabilize below twice the warm-idle baseline. A smaller feature graph and bounded live data take priority over speculative concurrency.
 
+### Implementation status
+
+- The UI-to-core boundary is active for sync: a bounded 64-command channel feeds one Tokio `current_thread` runtime, and a bounded 128-event channel returns results through Slint's local executor. Event backpressure and shutdown are cancellation-safe.
+- SQLite schema v1, atomic migrations, 50-row keyset projections, bounded reader excerpts, and a dedicated single-connection actor are implemented and tested. The actor is intentionally not constructed by `main` while the controller still reads `MailStore`.
+- Database replies currently expose a blocking staging receiver. Before activation, replies must enter the async core through a non-blocking bridge; the UI and the current-thread Tokio runtime must never call `recv` or `recv_timeout`.
+- Live SQLite search additionally requires stale-generation cancellation/coalescing and FTS. The bounded `LIKE` implementation preserves prototype semantics for validation but is not the production large-mailbox search path.
+- IMAP/SMTP, optional JMAP, MIME ingestion, OAuth2, keyring integration, and the controller's SQLite cutover remain planned backend slices.
+
 ## Process topology
 
 Nivalis uses three long-lived execution domains. They exchange typed messages and never share mutable protocol or database objects.
@@ -41,9 +49,9 @@ The network actor owns IMAP/JMAP sessions, SMTP submissions, OAuth token refresh
 
 ### SQLite actor
 
-A separate blocking thread owns the single `rusqlite::Connection`; neither the UI nor Tokio tasks access it directly. Bounded database requests use typed request/reply messages. The actor performs transactions, migrations, mailbox queries, FTS work, and durable outbox updates serially.
+A separate blocking thread owns the single `rusqlite::Connection`; neither the UI nor Tokio tasks access it directly. Bounded database requests use typed request/reply messages. The actor performs transactions, migrations, mailbox queries, and durable outbox updates serially. FTS will be added on this same actor before live search is enabled.
 
-SQLite stores accounts, folders, message metadata, flags, synchronization cursors, compact searchable text, and file references. Large bodies and attachments are streamed to bounded files and loaded on demand instead of being retained as database blobs or process-wide byte vectors. Queries return paged projections, never the full mailbox. WAL and cache sizing must be set explicitly and included in memory measurements.
+SQLite stores accounts, multi-folder message membership, metadata, flags, synchronization cursors, a durable SMTP envelope/outbox, compact searchable text, and file references. Large bodies, attachments, and outbound MIME are streamed to private bounded files and loaded on demand instead of being retained as database blobs or process-wide byte vectors. Queries return keyset-paged projections, never the full mailbox or an exact count scan on every page. WAL, file permissions, query limits, worker count, mmap, and cache sizing are explicit and covered by tests.
 
 ## Mail backends
 
@@ -79,6 +87,8 @@ The `keyring` crate stores refresh tokens and app passwords in the operating-sys
 
 Memory is measured from stripped release builds after startup and again after a representative multi-account sync/open/close cycle. `memory-report.md` defines the current Linux measurement procedure and remains the reproducible baseline.
 
+The current baseline predates activation of the SQLite actor. Release LTO removes the unreachable staging implementation, so database memory must be measured again when the actor and reply bridge become reachable; the actor's idle increment target is at most 4 MiB before the UI repository cutover proceeds.
+
 The release gates are:
 
 - Warm idle RSS is preferably at or below 50 MiB and must remain below 90 MiB on supported reference environments.
@@ -95,6 +105,8 @@ Every substantial dependency is added with `default-features = false`; release f
 
 - Slint keeps only `std`, Winit, Skia, accessibility, the required Winit compatibility layer, and `compat-1-2`.
 - Tokio uses a single current-thread runtime and no multithread scheduler, macros, process, signal, or filesystem feature unless required and measured.
+- Rusqlite disables defaults and enables only the bundled SQLite build plus runtime limits; one actor owns one connection with a 1MiB cache, mmap disabled, and SQLite worker threads set to zero.
+- Crossbeam channel defaults are disabled and only `std` is enabled for bounded database request, reply, startup, and shutdown channels.
 - `async-imap` uses `runtime-tokio`; async-std and IMAP compression stay out of the baseline.
 - Lettre uses only message building, SMTP, Tokio/Rustls, `ring`, and the platform verifier; pooling and DKIM stay out.
 - JMAP and any WebSocket transport are optional, with WebSocket disabled in the normal build.
