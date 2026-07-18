@@ -2,7 +2,7 @@ use std::{error::Error, fmt};
 
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(crate) const LATEST_SCHEMA_VERSION: u32 = 3;
+pub(crate) const LATEST_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -22,6 +22,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 3,
         sql: include_str!("../../../migrations/0003_file_reference_indexes.sql"),
+    },
+    Migration {
+        version: 4,
+        sql: include_str!("../../../migrations/0004_mutation_guards.sql"),
     },
 ];
 
@@ -323,7 +327,7 @@ mod tests {
             .query_row("SELECT count(*) FROM message_folders", [], |row| row.get(0))
             .expect("count preserved memberships");
         assert_eq!(membership_count, 2);
-        assert_eq!(schema_version(&connection), 3);
+        assert_eq!(schema_version(&connection), 4);
 
         let legacy_inbox_count: i64 = connection
             .query_row(
@@ -361,6 +365,23 @@ mod tests {
             duplicate_system_role.sqlite_error_code(),
             Some(ErrorCode::ConstraintViolation)
         );
+        let replace_label_as_inbox = connection
+            .execute(
+                "INSERT OR REPLACE INTO folders (id, account_id, remote_key, name, role)
+                 VALUES (11, 1, 'label-a', 'Disguised Inbox', 'inbox')",
+                [],
+            )
+            .expect_err("REPLACE cannot turn an existing label into a duplicate Inbox");
+        assert_eq!(
+            replace_label_as_inbox.sqlite_error_code(),
+            Some(ErrorCode::ConstraintViolation)
+        );
+        let preserved_role: String = connection
+            .query_row("SELECT role FROM folders WHERE id = 11", [], |row| {
+                row.get(0)
+            })
+            .expect("read preserved label role");
+        assert_eq!(preserved_role, "label");
         connection
             .execute(
                 "INSERT INTO folders (id, account_id, remote_key, name, role)
@@ -382,7 +403,7 @@ mod tests {
         assert!(matches!(
             error,
             MigrationError::FutureSchema {
-                found: 4,
+                found: 5,
                 supported: LATEST_SCHEMA_VERSION,
             }
         ));
@@ -533,6 +554,49 @@ mod tests {
         assert!(outbox_columns.contains("envelope_from"));
         assert!(outbox_columns.contains("wire_byte_count"));
         assert!(!outbox_columns.contains("mime"));
+    }
+
+    #[test]
+    fn live_file_references_remove_stale_gc_entries_transactionally() {
+        let mut connection = memory_connection();
+        migrate(&mut connection).expect("apply migrations");
+        insert_account(&connection, 1, "sender@example.test");
+        insert_message(&connection, 100, 1, "message-1");
+        connection
+            .execute(
+                "INSERT INTO file_gc (file_key, queued_at_ms)
+                 VALUES ('body.eml', 0), ('attachment.bin', 0), ('outbox.eml', 0)",
+                [],
+            )
+            .expect("seed stale GC entries");
+
+        connection
+            .execute(
+                "INSERT INTO message_content (message_id, body_file_key)
+                 VALUES (100, 'body.eml')",
+                [],
+            )
+            .expect("reference body file");
+        connection
+            .execute(
+                "INSERT INTO attachments (id, message_id, ordinal, file_key)
+                 VALUES (1, 100, 0, 'attachment.bin')",
+                [],
+            )
+            .expect("reference attachment file");
+        connection
+            .execute(
+                "INSERT INTO outbox
+                 (message_id, mime_file_key, envelope_from, wire_byte_count, state)
+                 VALUES (100, 'outbox.eml', 'sender@example.test', 1, 'pending')",
+                [],
+            )
+            .expect("reference Outbox file");
+
+        let queued_count: i64 = connection
+            .query_row("SELECT count(*) FROM file_gc", [], |row| row.get(0))
+            .expect("count remaining GC entries");
+        assert_eq!(queued_count, 0);
     }
 
     #[test]
