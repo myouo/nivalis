@@ -61,6 +61,8 @@ SQLite stores accounts, multi-folder message membership, metadata, flags, synchr
 
 The core exposes one provider-neutral mailbox interface. IMAP/SMTP is the required backend; JMAP is compiled and configured independently so providers can be selected without leaking protocol types into UI models.
 
+Remote identity, desired-state compaction, versioned claim/report handling, and conflict rules are fixed by [`remote-sync-contract.md`](remote-sync-contract.md). Provider adapters may be added only behind that contract; an IMAP UID by itself is never treated as an account-global message identity.
+
 ### IMAP and SMTP
 
 `async-imap` is the production IMAP client and is built with default features disabled and only its Tokio runtime integration. The application owns capability discovery, UIDVALIDITY handling, incremental synchronization, IDLE lifecycle, reconnect policy, and provider compatibility tests. IMAP compression is disabled until measurements demonstrate a net benefit.
