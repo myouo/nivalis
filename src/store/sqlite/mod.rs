@@ -1,6 +1,7 @@
 mod actor;
 mod domain;
 mod migrations;
+mod mutation;
 mod query;
 
 pub(crate) use actor::{
@@ -9,7 +10,8 @@ pub(crate) use actor::{
 };
 pub(crate) use domain::{AccountScope, FolderScope};
 pub(crate) use domain::{
-    DbReply, Generation, MailboxPage, MessageDetail, MessageId, PageSpec, RequestId, Tagged,
+    DbReply, Generation, MailboxPage, MessageDetail, MessageId, MessageMutation, MutationOutcome,
+    PageSpec, RequestId, Tagged, UndoToken,
 };
 
 pub(crate) fn spawn(

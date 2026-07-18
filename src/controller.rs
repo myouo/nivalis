@@ -347,7 +347,9 @@ pub(crate) fn install(
                 Event::MailboxLoaded(_)
                 | Event::MailboxLoadRejected { .. }
                 | Event::MessageLoaded(_)
-                | Event::MessageLoadRejected { .. } => {}
+                | Event::MessageLoadRejected { .. }
+                | Event::MutationFinished(_)
+                | Event::MutationRejected { .. } => {}
             }
         }
 

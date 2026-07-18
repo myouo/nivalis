@@ -5,6 +5,7 @@ use std::{
 
 pub(super) const MAX_PAGE_SIZE: u8 = 50;
 pub(super) const MAX_SEARCH_BYTES: usize = 256;
+pub(super) const TRASH_UNDO_TTL_MS: i64 = 5_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RequestId(NonZeroU64);
@@ -45,6 +46,22 @@ impl MessageId {
 
     pub(crate) fn get(self) -> i64 {
         self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UndoToken(NonZeroI64);
+
+impl UndoToken {
+    pub(super) fn from_database(value: i64) -> Result<Self, DbFailure> {
+        NonZeroI64::new(value)
+            .filter(|value| value.get() > 0)
+            .map(Self)
+            .ok_or_else(|| DbFailure::resource_limit("invalid trash undo token"))
+    }
+
+    pub(super) fn get(self) -> i64 {
+        self.0.get()
     }
 }
 
@@ -190,6 +207,78 @@ pub(crate) struct MessageDetail {
     pub(crate) body_file_key: Option<Box<str>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UndoReceipt {
+    pub(crate) token: UndoToken,
+    pub(crate) expires_at_ms: i64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MessageMutation {
+    SetUnread { id: MessageId, unread: bool },
+    SetStarred { id: MessageId, starred: bool },
+    Archive { id: MessageId },
+    MoveToTrash { id: MessageId },
+    DeletePermanently { id: MessageId },
+    UndoTrash { token: UndoToken },
+}
+
+impl MessageMutation {
+    pub(crate) fn set_unread(id: MessageId, unread: bool) -> Self {
+        Self::SetUnread { id, unread }
+    }
+
+    pub(crate) fn set_starred(id: MessageId, starred: bool) -> Self {
+        Self::SetStarred { id, starred }
+    }
+
+    pub(crate) fn archive(id: MessageId) -> Self {
+        Self::Archive { id }
+    }
+
+    pub(crate) fn move_to_trash(id: MessageId) -> Self {
+        Self::MoveToTrash { id }
+    }
+
+    pub(crate) fn delete_permanently(id: MessageId) -> Self {
+        Self::DeletePermanently { id }
+    }
+
+    pub(crate) fn undo_trash(token: UndoToken) -> Self {
+        Self::UndoTrash { token }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MessageState {
+    pub(crate) id: MessageId,
+    pub(crate) account_id: i64,
+    pub(crate) revision: u64,
+    pub(crate) unread: bool,
+    pub(crate) starred: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MutationOutcome {
+    Updated {
+        state: MessageState,
+        changed: bool,
+    },
+    Archived {
+        state: MessageState,
+        changed: bool,
+    },
+    MovedToTrash {
+        state: MessageState,
+        undo: UndoReceipt,
+    },
+    PermanentlyDeleted {
+        id: MessageId,
+        account_id: i64,
+    },
+    Restored(MessageState),
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Tagged<T> {
     pub(crate) request_id: RequestId,
@@ -201,6 +290,7 @@ pub(crate) struct Tagged<T> {
 pub(crate) enum DbReply {
     Mailbox(Tagged<MailboxPage>),
     Message(Tagged<Option<MessageDetail>>),
+    Mutation(Tagged<MutationOutcome>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -208,6 +298,8 @@ pub(crate) enum FailureKind {
     Database,
     Migration,
     ResourceLimit,
+    NotFound,
+    Conflict,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -234,6 +326,20 @@ impl DbFailure {
     pub(super) fn resource_limit(message: impl Into<Box<str>>) -> Self {
         Self {
             kind: FailureKind::ResourceLimit,
+            message: message.into(),
+        }
+    }
+
+    pub(super) fn not_found(message: impl Into<Box<str>>) -> Self {
+        Self {
+            kind: FailureKind::NotFound,
+            message: message.into(),
+        }
+    }
+
+    pub(super) fn conflict(message: impl Into<Box<str>>) -> Self {
+        Self {
+            kind: FailureKind::Conflict,
             message: message.into(),
         }
     }

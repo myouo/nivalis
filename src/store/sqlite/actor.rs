@@ -2,10 +2,10 @@ use std::{
     any::Any,
     fmt, fs,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard},
     task::{Context, Poll},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select_biased};
@@ -13,8 +13,11 @@ use rusqlite::{Connection, InterruptHandle, OpenFlags, limits::Limit};
 use tokio::sync::mpsc;
 
 use super::{
-    domain::{DbFailure, DbReply, Generation, MessageId, PageSpec, RequestId, Tagged},
+    domain::{
+        DbFailure, DbReply, Generation, MessageId, MessageMutation, PageSpec, RequestId, Tagged,
+    },
     migrations::migrate,
+    mutation::mutate_message,
     query::{open_message, query_mailbox},
 };
 
@@ -34,6 +37,11 @@ enum Request {
         generation: Generation,
         id: MessageId,
     },
+    Mutate {
+        request_id: RequestId,
+        generation: Generation,
+        mutation: MessageMutation,
+    },
     #[cfg(test)]
     RunLongQuery { started: Sender<()> },
 }
@@ -41,6 +49,9 @@ enum Request {
 #[derive(Clone)]
 pub(crate) struct DatabaseClient {
     requests: Sender<Request>,
+    admission: Arc<Mutex<bool>>,
+    interrupt: Arc<InterruptHandle>,
+    write_gate: Arc<Mutex<()>>,
 }
 
 impl DatabaseClient {
@@ -50,13 +61,11 @@ impl DatabaseClient {
         generation: Generation,
         spec: PageSpec,
     ) -> Result<(), SubmitError> {
-        self.requests
-            .try_send(Request::QueryMailbox {
-                request_id,
-                generation,
-                spec,
-            })
-            .map_err(SubmitError::from)
+        self.try_submit(Request::QueryMailbox {
+            request_id,
+            generation,
+            spec,
+        })
     }
 
     pub(crate) fn try_open_message(
@@ -65,13 +74,65 @@ impl DatabaseClient {
         generation: Generation,
         id: MessageId,
     ) -> Result<(), SubmitError> {
-        self.requests
-            .try_send(Request::OpenMessage {
-                request_id,
-                generation,
-                id,
-            })
-            .map_err(SubmitError::from)
+        self.try_submit(Request::OpenMessage {
+            request_id,
+            generation,
+            id,
+        })
+    }
+
+    pub(crate) fn try_mutate(
+        &self,
+        request_id: RequestId,
+        generation: Generation,
+        mutation: MessageMutation,
+    ) -> Result<(), SubmitError> {
+        self.try_mutate_recover(request_id, generation, mutation)
+            .map_err(|(error, _)| error)
+    }
+
+    pub(crate) fn try_mutate_recover(
+        &self,
+        request_id: RequestId,
+        generation: Generation,
+        mutation: MessageMutation,
+    ) -> Result<(), (SubmitError, MessageMutation)> {
+        let admission = lock_admission(&self.admission);
+        if !*admission {
+            return Err((SubmitError::Closed, mutation));
+        }
+        match self.requests.try_send(Request::Mutate {
+            request_id,
+            generation,
+            mutation,
+        }) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(Request::Mutate { mutation, .. })) => {
+                Err((SubmitError::Busy, mutation))
+            }
+            Err(TrySendError::Disconnected(Request::Mutate { mutation, .. })) => {
+                Err((SubmitError::Closed, mutation))
+            }
+            Err(_) => unreachable!("try_mutate_recover only submits mutation requests"),
+        }
+    }
+
+    pub(crate) fn interrupt_queries(&self) {
+        let _write_guard = lock_write_gate(&self.write_gate);
+        self.interrupt.interrupt();
+    }
+
+    fn try_submit(&self, request: Request) -> Result<(), SubmitError> {
+        let admission = lock_admission(&self.admission);
+        if !*admission {
+            return Err(SubmitError::Closed);
+        }
+        self.requests.try_send(request).map_err(SubmitError::from)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_run_long_query(&self, started: Sender<()>) -> Result<(), SubmitError> {
+        self.try_submit(Request::RunLongQuery { started })
     }
 }
 
@@ -162,9 +223,23 @@ fn spawn_target(
     let (reply_tx, reply_rx) = mpsc::channel(reply_capacity);
     let (shutdown_tx, shutdown_rx) = bounded(1);
     let (startup_tx, startup_rx) = bounded(1);
+    let admission = Arc::new(Mutex::new(true));
+    let actor_admission = admission.clone();
+    let write_gate = Arc::new(Mutex::new(()));
+    let actor_write_gate = write_gate.clone();
     let worker = thread::Builder::new()
         .name("nivalis-sqlite".into())
-        .spawn(move || run_actor(target, request_rx, reply_tx, shutdown_rx, startup_tx))
+        .spawn(move || {
+            run_actor(
+                target,
+                request_rx,
+                reply_tx,
+                shutdown_rx,
+                startup_tx,
+                actor_admission,
+                actor_write_gate,
+            )
+        })
         .map_err(StartError::Thread)?;
 
     let started = match startup_rx.recv() {
@@ -179,11 +254,16 @@ fn spawn_target(
     Ok((
         DatabaseClient {
             requests: request_tx,
+            admission: admission.clone(),
+            interrupt: started.interrupt.clone(),
+            write_gate: write_gate.clone(),
         },
         DatabaseReplies { replies: reply_rx },
         DatabaseRuntime {
             shutdown: Some(shutdown_tx),
+            admission,
             interrupt: Some(started.interrupt),
+            write_gate,
             worker: Some(worker),
         },
         started.info,
@@ -197,7 +277,7 @@ enum Target {
 
 struct Started {
     info: DatabaseInfo,
-    interrupt: InterruptHandle,
+    interrupt: Arc<InterruptHandle>,
 }
 
 fn run_actor(
@@ -206,8 +286,10 @@ fn run_actor(
     replies: mpsc::Sender<DbReply>,
     shutdown: Receiver<()>,
     startup: Sender<Result<Started, DbFailure>>,
+    admission: Arc<Mutex<bool>>,
+    write_gate: Arc<Mutex<()>>,
 ) -> Result<(), DbFailure> {
-    let connection = match open_connection(target).and_then(|mut connection| {
+    let mut connection = match open_connection(target).and_then(|mut connection| {
         configure(&mut connection)?;
         Ok(connection)
     }) {
@@ -220,7 +302,7 @@ fn run_actor(
 
     let started = Started {
         info: database_info(&connection)?,
-        interrupt: connection.get_interrupt_handle(),
+        interrupt: Arc::new(connection.get_interrupt_handle()),
     };
     if startup.send(Ok(started)).is_err() {
         return Ok(());
@@ -228,7 +310,15 @@ fn run_actor(
 
     loop {
         let request = select_biased! {
-            recv(shutdown) -> _ => return Ok(()),
+            recv(shutdown) -> _ => {
+                close_admission(&admission);
+                return drain_accepted_mutations(
+                    &mut connection,
+                    &requests,
+                    &write_gate,
+                    None,
+                );
+            },
             recv(requests) -> request => match request {
                 Ok(request) => request,
                 Err(_) => return Ok(()),
@@ -253,6 +343,15 @@ fn run_actor(
                 generation,
                 result: open_message(&connection, id),
             }),
+            Request::Mutate {
+                request_id,
+                generation,
+                mutation,
+            } => DbReply::Mutation(Tagged {
+                request_id,
+                generation,
+                result: execute_mutation(&mut connection, mutation, &write_gate),
+            }),
             #[cfg(test)]
             Request::RunLongQuery { started } => {
                 let _ = started.send(());
@@ -270,26 +369,95 @@ fn run_actor(
             }
         };
 
-        if !send_reply(&replies, &shutdown, reply) {
-            return Ok(());
+        if let Err(undelivered) = send_reply(&replies, &shutdown, reply) {
+            close_admission(&admission);
+            return drain_accepted_mutations(
+                &mut connection,
+                &requests,
+                &write_gate,
+                mutation_failure(*undelivered),
+            );
         }
     }
+}
+
+fn execute_mutation(
+    connection: &mut Connection,
+    mutation: MessageMutation,
+    write_gate: &Mutex<()>,
+) -> Result<super::domain::MutationOutcome, DbFailure> {
+    let _write_guard = lock_write_gate(write_gate);
+    mutate_message(connection, mutation, current_time_ms()?)
+}
+
+fn drain_accepted_mutations(
+    connection: &mut Connection,
+    requests: &Receiver<Request>,
+    write_gate: &Mutex<()>,
+    initial_failure: Option<DbFailure>,
+) -> Result<(), DbFailure> {
+    let mut first_failure = initial_failure;
+    while let Ok(request) = requests.try_recv() {
+        if let Request::Mutate { mutation, .. } = request {
+            let result = execute_mutation(connection, mutation, write_gate);
+            if first_failure.is_none() {
+                first_failure = result.err();
+            }
+        }
+    }
+    first_failure.map_or(Ok(()), Err)
+}
+
+fn mutation_failure(reply: DbReply) -> Option<DbFailure> {
+    match reply {
+        DbReply::Mutation(Tagged {
+            result: Err(failure),
+            ..
+        }) => Some(failure),
+        _ => None,
+    }
+}
+
+fn lock_admission(admission: &Mutex<bool>) -> MutexGuard<'_, bool> {
+    admission
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+fn close_admission(admission: &Mutex<bool>) {
+    *lock_admission(admission) = false;
+}
+
+fn lock_write_gate(write_gate: &Mutex<()>) -> MutexGuard<'_, ()> {
+    write_gate
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+fn current_time_ms() -> Result<i64, DbFailure> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| DbFailure::resource_limit(error.to_string()))?;
+    i64::try_from(elapsed.as_millis())
+        .map_err(|_| DbFailure::resource_limit("system time exceeds millisecond range"))
 }
 
 fn send_reply(
     replies: &mpsc::Sender<DbReply>,
     shutdown: &Receiver<()>,
     mut reply: DbReply,
-) -> bool {
+) -> Result<(), Box<DbReply>> {
     loop {
         match replies.try_send(reply) {
-            Ok(()) => return true,
-            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            Ok(()) => return Ok(()),
+            Err(mpsc::error::TrySendError::Closed(pending)) => return Err(Box::new(pending)),
             Err(mpsc::error::TrySendError::Full(pending)) => reply = pending,
         }
 
         match shutdown.recv_timeout(Duration::from_millis(1)) {
-            Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return false,
+            Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                return Err(Box::new(reply));
+            }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
         }
     }
@@ -421,7 +589,9 @@ fn secure_database_file(_path: &std::path::Path) -> Result<(), DbFailure> {
 
 pub(crate) struct DatabaseRuntime {
     shutdown: Option<Sender<()>>,
-    interrupt: Option<InterruptHandle>,
+    admission: Arc<Mutex<bool>>,
+    interrupt: Option<Arc<InterruptHandle>>,
+    write_gate: Arc<Mutex<()>>,
     worker: Option<thread::JoinHandle<Result<(), DbFailure>>>,
 }
 
@@ -431,6 +601,7 @@ impl DatabaseRuntime {
     }
 
     fn stop_and_join(&mut self) -> Result<(), ShutdownError> {
+        close_admission(&self.admission);
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.try_send(());
         }
@@ -441,6 +612,7 @@ impl DatabaseRuntime {
             .is_some_and(|worker| !worker.is_finished())
         {
             if let Some(interrupt) = &interrupt {
+                let _write_guard = lock_write_gate(&self.write_gate);
                 interrupt.interrupt();
             }
             thread::sleep(Duration::from_millis(1));
@@ -528,7 +700,7 @@ mod tests {
 
     use super::*;
     use crate::store::sqlite::{
-        domain::{AccountScope, FolderScope},
+        domain::{AccountScope, FailureKind, FolderScope, MessageMutation},
         migrations::LATEST_SCHEMA_VERSION,
     };
 
@@ -585,9 +757,39 @@ mod tests {
     }
 
     #[test]
+    fn mutation_round_trip_preserves_identity_and_typed_failure() {
+        let (client, mut replies, runtime, _info) =
+            spawn_target(Target::Memory, REQUEST_CAPACITY, REPLY_CAPACITY).unwrap();
+        let request_id = RequestId::new(9).unwrap();
+        let generation = Generation::new(4);
+
+        client
+            .try_mutate(
+                request_id,
+                generation,
+                MessageMutation::set_unread(MessageId::new(1).unwrap(), false),
+            )
+            .unwrap();
+
+        let DbReply::Mutation(reply) = receive_reply(&mut replies) else {
+            panic!("expected mutation reply");
+        };
+        assert_eq!(reply.request_id, request_id);
+        assert_eq!(reply.generation, generation);
+        assert_eq!(reply.result.unwrap_err().kind, FailureKind::NotFound);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
     fn full_request_queue_reports_busy_without_blocking() {
         let (sender, _receiver) = bounded(1);
-        let client = DatabaseClient { requests: sender };
+        let connection = Connection::open_in_memory().unwrap();
+        let client = DatabaseClient {
+            requests: sender,
+            admission: Arc::new(Mutex::new(true)),
+            interrupt: Arc::new(connection.get_interrupt_handle()),
+            write_gate: Arc::new(Mutex::new(())),
+        };
         client
             .try_query_mailbox(RequestId::new(1).unwrap(), Generation::new(0), empty_spec())
             .unwrap();
@@ -616,6 +818,90 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_reports_an_undelivered_mutation_failure() {
+        let (client, replies, runtime, _info) = spawn_target(Target::Memory, 2, 1).unwrap();
+        client
+            .try_query_mailbox(RequestId::new(1).unwrap(), Generation::new(0), empty_spec())
+            .unwrap();
+        while replies.is_empty() {
+            thread::yield_now();
+        }
+        client
+            .try_mutate(
+                RequestId::new(2).unwrap(),
+                Generation::new(0),
+                MessageMutation::set_unread(MessageId::new(1).unwrap(), false),
+            )
+            .unwrap();
+        while !client.requests.is_empty() {
+            thread::yield_now();
+        }
+        thread::sleep(Duration::from_millis(10));
+
+        let error = runtime.shutdown().unwrap_err();
+
+        assert!(matches!(error, ShutdownError::Worker(_)));
+    }
+
+    #[test]
+    fn shutdown_closes_admission_before_draining_live_clients() {
+        let (client, _replies, runtime, _info) =
+            spawn_target(Target::Memory, 1, REPLY_CAPACITY).unwrap();
+        let (started_tx, started_rx) = bounded(1);
+        client.try_run_long_query(started_tx).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let write_guard = lock_write_gate(&client.write_gate);
+        let admission = client.admission.clone();
+        let shutdown = thread::spawn(move || runtime.shutdown());
+        while *lock_admission(&admission) {
+            thread::yield_now();
+        }
+
+        assert!(!shutdown.is_finished());
+        assert_eq!(
+            client.try_query_mailbox(RequestId::new(3).unwrap(), Generation::new(0), empty_spec()),
+            Err(SubmitError::Closed)
+        );
+
+        drop(write_guard);
+        shutdown.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn closed_reply_stream_closes_admission_before_actor_drain() {
+        let (client, replies, runtime, _info) =
+            spawn_target(Target::Memory, 2, REPLY_CAPACITY).unwrap();
+        let write_guard = lock_write_gate(&client.write_gate);
+        drop(replies);
+        client
+            .try_query_mailbox(RequestId::new(1).unwrap(), Generation::new(0), empty_spec())
+            .unwrap();
+        client
+            .try_mutate(
+                RequestId::new(2).unwrap(),
+                Generation::new(0),
+                MessageMutation::set_unread(MessageId::new(1).unwrap(), false),
+            )
+            .unwrap();
+        let started = Instant::now();
+        while *lock_admission(&client.admission) && started.elapsed() < Duration::from_secs(1) {
+            thread::yield_now();
+        }
+
+        assert!(!*lock_admission(&client.admission));
+        assert_eq!(
+            client.try_query_mailbox(RequestId::new(3).unwrap(), Generation::new(0), empty_spec()),
+            Err(SubmitError::Closed)
+        );
+
+        drop(write_guard);
+        assert!(matches!(
+            runtime.shutdown().unwrap_err(),
+            ShutdownError::Worker(_)
+        ));
+    }
+
+    #[test]
     fn shutdown_interrupts_an_active_sql_query() {
         let (client, _replies, runtime, _info) =
             spawn_target(Target::Memory, 1, REPLY_CAPACITY).unwrap();
@@ -633,6 +919,67 @@ mod tests {
         runtime.shutdown().unwrap();
 
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn shutdown_drains_all_accepted_mutations_after_interrupting_queries() {
+        let path = temporary_database_path();
+        remove_database_files(&path);
+        let mut seed = Connection::open(&path).unwrap();
+        configure(&mut seed).unwrap();
+        seed.execute(
+            "INSERT INTO accounts
+             (id, provider, remote_key, name, address, state, accent_rgb)
+             VALUES (1, 'imap', 'account', 'Personal', 'user@example.test', 'active', 0)",
+            [],
+        )
+        .unwrap();
+        seed.execute(
+            "INSERT INTO messages (id, account_id, remote_key, received_at_ms)
+             VALUES (1, 1, 'message', 0)",
+            [],
+        )
+        .unwrap();
+        drop(seed);
+
+        let (client, _replies, runtime, _info) =
+            spawn_target(Target::File(path.clone()), 2, REPLY_CAPACITY).unwrap();
+        let (started_tx, started_rx) = bounded(1);
+        client
+            .requests
+            .send(Request::RunLongQuery {
+                started: started_tx,
+            })
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        client
+            .try_mutate(
+                RequestId::new(1).unwrap(),
+                Generation::new(0),
+                MessageMutation::set_unread(MessageId::new(2).unwrap(), false),
+            )
+            .unwrap();
+        client
+            .try_mutate(
+                RequestId::new(2).unwrap(),
+                Generation::new(0),
+                MessageMutation::set_unread(MessageId::new(1).unwrap(), false),
+            )
+            .unwrap();
+        drop(client);
+
+        let error = runtime.shutdown().unwrap_err();
+        assert!(matches!(error, ShutdownError::Worker(_)));
+
+        let connection = Connection::open(&path).unwrap();
+        let unread: bool = connection
+            .query_row("SELECT unread FROM messages WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(!unread);
+        drop(connection);
+        remove_database_files(&path);
     }
 
     #[test]

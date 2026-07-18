@@ -1,13 +1,14 @@
 use super::message::{
     COMMAND_CAPACITY, Command, CoreHandle, EVENT_CAPACITY, Event, EventReceiver, EventSender,
     MailboxLoadError, MailboxQuery, MailboxRequestKey, MessageLoadError, MessageQuery,
-    MessageRequestKey, event_channel,
+    MessageRequestKey, MutationRequest, MutationSubmitError, event_channel,
 };
 use crate::store::sqlite::{
     self, DatabaseClient, DatabaseInfo, DatabaseReplies, DatabaseRuntime, DatabaseSubmitError,
     DbReply,
 };
 use std::{
+    collections::VecDeque,
     fmt,
     future::{Future, poll_fn},
     path::PathBuf,
@@ -21,6 +22,7 @@ use tokio::{runtime::Builder, sync::mpsc, sync::oneshot, time};
 
 const SYNC_DELAY: Duration = Duration::from_millis(900);
 const COMMAND_BURST_LIMIT: u8 = 8;
+const SHUTDOWN_QUERY_INTERRUPT_INTERVAL: Duration = Duration::from_millis(10);
 
 #[cfg(test)]
 type SyncStarted = Option<std::sync::mpsc::SyncSender<()>>;
@@ -120,6 +122,7 @@ async fn run_core(
     let mut pending_sync = None;
     let mut mailbox = MailboxSchedule::default();
     let mut message = MessageSchedule::default();
+    let mut active_mutations = 0_usize;
     let mut command_streak = 0_u8;
 
     loop {
@@ -138,7 +141,15 @@ async fn run_core(
         }
 
         match input {
-            CoreInput::Shutdown | CoreInput::CommandsClosed => return Ok(()),
+            CoreInput::Shutdown | CoreInput::CommandsClosed => {
+                return finish_accepted_mutations(
+                    &mut commands,
+                    &database,
+                    &mut database_replies,
+                    active_mutations,
+                )
+                .await;
+            }
             CoreInput::DatabaseClosed => return Err(RuntimeError::DatabaseClosed),
             CoreInput::Command(Command::SyncNow { operation_id }) => {
                 if active_sync.is_some() {
@@ -156,7 +167,13 @@ async fn run_core(
                     && let Some(event) = submit_mailbox(&database, &mut mailbox, query)
                     && !send_event(&events, &mut shutdown, event).await
                 {
-                    return Ok(());
+                    return finish_accepted_mutations(
+                        &mut commands,
+                        &database,
+                        &mut database_replies,
+                        active_mutations,
+                    )
+                    .await;
                 }
             }
             CoreInput::Command(Command::OpenMessage(query)) => {
@@ -164,7 +181,34 @@ async fn run_core(
                     && let Some(event) = submit_message(&database, &mut message, query)
                     && !send_event(&events, &mut shutdown, event).await
                 {
-                    return Ok(());
+                    return finish_accepted_mutations(
+                        &mut commands,
+                        &database,
+                        &mut database_replies,
+                        active_mutations,
+                    )
+                    .await;
+                }
+            }
+            CoreInput::Command(Command::Mutate(request)) => {
+                match submit_mutation(&database, request) {
+                    MutationSubmission::Submitted => {
+                        active_mutations = active_mutations
+                            .checked_add(1)
+                            .ok_or(RuntimeError::MutationAccounting)?;
+                    }
+                    MutationSubmission::Rejected { event, request } => {
+                        if !send_event(&events, &mut shutdown, event).await {
+                            return finish_accepted_mutations_with(
+                                &mut commands,
+                                &database,
+                                &mut database_replies,
+                                active_mutations,
+                                Some(request),
+                            )
+                            .await;
+                        }
+                    }
                 }
             }
             CoreInput::Database(DbReply::Mailbox(reply)) => {
@@ -176,14 +220,26 @@ async fn run_core(
                     MailboxCompletion::Ignore => {}
                     MailboxCompletion::Publish => {
                         if !send_event(&events, &mut shutdown, Event::MailboxLoaded(reply)).await {
-                            return Ok(());
+                            return finish_accepted_mutations(
+                                &mut commands,
+                                &database,
+                                &mut database_replies,
+                                active_mutations,
+                            )
+                            .await;
                         }
                     }
                     MailboxCompletion::Dispatch(query) => {
                         if let Some(event) = submit_mailbox(&database, &mut mailbox, query)
                             && !send_event(&events, &mut shutdown, event).await
                         {
-                            return Ok(());
+                            return finish_accepted_mutations(
+                                &mut commands,
+                                &database,
+                                &mut database_replies,
+                                active_mutations,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -197,16 +253,54 @@ async fn run_core(
                     MessageCompletion::Ignore => {}
                     MessageCompletion::Publish => {
                         if !send_event(&events, &mut shutdown, Event::MessageLoaded(reply)).await {
-                            return Ok(());
+                            return finish_accepted_mutations(
+                                &mut commands,
+                                &database,
+                                &mut database_replies,
+                                active_mutations,
+                            )
+                            .await;
                         }
                     }
                     MessageCompletion::Dispatch(query) => {
                         if let Some(event) = submit_message(&database, &mut message, query)
                             && !send_event(&events, &mut shutdown, event).await
                         {
-                            return Ok(());
+                            return finish_accepted_mutations(
+                                &mut commands,
+                                &database,
+                                &mut database_replies,
+                                active_mutations,
+                            )
+                            .await;
                         }
                     }
+                }
+            }
+            CoreInput::Database(DbReply::Mutation(reply)) => {
+                active_mutations = active_mutations
+                    .checked_sub(1)
+                    .ok_or(RuntimeError::MutationAccounting)?;
+                let undelivered_failure = reply
+                    .result
+                    .as_ref()
+                    .err()
+                    .map(|failure| Arc::from(failure.to_string()));
+                if !send_event(&events, &mut shutdown, Event::MutationFinished(reply)).await {
+                    let finish = finish_accepted_mutations(
+                        &mut commands,
+                        &database,
+                        &mut database_replies,
+                        active_mutations,
+                    )
+                    .await;
+                    return match (finish, undelivered_failure) {
+                        (Err(error), _) => Err(error),
+                        (Ok(()), Some(message)) => {
+                            Err(RuntimeError::MutationDuringShutdown { message })
+                        }
+                        (Ok(()), None) => Ok(()),
+                    };
                 }
             }
             CoreInput::SyncElapsed => {
@@ -214,13 +308,130 @@ async fn run_core(
                     continue;
                 };
                 if !send_event(&events, &mut shutdown, Event::SyncFinished { operation_id }).await {
-                    return Ok(());
+                    return finish_accepted_mutations(
+                        &mut commands,
+                        &database,
+                        &mut database_replies,
+                        active_mutations,
+                    )
+                    .await;
                 }
                 if let Some(operation_id) = pending_sync.take() {
                     active_sync = Some((operation_id, Box::pin(time::sleep(sync_delay))));
                 }
             }
         }
+    }
+}
+
+enum MutationSubmission {
+    Submitted,
+    Rejected {
+        event: Event,
+        request: MutationRequest,
+    },
+}
+
+fn submit_mutation(database: &DatabaseClient, mut request: MutationRequest) -> MutationSubmission {
+    let request_id = request.request_id;
+    let generation = request.generation;
+    let (reason, mutation) =
+        match database.try_mutate_recover(request_id, generation, request.mutation) {
+            Ok(()) => return MutationSubmission::Submitted,
+            Err((DatabaseSubmitError::Busy, mutation)) => (MutationSubmitError::Busy, mutation),
+            Err((DatabaseSubmitError::Closed, mutation)) => {
+                (MutationSubmitError::Unavailable, mutation)
+            }
+        };
+    request.mutation = mutation;
+    MutationSubmission::Rejected {
+        event: Event::MutationRejected {
+            request_id,
+            generation,
+            reason,
+        },
+        request,
+    }
+}
+
+async fn finish_accepted_mutations(
+    commands: &mut mpsc::Receiver<Command>,
+    database: &DatabaseClient,
+    database_replies: &mut DatabaseReplies,
+    active_mutations: usize,
+) -> Result<(), RuntimeError> {
+    finish_accepted_mutations_with(commands, database, database_replies, active_mutations, None)
+        .await
+}
+
+async fn finish_accepted_mutations_with(
+    commands: &mut mpsc::Receiver<Command>,
+    database: &DatabaseClient,
+    database_replies: &mut DatabaseReplies,
+    mut active_mutations: usize,
+    initial_request: Option<MutationRequest>,
+) -> Result<(), RuntimeError> {
+    commands.close();
+    let mut pending =
+        VecDeque::with_capacity(commands.len() + usize::from(initial_request.is_some()));
+    pending.extend(initial_request);
+    while let Ok(command) = commands.try_recv() {
+        if let Command::Mutate(request) = command {
+            pending.push_back(request);
+        }
+    }
+
+    let mut first_failure = None;
+    database.interrupt_queries();
+    while !pending.is_empty() || active_mutations != 0 {
+        while let Some(mut request) = pending.pop_front() {
+            match database.try_mutate_recover(
+                request.request_id,
+                request.generation,
+                request.mutation,
+            ) {
+                Ok(()) => {
+                    active_mutations = active_mutations
+                        .checked_add(1)
+                        .ok_or(RuntimeError::MutationAccounting)?;
+                }
+                Err((DatabaseSubmitError::Busy, mutation)) => {
+                    request.mutation = mutation;
+                    pending.push_front(request);
+                    break;
+                }
+                Err((DatabaseSubmitError::Closed, _)) => {
+                    return Err(RuntimeError::DatabaseClosed);
+                }
+            }
+        }
+
+        if pending.is_empty() && active_mutations == 0 {
+            break;
+        }
+        let reply = loop {
+            match time::timeout(SHUTDOWN_QUERY_INTERRUPT_INTERVAL, database_replies.recv()).await {
+                Ok(Some(reply)) => break reply,
+                Ok(None) => return Err(RuntimeError::DatabaseClosed),
+                Err(_) => database.interrupt_queries(),
+            }
+        };
+        if let DbReply::Mutation(reply) = reply {
+            active_mutations = active_mutations
+                .checked_sub(1)
+                .ok_or(RuntimeError::MutationAccounting)?;
+            if let Err(failure) = reply.result
+                && first_failure.is_none()
+            {
+                first_failure = Some(Arc::from(failure.to_string()));
+            }
+        }
+    }
+
+    if let Some(message) = first_failure {
+        Err(RuntimeError::MutationDuringShutdown { message })
+    } else {
+        Ok(())
     }
 }
 
@@ -458,6 +669,8 @@ impl Drop for CoreRuntime {
 pub(crate) enum RuntimeError {
     DatabaseClosed,
     DatabaseShutdown { message: Arc<str> },
+    MutationAccounting,
+    MutationDuringShutdown { message: Arc<str> },
     ThreadPanicked { message: Arc<str> },
 }
 
@@ -467,6 +680,12 @@ impl fmt::Display for RuntimeError {
             Self::DatabaseClosed => formatter.write_str("SQLite actor stopped unexpectedly"),
             Self::DatabaseShutdown { message } => {
                 write!(formatter, "could not stop SQLite actor: {message}")
+            }
+            Self::MutationAccounting => {
+                formatter.write_str("SQLite mutation reply accounting became inconsistent")
+            }
+            Self::MutationDuringShutdown { message } => {
+                write!(formatter, "mail mutation failed during shutdown: {message}")
             }
             Self::ThreadPanicked { message } => {
                 write!(formatter, "core worker panicked: {message}")
@@ -518,7 +737,12 @@ mod tests {
         AccountScope, FolderScope, Generation, MailboxQuery, MessageId, MessageQuery, OperationId,
         PageSpec, RequestId,
     };
-    use std::time::Instant;
+    use rusqlite::Connection;
+    use std::{
+        fs,
+        sync::atomic::{AtomicU64, Ordering},
+        time::Instant,
+    };
 
     fn test_database() -> DatabaseParts {
         sqlite::spawn_in_memory().unwrap()
@@ -538,6 +762,52 @@ mod tests {
             Generation::new(generation),
             MessageId::new(message_id).unwrap(),
         )
+    }
+
+    fn mutation_request(request_id: u64, generation: u64, message_id: i64) -> MutationRequest {
+        MutationRequest::new(
+            RequestId::new(request_id).unwrap(),
+            Generation::new(generation),
+            crate::core::MessageMutation::set_unread(MessageId::new(message_id).unwrap(), false),
+        )
+    }
+
+    fn temporary_database_path() -> PathBuf {
+        static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
+        std::env::temp_dir().join(format!(
+            "nivalis-core-{}-{}.db",
+            std::process::id(),
+            NEXT_PATH.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn remove_database_files(path: &std::path::Path) {
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(format!("{}-wal", path.display()));
+        let _ = fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    fn seed_file_database(path: &std::path::Path) {
+        let (client, replies, database_runtime, _info) = sqlite::spawn(path.to_owned()).unwrap();
+        drop(client);
+        drop(replies);
+        database_runtime.shutdown().unwrap();
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO accounts
+                 (id, provider, remote_key, name, address, state, accent_rgb)
+                 VALUES (1, 'imap', 'account', 'Personal', 'user@example.test', 'active', 0)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages (id, account_id, remote_key, received_at_ms)
+                 VALUES (1, 1, 'message', 0)",
+                [],
+            )
+            .unwrap();
     }
 
     #[test]
@@ -654,6 +924,105 @@ mod tests {
         assert_eq!(reply.generation, Generation::new(4));
         assert_eq!(reply.result.unwrap(), None);
         runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn mutation_round_trip_preserves_request_identity_and_failure() {
+        let (core, mut events, runtime) = spawn_with_delay(Duration::from_millis(1)).unwrap();
+
+        core.try_mutate(mutation_request(9, 5, 1)).unwrap();
+
+        let Some(Event::MutationFinished(reply)) = events.blocking_recv() else {
+            panic!("expected mutation result");
+        };
+        assert_eq!(reply.request_id, RequestId::new(9).unwrap());
+        assert_eq!(reply.generation, Generation::new(5));
+        assert!(reply.result.is_err());
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn shutdown_commits_mutations_already_accepted_by_core() {
+        let path = temporary_database_path();
+        remove_database_files(&path);
+        seed_file_database(&path);
+
+        let database = sqlite::spawn(path.clone()).unwrap();
+        let (core, _events, runtime) =
+            spawn_with_options(Duration::from_secs(5), EVENT_CAPACITY, database, None).unwrap();
+        core.try_mutate(mutation_request(1, 0, 1)).unwrap();
+
+        runtime.shutdown().unwrap();
+
+        let connection = Connection::open(&path).unwrap();
+        let unread: bool = connection
+            .query_row("SELECT unread FROM messages WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(!unread);
+        drop(connection);
+        remove_database_files(&path);
+    }
+
+    #[test]
+    fn shutdown_interrupts_database_queries_before_draining_mutations() {
+        let database = test_database();
+        let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+        database.0.try_run_long_query(started_tx).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (core, _events, runtime) =
+            spawn_with_options(Duration::from_secs(5), EVENT_CAPACITY, database, None).unwrap();
+        core.try_mutate(mutation_request(1, 0, 1)).unwrap();
+        let started = Instant::now();
+
+        let error = runtime.shutdown().unwrap_err();
+
+        assert!(matches!(error, RuntimeError::MutationDuringShutdown { .. }));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn shutdown_executes_busy_mutation_when_rejection_feedback_was_not_delivered() {
+        let path = temporary_database_path();
+        remove_database_files(&path);
+        seed_file_database(&path);
+        let database = sqlite::spawn(path.clone()).unwrap();
+        let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+        database.0.try_run_long_query(started_tx).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        for offset in 0..16_u64 {
+            database
+                .0
+                .try_query_mailbox(
+                    RequestId::new(100 + offset).unwrap(),
+                    Generation::new(0),
+                    PageSpec::new(AccountScope::All, FolderScope::Inbox, None, None, 1).unwrap(),
+                )
+                .unwrap();
+        }
+        let (core, events, runtime) =
+            spawn_with_options(Duration::from_millis(1), 1, database, None).unwrap();
+        core.try_send_sync(OperationId::new(1)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while events.is_empty() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(events.len(), 1, "sync result should fill the event queue");
+        core.try_mutate(mutation_request(2, 0, 1)).unwrap();
+        thread::sleep(Duration::from_millis(20));
+
+        runtime.shutdown().unwrap();
+
+        let connection = Connection::open(&path).unwrap();
+        let unread: bool = connection
+            .query_row("SELECT unread FROM messages WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(!unread);
+        drop(connection);
+        remove_database_files(&path);
     }
 
     #[test]

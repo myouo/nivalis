@@ -1,5 +1,6 @@
 use crate::store::sqlite::{
-    Generation, MailboxPage, MessageDetail, MessageId, PageSpec, RequestId, Tagged,
+    Generation, MailboxPage, MessageDetail, MessageId, MessageMutation, MutationOutcome, PageSpec,
+    RequestId, Tagged,
 };
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::mpsc;
@@ -25,6 +26,8 @@ pub(super) enum Command {
     QueryMailbox(MailboxQuery),
     #[cfg_attr(not(test), allow(dead_code))]
     OpenMessage(MessageQuery),
+    #[cfg_attr(not(test), allow(dead_code))]
+    Mutate(MutationRequest),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -43,6 +46,12 @@ pub(crate) enum Event {
         request_id: RequestId,
         generation: Generation,
         reason: MessageLoadError,
+    },
+    MutationFinished(Tagged<MutationOutcome>),
+    MutationRejected {
+        request_id: RequestId,
+        generation: Generation,
+        reason: MutationSubmitError,
     },
 }
 
@@ -84,6 +93,28 @@ pub(crate) struct MessageQuery {
     pub(super) message_id: MessageId,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MutationRequest {
+    pub(super) request_id: RequestId,
+    pub(super) generation: Generation,
+    pub(super) mutation: MessageMutation,
+}
+
+impl MutationRequest {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn new(
+        request_id: RequestId,
+        generation: Generation,
+        mutation: MessageMutation,
+    ) -> Self {
+        Self {
+            request_id,
+            generation,
+            mutation,
+        }
+    }
+}
+
 impl MessageQuery {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(
@@ -120,6 +151,12 @@ pub(crate) enum MailboxLoadError {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MessageLoadError {
+    Busy,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MutationSubmitError {
     Busy,
     Unavailable,
 }
@@ -293,6 +330,13 @@ impl CoreHandle {
             .try_send(Command::OpenMessage(query))
             .map_err(SubmitError::from)
     }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn try_mutate(&self, request: MutationRequest) -> Result<(), SubmitError> {
+        self.commands
+            .try_send(Command::Mutate(request))
+            .map_err(SubmitError::from)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -400,5 +444,34 @@ mod tests {
             receiver.blocking_recv(),
             Some(Event::MessageLoadRejected { .. })
         ));
+    }
+
+    #[test]
+    fn mutation_results_are_never_coalesced() {
+        let (sender, mut receiver) = event_channel(2);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for request_id in [1, 2] {
+            runtime
+                .block_on(sender.send(Event::MutationRejected {
+                    request_id: RequestId::new(request_id).unwrap(),
+                    generation: Generation::new(0),
+                    reason: MutationSubmitError::Busy,
+                }))
+                .unwrap();
+        }
+
+        assert_eq!(receiver.len(), 2);
+        for request_id in [1, 2] {
+            assert_eq!(
+                receiver.blocking_recv(),
+                Some(Event::MutationRejected {
+                    request_id: RequestId::new(request_id).unwrap(),
+                    generation: Generation::new(0),
+                    reason: MutationSubmitError::Busy,
+                })
+            );
+        }
     }
 }
