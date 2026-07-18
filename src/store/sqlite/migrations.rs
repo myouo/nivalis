@@ -2,7 +2,7 @@ use std::{error::Error, fmt};
 
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(crate) const LATEST_SCHEMA_VERSION: u32 = 6;
+pub(crate) const LATEST_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -35,6 +35,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 6,
         sql: include_str!("../../../migrations/0006_account_mailbox_stats.sql"),
     },
+    Migration {
+        version: 7,
+        sql: include_str!("../../../migrations/0007_remote_change_journal.sql"),
+    },
 ];
 
 const _: () = {
@@ -50,6 +54,7 @@ const _: () = {
 pub(crate) enum MigrationError {
     Database(rusqlite::Error),
     ForeignKeysDisabled,
+    RecursiveTriggersDisabled,
     InvalidSchemaVersion(i64),
     FutureSchema { found: u32, supported: u32 },
 }
@@ -60,6 +65,9 @@ impl fmt::Display for MigrationError {
             Self::Database(error) => write!(formatter, "database migration failed: {error}"),
             Self::ForeignKeysDisabled => {
                 formatter.write_str("SQLite foreign-key enforcement could not be enabled")
+            }
+            Self::RecursiveTriggersDisabled => {
+                formatter.write_str("SQLite recursive-trigger enforcement could not be enabled")
             }
             Self::InvalidSchemaVersion(version) => {
                 write!(formatter, "invalid SQLite schema version {version}")
@@ -77,6 +85,7 @@ impl Error for MigrationError {
         match self {
             Self::Database(error) => Some(error),
             Self::ForeignKeysDisabled
+            | Self::RecursiveTriggersDisabled
             | Self::InvalidSchemaVersion(_)
             | Self::FutureSchema { .. } => None,
         }
@@ -91,6 +100,7 @@ impl From<rusqlite::Error> for MigrationError {
 
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), MigrationError> {
     enable_foreign_keys(connection)?;
+    enable_recursive_triggers(connection)?;
     migrate_with(connection, MIGRATIONS, LATEST_SCHEMA_VERSION)
 }
 
@@ -102,6 +112,18 @@ fn enable_foreign_keys(connection: &Connection) -> Result<(), MigrationError> {
         Ok(())
     } else {
         Err(MigrationError::ForeignKeysDisabled)
+    }
+}
+
+fn enable_recursive_triggers(connection: &Connection) -> Result<(), MigrationError> {
+    connection.pragma_update(None, "recursive_triggers", true)?;
+
+    let enabled: i64 =
+        connection.pragma_query_value(None, "recursive_triggers", |row| row.get(0))?;
+    if enabled == 1 {
+        Ok(())
+    } else {
+        Err(MigrationError::RecursiveTriggersDisabled)
     }
 }
 
@@ -147,16 +169,24 @@ mod tests {
 
     const TABLES: &[&str] = &[
         "account_mailbox_stats",
+        "account_object_states",
         "accounts",
         "attachments",
         "file_gc",
         "folders",
+        "imap_message_locations",
         "message_content",
         "message_folders",
+        "message_tombstone_imap_locations",
         "message_tombstones",
         "messages",
         "outbox",
         "outbox_recipients",
+        "remote_account_reconciliations",
+        "remote_change_intent_folders",
+        "remote_change_intent_imap_sources",
+        "remote_change_intents",
+        "remote_journal_usage",
         "sync_state",
         "trash_undo",
         "trash_undo_folders",
@@ -257,6 +287,10 @@ mod tests {
             .pragma_query_value(None, "foreign_keys", |row| row.get(0))
             .expect("read foreign-key setting");
         assert_eq!(foreign_keys, 1);
+        let recursive_triggers: i64 = connection
+            .pragma_query_value(None, "recursive_triggers", |row| row.get(0))
+            .expect("read recursive-trigger setting");
+        assert_eq!(recursive_triggers, 1);
 
         let tables = connection
             .prepare(
@@ -307,10 +341,13 @@ mod tests {
                 "idx_message_tombstones_deleted".to_owned(),
                 "idx_messages_account_time".to_owned(),
                 "idx_messages_global_time".to_owned(),
+                "idx_messages_legacy_reconcile_pending".to_owned(),
                 "idx_messages_starred".to_owned(),
                 "idx_messages_unread".to_owned(),
                 "idx_outbox_mime_file".to_owned(),
                 "idx_outbox_pending".to_owned(),
+                "idx_remote_intents_account_due".to_owned(),
+                "idx_remote_intents_global_due".to_owned(),
             ])
         );
     }
@@ -501,7 +538,7 @@ mod tests {
         migrate_with(&mut connection, &MIGRATIONS[..5], 5).expect("upgrade data to v5");
         assert_eq!(schema_version(&connection), 5);
 
-        migrate(&mut connection).expect("upgrade data to v6");
+        migrate_with(&mut connection, &MIGRATIONS[..6], 6).expect("upgrade data to v6");
 
         assert_eq!(schema_version(&connection), 6);
         assert_eq!(mailbox_stats(&connection, 1), [1, 1, 2, 1, 1, 1, 2]);
@@ -515,6 +552,663 @@ mod tests {
             )
             .expect("count legacy Inbox folders");
         assert_eq!(legacy_inbox_count, 2);
+    }
+
+    #[test]
+    fn v7_scopes_remote_identity_and_cascades_imap_locations() {
+        let mut connection = memory_connection();
+        migrate(&mut connection).expect("apply migrations");
+        insert_account(&connection, 1, "one@example.test");
+        insert_account(&connection, 2, "two@example.test");
+        insert_folder(&connection, 10, 1, "inbox", "inbox");
+        insert_folder(&connection, 20, 2, "inbox", "inbox");
+        insert_message(&connection, 100, 1, "message-100");
+        insert_message(&connection, 101, 1, "message-101");
+        connection
+            .execute(
+                "INSERT INTO message_folders (message_id, folder_id, account_id)
+                 VALUES (100, 10, 1), (101, 10, 1)",
+                [],
+            )
+            .expect("seed IMAP memberships");
+
+        connection
+            .execute(
+                "INSERT INTO sync_state
+                     (folder_id, uid_validity, highest_modseq, mailbox_object_id)
+                 VALUES (10, 7, 11, 'mailbox-object')",
+                [],
+            )
+            .expect("store per-mailbox IMAP state");
+        connection
+            .execute(
+                "INSERT INTO account_object_states
+                     (account_id, object_kind, state_token, updated_at_ms)
+                 VALUES (1, 'email', 'jmap-email-state', 0),
+                        (1, 'mailbox', 'jmap-mailbox-state', 0)",
+                [],
+            )
+            .expect("store account-scoped JMAP states");
+        connection
+            .execute(
+                "INSERT INTO imap_message_locations
+                     (message_id, folder_id, account_id, uid_validity, uid, modseq,
+                      email_id, remote_seen, remote_flagged)
+                 VALUES (100, 10, 1, 7, 42, 11, 'email-object', 0, 1)",
+                [],
+            )
+            .expect("store mailbox-scoped IMAP locator");
+
+        let duplicate = connection
+            .execute(
+                "INSERT INTO imap_message_locations
+                     (message_id, folder_id, account_id, uid_validity, uid,
+                      remote_seen, remote_flagged)
+                 VALUES (101, 10, 1, 7, 42, 0, 0)",
+                [],
+            )
+            .expect_err("one mailbox epoch and UID cannot identify two messages");
+        assert_eq!(
+            duplicate.sqlite_error_code(),
+            Some(ErrorCode::ConstraintViolation)
+        );
+        let zero_epoch = connection
+            .execute(
+                "INSERT INTO imap_message_locations
+                     (message_id, folder_id, account_id, uid_validity, uid,
+                      remote_seen, remote_flagged)
+                 VALUES (101, 10, 1, 0, 43, 0, 0)",
+                [],
+            )
+            .expect_err("UIDVALIDITY must be non-zero");
+        assert_eq!(
+            zero_epoch.sqlite_error_code(),
+            Some(ErrorCode::ConstraintViolation)
+        );
+
+        connection
+            .execute(
+                "DELETE FROM message_folders WHERE message_id = 100 AND folder_id = 10",
+                [],
+            )
+            .expect("remove membership");
+        let remaining: i64 = connection
+            .query_row("SELECT count(*) FROM imap_message_locations", [], |row| {
+                row.get(0)
+            })
+            .expect("count remaining IMAP locators");
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn v7_marks_legacy_remote_state_for_account_reconciliation() {
+        let mut connection = memory_connection();
+        enable_foreign_keys(&connection).expect("enable foreign keys");
+        migrate_with(&mut connection, &MIGRATIONS[..6], 6).expect("create v6 schema");
+        insert_account(&connection, 1, "one@example.test");
+        insert_message(&connection, 100, 1, "changed-message");
+        connection
+            .execute("UPDATE messages SET revision = 3 WHERE id = 100", [])
+            .expect("seed pre-journal local revision");
+        connection
+            .execute(
+                "INSERT INTO message_tombstones (account_id, remote_key, deleted_at_ms)
+                 VALUES (1, 'deleted-message', 123)",
+                [],
+            )
+            .expect("seed legacy tombstone");
+
+        migrate(&mut connection).expect("upgrade to v7");
+
+        let reconciliation: String = connection
+            .query_row(
+                "SELECT reason
+                 FROM remote_account_reconciliations
+                 WHERE account_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read legacy account reconciliation marker");
+        assert_eq!(reconciliation, "legacy_journal_bootstrap");
+        let legacy_revision: i64 = connection
+            .query_row(
+                "SELECT legacy_reconcile_revision FROM messages WHERE id = 100",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read target-level legacy reconciliation marker");
+        assert_eq!(legacy_revision, 3);
+        let advanced_marker = connection
+            .execute(
+                "UPDATE messages SET legacy_reconcile_revision = 4 WHERE id = 100",
+                [],
+            )
+            .expect_err("legacy marker cannot exceed the current local revision");
+        assert_eq!(
+            advanced_marker.sqlite_error_code(),
+            Some(ErrorCode::ConstraintViolation)
+        );
+        let feeder_plan: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT id FROM messages
+                 WHERE account_id = 1 AND legacy_reconcile_revision IS NOT NULL
+                 ORDER BY id
+                 LIMIT 1",
+                [],
+                |row| row.get(3),
+            )
+            .expect("explain bounded legacy feeder query");
+        assert!(
+            feeder_plan.contains("idx_messages_legacy_reconcile_pending"),
+            "legacy feeder must use its partial index: {feeder_plan}"
+        );
+        let intent_count: i64 = connection
+            .query_row("SELECT count(*) FROM remote_change_intents", [], |row| {
+                row.get(0)
+            })
+            .expect("count target intents after legacy migration");
+        assert_eq!(intent_count, 0);
+        assert_eq!(schema_version(&connection), 7);
+    }
+
+    #[test]
+    fn v7_migrates_legacy_state_above_target_journal_caps() {
+        let mut connection = memory_connection();
+        enable_foreign_keys(&connection).expect("enable foreign keys");
+        migrate_with(&mut connection, &MIGRATIONS[..6], 6).expect("create v6 schema");
+        for account_id in 1..=5 {
+            insert_account(
+                &connection,
+                account_id,
+                &format!("account-{account_id}@example.test"),
+            );
+        }
+
+        {
+            let transaction = connection
+                .transaction()
+                .expect("start legacy overflow transaction");
+            {
+                let mut insert = transaction
+                    .prepare(
+                        "INSERT INTO messages
+                             (id, account_id, remote_key, received_at_ms, revision)
+                         VALUES (?1, ?2, ?3, 0, 1)",
+                    )
+                    .expect("prepare legacy message insert");
+                for index in 0..16_385_i64 {
+                    let account_id = index / 4_096 + 1;
+                    insert
+                        .execute(params![index + 1, account_id, format!("legacy-{index}")])
+                        .expect("seed legacy state beyond global journal cap");
+                }
+            }
+            transaction.commit().expect("commit legacy overflow data");
+        }
+
+        migrate(&mut connection).expect("upgrade oversized legacy state to v7");
+
+        let marker_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM remote_account_reconciliations",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count bounded account reconciliation markers");
+        assert_eq!(marker_count, 5);
+        let pending_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM messages
+                 WHERE legacy_reconcile_revision IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count durable target-level reconciliation markers");
+        assert_eq!(pending_count, 16_385);
+        let intent_count: i64 = connection
+            .query_row("SELECT count(*) FROM remote_change_intents", [], |row| {
+                row.get(0)
+            })
+            .expect("count target intents after oversized migration");
+        assert_eq!(intent_count, 0);
+        assert_eq!(schema_version(&connection), 7);
+    }
+
+    #[test]
+    fn remote_journal_identity_and_lease_state_are_immutable() {
+        let mut connection = memory_connection();
+        migrate(&mut connection).expect("apply migrations");
+        insert_account(&connection, 1, "one@example.test");
+        insert_account(&connection, 2, "two@example.test");
+        insert_folder(&connection, 10, 1, "folder-10", "label");
+        insert_message(&connection, 100, 1, "message-100");
+        connection
+            .execute(
+                "INSERT INTO message_folders (message_id, folder_id, account_id)
+                 VALUES (100, 10, 1)",
+                [],
+            )
+            .expect("seed message membership");
+        connection
+            .execute(
+                "INSERT INTO remote_change_intents
+                     (account_id, message_id, target_key, local_revision,
+                      unread_base, unread_desired, placement_active,
+                      not_before_ms, created_at_ms, updated_at_ms)
+                 VALUES (1, 100, 'message-100', 0, 1, 0, 1, 0, 0, 0)",
+                [],
+            )
+            .expect("insert identity-bound intent");
+        let intent_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO remote_change_intent_folders (intent_id, side, folder_key)
+                 VALUES (?1, 'base', 'folder-10')",
+                [intent_id],
+            )
+            .expect("insert folder snapshot");
+        connection
+            .execute(
+                "INSERT INTO remote_change_intent_imap_sources
+                     (intent_id, folder_key, uid_validity, uid,
+                      remote_seen, remote_flagged)
+                 VALUES (?1, 'folder-10', 7, 42, 0, 0)",
+                [intent_id],
+            )
+            .expect("insert frozen IMAP source");
+        connection
+            .execute(
+                "INSERT INTO message_tombstones (account_id, remote_key, deleted_at_ms)
+                 VALUES (1, 'deleted-message', 0)",
+                [],
+            )
+            .expect("seed tombstone");
+        connection
+            .execute(
+                "INSERT INTO message_tombstone_imap_locations
+                     (account_id, target_key, folder_key, uid_validity, uid)
+                 VALUES (1, 'deleted-message', 'folder-10', 7, 43)",
+                [],
+            )
+            .expect("insert frozen tombstone locator");
+        let child_count: i64 = connection
+            .query_row(
+                "SELECT child_count FROM remote_journal_usage WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read journal child usage");
+        assert_eq!(child_count, 3);
+
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO remote_change_intent_imap_sources
+                     (intent_id, folder_key, uid_validity, uid,
+                      modseq, remote_seen, remote_flagged)
+                 VALUES (?1, 'folder-10', 7, 42, 2, 0, 0)",
+                [intent_id],
+            )
+            .expect("replace a frozen source without drifting its quota");
+        let child_count_after_replace: i64 = connection
+            .query_row(
+                "SELECT child_count FROM remote_journal_usage WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read usage after source replacement");
+        assert_eq!(child_count_after_replace, 3);
+
+        connection
+            .execute(
+                "UPDATE remote_journal_usage SET child_count = 65536 WHERE singleton = 1",
+                [],
+            )
+            .expect("simulate a full global child budget");
+        let updated_count = connection
+            .execute(
+                "INSERT INTO remote_change_intent_imap_sources
+                     (intent_id, folder_key, uid_validity, uid,
+                      modseq, remote_seen, remote_flagged)
+                 VALUES (?1, 'folder-10', 7, 42, 9, 1, 1)
+                 ON CONFLICT(intent_id, folder_key, uid_validity, uid) DO UPDATE
+                 SET modseq = excluded.modseq,
+                     remote_seen = excluded.remote_seen,
+                     remote_flagged = excluded.remote_flagged",
+                [intent_id],
+            )
+            .expect("an existing source remains updatable at the global cap");
+        assert_eq!(updated_count, 1);
+        let updated_source: (i64, bool, bool) = connection
+            .query_row(
+                "SELECT modseq, remote_seen, remote_flagged
+                 FROM remote_change_intent_imap_sources
+                 WHERE intent_id = ?1",
+                [intent_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read updated source checkpoint");
+        assert_eq!(updated_source, (9, true, true));
+        let global_overflow = connection
+            .execute(
+                "INSERT INTO remote_change_intent_imap_sources
+                     (intent_id, folder_key, uid_validity, uid,
+                      remote_seen, remote_flagged)
+                 VALUES (?1, 'folder-10', 7, 44, 0, 0)",
+                [intent_id],
+            )
+            .expect_err("a new source cannot exceed the global child cap");
+        assert_eq!(
+            global_overflow.sqlite_error_code(),
+            Some(ErrorCode::ConstraintViolation)
+        );
+        connection
+            .execute(
+                "UPDATE remote_journal_usage SET child_count = 3 WHERE singleton = 1",
+                [],
+            )
+            .expect("restore the measured child usage");
+
+        for (sql, message) in [
+            (
+                "UPDATE messages SET account_id = 2 WHERE id = 100",
+                "message account cannot move",
+            ),
+            (
+                "UPDATE messages SET remote_key = 'other-message' WHERE id = 100",
+                "message target key cannot change",
+            ),
+            (
+                "UPDATE accounts SET provider = 'jmap' WHERE id = 1",
+                "account provider cannot change",
+            ),
+            (
+                "UPDATE accounts SET remote_key = 'other-account' WHERE id = 1",
+                "account remote key cannot change",
+            ),
+            (
+                "UPDATE folders SET account_id = 2 WHERE id = 10",
+                "folder account cannot move",
+            ),
+            (
+                "UPDATE remote_change_intent_folders
+                 SET folder_key = 'other-folder'
+                 WHERE intent_id = 1 AND side = 'base' AND folder_key = 'folder-10'",
+                "folder snapshot identity cannot change",
+            ),
+            (
+                "UPDATE remote_change_intent_imap_sources SET uid = 99 WHERE intent_id = 1",
+                "source locator identity cannot change",
+            ),
+            (
+                "UPDATE message_tombstone_imap_locations SET uid = 99
+                 WHERE account_id = 1 AND target_key = 'deleted-message'",
+                "tombstone locator identity cannot change",
+            ),
+        ] {
+            let error = connection.execute(sql, []).expect_err(message);
+            assert_eq!(
+                error.sqlite_error_code(),
+                Some(ErrorCode::ConstraintViolation)
+            );
+        }
+
+        let mismatched_target = connection
+            .execute(
+                "INSERT INTO remote_change_intents
+                     (account_id, message_id, target_key, local_revision,
+                      starred_base, starred_desired,
+                      not_before_ms, created_at_ms, updated_at_ms)
+                 VALUES (1, 100, 'other-target', 0, 0, 1, 0, 0, 0)",
+                [],
+            )
+            .expect_err("intent target must equal the message remote key");
+        assert_eq!(
+            mismatched_target.sqlite_error_code(),
+            Some(ErrorCode::ConstraintViolation)
+        );
+        let wrong_account = connection
+            .execute(
+                "INSERT INTO remote_change_intents
+                     (account_id, message_id, target_key, local_revision,
+                      starred_base, starred_desired,
+                      not_before_ms, created_at_ms, updated_at_ms)
+                 VALUES (2, 100, 'message-100', 0, 0, 1, 0, 0, 0)",
+                [],
+            )
+            .expect_err("intent message must belong to its account");
+        assert_eq!(
+            wrong_account.sqlite_error_code(),
+            Some(ErrorCode::ConstraintViolation)
+        );
+
+        connection
+            .execute(
+                "UPDATE remote_change_intents
+                 SET intent_version = 2, claim_epoch = 1
+                 WHERE id = ?1",
+                [intent_id],
+            )
+            .expect("advance intent version and claim epoch");
+        for sql in [
+            "UPDATE remote_change_intents SET intent_version = 1 WHERE id = 1",
+            "UPDATE remote_change_intents SET claim_epoch = 0 WHERE id = 1",
+            "UPDATE remote_change_intents SET leased_version = 1 WHERE id = 1",
+        ] {
+            let error = connection
+                .execute(sql, [])
+                .expect_err("versions and lease pairs cannot regress");
+            assert_eq!(
+                error.sqlite_error_code(),
+                Some(ErrorCode::ConstraintViolation)
+            );
+        }
+
+        connection
+            .execute(
+                "DELETE FROM remote_change_intents WHERE id = ?1",
+                [intent_id],
+            )
+            .expect("delete intent and its frozen children");
+        let after_intent_delete: i64 = connection
+            .query_row(
+                "SELECT child_count FROM remote_journal_usage WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read usage after intent cascade");
+        assert_eq!(after_intent_delete, 1);
+        connection
+            .execute(
+                "DELETE FROM message_tombstones
+                 WHERE account_id = 1 AND remote_key = 'deleted-message'",
+                [],
+            )
+            .expect("delete tombstone and its frozen locator");
+        let after_tombstone_delete: i64 = connection
+            .query_row(
+                "SELECT child_count FROM remote_journal_usage WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read usage after tombstone cascade");
+        assert_eq!(after_tombstone_delete, 0);
+    }
+
+    #[test]
+    fn remote_intent_constraints_and_account_cap_are_hard_bounds() {
+        let mut connection = memory_connection();
+        migrate(&mut connection).expect("apply migrations");
+        insert_account(&connection, 1, "one@example.test");
+        insert_account(&connection, 2, "two@example.test");
+        insert_message(&connection, 100, 1, "message-100");
+
+        connection
+            .execute(
+                "INSERT INTO remote_change_intents
+                 (account_id, message_id, target_key, local_revision,
+                      unread_base, unread_desired, not_before_ms, created_at_ms, updated_at_ms)
+                 VALUES (1, 100, 'message-100', 0, 1, 0, 0, 0, 0)",
+                [],
+            )
+            .expect("insert bounded desired-state intent");
+        let intent_id = connection.last_insert_rowid();
+
+        let unmatched_flag = connection
+            .execute(
+                "INSERT INTO remote_change_intents
+                     (account_id, target_key, local_revision, unread_base,
+                      not_before_ms, created_at_ms, updated_at_ms)
+                 VALUES (1, 'invalid-pair', 0, 1, 0, 0, 0)",
+                [],
+            )
+            .expect_err("base and desired flags must be paired");
+        assert_eq!(
+            unmatched_flag.sqlite_error_code(),
+            Some(ErrorCode::ConstraintViolation)
+        );
+        let wrong_account = connection
+            .execute(
+                "INSERT INTO remote_change_intents
+                     (account_id, message_id, target_key, local_revision,
+                      starred_base, starred_desired, not_before_ms,
+                      created_at_ms, updated_at_ms)
+                 VALUES (2, 100, 'wrong-account', 0, 0, 1, 0, 0, 0)",
+                [],
+            )
+            .expect_err("intent message must belong to its account");
+        assert_eq!(
+            wrong_account.sqlite_error_code(),
+            Some(ErrorCode::ConstraintViolation)
+        );
+        let invalid_lease = connection
+            .execute(
+                "INSERT INTO remote_change_intents
+                     (account_id, target_key, local_revision,
+                      reconcile_requested, state, leased_version,
+                      lease_expires_at_ms, not_before_ms, created_at_ms, updated_at_ms)
+                 VALUES (1, 'invalid-lease', 0, 1, 'in_flight', 1, 1, 0, 0, 0)",
+                [],
+            )
+            .expect_err("an in-flight lease needs a positive claim and attempt");
+        assert_eq!(
+            invalid_lease.sqlite_error_code(),
+            Some(ErrorCode::ConstraintViolation)
+        );
+
+        connection
+            .execute(
+                "UPDATE remote_change_intents SET placement_active = 1 WHERE id = ?1",
+                [intent_id],
+            )
+            .expect("activate placement snapshot");
+        {
+            let transaction = connection
+                .transaction()
+                .expect("start folder-cap transaction");
+            {
+                let mut insert = transaction
+                    .prepare(
+                        "INSERT INTO remote_change_intent_folders
+                             (intent_id, side, folder_key)
+                         VALUES (?1, 'base', ?2)",
+                    )
+                    .expect("prepare folder snapshot insert");
+                for index in 0..256 {
+                    insert
+                        .execute(params![intent_id, format!("folder-{index}")])
+                        .expect("insert folder snapshot within cap");
+                }
+            }
+            transaction.commit().expect("commit folder snapshots");
+        }
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO remote_change_intent_folders
+                     (intent_id, side, folder_key)
+                 VALUES (?1, 'base', 'folder-0')",
+                [intent_id],
+            )
+            .expect("an existing folder remains idempotent at the cap");
+        let child_count: i64 = connection
+            .query_row(
+                "SELECT child_count FROM remote_journal_usage WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read folder snapshot usage");
+        assert_eq!(child_count, 256);
+        let folder_overflow = connection
+            .execute(
+                "INSERT INTO remote_change_intent_folders
+                     (intent_id, side, folder_key)
+                 VALUES (?1, 'base', 'folder-overflow')",
+                [intent_id],
+            )
+            .expect_err("the 257th base folder must be rejected");
+        assert_eq!(
+            folder_overflow.sqlite_error_code(),
+            Some(ErrorCode::ConstraintViolation)
+        );
+
+        {
+            let transaction = connection
+                .transaction()
+                .expect("start intent-cap transaction");
+            {
+                let mut insert = transaction
+                    .prepare(
+                        "INSERT INTO remote_change_intents
+                             (account_id, target_key, local_revision,
+                              starred_base, starred_desired,
+                              not_before_ms, created_at_ms, updated_at_ms)
+                         VALUES (1, ?1, 0, 0, 1, 0, 0, 0)",
+                    )
+                    .expect("prepare intent insert");
+                for index in 2..=4096 {
+                    insert
+                        .execute([format!("target-{index}")])
+                        .expect("insert intent within account cap");
+                }
+            }
+            transaction.commit().expect("commit capped intents");
+        }
+        let account_overflow = connection
+            .execute(
+                "INSERT INTO remote_change_intents
+                     (account_id, target_key, local_revision,
+                      starred_base, starred_desired,
+                      not_before_ms, created_at_ms, updated_at_ms)
+                 VALUES (1, 'target-4097', 0, 0, 1, 0, 0, 0)",
+                [],
+            )
+            .expect_err("the 4097th account intent must be rejected");
+        assert_eq!(
+            account_overflow.sqlite_error_code(),
+            Some(ErrorCode::ConstraintViolation)
+        );
+        connection
+            .execute(
+                "INSERT INTO remote_change_intents
+                     (account_id, target_key, local_revision,
+                      unread_base, unread_desired,
+                      not_before_ms, created_at_ms, updated_at_ms)
+                 VALUES (1, 'message-100', 1, 1, 1, 0, 0, 1)
+                 ON CONFLICT(account_id, target_key) DO UPDATE
+                 SET unread_desired = excluded.unread_desired,
+                     intent_version = remote_change_intents.intent_version + 1,
+                     updated_at_ms = excluded.updated_at_ms",
+                [],
+            )
+            .expect("merge an existing target while the account is at its cap");
+        let version: i64 = connection
+            .query_row(
+                "SELECT intent_version FROM remote_change_intents WHERE id = ?1",
+                [intent_id],
+                |row| row.get(0),
+            )
+            .expect("read merged intent version");
+        assert_eq!(version, 2);
     }
 
     #[test]
@@ -616,7 +1310,7 @@ mod tests {
         assert!(matches!(
             error,
             MigrationError::FutureSchema {
-                found: 7,
+                found: 8,
                 supported: LATEST_SCHEMA_VERSION,
             }
         ));

@@ -1009,6 +1009,9 @@ mod tests {
         let foreign_keys: i64 = connection
             .pragma_query_value(None, "foreign_keys", |row| row.get(0))
             .unwrap();
+        let recursive_triggers: i64 = connection
+            .pragma_query_value(None, "recursive_triggers", |row| row.get(0))
+            .unwrap();
         let cache_size: i64 = connection
             .pragma_query_value(None, "cache_size", |row| row.get(0))
             .unwrap();
@@ -1019,6 +1022,7 @@ mod tests {
             .pragma_query_value(None, "temp_store", |row| row.get(0))
             .unwrap();
         assert_eq!(foreign_keys, 1);
+        assert_eq!(recursive_triggers, 1);
         assert_eq!(cache_size, -SQLITE_CACHE_KIB);
         assert_eq!(synchronous, 2);
         assert_eq!(temp_store, 1);
