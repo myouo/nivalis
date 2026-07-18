@@ -2,7 +2,7 @@
 
 ## Status
 
-This document is the normative boundary between Nivalis' SQLite actor and its future IMAP and JMAP adapters. The controller must not switch to SQLite and no provider may issue remote writes until the locator schema, desired-state journal, and versioned report API implement this contract.
+This document is the normative boundary between Nivalis' SQLite actor and its future IMAP and JMAP adapters. Schema v7 implements the bounded locator, object-state, journal, and legacy-reconciliation storage described here, but no local mutation writes intents and no claim/report or provider execution API exists yet. The controller must not switch to SQLite, and providers must not issue remote writes, until mutation reduction, synchronization merge/reconciliation, and the versioned claim/report path implement this contract.
 
 The journal records the latest desired state of a logical message, not a history of UI actions. Local state, statistics, undo/tombstone data, and the journal change must commit in one SQLite `BEGIN IMMEDIATE` transaction.
 
@@ -76,6 +76,8 @@ JMAP Email ids remain stable across mailbox membership changes, and `Email/set` 
 
 Incoming synchronization may update dimensions with no pending intent. For pending or blocked dimensions, the local desired value is overlaid after importing the remote base so offline work is not overwritten. Cursor/state-token advancement, locator changes, journal progress, and statistics rebuilds commit atomically.
 
+The v7 migration does not expand every historical local revision into a target intent, because a real mailbox may exceed the live journal caps. It stores the migration-time revision in `messages.legacy_reconcile_revision`, keeps existing tombstones as the deletion backlog, and creates at most one reconciliation gate per account. A bounded feeder may materialize those targets only as journal capacity becomes available. Clearing a legacy revision, acknowledging its matching intent, advancing the remote cursor/state, and removing the account gate must follow the same version checks and transactional rules as normal synchronization.
+
 Permanent local deletion writes a terminal intent, freezes all known locators, and creates a tombstone before deleting the message. Import checks tombstones before recreating a message. A tombstone is collected only after a causally newer remote cursor or state fence confirms absence and that confirmation commits with the journal acknowledgement.
 
 ## Resource Limits
@@ -88,6 +90,8 @@ Permanent local deletion writes a terminal intent, freezes all known locators, a
 - Attempts are capped at 1,000. Error code and detail fields are capped at 64 and 1,024 UTF-8 bytes.
 
 Hitting any limit returns `ResourceLimit` and rolls back the complete local mutation. Updating an existing target remains possible when the parent-row cap is full, subject to its child and byte budgets. No queue scan materializes all pending intents in Rust, and the network actor owns at most one wake-up timer rather than one timer per row.
+
+SQLite maintains the global child-row budget with one transactional usage row rather than scanning all child tables on each insert. Every application connection enables and verifies foreign keys and recursive triggers so cascades and replacement paths keep that counter exact.
 
 ## Non-Goals
 
