@@ -2,6 +2,12 @@
 
 A task-first desktop mail client prototype built with Rust, Slint, and the Skia renderer. Its compact visual language is independently designed from Fluent-style desktop patterns: flat surfaces, thin outlines, stable navigation, and progressive disclosure without copying third-party code or assets.
 
+## Technology
+
+The confirmed application stack is Rust 2024 with Slint 1.17.1, Winit, and the Skia renderer. The production architecture keeps the native Slint UI on the main thread, runs network work on one Tokio current-thread runtime, and serializes SQLite access through a dedicated `rusqlite` actor. Mail transport uses IMAP and SMTP, with JMAP as an optional provider backend; MIME parsing, OAuth2, Rustls, and the `keyring` crate complete the protocol and credential boundary. Nivalis does not embed a WebView.
+
+These production services are architectural commitments and are being integrated incrementally; the current repository remains an interaction-complete local prototype. See [`docs/architecture.md`](docs/architecture.md) for ownership boundaries, backpressure rules, dependency features, and memory budgets.
+
 ## Run
 
 ```bash
@@ -44,10 +50,18 @@ NIVALIS_RENDERER=skia cargo run --release
 
 ## Structure
 
-- `ui/theme.slint` contains color, typography, contrast, and motion tokens.
-- `ui/components.slint` contains reusable compact desktop controls and state layers.
-- `ui/app.slint` contains the adaptive mailbox, reader, dialogs, sheets, and status surfaces.
-- `src/store.rs` contains the local multi-account mail model and tested state transitions.
+- `ui/app.slint` is the single Slint build entry and owns the stable Rust-facing window API, responsive state, keyboard routing, and conditional composition.
+- `ui/models.slint` and `ui/theme.slint` define shared UI data types and visual tokens without depending on feature views.
+- `ui/components.slint` is a compatibility facade over the primitives, controls, inputs, navigation, and feedback modules in `ui/components/`.
+- `ui/shared.slint`, `ui/actions.slint`, and `ui/shell.slint` contain cross-feature presentation elements, reader/compose actions, the title bar, and adaptive navigation.
+- `ui/mailbox.slint`, `ui/reader.slint`, `ui/composer.slint`, and `ui/states.slint` isolate the main task surfaces and reusable empty state.
+- `ui/overlays.slint` contains menus, settings, confirmation, and snackbar surfaces; `ui/app.slint` keeps their `if` boundaries so hidden overlays are not instantiated.
+- `src/main.rs` selects the process modules and starts the Slint event loop.
+- `src/platform.rs` owns renderer selection and native window integration.
+- `src/controller.rs` binds user intents to the current application services.
+- `src/presentation.rs` projects bounded Store snapshots into Slint models.
+- `src/benchmark.rs` contains the opt-in memory stress harness.
+- `src/store/` is the repository facade; `memory.rs` is the replaceable prototype backend.
 
 The embedded icon subset is generated from Material Symbols Rounded and retains its upstream license in `assets/licenses`. Text uses the system's Noto Sans installation, with normal platform fallback behavior.
 
@@ -67,6 +81,10 @@ The embedded icon subset is generated from Material Symbols Rounded and retains 
 - Release profiles use full LTO, one codegen unit, stripped symbols, and abort-on-panic. The recommended `s` profile retained `3`-level stress throughput within 2.5% while reducing the measured stress RSS by about 2MiB.
 - A production mailbox should back the same 50-row page with SQLite/FTS and load bodies and attachments from disk on demand.
 
-The verified Linux release executable is 18.0MB. Across three fresh X11 runs at 1200x900, the recommended release profile's worst idle sample was 35.5MiB RSS / 21.2MiB PSS / 18.0MiB USS. Three native Wayland runs stayed below 41.6MiB RSS / 22.4MiB PSS / 17.6MiB USS. See `memory-report.md` for the measurement contract, stress results, and reproduction command.
+The verified Linux release executable is 18.0MB. Across three fresh X11 runs at 1200x900 after UI modularization, the recommended release profile's worst idle sample was 35.7MiB RSS / 21.8MiB PSS / 18.4MiB USS. Three native Wayland runs stayed below 41.6MiB RSS / 22.4MiB PSS / 17.6MiB USS. See `memory-report.md` for the measurement contract, stress results, and reproduction command.
 
-This is an interaction-complete local prototype. Production email support still requires an IMAP/JMAP or provider API adapter, SMTP submission, encrypted credential storage, a durable local database, and safe HTML mail rendering.
+This is an interaction-complete local prototype. Production email support is being added within the fixed architecture above: IMAP/SMTP by default, optional JMAP, encrypted credential storage, a durable local database, and bounded native rendering for mail content.
+
+## License
+
+Nivalis Mail is distributed under the **GNU General Public License, version 3 only** (`GPL-3.0-only`). Distributions and modified versions must comply with GPLv3, including its corresponding-source and license-notice requirements. See [`LICENSE`](LICENSE) for the complete license text.

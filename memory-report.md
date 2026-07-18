@@ -29,11 +29,13 @@ Values below are the worst stable samples across the stated fresh-process runs.
 
 | Renderer | Platform | Runs | RSS | PSS | USS | Result |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
-| Skia software | X11 | 3 | 35.5MiB | 21.2MiB | 18.0MiB | Pass, including stretch target |
+| Skia software | X11 | 3 | 35.7MiB | 21.8MiB | 18.4MiB | Pass, including stretch target |
 | Skia software | Wayland | 3 | 41.5MiB | 22.4MiB | 17.5MiB | Pass, including stretch target |
 | Skia OpenGL | X11 | 1 A/B run | 248.0MiB | 81.9MiB | 34.0MiB | PSS pass, RSS stretch fail |
 
 The Skia software path is the product default because this mail UI is mostly static and partial rendering leaves measured idle CPU at 0.00%. The OpenGL renderer remains an explicit opt-in for workloads where GPU throughput is more important than process RSS.
+
+The X11 idle row was refreshed after the Slint UI was split into feature modules. The release settled at 0.00% interval CPU in every 10-second sample; the Wayland and stress rows retain the earlier memory-optimization measurements.
 
 ## Growth Results
 
