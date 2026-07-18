@@ -83,9 +83,7 @@ fn mailbox_query(spec: &PageSpec) -> (String, Vec<Value>) {
         FolderScope::Starred => {
             "m.starred = 1 AND EXISTS (
                 SELECT 1 FROM message_folders AS mf
-                JOIN folders AS f ON f.id = mf.folder_id AND f.account_id = mf.account_id
                 WHERE mf.message_id = m.id AND mf.account_id = m.account_id
-                  AND f.role <> 'trash'
             )"
         }
         FolderScope::Unread => {
@@ -129,6 +127,20 @@ fn mailbox_query(spec: &PageSpec) -> (String, Vec<Value>) {
             )"
         }
     });
+
+    if spec.folder != FolderScope::Trash {
+        sql.push_str(
+            " AND NOT EXISTS (
+                SELECT 1 FROM message_folders AS trash_mf
+                JOIN folders AS trash_f
+                  ON trash_f.id = trash_mf.folder_id
+                 AND trash_f.account_id = trash_mf.account_id
+                WHERE trash_mf.message_id = m.id
+                  AND trash_mf.account_id = m.account_id
+                  AND trash_f.role = 'trash'
+            )",
+        );
+    }
 
     if let Some(account_id) = spec.account.database_id() {
         parameters.push(Value::Integer(account_id));
@@ -395,7 +407,7 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO message_folders (message_id, folder_id, account_id)
-                 VALUES (2, 2, 1)",
+                 VALUES (2, 1, 1), (2, 2, 1), (2, 3, 1)",
                 [],
             )
             .unwrap();
@@ -406,5 +418,10 @@ mod tests {
             assert_eq!(page.rows.len(), 1);
             assert_eq!(page.rows[0].id, MessageId::new(1).unwrap());
         }
+
+        let trash = PageSpec::new(AccountScope::All, FolderScope::Trash, None, None, 50).unwrap();
+        let page = query_mailbox(&connection, &trash).unwrap();
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].id, MessageId::new(2).unwrap());
     }
 }
