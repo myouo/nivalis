@@ -5,8 +5,11 @@
 //! implementation can replace it without moving UI bindings again.
 
 mod memory;
-// Persistence lands incrementally before the controller switches data sources.
+mod path;
+// Persistence is active behind the core while the controller remains on one
+// consistent in-memory repository until the mutation API is complete.
 #[allow(dead_code)]
-mod sqlite;
+pub(crate) mod sqlite;
 
 pub(crate) use memory::{MailStats, MailStore, MailView};
+pub(crate) use path::database_path;

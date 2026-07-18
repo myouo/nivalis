@@ -15,7 +15,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ui = AppWindow::new()?;
     platform::install_window_handlers(&ui);
-    let (core, core_events, core_runtime) = core::spawn()?;
+    let database_path = store::database_path()?;
+    let (core, core_events, core_runtime) = core::spawn(database_path)?;
     let _core_event_task = controller::install(&ui, core, core_events)?;
 
     #[cfg(feature = "bench-harness")]

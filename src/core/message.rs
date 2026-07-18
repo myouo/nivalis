@@ -1,3 +1,4 @@
+use crate::store::sqlite::{Generation, MailboxPage, PageSpec, RequestId, Tagged};
 use tokio::sync::mpsc;
 
 pub(crate) const COMMAND_CAPACITY: usize = 64;
@@ -14,12 +15,61 @@ impl OperationId {
 
 #[derive(Debug)]
 pub(super) enum Command {
-    SyncNow { operation_id: OperationId },
+    SyncNow {
+        operation_id: OperationId,
+    },
+    #[cfg_attr(not(test), allow(dead_code))]
+    QueryMailbox(MailboxQuery),
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Event {
-    SyncFinished { operation_id: OperationId },
+    SyncFinished {
+        operation_id: OperationId,
+    },
+    MailboxLoaded(Tagged<MailboxPage>),
+    MailboxLoadRejected {
+        request_id: RequestId,
+        generation: Generation,
+        reason: MailboxLoadError,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MailboxQuery {
+    pub(super) request_id: RequestId,
+    pub(super) generation: Generation,
+    pub(super) spec: PageSpec,
+}
+
+impl MailboxQuery {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn new(request_id: RequestId, generation: Generation, spec: PageSpec) -> Self {
+        Self {
+            request_id,
+            generation,
+            spec,
+        }
+    }
+
+    pub(super) fn key(&self) -> MailboxRequestKey {
+        MailboxRequestKey {
+            request_id: self.request_id,
+            generation: self.generation,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct MailboxRequestKey {
+    pub(super) request_id: RequestId,
+    pub(super) generation: Generation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MailboxLoadError {
+    Busy,
+    Unavailable,
 }
 
 pub(crate) type EventReceiver = mpsc::Receiver<Event>;
@@ -37,6 +87,13 @@ impl CoreHandle {
     pub(crate) fn try_send_sync(&self, operation_id: OperationId) -> Result<(), SubmitError> {
         self.commands
             .try_send(Command::SyncNow { operation_id })
+            .map_err(SubmitError::from)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn try_query_mailbox(&self, query: MailboxQuery) -> Result<(), SubmitError> {
+        self.commands
+            .try_send(Command::QueryMailbox(query))
             .map_err(SubmitError::from)
     }
 }

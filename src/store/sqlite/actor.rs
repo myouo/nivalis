@@ -1,4 +1,12 @@
-use std::{any::Any, fmt, fs, path::PathBuf, sync::Arc, thread, time::Duration};
+use std::{
+    any::Any,
+    fmt, fs,
+    path::PathBuf,
+    sync::Arc,
+    task::{Context, Poll},
+    thread,
+    time::Duration,
+};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select_biased};
 use rusqlite::{Connection, InterruptHandle, OpenFlags, limits::Limit};
@@ -87,6 +95,10 @@ pub(crate) struct DatabaseReplies {
 }
 
 impl DatabaseReplies {
+    pub(crate) fn poll_recv(&mut self, context: &mut Context<'_>) -> Poll<Option<DbReply>> {
+        self.replies.poll_recv(context)
+    }
+
     pub(crate) async fn recv(&mut self) -> Option<DbReply> {
         self.replies.recv().await
     }
@@ -113,6 +125,19 @@ pub(crate) fn spawn(
     StartError,
 > {
     spawn_target(Target::File(path), REQUEST_CAPACITY, REPLY_CAPACITY)
+}
+
+#[cfg(test)]
+pub(super) fn spawn_in_memory() -> Result<
+    (
+        DatabaseClient,
+        DatabaseReplies,
+        DatabaseRuntime,
+        DatabaseInfo,
+    ),
+    StartError,
+> {
+    spawn_target(Target::Memory, REQUEST_CAPACITY, REPLY_CAPACITY)
 }
 
 fn spawn_target(
