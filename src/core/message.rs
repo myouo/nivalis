@@ -1,4 +1,5 @@
 use crate::store::sqlite::{Generation, MailboxPage, PageSpec, RequestId, Tagged};
+use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::mpsc;
 
 pub(crate) const COMMAND_CAPACITY: usize = 64;
@@ -72,7 +73,109 @@ pub(crate) enum MailboxLoadError {
     Unavailable,
 }
 
-pub(crate) type EventReceiver = mpsc::Receiver<Event>;
+enum EventEnvelope {
+    Control(Event),
+    MailboxReady,
+}
+
+#[derive(Default)]
+struct LatestMailboxEvent {
+    event: Option<Event>,
+    notification_queued: bool,
+}
+
+pub(super) struct EventSender {
+    events: mpsc::Sender<EventEnvelope>,
+    mailbox: Arc<Mutex<LatestMailboxEvent>>,
+}
+
+impl EventSender {
+    pub(super) async fn send(&self, event: Event) -> Result<(), ()> {
+        let envelope = if matches!(
+            &event,
+            Event::MailboxLoaded(_) | Event::MailboxLoadRejected { .. }
+        ) {
+            let mut mailbox = lock_mailbox(&self.mailbox);
+            mailbox.event = Some(event);
+            if mailbox.notification_queued {
+                return Ok(());
+            }
+            mailbox.notification_queued = true;
+            EventEnvelope::MailboxReady
+        } else {
+            EventEnvelope::Control(event)
+        };
+
+        self.events.send(envelope).await.map_err(|_| ())
+    }
+}
+
+pub(crate) struct EventReceiver {
+    events: mpsc::Receiver<EventEnvelope>,
+    mailbox: Arc<Mutex<LatestMailboxEvent>>,
+}
+
+impl EventReceiver {
+    pub(crate) async fn recv(&mut self) -> Option<Event> {
+        loop {
+            match self.events.recv().await? {
+                EventEnvelope::Control(event) => return Some(event),
+                EventEnvelope::MailboxReady => {
+                    let mut mailbox = lock_mailbox(&self.mailbox);
+                    mailbox.notification_queued = false;
+                    if let Some(event) = mailbox.event.take() {
+                        return Some(event);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn blocking_recv(&mut self) -> Option<Event> {
+        loop {
+            match self.events.blocking_recv()? {
+                EventEnvelope::Control(event) => return Some(event),
+                EventEnvelope::MailboxReady => {
+                    let mut mailbox = lock_mailbox(&self.mailbox);
+                    mailbox.notification_queued = false;
+                    if let Some(event) = mailbox.event.take() {
+                        return Some(event);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+}
+
+pub(super) fn event_channel(capacity: usize) -> (EventSender, EventReceiver) {
+    let (sender, receiver) = mpsc::channel(capacity);
+    let mailbox = Arc::new(Mutex::new(LatestMailboxEvent::default()));
+    (
+        EventSender {
+            events: sender,
+            mailbox: mailbox.clone(),
+        },
+        EventReceiver {
+            events: receiver,
+            mailbox,
+        },
+    )
+}
+
+fn lock_mailbox(mailbox: &Mutex<LatestMailboxEvent>) -> MutexGuard<'_, LatestMailboxEvent> {
+    mailbox.lock().unwrap_or_else(|poison| poison.into_inner())
+}
 
 #[derive(Clone)]
 pub(crate) struct CoreHandle {
@@ -139,5 +242,37 @@ mod tests {
             handle.try_send_sync(OperationId::new(1)),
             Err(SubmitError::Closed)
         );
+    }
+
+    #[test]
+    fn mailbox_event_slot_keeps_only_the_latest_result() {
+        let (sender, mut receiver) = event_channel(4);
+        let first = Event::MailboxLoadRejected {
+            request_id: RequestId::new(1).unwrap(),
+            generation: Generation::new(1),
+            reason: MailboxLoadError::Busy,
+        };
+        let latest = Event::MailboxLoadRejected {
+            request_id: RequestId::new(2).unwrap(),
+            generation: Generation::new(2),
+            reason: MailboxLoadError::Unavailable,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        runtime.block_on(sender.send(first)).unwrap();
+        runtime.block_on(sender.send(latest)).unwrap();
+
+        assert_eq!(receiver.len(), 1);
+        assert_eq!(
+            receiver.blocking_recv(),
+            Some(Event::MailboxLoadRejected {
+                request_id: RequestId::new(2).unwrap(),
+                generation: Generation::new(2),
+                reason: MailboxLoadError::Unavailable,
+            })
+        );
+        assert!(receiver.is_empty());
     }
 }

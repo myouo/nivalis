@@ -102,6 +102,11 @@ impl DatabaseReplies {
     pub(crate) async fn recv(&mut self) -> Option<DbReply> {
         self.replies.recv().await
     }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.replies.is_empty()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

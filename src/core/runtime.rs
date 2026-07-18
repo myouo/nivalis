@@ -1,6 +1,6 @@
 use super::message::{
-    COMMAND_CAPACITY, Command, CoreHandle, EVENT_CAPACITY, Event, EventReceiver, MailboxLoadError,
-    MailboxQuery, MailboxRequestKey,
+    COMMAND_CAPACITY, Command, CoreHandle, EVENT_CAPACITY, Event, EventReceiver, EventSender,
+    MailboxLoadError, MailboxQuery, MailboxRequestKey, event_channel,
 };
 use crate::store::sqlite::{
     self, DatabaseClient, DatabaseInfo, DatabaseReplies, DatabaseRuntime, DatabaseSubmitError,
@@ -19,6 +19,7 @@ use std::{
 use tokio::{runtime::Builder, sync::mpsc, sync::oneshot, time};
 
 const SYNC_DELAY: Duration = Duration::from_millis(900);
+const COMMAND_BURST_LIMIT: u8 = 8;
 
 #[cfg(test)]
 type SyncStarted = Option<std::sync::mpsc::SyncSender<()>>;
@@ -62,7 +63,7 @@ fn spawn_with_options(
 ) -> Result<(CoreHandle, EventReceiver, CoreRuntime), StartError> {
     let (database, database_replies, database_runtime, _database_info) = database;
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CAPACITY);
-    let (event_tx, event_rx) = mpsc::channel(event_capacity);
+    let (event_tx, event_rx) = event_channel(event_capacity);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let runtime = Builder::new_current_thread()
         .enable_time()
@@ -106,7 +107,7 @@ fn spawn_with_options(
 
 async fn run_core(
     mut commands: mpsc::Receiver<Command>,
-    events: mpsc::Sender<Event>,
+    events: EventSender,
     shutdown: oneshot::Receiver<()>,
     database: DatabaseClient,
     mut database_replies: DatabaseReplies,
@@ -115,25 +116,38 @@ async fn run_core(
 ) -> Result<(), RuntimeError> {
     let mut shutdown = Box::pin(shutdown);
     let mut active_sync: Option<(super::OperationId, Pin<Box<time::Sleep>>)> = None;
+    let mut pending_sync = None;
     let mut mailbox = MailboxSchedule::default();
+    let mut command_streak = 0_u8;
 
     loop {
-        match next_input(
+        let input = next_input(
             &mut shutdown,
             &mut commands,
             &mut database_replies,
             &mut active_sync,
+            command_streak < COMMAND_BURST_LIMIT,
         )
-        .await
-        {
+        .await;
+        if matches!(&input, CoreInput::Command(_)) {
+            command_streak = command_streak.saturating_add(1);
+        } else {
+            command_streak = 0;
+        }
+
+        match input {
             CoreInput::Shutdown | CoreInput::CommandsClosed => return Ok(()),
             CoreInput::DatabaseClosed => return Err(RuntimeError::DatabaseClosed),
             CoreInput::Command(Command::SyncNow { operation_id }) => {
-                #[cfg(test)]
-                if let Some(sync_started) = &_sync_started {
-                    let _ = sync_started.try_send(());
+                if active_sync.is_some() {
+                    pending_sync = Some(operation_id);
+                } else {
+                    #[cfg(test)]
+                    if let Some(sync_started) = &_sync_started {
+                        let _ = sync_started.try_send(());
+                    }
+                    active_sync = Some((operation_id, Box::pin(time::sleep(sync_delay))));
                 }
-                active_sync = Some((operation_id, Box::pin(time::sleep(sync_delay))));
             }
             CoreInput::Command(Command::QueryMailbox(query)) => {
                 if let Some(query) = mailbox.enqueue(query)
@@ -172,6 +186,9 @@ async fn run_core(
                 if !send_event(&events, &mut shutdown, Event::SyncFinished { operation_id }).await {
                     return Ok(());
                 }
+                if let Some(operation_id) = pending_sync.take() {
+                    active_sync = Some((operation_id, Box::pin(time::sleep(sync_delay))));
+                }
             }
         }
     }
@@ -191,10 +208,19 @@ async fn next_input(
     commands: &mut mpsc::Receiver<Command>,
     database_replies: &mut DatabaseReplies,
     active_sync: &mut Option<(super::OperationId, Pin<Box<time::Sleep>>)>,
+    commands_first: bool,
 ) -> CoreInput {
     poll_fn(|context| {
         if shutdown.as_mut().poll(context).is_ready() {
             return Poll::Ready(CoreInput::Shutdown);
+        }
+
+        if commands_first {
+            match commands.poll_recv(context) {
+                Poll::Ready(Some(command)) => return Poll::Ready(CoreInput::Command(command)),
+                Poll::Ready(None) => return Poll::Ready(CoreInput::CommandsClosed),
+                Poll::Pending => {}
+            }
         }
 
         match database_replies.poll_recv(context) {
@@ -209,7 +235,7 @@ async fn next_input(
             return Poll::Ready(CoreInput::SyncElapsed);
         }
 
-        if active_sync.is_none() {
+        if !commands_first {
             match commands.poll_recv(context) {
                 Poll::Ready(Some(command)) => return Poll::Ready(CoreInput::Command(command)),
                 Poll::Ready(None) => return Poll::Ready(CoreInput::CommandsClosed),
@@ -223,7 +249,7 @@ async fn next_input(
 }
 
 async fn send_event(
-    events: &mpsc::Sender<Event>,
+    events: &EventSender,
     shutdown: &mut Pin<Box<oneshot::Receiver<()>>>,
     event: Event,
 ) -> bool {
@@ -445,6 +471,34 @@ mod tests {
     }
 
     #[test]
+    fn mailbox_query_completes_while_sync_is_active() {
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (core, mut events, runtime) = spawn_with_options(
+            Duration::from_secs(5),
+            EVENT_CAPACITY,
+            test_database(),
+            Some(started_tx),
+        )
+        .unwrap();
+        core.try_send_sync(OperationId::new(1)).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        core.try_query_mailbox(mailbox_query(5, 5)).unwrap();
+
+        let event = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(1), events.recv())
+                    .await
+                    .unwrap()
+            });
+        assert!(matches!(event, Some(Event::MailboxLoaded(_))));
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
     fn full_event_queue_applies_backpressure_without_stopping_core() {
         let (core, mut events, runtime) =
             spawn_with_options(Duration::from_millis(1), 1, test_database(), None).unwrap();
@@ -505,6 +559,43 @@ mod tests {
             schedule.complete(latest_key),
             MailboxCompletion::Publish
         ));
+    }
+
+    #[test]
+    fn command_burst_yields_to_a_ready_database_reply() {
+        let (database, mut database_replies, database_runtime, _) = test_database();
+        let query = mailbox_query(6, 6);
+        database
+            .try_query_mailbox(query.request_id, query.generation, query.spec)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while database_replies.is_empty() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(!database_replies.is_empty());
+
+        let (command_tx, mut commands) = mpsc::channel(1);
+        command_tx
+            .try_send(Command::SyncNow {
+                operation_id: OperationId::new(1),
+            })
+            .unwrap();
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        let mut shutdown = Box::pin(shutdown_rx);
+        let mut active_sync = None;
+        let input = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(next_input(
+                &mut shutdown,
+                &mut commands,
+                &mut database_replies,
+                &mut active_sync,
+                false,
+            ));
+
+        assert!(matches!(input, CoreInput::Database(DbReply::Mailbox(_))));
+        database_runtime.shutdown().unwrap();
     }
 
     #[test]

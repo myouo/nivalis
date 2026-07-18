@@ -29,28 +29,26 @@ fn non_empty_env(name: &str) -> Option<OsString> {
     std::env::var_os(name).filter(|value| !value.is_empty())
 }
 
+fn absolute_env_path(name: &str) -> Option<PathBuf> {
+    non_empty_env(name)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+}
+
 #[cfg(target_os = "windows")]
 fn platform_data_root() -> Option<PathBuf> {
-    non_empty_env("LOCALAPPDATA").map(PathBuf::from)
+    absolute_env_path("LOCALAPPDATA")
 }
 
 #[cfg(target_os = "macos")]
 fn platform_data_root() -> Option<PathBuf> {
-    non_empty_env("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join("Library").join("Application Support"))
+    absolute_env_path("HOME").map(|home| home.join("Library").join("Application Support"))
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn platform_data_root() -> Option<PathBuf> {
-    non_empty_env("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or_else(|| {
-            non_empty_env("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".local").join("share"))
-        })
+    absolute_env_path("XDG_DATA_HOME")
+        .or_else(|| absolute_env_path("HOME").map(|home| home.join(".local").join("share")))
 }
 
 #[cfg(not(any(unix, target_os = "windows")))]
