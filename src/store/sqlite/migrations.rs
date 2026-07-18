@@ -2,7 +2,7 @@ use std::{error::Error, fmt};
 
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(crate) const LATEST_SCHEMA_VERSION: u32 = 4;
+pub(crate) const LATEST_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -26,6 +26,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 4,
         sql: include_str!("../../../migrations/0004_mutation_guards.sql"),
+    },
+    Migration {
+        version: 5,
+        sql: include_str!("../../../migrations/0005_clean_stale_file_gc.sql"),
     },
 ];
 
@@ -327,7 +331,7 @@ mod tests {
             .query_row("SELECT count(*) FROM message_folders", [], |row| row.get(0))
             .expect("count preserved memberships");
         assert_eq!(membership_count, 2);
-        assert_eq!(schema_version(&connection), 4);
+        assert_eq!(schema_version(&connection), 5);
 
         let legacy_inbox_count: i64 = connection
             .query_row(
@@ -403,7 +407,7 @@ mod tests {
         assert!(matches!(
             error,
             MigrationError::FutureSchema {
-                found: 5,
+                found: 6,
                 supported: LATEST_SCHEMA_VERSION,
             }
         ));
@@ -597,6 +601,41 @@ mod tests {
             .query_row("SELECT count(*) FROM file_gc", [], |row| row.get(0))
             .expect("count remaining GC entries");
         assert_eq!(queued_count, 0);
+    }
+
+    #[test]
+    fn v5_upgrade_removes_preexisting_gc_entries_for_live_files() {
+        let mut connection = memory_connection();
+        enable_foreign_keys(&connection).expect("enable foreign keys");
+        migrate_with(&mut connection, &MIGRATIONS[..4], 4).expect("create v4 schema");
+        insert_account(&connection, 1, "sender@example.test");
+        insert_message(&connection, 100, 1, "message-1");
+        connection
+            .execute(
+                "INSERT INTO message_content (message_id, body_file_key)
+                 VALUES (100, 'live.eml')",
+                [],
+            )
+            .expect("reference live file");
+        connection
+            .execute(
+                "INSERT INTO file_gc (file_key, queued_at_ms)
+                 VALUES ('live.eml', 0), ('orphan.eml', 0)",
+                [],
+            )
+            .expect("seed v4 GC queue");
+
+        migrate(&mut connection).expect("upgrade to v5");
+
+        let queued = connection
+            .prepare("SELECT file_key FROM file_gc ORDER BY file_key")
+            .expect("prepare GC query")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query GC entries")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect GC entries");
+        assert_eq!(queued, ["orphan.eml"]);
+        assert_eq!(schema_version(&connection), 5);
     }
 
     #[test]
