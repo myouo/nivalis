@@ -940,6 +940,7 @@ mod tests {
             [],
         )
         .unwrap();
+        super::super::stats::rebuild_account(&seed, 1).unwrap();
         drop(seed);
 
         let (client, _replies, runtime, _info) =
@@ -1082,6 +1083,7 @@ mod tests {
                 [],
             )
             .unwrap();
+        super::super::stats::rebuild_account(&connection, 1).unwrap();
         drop(connection);
 
         let (client, mut replies, runtime, info) =
@@ -1093,7 +1095,9 @@ mod tests {
         let DbReply::Mailbox(reply) = receive_reply(&mut replies) else {
             panic!("expected mailbox reply");
         };
-        assert_eq!(reply.result.unwrap().rows.len(), 1);
+        let page = reply.result.unwrap();
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.stats.selected_total, Some(1));
         runtime.shutdown().unwrap();
         remove_database_files(&path);
     }

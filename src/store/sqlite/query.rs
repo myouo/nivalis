@@ -9,6 +9,7 @@ use super::domain::{
     DbFailure, FolderScope, MailSummaryDto, MailboxPage, MessageDetail, MessageId, PageCursor,
     PageSpec,
 };
+use super::stats::query_mailbox_stats;
 
 const MAILBOX_SELECT: &str = "
     SELECT m.id, m.account_id, m.sender_name, m.sender_address, m.subject, m.preview,
@@ -28,6 +29,7 @@ pub(super) fn query_mailbox(
     connection: &Connection,
     spec: &PageSpec,
 ) -> Result<MailboxPage, DbFailure> {
+    let stats = query_mailbox_stats(connection, spec)?;
     let (sql, parameters) = mailbox_query(spec);
     let mut statement = connection.prepare(&sql).map_err(DbFailure::database)?;
     let mapped = statement
@@ -64,6 +66,7 @@ pub(super) fn query_mailbox(
     Ok(MailboxPage {
         rows: rows.into_boxed_slice(),
         next_cursor,
+        stats,
     })
 }
 
@@ -272,6 +275,7 @@ mod tests {
                 )
                 .unwrap();
         }
+        super::super::stats::rebuild_account(&connection, 1).unwrap();
         connection
     }
 
@@ -282,6 +286,9 @@ mod tests {
             PageSpec::new(AccountScope::All, FolderScope::Inbox, None, None, 50).unwrap();
         let first = query_mailbox(&connection, &first_spec).unwrap();
         assert_eq!(first.rows.len(), 50);
+        assert_eq!(first.stats.selected_total, Some(51));
+        assert_eq!(first.stats.inbox_unread, 51);
+        assert_eq!(first.stats.account_unread.len(), 1);
         let cursor = first.next_cursor.expect("second page cursor");
 
         let second_spec = PageSpec::new(
@@ -294,6 +301,7 @@ mod tests {
         .unwrap();
         let second = query_mailbox(&connection, &second_spec).unwrap();
         assert_eq!(second.rows.len(), 1);
+        assert_eq!(second.stats.selected_total, Some(51));
         assert!(second.next_cursor.is_none());
         assert!(!first.rows.iter().any(|row| row.id == second.rows[0].id));
     }
@@ -320,6 +328,7 @@ mod tests {
         let page = query_mailbox(&connection, &spec).unwrap();
 
         assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.stats.selected_total, None);
     }
 
     #[test]
@@ -411,17 +420,22 @@ mod tests {
                 [],
             )
             .unwrap();
+        super::super::stats::rebuild_account(&connection, 1).unwrap();
 
         for folder in [FolderScope::Starred, FolderScope::Unread] {
             let spec = PageSpec::new(AccountScope::All, folder, None, None, 50).unwrap();
             let page = query_mailbox(&connection, &spec).unwrap();
             assert_eq!(page.rows.len(), 1);
             assert_eq!(page.rows[0].id, MessageId::new(1).unwrap());
+            assert_eq!(page.stats.selected_total, Some(1));
+            assert_eq!(page.stats.inbox_unread, 1);
+            assert_eq!(page.stats.starred_total, 1);
         }
 
         let trash = PageSpec::new(AccountScope::All, FolderScope::Trash, None, None, 50).unwrap();
         let page = query_mailbox(&connection, &trash).unwrap();
         assert_eq!(page.rows.len(), 1);
         assert_eq!(page.rows[0].id, MessageId::new(2).unwrap());
+        assert_eq!(page.stats.selected_total, Some(1));
     }
 }

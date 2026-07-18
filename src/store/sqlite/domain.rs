@@ -4,6 +4,7 @@ use std::{
 };
 
 pub(super) const MAX_PAGE_SIZE: u8 = 50;
+pub(super) const MAX_ACCOUNT_STATS: usize = 64;
 pub(super) const MAX_SEARCH_BYTES: usize = 256;
 pub(super) const TRASH_UNDO_TTL_MS: i64 = 5_000;
 
@@ -188,10 +189,26 @@ pub(crate) struct MailSummaryDto {
     pub(crate) has_attachment: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AccountUnreadDto {
+    pub(crate) account_id: i64,
+    pub(crate) unread: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MailboxStatsDto {
+    pub(crate) selected_total: Option<u64>,
+    pub(crate) inbox_unread: u64,
+    pub(crate) starred_total: u64,
+    pub(crate) drafts_total: u64,
+    pub(crate) account_unread: Box<[AccountUnreadDto]>,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct MailboxPage {
     pub(crate) rows: Box<[MailSummaryDto]>,
     pub(crate) next_cursor: Option<PageCursor>,
+    pub(crate) stats: MailboxStatsDto,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -258,25 +275,68 @@ pub(crate) struct MessageState {
     pub(crate) starred: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AccountStatsDelta {
+    pub(crate) account_id: i64,
+    pub(crate) inbox_total: i8,
+    pub(crate) inbox_unread: i8,
+    pub(crate) starred_total: i8,
+    pub(crate) sent_total: i8,
+    pub(crate) drafts_total: i8,
+    pub(crate) archive_total: i8,
+    pub(crate) trash_total: i8,
+}
+
+impl AccountStatsDelta {
+    pub(super) fn from_values(account_id: i64, values: [i8; 7]) -> Self {
+        let [
+            inbox_total,
+            inbox_unread,
+            starred_total,
+            sent_total,
+            drafts_total,
+            archive_total,
+            trash_total,
+        ] = values;
+        Self {
+            account_id,
+            inbox_total,
+            inbox_unread,
+            starred_total,
+            sent_total,
+            drafts_total,
+            archive_total,
+            trash_total,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum MutationOutcome {
     Updated {
         state: MessageState,
         changed: bool,
+        stats_delta: AccountStatsDelta,
     },
     Archived {
         state: MessageState,
         changed: bool,
+        stats_delta: AccountStatsDelta,
     },
     MovedToTrash {
         state: MessageState,
         undo: UndoReceipt,
+        stats_delta: AccountStatsDelta,
     },
     PermanentlyDeleted {
         id: MessageId,
         account_id: i64,
+        stats_delta: AccountStatsDelta,
     },
-    Restored(MessageState),
+    Restored {
+        state: MessageState,
+        stats_delta: AccountStatsDelta,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]

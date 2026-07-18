@@ -4,6 +4,7 @@ use super::domain::{
     DbFailure, MessageId, MessageMutation, MessageState, MutationOutcome, TRASH_UNDO_TTL_MS,
     UndoReceipt, UndoToken,
 };
+use super::stats::{apply_transition, load_message_snapshot};
 
 const MIN_TIMESTAMP_MS: i64 = -62_135_596_800_000;
 const MAX_TIMESTAMP_MS: i64 = 253_402_300_799_999;
@@ -31,6 +32,7 @@ fn set_unread(
     unread: bool,
 ) -> Result<MutationOutcome, DbFailure> {
     let transaction = immediate_transaction(connection)?;
+    let before = load_message_snapshot(&transaction, id)?;
     let changed = transaction
         .execute(
             "UPDATE messages
@@ -41,8 +43,18 @@ fn set_unread(
         .map_err(DbFailure::database)?
         != 0;
     let state = load_state(&transaction, id)?;
+    let after = if changed {
+        load_message_snapshot(&transaction, id)?
+    } else {
+        before
+    };
+    let stats_delta = apply_transition(&transaction, before, Some(after))?;
     transaction.commit().map_err(DbFailure::database)?;
-    Ok(MutationOutcome::Updated { state, changed })
+    Ok(MutationOutcome::Updated {
+        state,
+        changed,
+        stats_delta,
+    })
 }
 
 fn set_starred(
@@ -51,6 +63,7 @@ fn set_starred(
     starred: bool,
 ) -> Result<MutationOutcome, DbFailure> {
     let transaction = immediate_transaction(connection)?;
+    let before = load_message_snapshot(&transaction, id)?;
     let changed = transaction
         .execute(
             "UPDATE messages
@@ -61,13 +74,24 @@ fn set_starred(
         .map_err(DbFailure::database)?
         != 0;
     let state = load_state(&transaction, id)?;
+    let after = if changed {
+        load_message_snapshot(&transaction, id)?
+    } else {
+        before
+    };
+    let stats_delta = apply_transition(&transaction, before, Some(after))?;
     transaction.commit().map_err(DbFailure::database)?;
-    Ok(MutationOutcome::Updated { state, changed })
+    Ok(MutationOutcome::Updated {
+        state,
+        changed,
+        stats_delta,
+    })
 }
 
 fn archive(connection: &mut Connection, id: MessageId) -> Result<MutationOutcome, DbFailure> {
     let transaction = immediate_transaction(connection)?;
     let state = load_state(&transaction, id)?;
+    let before = load_message_snapshot(&transaction, id)?;
     let archive_id = canonical_role_folder(&transaction, state.account_id, "archive")?;
     let blocked_placement_count: i64 = transaction
         .query_row(
@@ -127,8 +151,18 @@ fn archive(connection: &mut Connection, id: MessageId) -> Result<MutationOutcome
     }
 
     let state = load_state(&transaction, id)?;
+    let after = if changed {
+        load_message_snapshot(&transaction, id)?
+    } else {
+        before
+    };
+    let stats_delta = apply_transition(&transaction, before, Some(after))?;
     transaction.commit().map_err(DbFailure::database)?;
-    Ok(MutationOutcome::Archived { state, changed })
+    Ok(MutationOutcome::Archived {
+        state,
+        changed,
+        stats_delta,
+    })
 }
 
 fn move_to_trash(
@@ -139,6 +173,7 @@ fn move_to_trash(
     let expires_at_ms = checked_expiry(now_ms)?;
     let transaction = immediate_transaction(connection)?;
     let state = load_state(&transaction, id)?;
+    let before = load_message_snapshot(&transaction, id)?;
     let (folder_count, trash_count) = membership_counts(&transaction, id)?;
     if folder_count == 0 {
         return Err(DbFailure::conflict(
@@ -210,6 +245,8 @@ fn move_to_trash(
         .map_err(DbFailure::database)?;
     increment_revision(&transaction, id)?;
     let state = load_state(&transaction, id)?;
+    let after = load_message_snapshot(&transaction, id)?;
+    let stats_delta = apply_transition(&transaction, before, Some(after))?;
     transaction.commit().map_err(DbFailure::database)?;
 
     Ok(MutationOutcome::MovedToTrash {
@@ -218,6 +255,7 @@ fn move_to_trash(
             token,
             expires_at_ms,
         },
+        stats_delta,
     })
 }
 
@@ -229,6 +267,7 @@ fn delete_permanently(
     validate_timestamp(now_ms)?;
     let transaction = immediate_transaction(connection)?;
     let state = load_state(&transaction, id)?;
+    let before = load_message_snapshot(&transaction, id)?;
     let (_, trash_count) = membership_counts(&transaction, id)?;
     if trash_count == 0 {
         return Err(DbFailure::conflict(
@@ -256,10 +295,12 @@ fn delete_permanently(
     transaction
         .execute("DELETE FROM messages WHERE id = ?1", [id.get()])
         .map_err(DbFailure::database)?;
+    let stats_delta = apply_transition(&transaction, before, None)?;
     transaction.commit().map_err(DbFailure::database)?;
     Ok(MutationOutcome::PermanentlyDeleted {
         id,
         account_id: state.account_id,
+        stats_delta,
     })
 }
 
@@ -297,6 +338,7 @@ fn undo_trash(
             "the message is no longer in the expected Trash placement",
         ));
     }
+    let before = load_message_snapshot(&transaction, snapshot.message_id)?;
 
     let (snapshot_count, valid_count, trash_snapshot_count): (i64, i64, i64) = transaction
         .query_row(
@@ -345,8 +387,10 @@ fn undo_trash(
     increment_revision(&transaction, snapshot.message_id)?;
     clear_undo(&transaction)?;
     let state = load_state(&transaction, snapshot.message_id)?;
+    let after = load_message_snapshot(&transaction, snapshot.message_id)?;
+    let stats_delta = apply_transition(&transaction, before, Some(after))?;
     transaction.commit().map_err(DbFailure::database)?;
-    Ok(MutationOutcome::Restored(state))
+    Ok(MutationOutcome::Restored { state, stats_delta })
 }
 
 fn immediate_transaction(connection: &mut Connection) -> Result<Transaction<'_>, DbFailure> {
@@ -635,6 +679,7 @@ mod tests {
                 )
                 .unwrap();
         }
+        super::super::stats::rebuild_account(connection, 1).unwrap();
     }
 
     fn roles(connection: &Connection, id: i64) -> Vec<String> {
@@ -651,6 +696,34 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap()
+    }
+
+    fn stored_stats(connection: &Connection) -> [i64; 7] {
+        connection
+            .query_row(
+                "SELECT inbox_total, inbox_unread, starred_total, sent_total,
+                        drafts_total, archive_total, trash_total
+                 FROM account_mailbox_stats WHERE account_id = 1",
+                [],
+                |row| {
+                    Ok([
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ])
+                },
+            )
+            .unwrap()
+    }
+
+    fn assert_stats_match_rebuild(connection: &Connection) {
+        let before = stored_stats(connection);
+        super::super::stats::rebuild_account(connection, 1).unwrap();
+        assert_eq!(before, stored_stats(connection));
     }
 
     fn mutate(
@@ -674,39 +747,93 @@ mod tests {
         insert_message(&connection, 1, &[1]);
         let id = MessageId::new(1).unwrap();
 
-        let MutationOutcome::Updated { state, changed } =
-            mutate(&mut connection, MessageMutation::set_unread(id, true)).unwrap()
+        let MutationOutcome::Updated {
+            state,
+            changed,
+            stats_delta,
+        } = mutate(&mut connection, MessageMutation::set_unread(id, true)).unwrap()
         else {
             panic!("expected flag result");
         };
         assert!(!changed);
+        assert_eq!(stats_delta.inbox_unread, 0);
         assert_eq!(state.revision, 0);
 
-        let MutationOutcome::Updated { state, changed } =
-            mutate(&mut connection, MessageMutation::set_unread(id, false)).unwrap()
+        let MutationOutcome::Updated {
+            state,
+            changed,
+            stats_delta,
+        } = mutate(&mut connection, MessageMutation::set_unread(id, false)).unwrap()
         else {
             panic!("expected flag result");
         };
         assert!(changed);
+        assert_eq!(stats_delta.inbox_unread, -1);
         assert_eq!(state.revision, 1);
         assert!(!state.unread);
 
-        let MutationOutcome::Updated { state, changed } =
-            mutate(&mut connection, MessageMutation::set_starred(id, true)).unwrap()
+        let MutationOutcome::Updated {
+            state,
+            changed,
+            stats_delta,
+        } = mutate(&mut connection, MessageMutation::set_starred(id, true)).unwrap()
         else {
             panic!("expected flag result");
         };
         assert!(changed);
+        assert_eq!(stats_delta.starred_total, 1);
         assert_eq!(state.revision, 2);
         assert!(state.starred);
 
-        let MutationOutcome::Updated { state, changed } =
+        let MutationOutcome::Updated { state, changed, .. } =
             mutate(&mut connection, MessageMutation::set_starred(id, true)).unwrap()
         else {
             panic!("expected flag result");
         };
         assert!(!changed);
         assert_eq!(state.revision, 2);
+    }
+
+    #[test]
+    fn sequential_mutations_keep_persistent_stats_in_sync() {
+        let mut connection = database();
+        insert_message(&connection, 1, &[1, 4]);
+        let id = MessageId::new(1).unwrap();
+        assert_stats_match_rebuild(&connection);
+
+        mutate(&mut connection, MessageMutation::set_starred(id, true)).unwrap();
+        assert_eq!(stored_stats(&connection), [1, 1, 1, 0, 0, 0, 0]);
+        assert_stats_match_rebuild(&connection);
+
+        mutate(&mut connection, MessageMutation::archive(id)).unwrap();
+        assert_eq!(stored_stats(&connection), [0, 0, 1, 0, 0, 1, 0]);
+        assert_stats_match_rebuild(&connection);
+
+        let MutationOutcome::MovedToTrash { undo, .. } =
+            mutate(&mut connection, MessageMutation::move_to_trash(id)).unwrap()
+        else {
+            panic!("expected Trash result");
+        };
+        assert_eq!(stored_stats(&connection), [0, 0, 0, 0, 0, 0, 1]);
+        assert_stats_match_rebuild(&connection);
+
+        mutate(&mut connection, MessageMutation::set_unread(id, false)).unwrap();
+        assert_eq!(stored_stats(&connection), [0, 0, 0, 0, 0, 0, 1]);
+        assert_stats_match_rebuild(&connection);
+
+        mutate_at(
+            &mut connection,
+            MessageMutation::undo_trash(undo.token),
+            NOW_MS + 1,
+        )
+        .unwrap();
+        assert_eq!(stored_stats(&connection), [0, 0, 1, 0, 0, 1, 0]);
+        assert_stats_match_rebuild(&connection);
+
+        mutate(&mut connection, MessageMutation::move_to_trash(id)).unwrap();
+        mutate(&mut connection, MessageMutation::delete_permanently(id)).unwrap();
+        assert_eq!(stored_stats(&connection), [0; 7]);
+        assert_stats_match_rebuild(&connection);
     }
 
     #[test]
@@ -744,16 +871,21 @@ mod tests {
         insert_message(&connection, 1, &[1, 4]);
         let id = MessageId::new(1).unwrap();
 
-        let MutationOutcome::Archived { state, changed } =
-            mutate(&mut connection, MessageMutation::archive(id)).unwrap()
+        let MutationOutcome::Archived {
+            state,
+            changed,
+            stats_delta,
+        } = mutate(&mut connection, MessageMutation::archive(id)).unwrap()
         else {
             panic!("expected archive result");
         };
         assert!(changed);
+        assert_eq!(stats_delta.inbox_total, -1);
+        assert_eq!(stats_delta.archive_total, 1);
         assert_eq!(state.revision, 1);
         assert_eq!(roles(&connection, 1), ["archive", "label"]);
 
-        let MutationOutcome::Archived { state, changed } =
+        let MutationOutcome::Archived { state, changed, .. } =
             mutate(&mut connection, MessageMutation::archive(id)).unwrap()
         else {
             panic!("expected archive result");
@@ -817,7 +949,7 @@ mod tests {
         insert_message(&connection, 1, &[1, 4]);
         let id = MessageId::new(1).unwrap();
 
-        let MutationOutcome::MovedToTrash { state, undo } =
+        let MutationOutcome::MovedToTrash { state, undo, .. } =
             mutate(&mut connection, MessageMutation::move_to_trash(id)).unwrap()
         else {
             panic!("expected Trash result");
@@ -826,7 +958,7 @@ mod tests {
         assert_eq!(roles(&connection, 1), ["trash"]);
 
         mutate(&mut connection, MessageMutation::set_starred(id, true)).unwrap();
-        let MutationOutcome::Restored(state) = mutate_at(
+        let MutationOutcome::Restored { state, .. } = mutate_at(
             &mut connection,
             MessageMutation::undo_trash(undo.token),
             NOW_MS + 1,
@@ -1006,11 +1138,17 @@ mod tests {
             )
             .unwrap();
 
-        let outcome = mutate(&mut connection, MessageMutation::delete_permanently(id)).unwrap();
-        assert_eq!(
-            outcome,
-            MutationOutcome::PermanentlyDeleted { id, account_id: 1 }
-        );
+        let MutationOutcome::PermanentlyDeleted {
+            id: deleted_id,
+            account_id,
+            stats_delta,
+        } = mutate(&mut connection, MessageMutation::delete_permanently(id)).unwrap()
+        else {
+            panic!("expected permanent deletion result");
+        };
+        assert_eq!(deleted_id, id);
+        assert_eq!(account_id, 1);
+        assert_eq!(stats_delta.trash_total, -1);
         let message_count: i64 = connection
             .query_row("SELECT count(*) FROM messages", [], |row| row.get(0))
             .unwrap();

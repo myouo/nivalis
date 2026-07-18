@@ -3,6 +3,7 @@ mod domain;
 mod migrations;
 mod mutation;
 mod query;
+mod stats;
 
 pub(crate) use actor::{
     DatabaseClient, DatabaseInfo, DatabaseReplies, DatabaseRuntime, StartError,
@@ -10,8 +11,8 @@ pub(crate) use actor::{
 };
 pub(crate) use domain::{AccountScope, FolderScope};
 pub(crate) use domain::{
-    DbReply, Generation, MailboxPage, MessageDetail, MessageId, MessageMutation, MutationOutcome,
-    PageSpec, RequestId, Tagged, UndoToken,
+    AccountStatsDelta, DbReply, Generation, MailboxPage, MessageDetail, MessageId, MessageMutation,
+    MutationOutcome, PageSpec, RequestId, Tagged, UndoToken,
 };
 
 pub(crate) fn spawn(
@@ -26,6 +27,14 @@ pub(crate) fn spawn(
     StartError,
 > {
     actor::spawn(path.into())
+}
+
+#[cfg(test)]
+pub(crate) fn rebuild_account_stats_for_test(
+    connection: &rusqlite::Connection,
+    account_id: i64,
+) -> Result<(), domain::DbFailure> {
+    stats::rebuild_account(connection, account_id)
 }
 
 #[cfg(test)]

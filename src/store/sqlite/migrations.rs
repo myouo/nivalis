@@ -2,7 +2,7 @@ use std::{error::Error, fmt};
 
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(crate) const LATEST_SCHEMA_VERSION: u32 = 5;
+pub(crate) const LATEST_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -30,6 +30,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 5,
         sql: include_str!("../../../migrations/0005_clean_stale_file_gc.sql"),
+    },
+    Migration {
+        version: 6,
+        sql: include_str!("../../../migrations/0006_account_mailbox_stats.sql"),
     },
 ];
 
@@ -142,6 +146,7 @@ mod tests {
     };
 
     const TABLES: &[&str] = &[
+        "account_mailbox_stats",
         "accounts",
         "attachments",
         "file_gc",
@@ -155,6 +160,17 @@ mod tests {
         "sync_state",
         "trash_undo",
         "trash_undo_folders",
+    ];
+
+    const MAILBOX_STATS_COLUMNS: &[&str] = &[
+        "inbox_total",
+        "inbox_unread",
+        "starred_total",
+        "sent_total",
+        "drafts_total",
+        "archive_total",
+        "trash_total",
+        "dirty",
     ];
 
     fn memory_connection() -> Connection {
@@ -204,6 +220,29 @@ mod tests {
             .expect("insert message");
     }
 
+    fn mailbox_stats(connection: &Connection, account_id: i64) -> [i64; 7] {
+        connection
+            .query_row(
+                "SELECT inbox_total, inbox_unread, starred_total, sent_total,
+                        drafts_total, archive_total, trash_total
+                 FROM account_mailbox_stats
+                 WHERE account_id = ?1",
+                [account_id],
+                |row| {
+                    Ok([
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ])
+                },
+            )
+            .expect("read account mailbox statistics")
+    }
+
     #[test]
     fn creates_expected_schema_and_indexes() {
         let mut connection = memory_connection();
@@ -231,6 +270,20 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("collect tables");
         assert_eq!(tables, TABLES);
+
+        let stats_columns = connection
+            .prepare("PRAGMA table_info(account_mailbox_stats)")
+            .expect("prepare mailbox stats table-info query")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query mailbox stats columns")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect mailbox stats columns");
+        assert_eq!(
+            stats_columns,
+            std::iter::once("account_id")
+                .chain(MAILBOX_STATS_COLUMNS.iter().copied())
+                .collect::<Vec<_>>()
+        );
 
         let indexes = connection
             .prepare(
@@ -331,7 +384,10 @@ mod tests {
             .query_row("SELECT count(*) FROM message_folders", [], |row| row.get(0))
             .expect("count preserved memberships");
         assert_eq!(membership_count, 2);
-        assert_eq!(schema_version(&connection), 5);
+        assert_eq!(
+            schema_version(&connection),
+            i64::from(LATEST_SCHEMA_VERSION)
+        );
 
         let legacy_inbox_count: i64 = connection
             .query_row(
@@ -396,6 +452,159 @@ mod tests {
     }
 
     #[test]
+    fn v6_backfills_deduplicated_stats_with_trash_precedence() {
+        let mut connection = memory_connection();
+        enable_foreign_keys(&connection).expect("enable foreign keys");
+        migrate_with(&mut connection, &MIGRATIONS[..1], 1).expect("create v1 schema");
+        insert_account(&connection, 1, "one@example.test");
+        insert_account(&connection, 2, "two@example.test");
+
+        for (id, remote_key, role) in [
+            (10, "inbox", "inbox"),
+            (11, "legacy-inbox", "inbox"),
+            (12, "archive", "archive"),
+            (13, "trash", "trash"),
+            (14, "sent", "sent"),
+            (15, "drafts", "drafts"),
+            (16, "label", "label"),
+        ] {
+            insert_folder(&connection, id, 1, remote_key, role);
+        }
+        connection
+            .execute_batch(
+                "INSERT INTO messages
+                     (id, account_id, remote_key, received_at_ms, unread, starred)
+                 VALUES
+                     (100, 1, 'inbox-starred', 0, 1, 1),
+                     (101, 1, 'archive-starred', 0, 0, 1),
+                     (102, 1, 'inbox-and-trash', 0, 1, 1),
+                     (103, 1, 'sent', 0, 0, 0),
+                     (104, 1, 'draft', 0, 0, 0),
+                     (105, 1, 'archive-and-trash', 0, 0, 0),
+                     (106, 1, 'unfiled-starred', 0, 1, 1);
+
+                 INSERT INTO message_folders (message_id, folder_id, account_id)
+                 VALUES
+                     (100, 10, 1),
+                     (100, 11, 1),
+                     (100, 16, 1),
+                     (101, 12, 1),
+                     (102, 10, 1),
+                     (102, 13, 1),
+                     (103, 14, 1),
+                     (104, 15, 1),
+                     (105, 12, 1),
+                     (105, 13, 1);",
+            )
+            .expect("seed v1 mailbox data");
+
+        migrate_with(&mut connection, &MIGRATIONS[..5], 5).expect("upgrade data to v5");
+        assert_eq!(schema_version(&connection), 5);
+
+        migrate(&mut connection).expect("upgrade data to v6");
+
+        assert_eq!(schema_version(&connection), 6);
+        assert_eq!(mailbox_stats(&connection, 1), [1, 1, 2, 1, 1, 1, 2]);
+        assert_eq!(mailbox_stats(&connection, 2), [0; 7]);
+        let legacy_inbox_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM folders
+                 WHERE account_id = 1 AND role = 'inbox'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count legacy Inbox folders");
+        assert_eq!(legacy_inbox_count, 2);
+    }
+
+    #[test]
+    fn account_stats_follow_account_lifecycle_and_enforce_count_bounds() {
+        let mut connection = memory_connection();
+        migrate(&mut connection).expect("apply migrations");
+
+        insert_account(&connection, 1, "one@example.test");
+        assert_eq!(mailbox_stats(&connection, 1), [0; 7]);
+
+        connection
+            .execute(
+                "UPDATE account_mailbox_stats
+                 SET inbox_total = ?1,
+                     inbox_unread = ?1,
+                     starred_total = ?1,
+                     sent_total = ?1,
+                     drafts_total = ?1,
+                     archive_total = ?1,
+                     trash_total = ?1
+                 WHERE account_id = 1",
+                [i64::MAX],
+            )
+            .expect("the maximum signed SQLite count is valid");
+        assert_eq!(mailbox_stats(&connection, 1), [i64::MAX; 7]);
+
+        for column in MAILBOX_STATS_COLUMNS {
+            let error = connection
+                .execute(
+                    &format!("UPDATE account_mailbox_stats SET {column} = -1 WHERE account_id = 1"),
+                    [],
+                )
+                .expect_err("mailbox counts cannot be negative");
+            assert_eq!(
+                error.sqlite_error_code(),
+                Some(ErrorCode::ConstraintViolation)
+            );
+        }
+
+        connection
+            .execute("DELETE FROM accounts WHERE id = 1", [])
+            .expect("delete account");
+        let remaining_stats: i64 = connection
+            .query_row("SELECT count(*) FROM account_mailbox_stats", [], |row| {
+                row.get(0)
+            })
+            .expect("count remaining mailbox stats rows");
+        assert_eq!(remaining_stats, 0);
+    }
+
+    #[test]
+    fn account_limit_is_enforced_without_blocking_existing_account_updates() {
+        let mut connection = memory_connection();
+        migrate(&mut connection).expect("apply migrations");
+
+        for id in 1..=64 {
+            insert_account(&connection, id, &format!("account-{id}"));
+        }
+
+        let error = connection
+            .execute(
+                "INSERT INTO accounts
+                 (id, provider, remote_key, name, address, state, accent_rgb)
+                 VALUES (65, 'imap', 'account-65', 'Too many', 'account-65', 'active', 0)",
+                [],
+            )
+            .expect_err("the sixty-fifth account must be rejected");
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(ErrorCode::ConstraintViolation)
+        );
+
+        connection
+            .execute(
+                "INSERT INTO accounts
+                 (id, provider, remote_key, name, address, state, accent_rgb)
+                 VALUES (64, 'imap', 'account-64', 'Updated', 'account-64', 'active', 0)
+                 ON CONFLICT(id) DO UPDATE SET name = excluded.name",
+                [],
+            )
+            .expect("upsert an existing account at the limit");
+        let name: String = connection
+            .query_row("SELECT name FROM accounts WHERE id = 64", [], |row| {
+                row.get(0)
+            })
+            .expect("read updated account");
+        assert_eq!(name, "Updated");
+    }
+
+    #[test]
     fn rejects_schema_from_a_newer_application() {
         let mut connection = memory_connection();
         connection
@@ -407,7 +616,7 @@ mod tests {
         assert!(matches!(
             error,
             MigrationError::FutureSchema {
-                found: 6,
+                found: 7,
                 supported: LATEST_SCHEMA_VERSION,
             }
         ));
@@ -625,7 +834,7 @@ mod tests {
             )
             .expect("seed v4 GC queue");
 
-        migrate(&mut connection).expect("upgrade to v5");
+        migrate_with(&mut connection, &MIGRATIONS[..5], 5).expect("upgrade to v5");
 
         let queued = connection
             .prepare("SELECT file_key FROM file_gc ORDER BY file_key")

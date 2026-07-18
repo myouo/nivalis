@@ -808,6 +808,7 @@ mod tests {
                 [],
             )
             .unwrap();
+        sqlite::rebuild_account_stats_for_test(&connection, 1).unwrap();
     }
 
     #[test]
