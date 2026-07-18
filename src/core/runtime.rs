@@ -11,6 +11,11 @@ use tokio::{runtime::Builder, sync::mpsc, sync::oneshot, time};
 
 const SYNC_DELAY: Duration = Duration::from_millis(900);
 
+#[cfg(test)]
+type SyncStarted = Option<std::sync::mpsc::SyncSender<()>>;
+#[cfg(not(test))]
+type SyncStarted = ();
+
 pub(crate) fn spawn() -> std::io::Result<(CoreHandle, EventReceiver, CoreRuntime)> {
     spawn_with_delay(SYNC_DELAY)
 }
@@ -18,8 +23,23 @@ pub(crate) fn spawn() -> std::io::Result<(CoreHandle, EventReceiver, CoreRuntime
 fn spawn_with_delay(
     sync_delay: Duration,
 ) -> std::io::Result<(CoreHandle, EventReceiver, CoreRuntime)> {
+    #[cfg(test)]
+    {
+        spawn_with_options(sync_delay, EVENT_CAPACITY, None)
+    }
+    #[cfg(not(test))]
+    {
+        spawn_with_options(sync_delay, EVENT_CAPACITY, ())
+    }
+}
+
+fn spawn_with_options(
+    sync_delay: Duration,
+    event_capacity: usize,
+    sync_started: SyncStarted,
+) -> std::io::Result<(CoreHandle, EventReceiver, CoreRuntime)> {
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CAPACITY);
-    let (event_tx, event_rx) = mpsc::channel(EVENT_CAPACITY);
+    let (event_tx, event_rx) = mpsc::channel(event_capacity);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let runtime = Builder::new_current_thread()
         .enable_time()
@@ -27,7 +47,15 @@ fn spawn_with_delay(
         .build()?;
     let worker = thread::Builder::new()
         .name("nivalis-core".into())
-        .spawn(move || runtime.block_on(run_core(command_rx, event_tx, shutdown_rx, sync_delay)))?;
+        .spawn(move || {
+            runtime.block_on(run_core(
+                command_rx,
+                event_tx,
+                shutdown_rx,
+                sync_delay,
+                sync_started,
+            ))
+        })?;
 
     Ok((
         CoreHandle::new(command_tx),
@@ -44,6 +72,7 @@ async fn run_core(
     events: mpsc::Sender<Event>,
     shutdown: oneshot::Receiver<()>,
     sync_delay: Duration,
+    _sync_started: SyncStarted,
 ) -> Result<(), RuntimeError> {
     let mut shutdown = Box::pin(shutdown);
 
@@ -63,6 +92,10 @@ async fn run_core(
 
         match command {
             Command::SyncNow { operation_id } => {
+                #[cfg(test)]
+                if let Some(sync_started) = &_sync_started {
+                    let _ = sync_started.try_send(());
+                }
                 let mut delay = Box::pin(time::sleep(sync_delay));
                 let interrupted = poll_fn(|context| {
                     if shutdown.as_mut().poll(context).is_ready() {
@@ -79,12 +112,19 @@ async fn run_core(
                     return Ok(());
                 }
 
-                match events.try_send(Event::SyncFinished { operation_id }) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        return Err(RuntimeError::EventQueueFull);
+                let mut delivery = Box::pin(events.send(Event::SyncFinished { operation_id }));
+                let delivery = poll_fn(|context| {
+                    if shutdown.as_mut().poll(context).is_ready() {
+                        Poll::Ready(None)
+                    } else {
+                        delivery.as_mut().poll(context).map(Some)
                     }
+                })
+                .await;
+
+                match delivery {
+                    Some(Ok(())) => {}
+                    Some(Err(_)) | None => return Ok(()),
                 }
             }
         }
@@ -125,14 +165,12 @@ impl Drop for CoreRuntime {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RuntimeError {
-    EventQueueFull,
     ThreadPanicked { message: Arc<str> },
 }
 
 impl fmt::Display for RuntimeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EventQueueFull => formatter.write_str("core event queue is full"),
             Self::ThreadPanicked { message } => {
                 write!(formatter, "core worker panicked: {message}")
             }
@@ -174,12 +212,39 @@ mod tests {
 
     #[test]
     fn shutdown_interrupts_pending_sync() {
-        let (core, _events, runtime) = spawn_with_delay(Duration::from_secs(5)).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (core, _events, runtime) =
+            spawn_with_options(Duration::from_secs(5), EVENT_CAPACITY, Some(started_tx)).unwrap();
         core.try_send_sync(OperationId::new(1)).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let started = Instant::now();
 
         runtime.shutdown().unwrap();
 
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn full_event_queue_applies_backpressure_without_stopping_core() {
+        let (core, mut events, runtime) =
+            spawn_with_options(Duration::from_millis(1), 1, None).unwrap();
+        let first = OperationId::new(1);
+        let second = OperationId::new(2);
+        core.try_send_sync(first).unwrap();
+        core.try_send_sync(second).unwrap();
+
+        assert_eq!(
+            events.blocking_recv(),
+            Some(Event::SyncFinished {
+                operation_id: first
+            })
+        );
+        assert_eq!(
+            events.blocking_recv(),
+            Some(Event::SyncFinished {
+                operation_id: second
+            })
+        );
+        runtime.shutdown().unwrap();
     }
 }
