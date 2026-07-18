@@ -2,7 +2,7 @@
 
 ## Status
 
-This document is the normative boundary between Nivalis' SQLite actor and its future IMAP and JMAP adapters. Schema v7 implements the bounded locator, object-state, journal, and legacy-reconciliation storage described here, but no local mutation writes intents and no claim/report or provider execution API exists yet. The controller must not switch to SQLite, and providers must not issue remote writes, until mutation reduction, synchronization merge/reconciliation, and the versioned claim/report path implement this contract.
+This document is the normative boundary between Nivalis' SQLite actor and its future IMAP and JMAP adapters. Schema v7 implements the bounded locator, object-state, journal, and legacy-reconciliation storage described here. Local flags, Archive, Trash, Trash undo, and permanent deletion now reduce into that journal atomically, including frozen folder and locator snapshots, terminal tombstones, version compaction, and complete rollback on resource limits. No claim/report or provider execution API exists yet. The controller must not switch to SQLite, and providers must not issue remote writes, until synchronization merge/reconciliation and the versioned claim/report path implement this contract.
 
 The journal records the latest desired state of a logical message, not a history of UI actions. Local state, statistics, undo/tombstone data, and the journal change must commit in one SQLite `BEGIN IMMEDIATE` transaction.
 
