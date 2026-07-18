@@ -6,7 +6,7 @@ A task-first desktop mail client prototype built with Rust, Slint, and the Skia 
 
 The confirmed application stack is Rust 2024 with Slint 1.17.1, Winit, and the Skia renderer. The production architecture keeps the native Slint UI on the main thread, runs network work on one Tokio current-thread runtime, and serializes SQLite access through a dedicated `rusqlite` actor. Mail transport uses IMAP and SMTP, with JMAP as an optional provider backend; MIME parsing, OAuth2, Rustls, and the `keyring` crate complete the protocol and credential boundary. Nivalis does not embed a WebView.
 
-The bounded Tokio core, durable schema, keyset mailbox projections, and single-connection SQLite actor are now implemented. The controller still uses the in-memory repository while the asynchronous database reply bridge, request cancellation, and production mail protocols are added, so the visible app remains an interaction-complete local prototype. See [`docs/architecture.md`](docs/architecture.md) for ownership boundaries, backpressure rules, dependency features, implementation status, and memory budgets.
+The bounded Tokio core, durable schema, keyset mailbox projections, and single-connection SQLite actor are now active. SQLite replies enter the core through a bounded asynchronous channel; mailbox pages and selected-message details coalesce by request generation into independent latest-value slots. The controller still uses the in-memory repository until persistent mutations, account statistics, and FTS reach parity, so the visible app remains an interaction-complete local prototype with one consistent UI data source. See [`docs/architecture.md`](docs/architecture.md) for ownership boundaries, backpressure rules, dependency features, implementation status, and memory budgets.
 
 ## Run
 
@@ -75,16 +75,17 @@ The embedded icon subset is generated from Material Symbols Rounded and retains 
 - Search uses an allocation-free ASCII case-insensitive matcher and a restartable 180ms debounce instead of rebuilding the model on every keystroke.
 - Dialogs, menus, settings, and the composer are conditionally instantiated and no decorative animation or periodic UI timer runs while idle.
 - Sync crosses bounded 64-command and 128-event channels without blocking the UI; snackbar feedback alone uses a restartable UI timer.
+- Full mailbox and reader projections never accumulate in the 128-slot control queue: it carries lightweight notifications while independent latest-value slots retain at most one 50-row page and one 64KiB detail.
 - Row-only mutations update one existing row; membership changes rebuild one strict 50-row snapshot, preventing 49/51-row pagination drift.
 - Message previews are capped at 280 Unicode scalar values, and reader shaping is capped at 16,384 values until the user explicitly loads an unusually large body.
 - Local cache content renders immediately instead of constructing and discarding an artificial 650ms skeleton state.
 - Production releases exclude the environment-driven stress harness. Benchmark it explicitly with `cargo build --release --features bench-harness`.
 - Release profiles use full LTO, one codegen unit, stripped symbols, and abort-on-panic. The recommended `s` profile retained `3`-level stress throughput within 2.5% while reducing the measured stress RSS by about 2MiB.
-- The staged SQLite path returns at most 50 metadata rows, reads at most one 64KiB reader excerpt, stores large bodies and MIME payloads by private file reference, and caps the SQLite page cache at 1MiB. FTS and stale-search cancellation are required before this path replaces live UI search.
+- The active SQLite path returns at most 50 metadata rows, reads at most one 64KiB reader excerpt, stores large bodies and MIME payloads by private file reference, and caps the SQLite page cache at 1MiB. The actor and Tokio core remain separate threads; no reply-bridge thread or periodic polling loop is created. FTS and active-query interruption are still required before this path replaces live UI search.
 
-The verified Linux release executable remains 18.0MB. Across three fresh X11 runs at 1200x900 after UI modularization, the recommended release profile's worst idle sample was 35.7MiB RSS / 21.8MiB PSS / 18.4MiB USS. Three native Wayland runs stayed below 41.6MiB RSS / 22.4MiB PSS / 17.6MiB USS. These measurements do not include an active SQLite actor; the staged code is currently unreachable and removed by release LTO. See `memory-report.md` for the measurement contract, stress results, and reproduction command.
+The verified Linux release executable is 18.4MiB. With the SQLite actor active, three fresh X11 runs at 1200x900 produced a worst stable idle sample of 37.0MiB RSS / 24.6MiB PSS / 21.2MiB USS and 0.00% interval CPU. A 2,000-action run settled at 41.1/27.3/23.7MiB, while a 3840x2400 resize and restore settled at 66.7/39.3/20.9MiB; both remain below the 100% growth limit. See `memory-report.md` for the measurement contract, historical platform references, and reproduction commands.
 
-This is an interaction-complete local prototype with production runtime and persistence foundations. The next backend slice connects SQLite replies to the async core without blocking either Slint or Tokio, then replaces demo reads incrementally before IMAP/SMTP, optional JMAP, and encrypted credentials are enabled.
+This is an interaction-complete local prototype with production runtime and persistence foundations. The next backend slice adds transactional flag/folder mutations, persistent account statistics, and FTS before the controller switches away from its in-memory repository. IMAP/SMTP, optional JMAP, MIME ingestion, and encrypted credentials follow that consistent repository boundary.
 
 ## License
 
