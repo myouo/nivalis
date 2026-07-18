@@ -2,7 +2,7 @@ use std::{error::Error, fmt};
 
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(crate) const LATEST_SCHEMA_VERSION: u32 = 2;
+pub(crate) const LATEST_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -18,6 +18,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 2,
         sql: include_str!("../../../migrations/0002_mail_mutations.sql"),
+    },
+    Migration {
+        version: 3,
+        sql: include_str!("../../../migrations/0003_file_reference_indexes.sql"),
     },
 ];
 
@@ -236,12 +240,15 @@ mod tests {
                 "idx_folders_account".to_owned(),
                 "idx_folders_system_role".to_owned(),
                 "idx_file_gc_queued".to_owned(),
+                "idx_attachments_file".to_owned(),
                 "idx_message_folders_folder".to_owned(),
+                "idx_message_content_body_file".to_owned(),
                 "idx_message_tombstones_deleted".to_owned(),
                 "idx_messages_account_time".to_owned(),
                 "idx_messages_global_time".to_owned(),
                 "idx_messages_starred".to_owned(),
                 "idx_messages_unread".to_owned(),
+                "idx_outbox_mime_file".to_owned(),
                 "idx_outbox_pending".to_owned(),
             ])
         );
@@ -316,7 +323,7 @@ mod tests {
             .query_row("SELECT count(*) FROM message_folders", [], |row| row.get(0))
             .expect("count preserved memberships");
         assert_eq!(membership_count, 2);
-        assert_eq!(schema_version(&connection), 2);
+        assert_eq!(schema_version(&connection), 3);
 
         let legacy_inbox_count: i64 = connection
             .query_row(
@@ -375,7 +382,7 @@ mod tests {
         assert!(matches!(
             error,
             MigrationError::FutureSchema {
-                found: 3,
+                found: 4,
                 supported: LATEST_SCHEMA_VERSION,
             }
         ));
