@@ -5,5 +5,8 @@
 //! implementation can replace it without moving UI bindings again.
 
 mod memory;
+// Persistence lands incrementally before the controller switches data sources.
+#[allow(dead_code)]
+mod sqlite;
 
 pub(crate) use memory::{MailStats, MailStore, MailView};

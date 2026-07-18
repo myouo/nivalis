@@ -11,6 +11,10 @@ default = []
 bench-harness = []
 
 [dependencies]
+rusqlite = { version = "=0.40.1", default-features = false, features = [
+    "bundled",
+    "limits",
+] }
 slint = { version = "=1.17.1", default-features = false, features = [
     "std",
     "backend-winit",
