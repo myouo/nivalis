@@ -1,0 +1,6 @@
+/target
+.agents/
+.codex/
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,39 @@
+[package]
+name = "nivalis-mail"
+version = "0.1.0"
+edition = "2024"
+description = "A focused desktop mail client built with Rust, Slint, and Skia"
+license = "MIT"
+build = "build.rs"
+
+[features]
+default = []
+bench-harness = []
+
+[dependencies]
+slint = { version = "=1.17.1", default-features = false, features = [
+    "std",
+    "backend-winit",
+    "renderer-skia",
+    "accessibility",
+    "unstable-winit-030",
+    "compat-1-2",
+] }
+
+[build-dependencies]
+slint-build = "=1.17.1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.performance]
+inherits = "release"
+opt-level = 3
+
+[profile.release-size]
+inherits = "release"
+opt-level = "z"

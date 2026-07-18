@@ -1,0 +1,61 @@
+export global Theme {
+    in-out property <bool> dark-mode: false;
+    in-out property <bool> high-contrast: false;
+    in-out property <bool> reduced-motion: false;
+
+    out property <color> background: dark-mode ? #2b2c30 : #f3f3f3;
+    out property <color> surface: dark-mode ? #1c1d1f : #ffffff;
+    out property <color> surface-container-low: dark-mode ? #252629 : #f7f7f8;
+    out property <color> surface-container: dark-mode ? #292a2d : #f9fafb;
+    out property <color> surface-container-high: dark-mode ? #303135 : #f0f1f2;
+    out property <color> surface-container-highest: dark-mode ? #393b40 : #e7e9ec;
+
+    out property <color> on-surface: high-contrast ? (dark-mode ? white : black) : (dark-mode ? #f1f1f1 : #1a1a1a);
+    out property <color> on-surface-variant: high-contrast ? (dark-mode ? #f2f2f2 : #242424) : (dark-mode ? #b8bbc0 : #666666);
+    out property <color> outline: high-contrast ? on-surface : (dark-mode ? #666a70 : #b7bcc2);
+    out property <color> outline-variant: high-contrast ? on-surface-variant : (dark-mode ? #404247 : #e1e5e7);
+
+    out property <color> primary: dark-mode ? #60a5fa : #0067c0;
+    out property <color> primary-hover: dark-mode ? #78b3fb : #005a9e;
+    out property <color> primary-pressed: dark-mode ? #4b93e8 : #004578;
+    out property <color> on-primary: dark-mode ? #10233b : white;
+    out property <color> primary-container: dark-mode ? #193b5d : #e6f4ff;
+    out property <color> primary-container-hover: dark-mode ? #244b71 : #d8ecfb;
+    out property <color> primary-container-pressed: dark-mode ? #2d5a83 : #c8e2f6;
+    out property <color> on-primary-container: dark-mode ? #d7eaff : #003b6f;
+
+    out property <color> secondary: dark-mode ? #b8bbc0 : #5c6167;
+    out property <color> on-secondary: dark-mode ? #24262a : white;
+    out property <color> secondary-container: dark-mode ? #37393e : #e8eaed;
+    out property <color> secondary-container-hover: dark-mode ? #41444a : #dde0e3;
+    out property <color> secondary-container-pressed: dark-mode ? #4b4e55 : #d2d5d9;
+    out property <color> on-secondary-container: dark-mode ? #f0f1f2 : #202124;
+
+    out property <color> tertiary: dark-mode ? #f2c66d : #8a5a00;
+    out property <color> tertiary-container: dark-mode ? #493a1d : #fff9ed;
+    out property <color> on-tertiary-container: dark-mode ? #ffe5ad : #6f4800;
+
+    out property <color> error: dark-mode ? #ff9b92 : #c42b1c;
+    out property <color> error-hover: dark-mode ? #ffb0a9 : #a92317;
+    out property <color> error-pressed: dark-mode ? #e7837b : #8a1c13;
+    out property <color> on-error: dark-mode ? #4d0a05 : white;
+    out property <color> error-container: dark-mode ? #4f2422 : #fff1f0;
+    out property <color> on-error-container: dark-mode ? #ffd9d5 : #7a1710;
+
+    out property <color> success: dark-mode ? #59c878 : #16a34a;
+    out property <color> warning: dark-mode ? #f1b957 : #c87800;
+    out property <color> scrim: #00000080;
+    out property <color> focus-ring: dark-mode ? #8bc0ff : #005fb8;
+    out property <color> inverse-surface: dark-mode ? #f1f1f1 : #292b2f;
+    out property <color> inverse-surface-hover: dark-mode ? #dfe1e3 : #373a3f;
+    out property <color> inverse-surface-pressed: dark-mode ? #cdd0d3 : #44474d;
+    out property <color> on-inverse-surface: dark-mode ? #24262a : #f6f7f8;
+    out property <color> inverse-primary: dark-mode ? #0067c0 : #8bc0ff;
+
+    out property <string> body-font: "Noto Sans";
+    out property <string> icon-font: "Material Symbols Rounded";
+
+    out property <duration> motion-fast: reduced-motion ? 0ms : 90ms;
+    out property <duration> motion-medium: reduced-motion ? 0ms : 160ms;
+    out property <duration> motion-slow: reduced-motion ? 0ms : 200ms;
+}
