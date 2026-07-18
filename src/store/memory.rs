@@ -1,3 +1,5 @@
+//! Bounded in-memory repository used by the interactive prototype and tests.
+
 use crate::{AccountItem, MailDetail, MailSummary};
 use slint::{Color, SharedString};
 

@@ -1,0 +1,137 @@
+use crate::AppWindow;
+use slint::{ComponentHandle, Timer, TimerMode};
+use std::cell::Cell;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
+pub(crate) fn install_memory_stress(ui: &AppWindow) -> Option<Rc<Timer>> {
+    let steps = std::env::var("NIVALIS_STRESS_STEPS")
+        .ok()?
+        .parse::<usize>()
+        .ok()?
+        .max(1);
+    let delay = std::env::var("NIVALIS_STRESS_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(5_000);
+    let interval = std::env::var("NIVALIS_STRESS_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(2)
+        .max(1);
+
+    let timer = Rc::new(Timer::default());
+    let timer_weak = Rc::downgrade(&timer);
+    let ui_weak = ui.as_weak();
+    let step = Rc::new(Cell::new(0usize));
+
+    Timer::single_shot(Duration::from_millis(delay), move || {
+        let Some(timer) = timer_weak.upgrade() else {
+            return;
+        };
+        let started = Instant::now();
+        let timer_for_callback = Rc::downgrade(&timer);
+        timer.start(
+            TimerMode::Repeated,
+            Duration::from_millis(interval),
+            move || {
+                let Some(ui) = ui_weak.upgrade() else {
+                    return;
+                };
+                let current = step.get();
+                if current >= steps {
+                    ui.set_settings_open(false);
+                    ui.set_account_menu_open(false);
+                    ui.set_composer_open(false);
+                    ui.set_compose_to("".into());
+                    ui.set_compose_subject("".into());
+                    ui.set_compose_body("".into());
+                    ui.set_search_query("".into());
+                    ui.invoke_query_mail("".into());
+                    ui.set_status_text("Memory stress complete".into());
+                    eprintln!(
+                        "NIVALIS_STRESS_RESULT steps={steps} elapsed_ms={}",
+                        started.elapsed().as_millis()
+                    );
+                    if let Some(timer) = timer_for_callback.upgrade() {
+                        timer.stop();
+                    }
+                    if std::env::var("NIVALIS_STRESS_EXIT").as_deref() == Ok("1") {
+                        let _ = ui.hide();
+                        let _ = slint::quit_event_loop();
+                    }
+                    return;
+                }
+
+                const IDS: [i32; 10] = [1, 2, 3, 4, 5, 8, 9, 10, 11, 12];
+                let id = IDS[current % IDS.len()];
+                match current % 8 {
+                    0 => ui.invoke_select_mail(id),
+                    1 => ui.invoke_toggle_star(id),
+                    2 => {
+                        ui.set_account_menu_open(false);
+                        ui.set_settings_open(true);
+                    }
+                    3 => {
+                        ui.set_settings_open(false);
+                        ui.set_account_menu_open(true);
+                    }
+                    4 => {
+                        ui.set_account_menu_open(false);
+                        ui.set_composer_open(true);
+                        ui.set_compose_to("stress@example.com".into());
+                        ui.set_compose_subject("Bounded interaction stress".into());
+                        if current == 4 {
+                            ui.set_compose_body("x".repeat(64 * 1024).into());
+                        }
+                    }
+                    5 => {
+                        ui.set_composer_open(false);
+                        ui.set_compose_to("".into());
+                        ui.set_compose_subject("".into());
+                        ui.set_compose_body("".into());
+                    }
+                    6 => ui.invoke_sync(),
+                    _ => {
+                        let query = if current % 16 == 7 { "maya" } else { "" };
+                        ui.set_search_query(query.into());
+                        ui.invoke_query_mail(query.into());
+                    }
+                }
+                step.set(current + 1);
+            },
+        );
+    });
+
+    Some(timer)
+}
+
+pub(crate) fn install_maximize_stress(ui: &AppWindow) {
+    if std::env::var("NIVALIS_MAXIMIZE_STRESS").as_deref() != Ok("1") {
+        return;
+    }
+
+    let delay = std::env::var("NIVALIS_MAXIMIZE_STRESS_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(5_000);
+    let duration = std::env::var("NIVALIS_MAXIMIZE_STRESS_DURATION_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(5_000);
+    let ui_weak = ui.as_weak();
+
+    Timer::single_shot(Duration::from_millis(delay), move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        ui.window().set_maximized(true);
+
+        let ui_weak = ui.as_weak();
+        Timer::single_shot(Duration::from_millis(duration), move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.window().set_maximized(false);
+            }
+        });
+    });
+}
