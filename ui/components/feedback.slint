@@ -1,0 +1,24 @@
+import { Theme } from "../theme.slint";
+
+export component SkeletonRow inherits Rectangle {
+    height: 76px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: Theme.outline-variant;
+    background: Theme.surface-container-low;
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        padding-top: 10px;
+        padding-bottom: 10px;
+        spacing: 10px;
+        Rectangle { width: 34px; height: 34px; border-radius: 4px; background: Theme.surface-container-highest; }
+        VerticalLayout {
+            padding-top: 1px;
+            spacing: 7px;
+            Rectangle { height: 8px; width: 42%; border-radius: 4px; background: Theme.surface-container-highest; }
+            Rectangle { height: 8px; width: 70%; border-radius: 4px; background: Theme.surface-container-highest; }
+            Rectangle { height: 7px; width: 88%; border-radius: 4px; background: Theme.surface-container-high; }
+        }
+    }
+}

@@ -1,0 +1,16 @@
+import { Theme } from "../theme.slint";
+
+export component MaterialIcon inherits Text {
+    in property <string> name;
+    in property <length> size: 18px;
+    in property <color> icon-color: Theme.on-surface-variant;
+    text: name;
+    color: icon-color;
+    font-family: Theme.icon-font;
+    font-size: size;
+    font-weight: 500;
+    horizontal-alignment: center;
+    vertical-alignment: center;
+    overflow: clip;
+    accessible-role: none;
+}

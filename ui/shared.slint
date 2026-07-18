@@ -1,0 +1,34 @@
+import { Theme } from "theme.slint";
+
+export component AccountAvatar inherits Rectangle {
+    in property <string> initials;
+    in property <color> avatar-color: Theme.primary;
+    in property <length> avatar-size: 34px;
+    in property <bool> has-error: false;
+
+    width: avatar-size;
+    height: avatar-size;
+    border-radius: 4px;
+    background: avatar-color;
+
+    Text {
+        text: root.initials;
+        color: white;
+        font-family: Theme.body-font;
+        font-size: root.avatar-size < 34px ? 9px : 11px;
+        font-weight: 500;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    if root.has-error: Rectangle {
+        x: parent.width - 8px;
+        y: parent.height - 8px;
+        width: 9px;
+        height: 9px;
+        border-radius: 5px;
+        border-width: 2px;
+        border-color: Theme.surface;
+        background: Theme.error;
+    }
+}

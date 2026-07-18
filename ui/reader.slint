@@ -1,0 +1,226 @@
+import { ScrollView } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { MailDetail } from "models.slint";
+import { MButton, MaterialIcon, MIconButton } from "components.slint";
+import { ReaderAction } from "actions.slint";
+import { EmptyState } from "states.slint";
+import { AccountAvatar } from "shared.slint";
+
+export component ReaderPane inherits Rectangle {
+    in property <bool> compact-layout: false;
+    in property <length> window-width: 1200px;
+    in property <int> selected-id: -1;
+    in property <MailDetail> selected-mail;
+    in-out property <bool> detail-open: false;
+    in-out property <bool> composer-open: false;
+    in-out property <string> compose-to;
+    in-out property <string> compose-subject;
+    in-out property <string> compose-body;
+    in-out property <string> composer-error;
+    in-out property <bool> delete-dialog-open: false;
+    in-out property <bool> message-menu-open: false;
+    callback filter-folder(string);
+    callback toggle-star(int);
+    callback archive(int);
+    callback mark-unread(int);
+    callback load-full-message(int);
+
+    horizontal-stretch: 1;
+    background: Theme.surface;
+    accessible-role: complementary;
+    accessible-label: "Message reader";
+
+    if !root.compact-layout: Rectangle { x: 0; width: 1px; height: parent.height; background: Theme.outline-variant; }
+
+    if root.selected-id < 0: EmptyState {
+        title: "Select a message";
+        detail: "Choose a conversation from the inbox to read it here.";
+        icon: "mail";
+        action-label: "Go to inbox";
+        action => { root.filter-folder("Inbox"); root.detail-open = false; }
+    }
+
+    if root.selected-id >= 0: VerticalLayout {
+        spacing: 0px;
+
+        Rectangle {
+            height: root.compact-layout ? 0px : 120px;
+            visible: !root.compact-layout;
+            background: Theme.surface;
+        }
+
+        Rectangle {
+            height: 68px;
+            if !root.compact-layout: Rectangle { y: 0; width: parent.width; height: 1px; background: Theme.outline-variant; }
+            Rectangle { y: parent.height - 1px; width: parent.width; height: 1px; background: Theme.outline-variant; }
+            HorizontalLayout {
+                padding-left: 6px;
+                padding-right: 6px;
+                spacing: 0px;
+                if root.compact-layout: MIconButton { icon: "arrow_back"; label: "Back to message list"; clicked => { root.detail-open = false; } }
+                ReaderAction {
+                    label: "Reply";
+                    icon: "reply";
+                    clicked => {
+                        root.compose-to = root.selected-mail.email;
+                        root.compose-subject = "Re: " + root.selected-mail.subject;
+                        root.compose-body = "";
+                        root.composer-error = "";
+                        root.composer-open = true;
+                    }
+                }
+                if root.window-width >= 1040px: ReaderAction {
+                    label: "Reply all";
+                    icon: "reply_all";
+                    clicked => {
+                        root.compose-to = root.selected-mail.email;
+                        root.compose-subject = "Re: " + root.selected-mail.subject;
+                        root.compose-body = "";
+                        root.composer-error = "";
+                        root.composer-open = true;
+                    }
+                }
+                if root.window-width >= 1180px: ReaderAction {
+                    label: "Forward";
+                    icon: "forward";
+                    clicked => {
+                        root.compose-to = "";
+                        root.compose-subject = "Fwd: " + root.selected-mail.subject;
+                        root.compose-body = "\n\n--- Forwarded message ---\n" + root.selected-mail.body;
+                        root.composer-error = "";
+                        root.composer-open = true;
+                    }
+                }
+                Rectangle { width: 1px; height: 32px; background: Theme.outline-variant; }
+                Rectangle { horizontal-stretch: 1; }
+                ReaderAction { label: "Archive"; icon: "archive"; clicked => { root.archive(root.selected-id); root.detail-open = false; } }
+                if root.window-width >= 1000px: ReaderAction { width: 76px; label: "Mark unread"; icon: "mark_email_unread"; clicked => { root.mark-unread(root.selected-id); } }
+                Rectangle { width: 1px; height: 32px; background: Theme.outline-variant; }
+                ReaderAction { width: 58px; icon: "delete"; label: "Delete"; danger: true; clicked => { root.delete-dialog-open = true; } }
+                ReaderAction { width: 58px; icon: "more_horiz"; label: "More"; clicked => { root.message-menu-open = true; } }
+            }
+        }
+
+        ScrollView {
+            VerticalLayout {
+                alignment: start;
+                padding-left: root.compact-layout ? 18px : 22px;
+                padding-right: root.compact-layout ? 18px : 28px;
+                padding-top: 18px;
+                padding-bottom: 28px;
+                spacing: 12px;
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: root.selected-mail.subject;
+                        color: Theme.on-surface;
+                        font-family: Theme.body-font;
+                        font-size: 22px;
+                        font-weight: 500;
+                        wrap: word-wrap;
+                        horizontal-stretch: 1;
+                    }
+                    Rectangle {
+                        width: 54px;
+                        height: 24px;
+                        border-radius: 4px;
+                        border-width: 1px;
+                        border-color: Theme.outline-variant;
+                        background: Theme.surface-container-low;
+                        Text { text: root.selected-mail.folder; color: Theme.on-surface-variant; font-family: Theme.body-font; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; overflow: elide; }
+                    }
+                    MIconButton { icon: root.selected-mail.starred ? "star" : "star_outline"; label: root.selected-mail.starred ? "Remove star" : "Add star"; selected: root.selected-mail.starred; clicked => { root.toggle-star(root.selected-id); } }
+                    MIconButton { icon: "more_horiz"; label: "More message actions"; clicked => { root.message-menu-open = true; } }
+                }
+
+                HorizontalLayout {
+                    height: 48px;
+                    spacing: 10px;
+                    AccountAvatar { initials: root.selected-mail.initials; avatar-color: root.selected-mail.avatar-color; avatar-size: 42px; }
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 2px;
+                        horizontal-stretch: 1;
+                        HorizontalLayout {
+                            spacing: 5px;
+                            Text { text: root.selected-mail.sender; color: Theme.on-surface; font-family: Theme.body-font; font-size: 13px; font-weight: 500; vertical-alignment: center; }
+                            Text { text: "<" + root.selected-mail.email + ">"; color: Theme.on-surface-variant; font-family: Theme.body-font; font-size: 10px; vertical-alignment: center; overflow: elide; }
+                        }
+                        Text { text: "To: Product Team, Leadership Team"; color: Theme.on-surface-variant; font-family: Theme.body-font; font-size: 10px; overflow: elide; }
+                    }
+                    Text { text: root.selected-mail.date; color: Theme.on-surface-variant; font-family: Theme.body-font; font-size: 10px; vertical-alignment: center; }
+                    MIconButton { icon: "reply"; label: "Reply to sender"; compact-visual: true; clicked => { root.compose-to = root.selected-mail.email; root.compose-subject = "Re: " + root.selected-mail.subject; root.compose-body = ""; root.composer-open = true; } }
+                    MIconButton { icon: "more_vert"; label: "More sender actions"; compact-visual: true; clicked => { root.message-menu-open = true; } }
+                }
+
+                Rectangle { height: 1px; background: Theme.outline-variant; }
+                Text {
+                    text: root.selected-mail.body;
+                    color: Theme.on-surface;
+                    font-family: Theme.body-font;
+                    font-size: 13px;
+                    font-weight: 400;
+                    wrap: word-wrap;
+                    vertical-stretch: 0;
+                }
+
+                if root.selected-mail.body-truncated: Rectangle {
+                    height: 52px;
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: Theme.outline-variant;
+                    background: Theme.surface-container-low;
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 4px;
+                        spacing: 8px;
+                        Text {
+                            text: "This message is unusually large. Load the remainder when needed.";
+                            color: Theme.on-surface-variant;
+                            font-family: Theme.body-font;
+                            font-size: 10px;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            overflow: elide;
+                        }
+                        MButton {
+                            width: 128px;
+                            label: "Load full message";
+                            variant: "outlined";
+                            clicked => { root.load-full-message(root.selected-id); }
+                        }
+                    }
+                }
+
+                if root.selected-mail.has-attachment: Rectangle {
+                    width: 392px;
+                    horizontal-stretch: 0;
+                    height: 58px;
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: Theme.outline;
+                    background: Theme.surface-container-low;
+                    accessible-role: button;
+                    accessible-label: "Attachment: Planning Notes PDF, 428 kilobytes";
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 4px;
+                        spacing: 9px;
+                        MaterialIcon { name: "picture_as_pdf"; width: 26px; size: 22px; icon-color: Theme.error; }
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 1px;
+                            horizontal-stretch: 1;
+                            Text { text: "Q3_Planning_Notes.pdf"; color: Theme.on-surface; font-family: Theme.body-font; font-size: 11px; font-weight: 500; overflow: elide; }
+                            Text { text: "PDF  ·  428 KB"; color: Theme.on-surface-variant; font-family: Theme.body-font; font-size: 9px; }
+                        }
+                        MIconButton { icon: "download"; label: "Download attachment"; }
+                        MIconButton { icon: "more_vert"; label: "More attachment actions"; }
+                    }
+                }
+
+            }
+        }
+    }
+}

@@ -1,0 +1,307 @@
+import { Palette } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { AccountItem } from "models.slint";
+import {
+    MaterialIcon, MIconButton, NavDestination, WideNavItem
+} from "components.slint";
+import { ComposeAction } from "actions.slint";
+import { AccountAvatar } from "shared.slint";
+
+export component TitleBarButton inherits Rectangle {
+    in property <string> icon;
+    in property <string> label;
+    in property <bool> danger: false;
+    callback clicked;
+    forward-focus: focus;
+
+    width: 46px;
+    height: 40px;
+    background: touch.pressed ? (danger ? Theme.error-pressed : Theme.surface-container-highest) :
+        touch.has-hover ? (danger ? Theme.error : Theme.surface-container-high) : transparent;
+    accessible-role: button;
+    accessible-label: label;
+    accessible-action-default => { root.clicked(); }
+
+    MaterialIcon {
+        x: 13px;
+        y: 10px;
+        width: 20px;
+        height: 20px;
+        name: root.icon;
+        size: 16px;
+        icon-color: root.danger && touch.has-hover ? Theme.on-error : Theme.on-surface;
+    }
+    if focus.has-focus: Rectangle {
+        x: 4px;
+        y: 4px;
+        width: parent.width - 8px;
+        height: parent.height - 8px;
+        border-radius: 4px;
+        border-width: 2px;
+        border-color: Theme.focus-ring;
+        background: transparent;
+    }
+
+    focus := FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) { root.clicked(); return accept; }
+            return reject;
+        }
+        touch := TouchArea { mouse-cursor: pointer; clicked => { focus.focus(); root.clicked(); } }
+    }
+}
+
+export component AccountSwitcher inherits Rectangle {
+    in property <string> name;
+    in property <string> detail;
+    in property <string> initials;
+    in property <color> avatar-color;
+    in property <bool> expanded: false;
+    in property <bool> has-error: false;
+    callback clicked;
+    forward-focus: focus;
+
+    height: 58px;
+    background: transparent;
+    accessible-role: button;
+    accessible-label: "Current account: " + name + ". " + detail;
+    accessible-expandable: true;
+    accessible-expanded: expanded;
+    accessible-action-default => { root.clicked(); }
+    accessible-action-expand => { root.clicked(); }
+
+    Rectangle {
+        y: 4px;
+        width: parent.width;
+        height: 50px;
+        border-radius: 6px;
+        border-width: focus.has-focus ? 2px : 1px;
+        border-color: focus.has-focus ? Theme.focus-ring : Theme.outline-variant;
+        background: touch.pressed ? Theme.surface-container-highest : touch.has-hover ? Theme.surface-container-high : Theme.surface-container-low;
+    }
+    HorizontalLayout {
+        padding-left: 9px;
+        padding-right: 8px;
+        spacing: 9px;
+        if root.name == "All inboxes": Rectangle {
+            width: 30px;
+            height: 30px;
+            border-radius: 4px;
+            background: transparent;
+            MaterialIcon { name: "account_circle"; size: 19px; icon-color: Theme.on-surface-variant; }
+            Rectangle { x: 22px; y: 22px; width: 7px; height: 7px; border-radius: 4px; border-width: 1px; border-color: Theme.surface; background: root.has-error ? Theme.error : Theme.success; }
+        }
+        if root.name != "All inboxes": AccountAvatar { initials: root.initials; avatar-color: root.avatar-color; has-error: root.has-error; avatar-size: 30px; }
+        VerticalLayout {
+            alignment: center;
+            spacing: 1px;
+            horizontal-stretch: 1;
+            Text { text: root.name; color: Theme.on-surface; font-family: Theme.body-font; font-size: 12px; font-weight: 500; overflow: elide; }
+            Text { text: root.detail; color: Theme.on-surface-variant; font-family: Theme.body-font; font-size: 10px; overflow: elide; }
+        }
+        MaterialIcon { name: expanded ? "expand_less" : "expand_more"; width: 18px; size: 16px; }
+    }
+
+    focus := FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) { root.clicked(); return accept; }
+            return reject;
+        }
+        touch := TouchArea { mouse-cursor: pointer; clicked => { focus.focus(); root.clicked(); } }
+    }
+}
+
+export component AccountMenuRow inherits Rectangle {
+    in property <AccountItem> account;
+    in property <bool> selected: false;
+    callback clicked(int);
+    forward-focus: focus;
+
+    accessible-role: button;
+    accessible-label: account.name + ", " + account.address + ", " + account.status;
+    accessible-checkable: true;
+    accessible-checked: selected;
+    accessible-action-default => { root.clicked(root.account.id); }
+
+    height: 58px;
+    border-radius: 4px;
+    border-width: focus.has-focus ? 2px : 0px;
+    border-color: Theme.focus-ring;
+    background: selected ? Theme.primary-container : touch.pressed ? Theme.surface-container-highest : touch.has-hover ? Theme.surface-container-high : transparent;
+
+    HorizontalLayout {
+        padding-left: 9px;
+        padding-right: 9px;
+        spacing: 10px;
+        AccountAvatar { initials: root.account.initials; avatar-color: root.account.avatar-color; has-error: root.account.has-error; avatar-size: 32px; }
+        VerticalLayout {
+            alignment: center;
+            spacing: 1px;
+            horizontal-stretch: 1;
+            Text { text: root.account.name; color: Theme.on-surface; font-family: Theme.body-font; font-size: 12px; font-weight: 500; overflow: elide; }
+            Text { text: root.account.address; color: Theme.on-surface-variant; font-family: Theme.body-font; font-size: 10px; overflow: elide; }
+            Text { text: root.account.status; color: root.account.has-error ? Theme.error : Theme.on-surface-variant; font-family: Theme.body-font; font-size: 9px; overflow: elide; }
+        }
+        if root.account.unread-count > 0: Text {
+            text: root.account.unread-count;
+            color: root.selected ? Theme.primary : Theme.on-surface-variant;
+            font-family: Theme.body-font;
+            font-size: 10px;
+            font-weight: 500;
+            vertical-alignment: center;
+        }
+    }
+
+    focus := FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) { root.clicked(root.account.id); return accept; }
+            return reject;
+        }
+        touch := TouchArea { mouse-cursor: pointer; clicked => { focus.focus(); root.clicked(root.account.id); } }
+    }
+}
+
+export component TitleBar inherits Rectangle {
+    in-out property <bool> dark-mode: false;
+    in-out property <bool> is-maximized: false;
+    callback minimize;
+    callback maximize(bool);
+    callback close;
+    callback drag;
+
+    height: 40px;
+    background: Theme.background;
+    accessible-role: region;
+    accessible-label: "Application title bar";
+
+    drag-area := TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width - 184px;
+        height: parent.height;
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                root.drag();
+            }
+        }
+    }
+
+    HorizontalLayout {
+        x: 10px;
+        width: 220px;
+        height: parent.height;
+        spacing: 8px;
+        Image { width: 24px; height: 24px; source: @image-url("../assets/images/nivalis-mark.png"); image-fit: contain; }
+        Text { width: 92px; text: "Nivalis Mail"; color: Theme.on-surface; font-family: Theme.body-font; font-size: 13px; font-weight: 500; vertical-alignment: center; overflow: elide; }
+        Text { width: 50px; text: "v0.1.0"; color: Theme.on-surface-variant; font-family: Theme.body-font; font-size: 10px; vertical-alignment: center; }
+    }
+
+    HorizontalLayout {
+        x: parent.width - 185px;
+        width: 185px;
+        height: parent.height;
+        spacing: 0px;
+        TitleBarButton {
+            width: 46px;
+            icon: root.dark-mode ? "light_mode" : "dark_mode";
+            label: root.dark-mode ? "Use light theme" : "Use dark theme";
+            clicked => {
+                root.dark-mode = !root.dark-mode;
+                Theme.dark-mode = root.dark-mode;
+                Palette.color-scheme = root.dark-mode ? ColorScheme.dark : ColorScheme.light;
+            }
+        }
+        Rectangle { width: 1px; height: 20px; background: Theme.outline-variant; }
+        TitleBarButton { icon: "remove"; label: "Minimize window"; clicked => { root.minimize(); } }
+        TitleBarButton {
+            icon: root.is-maximized ? "filter_none" : "crop_square";
+            label: root.is-maximized ? "Restore window" : "Maximize window";
+            clicked => { root.is-maximized = !root.is-maximized; root.maximize(root.is-maximized); }
+        }
+        TitleBarButton { icon: "close"; label: "Close window"; danger: true; clicked => { root.close(); } }
+    }
+}
+
+export component NavigationPane inherits Rectangle {
+    in property <length> pane-width: 248px;
+    in property <bool> wide: true;
+    in property <string> account-name;
+    in property <string> account-detail;
+    in property <string> account-initials;
+    in property <color> account-color;
+    in property <bool> account-error: false;
+    in property <bool> account-menu-open: false;
+    in property <bool> settings-open: false;
+    in property <string> active-folder: "Inbox";
+    in property <int> inbox-count: 0;
+    in property <int> starred-count: 0;
+    in property <int> draft-count: 0;
+    callback collapsed(bool);
+    callback compose;
+    callback folder-selected(string);
+    callback open-accounts;
+    callback open-settings;
+
+    width: root.pane-width;
+    background: Theme.background;
+    accessible-role: navigation;
+    accessible-label: "Mailboxes and accounts";
+    animate width { duration: Theme.motion-slow; easing: ease-out; }
+
+    if root.wide: VerticalLayout {
+        padding-left: 9px;
+        padding-right: 9px;
+        padding-top: 4px;
+        padding-bottom: 8px;
+        spacing: 2px;
+
+        MIconButton {
+            icon: "menu";
+            label: "Collapse navigation";
+            clicked => { root.collapsed(true); }
+        }
+        AccountSwitcher {
+            name: root.account-name;
+            detail: root.account-detail;
+            initials: root.account-initials;
+            avatar-color: root.account-color;
+            expanded: root.account-menu-open;
+            has-error: root.account-error;
+            clicked => { root.open-accounts(); }
+        }
+        Rectangle { height: 6px; }
+        ComposeAction { clicked => { root.compose(); } }
+        Rectangle { height: 4px; }
+        WideNavItem { icon: "inbox"; label: "Inbox"; selected: root.active-folder == "Inbox"; count: root.inbox-count; clicked => { root.folder-selected("Inbox"); } }
+        WideNavItem { icon: "star"; label: "Starred"; selected: root.active-folder == "Starred"; count: root.starred-count; clicked => { root.folder-selected("Starred"); } }
+        WideNavItem { icon: "draft"; label: "Drafts"; selected: root.active-folder == "Drafts"; count: root.draft-count; clicked => { root.folder-selected("Drafts"); } }
+        WideNavItem { icon: "send"; label: "Sent"; selected: root.active-folder == "Sent"; clicked => { root.folder-selected("Sent"); } }
+        WideNavItem { icon: "archive"; label: "Archive"; selected: root.active-folder == "Archive"; clicked => { root.folder-selected("Archive"); } }
+        WideNavItem { icon: "delete"; label: "Trash"; selected: root.active-folder == "Trash"; clicked => { root.folder-selected("Trash"); } }
+        Rectangle { vertical-stretch: 1; }
+        Rectangle { height: 1px; background: Theme.outline-variant; }
+        WideNavItem { icon: "account_circle"; label: "Accounts"; selected: root.account-menu-open; clicked => { root.open-accounts(); } }
+        WideNavItem { icon: "settings"; label: "Settings"; selected: root.settings-open; clicked => { root.open-settings(); } }
+    }
+
+    if !root.wide: VerticalLayout {
+        padding-left: 3px;
+        padding-right: 3px;
+        padding-top: 4px;
+        padding-bottom: 8px;
+        spacing: 2px;
+        NavDestination { icon: "menu"; label: "Expand navigation"; clicked => { root.collapsed(false); } }
+        ComposeAction { compact: true; clicked => { root.compose(); } }
+        Rectangle { height: 4px; }
+        NavDestination { icon: "inbox"; label: "Inbox"; selected: root.active-folder == "Inbox"; badge: root.inbox-count; clicked => { root.folder-selected("Inbox"); } }
+        NavDestination { icon: "star"; label: "Starred"; selected: root.active-folder == "Starred"; badge: root.starred-count; clicked => { root.folder-selected("Starred"); } }
+        NavDestination { icon: "draft"; label: "Drafts"; selected: root.active-folder == "Drafts"; badge: root.draft-count; clicked => { root.folder-selected("Drafts"); } }
+        NavDestination { icon: "send"; label: "Sent"; selected: root.active-folder == "Sent"; clicked => { root.folder-selected("Sent"); } }
+        NavDestination { icon: "archive"; label: "Archive"; selected: root.active-folder == "Archive"; clicked => { root.folder-selected("Archive"); } }
+        NavDestination { icon: "delete"; label: "Trash"; selected: root.active-folder == "Trash"; clicked => { root.folder-selected("Trash"); } }
+        Rectangle { vertical-stretch: 1; }
+        Rectangle { height: 1px; background: Theme.outline-variant; }
+        NavDestination { icon: "account_circle"; label: "Accounts"; selected: root.account-menu-open; clicked => { root.open-accounts(); } }
+        NavDestination { icon: "settings"; label: "Settings"; selected: root.settings-open; clicked => { root.open-settings(); } }
+    }
+}

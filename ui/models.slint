@@ -1,0 +1,40 @@
+export struct AccountItem {
+    id: int,
+    name: string,
+    address: string,
+    initials: string,
+    unread-count: int,
+    status: string,
+    avatar-color: color,
+    has-error: bool,
+}
+
+export struct MailSummary {
+    id: int,
+    account-id: int,
+    account-label: string,
+    sender: string,
+    initials: string,
+    subject: string,
+    preview: string,
+    time: string,
+    unread: bool,
+    starred: bool,
+    has-attachment: bool,
+    avatar-color: color,
+}
+
+export struct MailDetail {
+    id: int,
+    sender: string,
+    email: string,
+    initials: string,
+    subject: string,
+    body: string,
+    body-truncated: bool,
+    date: string,
+    folder: string,
+    starred: bool,
+    has-attachment: bool,
+    avatar-color: color,
+}

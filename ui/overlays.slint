@@ -1,0 +1,294 @@
+import { Palette } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { AccountItem, MailDetail } from "models.slint";
+import {
+    MButton, MaterialIcon, MIconButton, SettingsToggle, WideNavItem
+} from "components.slint";
+import { AccountMenuRow } from "shell.slint";
+
+export component AccountMenuOverlay inherits Rectangle {
+    in property <bool> wide-sidebar: true;
+    in property <[AccountItem]> accounts;
+    in property <int> active-account-id: 0;
+    in-out property <bool> account-menu-open: false;
+    in-out property <bool> settings-open: false;
+    in-out property <bool> detail-open: false;
+    callback switch-account(int);
+
+    z: 20;
+    background: transparent;
+    TouchArea { clicked => { root.account-menu-open = false; } }
+    Rectangle {
+        x: root.wide-sidebar ? 12px : 58px;
+        y: 82px;
+        width: 340px;
+        height: 346px;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.outline;
+        background: Theme.surface;
+        accessible-role: complementary;
+        accessible-label: "Account switcher";
+        TouchArea { }
+        VerticalLayout {
+            padding: 12px;
+            spacing: 3px;
+            HorizontalLayout {
+                height: 40px;
+                Text { text: "Choose an account"; color: Theme.on-surface; font-family: Theme.body-font; font-size: 16px; font-weight: 500; vertical-alignment: center; horizontal-stretch: 1; }
+                MIconButton { icon: "close"; label: "Close account switcher"; compact-visual: true; clicked => { root.account-menu-open = false; } }
+            }
+            for account in root.accounts: AccountMenuRow {
+                account: account;
+                selected: root.active-account-id == account.id;
+                clicked(id) => { root.switch-account(id); root.account-menu-open = false; root.detail-open = false; }
+            }
+            Rectangle { vertical-stretch: 1; }
+            MButton { label: "Display settings"; icon: "settings"; variant: "tonal"; clicked => { root.account-menu-open = false; root.settings-open = true; } }
+        }
+    }
+}
+
+export component FilterMenuOverlay inherits Rectangle {
+    in property <length> navigation-width: 248px;
+    in property <bool> compact-layout: false;
+    in property <bool> wide-sidebar: true;
+    in property <string> active-folder: "Inbox";
+    in-out property <bool> filter-menu-open: false;
+    callback filter-folder(string);
+
+    z: 21;
+    background: transparent;
+    TouchArea { clicked => { root.filter-menu-open = false; } }
+    Rectangle {
+        x: root.navigation-width + (root.compact-layout ? parent.width - root.navigation-width - 220px : (root.wide-sidebar ? 188px : 152px));
+        y: 144px;
+        width: 210px;
+        height: 206px;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.outline;
+        background: Theme.surface;
+        TouchArea { }
+        VerticalLayout {
+            padding: 9px;
+            spacing: 2px;
+            Text { text: "Filter messages"; color: Theme.on-surface; font-family: Theme.body-font; font-size: 12px; font-weight: 500; height: 30px; vertical-alignment: center; }
+            WideNavItem { icon: "inbox"; label: "All inbox mail"; selected: root.active-folder == "Inbox"; clicked => { root.filter-folder("Inbox"); root.filter-menu-open = false; } }
+            WideNavItem { icon: "mark_email_unread"; label: "Unread only"; selected: root.active-folder == "Unread"; clicked => { root.filter-folder("Unread"); root.filter-menu-open = false; } }
+            WideNavItem { icon: "star"; label: "Starred only"; selected: root.active-folder == "Starred"; clicked => { root.filter-folder("Starred"); root.filter-menu-open = false; } }
+        }
+    }
+}
+
+export component InboxMoreMenuOverlay inherits Rectangle {
+    in property <length> navigation-width: 248px;
+    in property <bool> compact-layout: false;
+    in property <bool> wide-sidebar: true;
+    in-out property <bool> more-menu-open: false;
+    in-out property <bool> account-menu-open: false;
+    in-out property <bool> settings-open: false;
+    callback sync;
+
+    z: 22;
+    background: transparent;
+    TouchArea { clicked => { root.more-menu-open = false; } }
+    Rectangle {
+        x: root.navigation-width + (root.compact-layout ? parent.width - root.navigation-width - 226px : (root.wide-sidebar ? 178px : 142px));
+        y: 88px;
+        width: 218px;
+        height: 160px;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.outline;
+        background: Theme.surface;
+        TouchArea { }
+        VerticalLayout {
+            padding: 9px;
+            spacing: 2px;
+            MButton { label: "Sync all accounts"; icon: "refresh"; clicked => { root.sync(); root.more-menu-open = false; } }
+            MButton { label: "Account status"; icon: "account_circle"; clicked => { root.more-menu-open = false; root.account-menu-open = true; } }
+            MButton { label: "Display settings"; icon: "settings"; clicked => { root.more-menu-open = false; root.settings-open = true; } }
+        }
+    }
+}
+
+export component SettingsOverlay inherits Rectangle {
+    in-out property <bool> settings-open: false;
+    in-out property <bool> dark-mode: false;
+    in-out property <bool> high-contrast: false;
+    in-out property <bool> reduced-motion: false;
+
+    z: 24;
+    background: Theme.scrim;
+    TouchArea { clicked => { root.settings-open = false; } }
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: parent.width < 540px ? parent.width - 24px : 500px;
+        height: 392px;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.outline;
+        background: Theme.surface;
+        accessible-role: region;
+        accessible-label: "Display preferences";
+        TouchArea { }
+        VerticalLayout {
+            padding: 20px;
+            spacing: 6px;
+            HorizontalLayout {
+                height: 48px;
+                VerticalLayout {
+                    alignment: center;
+                    Text { text: "Display preferences"; color: Theme.on-surface; font-family: Theme.body-font; font-size: 18px; font-weight: 500; }
+                    Text { text: "Make mail comfortable to read."; color: Theme.on-surface-variant; font-family: Theme.body-font; font-size: 10px; }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                MIconButton { icon: "close"; label: "Close settings"; clicked => { root.settings-open = false; } }
+            }
+            SettingsToggle {
+                icon: "dark_mode";
+                label: "Dark theme";
+                description: "Use darker surfaces in low light";
+                checked <=> root.dark-mode;
+                toggled(value) => {
+                    Theme.dark-mode = value;
+                    Palette.color-scheme = value ? ColorScheme.dark : ColorScheme.light;
+                }
+            }
+            SettingsToggle {
+                icon: "contrast";
+                label: "High contrast";
+                description: "Strengthen text, outlines, and focus rings";
+                checked <=> root.high-contrast;
+                toggled(value) => { Theme.high-contrast = value; }
+            }
+            SettingsToggle {
+                icon: "motion_photos_off";
+                label: "Reduce motion";
+                description: "Use immediate state changes";
+                checked <=> root.reduced-motion;
+                toggled(value) => { Theme.reduced-motion = value; }
+            }
+            Rectangle { vertical-stretch: 1; }
+            HorizontalLayout {
+                Rectangle { horizontal-stretch: 1; }
+                MButton { label: "Close preferences"; variant: "tonal"; clicked => { root.settings-open = false; } }
+            }
+        }
+    }
+}
+
+export component MessageMenuOverlay inherits Rectangle {
+    in property <bool> compact-layout: false;
+    in property <MailDetail> selected-mail;
+    in property <int> selected-id: -1;
+    in property <string> active-folder: "Inbox";
+    in-out property <bool> message-menu-open: false;
+    in-out property <bool> delete-dialog-open: false;
+    callback toggle-star(int);
+    callback mark-unread(int);
+
+    z: 25;
+    background: transparent;
+    TouchArea { clicked => { root.message-menu-open = false; } }
+    Rectangle {
+        x: parent.width - self.width - 16px;
+        y: root.compact-layout ? 104px : 202px;
+        width: 232px;
+        height: 160px;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.outline;
+        background: Theme.surface;
+        TouchArea { }
+        VerticalLayout {
+            padding: 8px;
+            spacing: 2px;
+            MButton { label: root.selected-mail.starred ? "Remove star" : "Add star"; icon: root.selected-mail.starred ? "star" : "star_outline"; clicked => { root.toggle-star(root.selected-id); root.message-menu-open = false; } }
+            MButton { label: "Mark unread"; icon: "mark_email_unread"; clicked => { root.mark-unread(root.selected-id); root.message-menu-open = false; } }
+            MButton { label: root.active-folder == "Trash" ? "Delete permanently" : "Move to trash"; icon: "delete"; variant: "danger"; clicked => { root.message-menu-open = false; root.delete-dialog-open = true; } }
+        }
+    }
+}
+
+export component DeleteDialog inherits Rectangle {
+    in property <string> active-folder: "Inbox";
+    in property <int> selected-id: -1;
+    in-out property <bool> delete-dialog-open: false;
+    in-out property <bool> detail-open: false;
+    callback delete-mail(int);
+
+    z: 40;
+    background: Theme.scrim;
+    TouchArea { }
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: parent.width < 460px ? parent.width - 24px : 420px;
+        height: 234px;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.outline;
+        background: Theme.surface;
+        accessible-role: region;
+        accessible-label: root.active-folder == "Trash" ? "Confirm permanent deletion" : "Confirm moving message to trash";
+        VerticalLayout {
+            padding: 20px;
+            spacing: 10px;
+            MaterialIcon { name: "delete"; width: 32px; height: 32px; size: 24px; icon-color: Theme.error; }
+            Text { text: root.active-folder == "Trash" ? "Delete this message forever?" : "Move this message to trash?"; color: Theme.on-surface; font-family: Theme.body-font; font-size: 18px; font-weight: 500; wrap: word-wrap; }
+            Text {
+                text: root.active-folder == "Trash" ? "This permanently removes the message and cannot be undone." : "The message leaves this mailbox. You can undo from the confirmation message.";
+                color: Theme.on-surface-variant;
+                font-family: Theme.body-font;
+                font-size: 11px;
+                wrap: word-wrap;
+            }
+            Rectangle { vertical-stretch: 1; }
+            HorizontalLayout {
+                spacing: 8px;
+                Rectangle { horizontal-stretch: 1; }
+                MButton { label: "Keep message"; clicked => { root.delete-dialog-open = false; } }
+                MButton {
+                    label: root.active-folder == "Trash" ? "Delete permanently" : "Move to trash";
+                    icon: "delete";
+                    variant: "danger-filled";
+                    clicked => { root.delete-dialog-open = false; root.delete-mail(root.selected-id); root.detail-open = false; }
+                }
+            }
+        }
+    }
+}
+
+export component Snackbar inherits Rectangle {
+    in property <length> window-width: 1200px;
+    in property <length> window-height: 800px;
+    in property <string> snackbar-text;
+    in property <bool> snackbar-can-undo: false;
+    in-out property <bool> snackbar-visible: false;
+    callback undo-delete;
+
+    z: 50;
+    x: (root.window-width - self.width) / 2;
+    y: root.window-height - self.height - 16px;
+    width: root.window-width < 500px ? root.window-width - 24px : 460px;
+    height: 56px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.outline;
+    background: Theme.surface;
+    accessible-role: region;
+    accessible-live-region: polite;
+    accessible-label: root.snackbar-text + (root.snackbar-can-undo ? ". Undo available." : "");
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 4px;
+        spacing: 6px;
+        MaterialIcon { name: "check_circle"; width: 22px; size: 19px; icon-color: Theme.success; }
+        Text { text: root.snackbar-text; color: Theme.on-surface; font-family: Theme.body-font; font-size: 11px; font-weight: 400; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+        if root.snackbar-can-undo: MButton { label: "Undo"; clicked => { root.undo-delete(); root.snackbar-visible = false; } }
+        MIconButton { icon: "close"; label: "Dismiss notification"; compact-visual: true; clicked => { root.snackbar-visible = false; } }
+    }
+}

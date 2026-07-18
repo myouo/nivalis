@@ -1,0 +1,220 @@
+import { Theme } from "../theme.slint";
+import { MaterialIcon } from "primitives.slint";
+
+export component MButton inherits Rectangle {
+    in property <string> label;
+    in property <string> icon: "";
+    in property <string> variant: "text";
+    in property <bool> enabled: true;
+    in property <bool> loading: false;
+    callback clicked;
+    forward-focus: focus;
+
+    accessible-role: button;
+    accessible-label: loading ? label + ", loading" : label;
+    accessible-enabled: enabled && !loading;
+    accessible-action-default => {
+        if (root.enabled && !root.loading) { root.clicked(); }
+    }
+
+    height: 48px;
+    min-width: 76px;
+    background: transparent;
+
+    visual := Rectangle {
+        x: 0;
+        y: 6px;
+        width: parent.width;
+        height: 36px;
+        border-radius: 4px;
+        border-width: focus.has-focus ? 2px : (root.variant == "outlined" || root.variant == "danger" ? 1px : 0px);
+        border-color: focus.has-focus ? Theme.focus-ring : root.variant == "danger" ? Theme.error : Theme.outline;
+        background: !root.enabled ? Theme.surface-container-high :
+            root.variant == "filled" ? (touch.pressed ? Theme.primary-pressed : touch.has-hover ? Theme.primary-hover : Theme.primary) :
+            root.variant == "danger-filled" ? (touch.pressed ? Theme.error-pressed : touch.has-hover ? Theme.error-hover : Theme.error) :
+            root.variant == "tonal" ? (touch.pressed ? Theme.secondary-container-pressed : touch.has-hover ? Theme.secondary-container-hover : Theme.secondary-container) :
+            root.variant == "inverse" ? (touch.pressed ? Theme.inverse-surface-pressed : touch.has-hover ? Theme.inverse-surface-hover : transparent) :
+            touch.pressed ? Theme.surface-container-highest : touch.has-hover ? Theme.surface-container-high : transparent;
+        animate background { duration: Theme.motion-fast; easing: ease-out; }
+        animate border-color { duration: Theme.motion-fast; easing: ease-out; }
+
+        HorizontalLayout {
+            padding-left: 12px;
+            padding-right: 12px;
+            spacing: 7px;
+            alignment: center;
+
+            if root.loading: MaterialIcon {
+                name: "progress_activity";
+                size: 16px;
+                width: 18px;
+                icon-color: root.variant == "filled" ? Theme.on-primary : root.variant == "danger-filled" ? Theme.on-error : Theme.on-surface;
+            }
+
+            if !root.loading && root.icon != "": MaterialIcon {
+                name: root.icon;
+                size: 16px;
+                width: 18px;
+                icon-color: !root.enabled ? Theme.outline :
+                    root.variant == "filled" ? Theme.on-primary :
+                    root.variant == "danger-filled" ? Theme.on-error :
+                    root.variant == "danger" ? Theme.error :
+                    root.variant == "inverse" ? Theme.inverse-primary :
+                    root.variant == "tonal" ? Theme.on-secondary-container : Theme.on-surface;
+            }
+
+            Text {
+                text: root.label;
+                color: !root.enabled ? Theme.outline :
+                    root.variant == "filled" ? Theme.on-primary :
+                    root.variant == "danger-filled" ? Theme.on-error :
+                    root.variant == "danger" ? Theme.error :
+                    root.variant == "inverse" ? Theme.inverse-primary :
+                    root.variant == "tonal" ? Theme.on-secondary-container : Theme.on-surface;
+                font-family: Theme.body-font;
+                font-size: 12px;
+                font-weight: 500;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+    }
+
+    focus := FocusScope {
+        enabled: root.enabled && !root.loading;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
+        touch := TouchArea {
+            enabled: root.enabled && !root.loading;
+            mouse-cursor: pointer;
+            clicked => { focus.focus(); root.clicked(); }
+        }
+    }
+}
+
+export component MIconButton inherits Rectangle {
+    in property <string> icon;
+    in property <string> label;
+    in property <bool> selected: false;
+    in property <bool> danger: false;
+    in property <bool> inverse: false;
+    in property <bool> enabled: true;
+    in property <bool> compact-visual: false;
+    callback clicked;
+    forward-focus: focus;
+
+    accessible-role: button;
+    accessible-label: label;
+    accessible-enabled: enabled;
+    accessible-action-default => { if (root.enabled) { root.clicked(); } }
+
+    width: 48px;
+    height: 48px;
+    background: transparent;
+
+    Rectangle {
+        x: compact-visual ? 10px : 8px;
+        y: compact-visual ? 10px : 8px;
+        width: compact-visual ? 28px : 32px;
+        height: compact-visual ? 28px : 32px;
+        border-radius: 4px;
+        border-width: focus.has-focus ? 2px : 0px;
+        border-color: Theme.focus-ring;
+        background: root.selected ?
+                (touch.pressed ? Theme.primary-container-pressed : touch.has-hover ? Theme.primary-container-hover : Theme.primary-container) :
+            root.inverse ?
+                (touch.pressed ? Theme.inverse-surface-pressed : touch.has-hover ? Theme.inverse-surface-hover : transparent) :
+            touch.pressed ? Theme.surface-container-highest : touch.has-hover ? Theme.surface-container-high : transparent;
+        animate background { duration: Theme.motion-fast; easing: ease-out; }
+    }
+
+    MaterialIcon {
+        x: 13px;
+        y: 13px;
+        width: 22px;
+        height: 22px;
+        name: root.icon;
+        size: root.compact-visual ? 16px : 18px;
+        icon-color: !root.enabled ? Theme.outline : root.inverse ? Theme.on-inverse-surface : root.danger ? Theme.error : root.selected ? Theme.on-primary-container : Theme.on-surface-variant;
+    }
+
+    focus := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
+        touch := TouchArea {
+            enabled: root.enabled;
+            mouse-cursor: pointer;
+            clicked => { focus.focus(); root.clicked(); }
+        }
+    }
+}
+
+export component FilterChip inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected: false;
+    in property <string> icon: "";
+    callback clicked;
+    forward-focus: focus;
+
+    accessible-role: button;
+    accessible-label: label;
+    accessible-checkable: true;
+    accessible-checked: selected;
+    accessible-action-default => { root.clicked(); }
+
+    height: 48px;
+    min-width: 72px;
+    background: transparent;
+
+    Rectangle {
+        x: 0;
+        y: 6px;
+        width: parent.width;
+        height: 36px;
+        border-radius: 4px;
+        border-width: focus.has-focus ? 2px : 1px;
+        border-color: focus.has-focus ? Theme.focus-ring : root.selected ? Theme.primary : Theme.outline-variant;
+        background: root.selected ? Theme.primary-container : touch.pressed ? Theme.surface-container-highest : touch.has-hover ? Theme.surface-container-high : Theme.surface;
+        animate background { duration: Theme.motion-fast; easing: ease-out; }
+    }
+
+    HorizontalLayout {
+        padding-left: 11px;
+        padding-right: 11px;
+        spacing: 6px;
+        alignment: center;
+        if root.icon != "": MaterialIcon {
+            name: root.icon;
+            size: 16px;
+            width: 18px;
+            icon-color: root.selected ? Theme.primary : Theme.on-surface-variant;
+        }
+        Text {
+            text: root.label;
+            color: root.selected ? Theme.on-primary-container : Theme.on-surface;
+            font-family: Theme.body-font;
+            font-size: 12px;
+            font-weight: 500;
+            vertical-alignment: center;
+        }
+    }
+
+    focus := FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) { root.clicked(); return accept; }
+            return reject;
+        }
+        touch := TouchArea { mouse-cursor: pointer; clicked => { focus.focus(); root.clicked(); } }
+    }
+}

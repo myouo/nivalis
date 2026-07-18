@@ -1,0 +1,110 @@
+import { Theme } from "theme.slint";
+import { MaterialIcon } from "components.slint";
+
+export component ReaderAction inherits Rectangle {
+    in property <string> icon;
+    in property <string> label;
+    in property <bool> danger: false;
+    callback clicked;
+    forward-focus: focus;
+
+    width: 64px;
+    height: 68px;
+    border-radius: 4px;
+    border-width: focus.has-focus ? 2px : 0px;
+    border-color: Theme.focus-ring;
+    background: touch.pressed ? Theme.surface-container-highest : touch.has-hover ? Theme.surface-container-high : transparent;
+    accessible-role: button;
+    accessible-label: label;
+    accessible-action-default => { root.clicked(); }
+
+    MaterialIcon {
+        x: (parent.width - 20px) / 2;
+        y: 9px;
+        width: 20px;
+        height: 20px;
+        name: root.icon;
+        size: 17px;
+        icon-color: root.danger ? Theme.error : Theme.on-surface-variant;
+    }
+    Text {
+        x: 3px;
+        y: 31px;
+        width: parent.width - 6px;
+        height: 27px;
+        text: root.label;
+        color: root.danger ? Theme.error : Theme.on-surface;
+        font-family: Theme.body-font;
+        font-size: 9px;
+        font-weight: 400;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    focus := FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) { root.clicked(); return accept; }
+            return reject;
+        }
+        touch := TouchArea { mouse-cursor: pointer; clicked => { focus.focus(); root.clicked(); } }
+    }
+}
+
+export component ComposeAction inherits Rectangle {
+    in property <bool> compact: false;
+    callback clicked;
+    forward-focus: focus;
+
+    height: 48px;
+    width: compact ? 48px : 216px;
+    background: transparent;
+    accessible-role: button;
+    accessible-label: "Compose a new message";
+    accessible-action-default => { root.clicked(); }
+
+    Rectangle {
+        x: root.compact ? 6px : 0px;
+        y: 6px;
+        width: root.compact ? 36px : parent.width;
+        height: 36px;
+        border-radius: 4px;
+        border-width: focus.has-focus ? 2px : 0px;
+        border-color: Theme.focus-ring;
+        background: touch.pressed ? Theme.primary-pressed : touch.has-hover ? Theme.primary-hover : Theme.primary;
+        animate background { duration: Theme.motion-fast; easing: ease-out; }
+    }
+
+    if root.compact: MaterialIcon {
+        x: 14px;
+        y: 14px;
+        width: 20px;
+        height: 20px;
+        name: "edit";
+        size: 17px;
+        icon-color: Theme.on-primary;
+    }
+
+    if !root.compact: HorizontalLayout {
+        padding-left: 13px;
+        padding-right: 13px;
+        spacing: 8px;
+        MaterialIcon { name: "edit"; width: 20px; size: 17px; icon-color: Theme.on-primary; }
+        Text {
+            text: "Compose";
+            color: Theme.on-primary;
+            font-family: Theme.body-font;
+            font-size: 13px;
+            font-weight: 500;
+            vertical-alignment: center;
+        }
+    }
+
+    focus := FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) { root.clicked(); return accept; }
+            return reject;
+        }
+        touch := TouchArea { mouse-cursor: pointer; clicked => { focus.focus(); root.clicked(); } }
+    }
+}

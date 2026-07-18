@@ -18,6 +18,7 @@
 **Full-View Evidence**
 
 - Final side-by-side comparison: `artifacts/nivalis-qa-comparison-memory.png`
+- UI modularization regression comparison: `artifacts/nivalis-ui-split-comparison.png`
 - The source and implementation use the same 1200 x 900 frame and default inbox-reading state. Major-region proportions, navigation placement, list density, reader hierarchy, and above-the-fold content align.
 
 **Focused Evidence**
@@ -44,6 +45,8 @@
 5. Memory optimization changed the default surface from Skia OpenGL to Skia software rendering and split summary/detail models.
    Visual regression evidence: `artifacts/nivalis-memory-visual-comparison.png` compares the pre-optimization GPU capture with the optimized default capture; normalized pixel RMSE is 0.00132 and no layout, wrapping, icon, color, or interaction hierarchy regression is visible.
    Final source comparison: `artifacts/nivalis-qa-comparison-memory.png`; no P0/P1/P2 issue remains.
+6. UI modularization moved models, controls, shell, mailbox, reader, composer, states, and overlays behind explicit Slint module boundaries while keeping `AppWindow` as the state and conditional-instantiation root.
+   Regression evidence: `artifacts/nivalis-ui-split-comparison.png` compares the prior memory-optimized build with the modular build at the same 1200 x 900 state. Pixel RMSE is exactly 0, and the composer still opens with recipient focus and closes through Escape.
 
 **Primary Interactions Tested**
 
@@ -59,7 +62,7 @@
 
 - Stripped recommended release executable: 18.0 MB (`opt-level = "s"`).
 - Embedded Material Symbols subset: 110 KB.
-- Default Skia software profile, three fresh X11 runs at 1200 x 900: worst stable sample 35.5 MiB RSS / 21.2 MiB PSS / 18.0 MiB USS.
+- Default Skia software profile, three fresh X11 runs at 1200 x 900 after UI modularization: worst stable sample 35.7 MiB RSS / 21.8 MiB PSS / 18.4 MiB USS.
 - Three native Wayland runs: worst stable sample 41.5 MiB RSS / 22.4 MiB PSS / 17.5 MiB USS.
 - The opt-in Skia OpenGL profile remains available through `NIVALIS_RENDERER=skia`. Full methodology and growth results are in `memory-report.md`.
 

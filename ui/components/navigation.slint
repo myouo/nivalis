@@ -1,0 +1,154 @@
+import { Theme } from "../theme.slint";
+import { MaterialIcon } from "primitives.slint";
+
+export component NavDestination inherits Rectangle {
+    in property <string> icon;
+    in property <string> label;
+    in property <bool> selected: false;
+    in property <int> badge: 0;
+    callback clicked;
+    forward-focus: focus;
+
+    accessible-role: button;
+    accessible-label: label + (badge > 0 ? ", " + badge + " unread" : "");
+    accessible-checkable: true;
+    accessible-checked: selected;
+    accessible-action-default => { root.clicked(); }
+
+    width: 48px;
+    height: 48px;
+    background: transparent;
+
+    Rectangle {
+        x: 4px;
+        y: 6px;
+        width: 40px;
+        height: 36px;
+        border-radius: 4px;
+        border-width: focus.has-focus ? 2px : 0px;
+        border-color: Theme.focus-ring;
+        background: selected ? Theme.primary-container : touch.pressed ? Theme.surface-container-highest : touch.has-hover ? Theme.surface-container-high : transparent;
+    }
+    if root.selected: Rectangle { x: 0; y: 16px; width: 3px; height: 16px; border-radius: 2px; background: Theme.primary; }
+    MaterialIcon {
+        x: 13px;
+        y: 13px;
+        width: 22px;
+        height: 22px;
+        name: root.icon;
+        size: 18px;
+        icon-color: root.selected ? Theme.primary : Theme.on-surface-variant;
+    }
+    if root.badge > 0: Rectangle {
+        x: 29px;
+        y: 6px;
+        width: 15px;
+        height: 15px;
+        border-radius: 8px;
+        background: Theme.primary;
+        Text {
+            text: root.badge > 9 ? "9+" : root.badge;
+            color: Theme.on-primary;
+            font-family: Theme.body-font;
+            font-size: 8px;
+            font-weight: 700;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+    if touch.has-hover: Rectangle {
+        z: 20;
+        x: 52px;
+        y: 8px;
+        width: 104px;
+        height: 32px;
+        border-radius: 4px;
+        background: Theme.inverse-surface;
+        Text {
+            text: root.label;
+            color: Theme.on-inverse-surface;
+            font-family: Theme.body-font;
+            font-size: 11px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+
+    focus := FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) { root.clicked(); return accept; }
+            return reject;
+        }
+        touch := TouchArea { mouse-cursor: pointer; clicked => { focus.focus(); root.clicked(); } }
+    }
+}
+
+export component WideNavItem inherits Rectangle {
+    in property <string> icon;
+    in property <string> label;
+    in property <bool> selected: false;
+    in property <int> count: 0;
+    callback clicked;
+    forward-focus: focus;
+
+    accessible-role: button;
+    accessible-label: label + (count > 0 ? ", " + count : "");
+    accessible-checkable: true;
+    accessible-checked: selected;
+    accessible-action-default => { root.clicked(); }
+
+    height: 48px;
+    background: transparent;
+
+    Rectangle {
+        x: 0;
+        y: 4px;
+        width: parent.width;
+        height: 40px;
+        border-radius: 4px;
+        border-width: focus.has-focus ? 2px : 0px;
+        border-color: Theme.focus-ring;
+        background: selected ? Theme.primary-container : touch.pressed ? Theme.surface-container-highest : touch.has-hover ? Theme.surface-container-high : transparent;
+        animate background { duration: Theme.motion-fast; easing: ease-out; }
+    }
+    if root.selected: Rectangle { x: 0; y: 16px; width: 3px; height: 16px; border-radius: 2px; background: Theme.primary; }
+
+    HorizontalLayout {
+        padding-left: 13px;
+        padding-right: 12px;
+        spacing: 11px;
+        MaterialIcon {
+            name: root.icon;
+            width: 20px;
+            size: 18px;
+            icon-color: root.selected ? Theme.primary : root.icon == "delete" ? Theme.error : Theme.on-surface-variant;
+        }
+        Text {
+            text: root.label;
+            color: Theme.on-surface;
+            font-family: Theme.body-font;
+            font-size: 13px;
+            font-weight: root.selected ? 500 : 400;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        if root.count > 0: Text {
+            text: root.count;
+            color: root.selected ? Theme.primary : Theme.on-surface-variant;
+            font-family: Theme.body-font;
+            font-size: 11px;
+            font-weight: 500;
+            vertical-alignment: center;
+        }
+    }
+
+    focus := FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) { root.clicked(); return accept; }
+            return reject;
+        }
+        touch := TouchArea { mouse-cursor: pointer; clicked => { focus.focus(); root.clicked(); } }
+    }
+}

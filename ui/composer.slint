@@ -1,0 +1,118 @@
+import { Theme } from "theme.slint";
+import {
+    LabeledTextField, MButton, MaterialIcon, MIconButton
+} from "components.slint";
+
+export component ComposerOverlay inherits FocusScope {
+    in property <bool> compact-layout: false;
+    in property <bool> short-window: false;
+    in-out property <bool> composer-open: false;
+    in-out property <string> compose-to;
+    in-out property <string> compose-subject;
+    in-out property <string> compose-body;
+    in-out property <string> composer-error;
+    callback send-message(string, string, string) -> bool;
+
+    z: 30;
+    init => { self.focus(); }
+    forward-focus: recipient-field;
+    key-pressed(event) => {
+        if (event.text == Key.Escape) { root.composer-open = false; return accept; }
+        return reject;
+    }
+
+    Rectangle {
+        background: Theme.scrim;
+        accessible-role: form;
+        accessible-label: "Compose message";
+        TouchArea { }
+
+        Rectangle {
+            x: root.compact-layout ? 0px : parent.width - self.width - 18px;
+            y: root.compact-layout ? 0px : parent.height - self.height - 18px;
+            width: root.compact-layout ? parent.width : 560px;
+            height: root.compact-layout ? parent.height : (root.short-window ? parent.height - 24px : 480px);
+            border-radius: root.compact-layout ? 0px : 12px;
+            border-width: root.compact-layout ? 0px : 1px;
+            border-color: Theme.outline;
+            background: Theme.surface;
+
+            VerticalLayout {
+                padding: root.compact-layout ? 14px : 20px;
+                spacing: 9px;
+                HorizontalLayout {
+                    height: 44px;
+                    MIconButton { icon: "close"; label: "Close composer and keep draft"; clicked => { root.composer-open = false; } }
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 1px;
+                        horizontal-stretch: 1;
+                        Text { text: "New message"; color: Theme.on-surface; font-family: Theme.body-font; font-size: 18px; font-weight: 500; }
+                        Text { text: root.compose-body == "" && root.compose-subject == "" ? "Draft not yet saved" : "Draft saved locally"; color: Theme.on-surface-variant; font-family: Theme.body-font; font-size: 10px; }
+                    }
+                    MIconButton { icon: "more_vert"; label: "More compose options"; enabled: false; }
+                }
+
+                recipient-field := LabeledTextField {
+                    label: "Recipients";
+                    value <=> root.compose-to;
+                    placeholder: "name@example.com";
+                    helper: "Separate multiple addresses with commas";
+                    error: root.composer-error != "" && root.compose-to == "" ? "Add at least one recipient" : "";
+                }
+                LabeledTextField {
+                    label: "Subject";
+                    value <=> root.compose-subject;
+                    placeholder: "What is this message about?";
+                    error: root.composer-error != "" && root.compose-subject == "" ? "Add a subject before sending" : "";
+                }
+                LabeledTextField {
+                    label: "Message";
+                    value <=> root.compose-body;
+                    placeholder: "Write your message";
+                    multiline: true;
+                    vertical-stretch: 1;
+                }
+
+                if root.composer-error != "": Rectangle {
+                    height: 42px;
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: Theme.error;
+                    background: Theme.error-container;
+                    accessible-role: region;
+                    accessible-live-region: assertive;
+                    accessible-label: root.composer-error;
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        spacing: 7px;
+                        MaterialIcon { name: "error"; width: 18px; size: 16px; icon-color: Theme.error; }
+                        Text { text: root.composer-error; color: Theme.on-error-container; font-family: Theme.body-font; font-size: 10px; vertical-alignment: center; horizontal-stretch: 1; }
+                    }
+                }
+
+                HorizontalLayout {
+                    height: 50px;
+                    spacing: 6px;
+                    MIconButton { icon: "attach_file"; label: "Attachments are not available in local preview"; enabled: false; }
+                    Text { text: "Plain text"; color: Theme.on-surface-variant; font-family: Theme.body-font; font-size: 10px; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
+                    MButton {
+                        label: "Send message";
+                        icon: "send";
+                        variant: "filled";
+                        clicked => {
+                            if (root.send-message(root.compose-to, root.compose-subject, root.compose-body)) {
+                                root.compose-to = "";
+                                root.compose-subject = "";
+                                root.compose-body = "";
+                                root.composer-error = "";
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
