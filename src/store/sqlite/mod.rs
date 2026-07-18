@@ -1,5 +1,6 @@
 mod actor;
 mod domain;
+mod journal;
 mod migrations;
 mod mutation;
 mod query;

@@ -4,6 +4,9 @@ use super::domain::{
     DbFailure, MessageId, MessageMutation, MessageState, MutationOutcome, TRASH_UNDO_TTL_MS,
     UndoReceipt, UndoToken,
 };
+use super::journal::{
+    FlagDimension, finish_placement, merge_flag, merge_terminal_delete, prepare_placement,
+};
 use super::stats::{apply_transition, load_message_snapshot};
 
 const MIN_TIMESTAMP_MS: i64 = -62_135_596_800_000;
@@ -16,10 +19,11 @@ pub(super) fn mutate_message(
     mutation: MessageMutation,
     now_ms: i64,
 ) -> Result<MutationOutcome, DbFailure> {
+    validate_timestamp(now_ms)?;
     match mutation {
-        MessageMutation::SetUnread { id, unread } => set_unread(connection, id, unread),
-        MessageMutation::SetStarred { id, starred } => set_starred(connection, id, starred),
-        MessageMutation::Archive { id } => archive(connection, id),
+        MessageMutation::SetUnread { id, unread } => set_unread(connection, id, unread, now_ms),
+        MessageMutation::SetStarred { id, starred } => set_starred(connection, id, starred, now_ms),
+        MessageMutation::Archive { id } => archive(connection, id, now_ms),
         MessageMutation::MoveToTrash { id } => move_to_trash(connection, id, now_ms),
         MessageMutation::DeletePermanently { id } => delete_permanently(connection, id, now_ms),
         MessageMutation::UndoTrash { token } => undo_trash(connection, token, now_ms),
@@ -30,8 +34,10 @@ fn set_unread(
     connection: &mut Connection,
     id: MessageId,
     unread: bool,
+    now_ms: i64,
 ) -> Result<MutationOutcome, DbFailure> {
     let transaction = immediate_transaction(connection)?;
+    let before_state = load_state(&transaction, id)?;
     let before = load_message_snapshot(&transaction, id)?;
     let changed = transaction
         .execute(
@@ -43,6 +49,17 @@ fn set_unread(
         .map_err(DbFailure::database)?
         != 0;
     let state = load_state(&transaction, id)?;
+    if changed {
+        merge_flag(
+            &transaction,
+            id,
+            FlagDimension::Unread,
+            before_state.unread,
+            state.unread,
+            state.revision,
+            now_ms,
+        )?;
+    }
     let after = if changed {
         load_message_snapshot(&transaction, id)?
     } else {
@@ -61,8 +78,10 @@ fn set_starred(
     connection: &mut Connection,
     id: MessageId,
     starred: bool,
+    now_ms: i64,
 ) -> Result<MutationOutcome, DbFailure> {
     let transaction = immediate_transaction(connection)?;
+    let before_state = load_state(&transaction, id)?;
     let before = load_message_snapshot(&transaction, id)?;
     let changed = transaction
         .execute(
@@ -74,6 +93,17 @@ fn set_starred(
         .map_err(DbFailure::database)?
         != 0;
     let state = load_state(&transaction, id)?;
+    if changed {
+        merge_flag(
+            &transaction,
+            id,
+            FlagDimension::Starred,
+            before_state.starred,
+            state.starred,
+            state.revision,
+            now_ms,
+        )?;
+    }
     let after = if changed {
         load_message_snapshot(&transaction, id)?
     } else {
@@ -88,7 +118,11 @@ fn set_starred(
     })
 }
 
-fn archive(connection: &mut Connection, id: MessageId) -> Result<MutationOutcome, DbFailure> {
+fn archive(
+    connection: &mut Connection,
+    id: MessageId,
+    now_ms: i64,
+) -> Result<MutationOutcome, DbFailure> {
     let transaction = immediate_transaction(connection)?;
     let state = load_state(&transaction, id)?;
     let before = load_message_snapshot(&transaction, id)?;
@@ -129,6 +163,8 @@ fn archive(connection: &mut Connection, id: MessageId) -> Result<MutationOutcome
         .map_err(DbFailure::database)?;
 
     if changed {
+        let next_revision = checked_next_revision(state.revision)?;
+        let placement = prepare_placement(&transaction, id, next_revision, now_ms, now_ms)?;
         transaction
             .execute(
                 "DELETE FROM message_folders
@@ -148,6 +184,7 @@ fn archive(connection: &mut Connection, id: MessageId) -> Result<MutationOutcome
             )
             .map_err(DbFailure::database)?;
         increment_revision(&transaction, id)?;
+        finish_placement(&transaction, placement, id)?;
     }
 
     let state = load_state(&transaction, id)?;
@@ -189,6 +226,8 @@ fn move_to_trash(
         )));
     }
     let trash_id = canonical_role_folder(&transaction, state.account_id, "trash")?;
+    let next_revision = checked_next_revision(state.revision)?;
+    let placement = prepare_placement(&transaction, id, next_revision, now_ms, expires_at_ms)?;
 
     clear_undo(&transaction)?;
     transaction
@@ -244,6 +283,7 @@ fn move_to_trash(
         )
         .map_err(DbFailure::database)?;
     increment_revision(&transaction, id)?;
+    finish_placement(&transaction, placement, id)?;
     let state = load_state(&transaction, id)?;
     let after = load_message_snapshot(&transaction, id)?;
     let stats_delta = apply_transition(&transaction, before, Some(after))?;
@@ -282,16 +322,15 @@ fn delete_permanently(
         )
         .map_err(DbFailure::database)?;
 
+    merge_terminal_delete(
+        &transaction,
+        id,
+        state.revision,
+        state.account_id,
+        &remote_key,
+        now_ms,
+    )?;
     queue_message_files(&transaction, id, now_ms)?;
-    transaction
-        .execute(
-            "INSERT INTO message_tombstones (account_id, remote_key, deleted_at_ms)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT (account_id, remote_key) DO UPDATE
-             SET deleted_at_ms = excluded.deleted_at_ms",
-            params![state.account_id, remote_key, now_ms],
-        )
-        .map_err(DbFailure::database)?;
     transaction
         .execute("DELETE FROM messages WHERE id = ?1", [id.get()])
         .map_err(DbFailure::database)?;
@@ -339,6 +378,14 @@ fn undo_trash(
         ));
     }
     let before = load_message_snapshot(&transaction, snapshot.message_id)?;
+    let next_revision = checked_next_revision(state.revision)?;
+    let placement = prepare_placement(
+        &transaction,
+        snapshot.message_id,
+        next_revision,
+        now_ms,
+        now_ms,
+    )?;
 
     let (snapshot_count, valid_count, trash_snapshot_count): (i64, i64, i64) = transaction
         .query_row(
@@ -385,6 +432,7 @@ fn undo_trash(
         ));
     }
     increment_revision(&transaction, snapshot.message_id)?;
+    finish_placement(&transaction, placement, snapshot.message_id)?;
     clear_undo(&transaction)?;
     let state = load_state(&transaction, snapshot.message_id)?;
     let after = load_message_snapshot(&transaction, snapshot.message_id)?;
@@ -478,6 +526,15 @@ fn increment_revision(transaction: &Transaction<'_>, id: MessageId) -> Result<()
     } else {
         Err(DbFailure::not_found("message no longer exists"))
     }
+}
+
+fn checked_next_revision(revision: u64) -> Result<u64, DbFailure> {
+    let revision = revision
+        .checked_add(1)
+        .ok_or_else(|| DbFailure::resource_limit("message revision overflow"))?;
+    i64::try_from(revision)
+        .map_err(|_| DbFailure::resource_limit("message revision exceeds SQLite bounds"))?;
+    Ok(revision)
 }
 
 fn clear_undo(transaction: &Transaction<'_>) -> Result<(), DbFailure> {
@@ -680,6 +737,37 @@ mod tests {
                 .unwrap();
         }
         super::super::stats::rebuild_account(connection, 1).unwrap();
+    }
+
+    fn insert_imap_location(connection: &Connection, message_id: i64, folder_id: i64, uid: i64) {
+        connection
+            .execute(
+                "INSERT INTO sync_state
+                 (folder_id, uid_validity, mailbox_object_id)
+                 VALUES (?1, 7, ?2)
+                 ON CONFLICT (folder_id) DO UPDATE
+                 SET uid_validity = excluded.uid_validity,
+                     mailbox_object_id = excluded.mailbox_object_id",
+                params![folder_id, format!("mailbox-{folder_id}")],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO imap_message_locations
+                 (message_id, folder_id, account_id, uid_validity, uid, modseq,
+                  email_id, remote_seen, remote_flagged)
+                 VALUES (?1, ?2, 1, 7, ?3, 11, ?4, 0, 0)",
+                params![message_id, folder_id, uid, format!("email-{message_id}")],
+            )
+            .unwrap();
+    }
+
+    fn intent_count(connection: &Connection) -> i64 {
+        connection
+            .query_row("SELECT count(*) FROM remote_change_intents", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
     }
 
     fn roles(connection: &Connection, id: i64) -> Vec<String> {
@@ -1244,5 +1332,527 @@ mod tests {
             })
             .unwrap();
         assert_eq!(revision, 0);
+    }
+
+    #[test]
+    fn journal_compacts_undispatched_flag_reversals() {
+        let mut connection = database();
+        insert_message(&connection, 1, &[1]);
+        insert_imap_location(&connection, 1, 1, 41);
+        let id = MessageId::new(1).unwrap();
+
+        mutate(&mut connection, MessageMutation::set_unread(id, false)).unwrap();
+        let first: (i64, i64, Option<bool>, Option<bool>, String) = connection
+            .query_row(
+                "SELECT intent_version, local_revision, unread_base, unread_desired, state
+                 FROM remote_change_intents",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(first, (1, 1, Some(true), Some(false), "ready".into()));
+
+        mutate(&mut connection, MessageMutation::set_starred(id, true)).unwrap();
+        mutate(&mut connection, MessageMutation::set_starred(id, true)).unwrap();
+        let second: (i64, Option<bool>, Option<bool>) = connection
+            .query_row(
+                "SELECT intent_version, starred_base, starred_desired
+                 FROM remote_change_intents",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(second, (2, Some(false), Some(true)));
+
+        mutate(&mut connection, MessageMutation::set_unread(id, true)).unwrap();
+        let third: (i64, Option<bool>, Option<bool>) = connection
+            .query_row(
+                "SELECT intent_version, unread_base, unread_desired
+                 FROM remote_change_intents",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(third, (3, None, None));
+
+        mutate(&mut connection, MessageMutation::set_starred(id, false)).unwrap();
+        assert_eq!(intent_count(&connection), 0);
+        let child_count: i64 = connection
+            .query_row(
+                "SELECT child_count FROM remote_journal_usage WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(child_count, 0);
+    }
+
+    #[test]
+    fn journal_drops_missing_locator_reconcile_after_flag_reversal() {
+        let mut connection = database();
+        insert_message(&connection, 1, &[1]);
+        let id = MessageId::new(1).unwrap();
+
+        mutate(&mut connection, MessageMutation::set_unread(id, false)).unwrap();
+        let initial: (bool, String, Option<String>) = connection
+            .query_row(
+                "SELECT reconcile_requested, state, error_code FROM remote_change_intents",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            initial,
+            (
+                true,
+                "reconcile".into(),
+                Some("missing_imap_locator".into())
+            )
+        );
+
+        mutate(&mut connection, MessageMutation::set_unread(id, true)).unwrap();
+        assert_eq!(intent_count(&connection), 0);
+    }
+
+    #[test]
+    fn journal_preserves_independent_reconciliation_after_flag_reversal() {
+        let mut connection = database();
+        insert_message(&connection, 1, &[1]);
+        connection
+            .execute(
+                "INSERT INTO remote_change_intents
+                 (account_id, message_id, target_key, local_revision,
+                  reconcile_requested, state, not_before_ms, created_at_ms, updated_at_ms)
+                 VALUES (1, 1, 'message-1', 0, 1, 'reconcile', ?1, ?1, ?1)",
+                [NOW_MS],
+            )
+            .unwrap();
+        let id = MessageId::new(1).unwrap();
+
+        mutate(&mut connection, MessageMutation::set_unread(id, false)).unwrap();
+        mutate(&mut connection, MessageMutation::set_unread(id, true)).unwrap();
+
+        let intent: (i64, i64, Option<bool>, bool, Option<String>) = connection
+            .query_row(
+                "SELECT intent_version, local_revision, unread_base,
+                        reconcile_requested, error_code
+                 FROM remote_change_intents",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(intent, (3, 2, None, true, None));
+    }
+
+    #[test]
+    fn journal_keeps_in_flight_flag_reversal_as_compensation() {
+        let mut connection = database();
+        insert_message(&connection, 1, &[1]);
+        insert_imap_location(&connection, 1, 1, 42);
+        let id = MessageId::new(1).unwrap();
+        mutate(&mut connection, MessageMutation::set_unread(id, false)).unwrap();
+        connection
+            .execute(
+                "UPDATE remote_change_intents
+                 SET dispatched_mask = 1,
+                     state = 'in_flight',
+                     leased_version = 1,
+                     claim_epoch = 3,
+                     lease_expires_at_ms = ?1,
+                     attempt_count = 1,
+                     error_class = 'network',
+                     error_code = 'timeout',
+                     error_detail = 'retry after reconnect'",
+                [NOW_MS + 10_000],
+            )
+            .unwrap();
+
+        mutate_at(
+            &mut connection,
+            MessageMutation::set_unread(id, true),
+            NOW_MS + 1,
+        )
+        .unwrap();
+
+        let intent: (i64, i64, bool, bool, String, i64, i64, i64) = connection
+            .query_row(
+                "SELECT intent_version, local_revision, unread_base, unread_desired,
+                        state, leased_version, claim_epoch, lease_expires_at_ms
+                 FROM remote_change_intents",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            intent,
+            (2, 2, true, true, "in_flight".into(), 1, 3, NOW_MS + 10_000)
+        );
+        let preserved: (i64, i64, Option<String>, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT attempt_count, dispatched_mask, error_class, error_code, error_detail
+                 FROM remote_change_intents",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            (
+                1,
+                1,
+                Some("network".into()),
+                Some("timeout".into()),
+                Some("retry after reconnect".into()),
+            )
+        );
+    }
+
+    #[test]
+    fn journal_snapshots_placement_and_frozen_imap_sources() {
+        let mut connection = database();
+        insert_message(&connection, 1, &[1, 4]);
+        insert_imap_location(&connection, 1, 1, 43);
+        insert_imap_location(&connection, 1, 4, 44);
+        let id = MessageId::new(1).unwrap();
+
+        let MutationOutcome::MovedToTrash { undo, .. } =
+            mutate(&mut connection, MessageMutation::move_to_trash(id)).unwrap()
+        else {
+            panic!("expected Trash result");
+        };
+        let folders = connection
+            .prepare(
+                "SELECT side || ':' || folder_key
+                 FROM remote_change_intent_folders
+                 ORDER BY side, folder_key",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(folders, ["base:inbox", "base:label", "desired:trash"]);
+        let (source_count, live_locator_count, not_before_ms): (i64, i64, i64) = connection
+            .query_row(
+                "SELECT
+                     (SELECT count(*) FROM remote_change_intent_imap_sources),
+                     (SELECT count(*) FROM imap_message_locations),
+                     not_before_ms
+                 FROM remote_change_intents",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(source_count, 2);
+        assert_eq!(live_locator_count, 0);
+        assert_eq!(not_before_ms, undo.expires_at_ms);
+
+        mutate_at(
+            &mut connection,
+            MessageMutation::undo_trash(undo.token),
+            NOW_MS + 1,
+        )
+        .unwrap();
+        assert_eq!(intent_count(&connection), 0);
+        assert_eq!(roles(&connection, 1), ["inbox", "label"]);
+    }
+
+    #[test]
+    fn terminal_delete_retains_locator_identity_after_message_cascade() {
+        let mut connection = database();
+        insert_message(&connection, 1, &[1, 4]);
+        insert_imap_location(&connection, 1, 1, 45);
+        insert_imap_location(&connection, 1, 4, 46);
+        let id = MessageId::new(1).unwrap();
+        mutate(&mut connection, MessageMutation::move_to_trash(id)).unwrap();
+        mutate_at(
+            &mut connection,
+            MessageMutation::delete_permanently(id),
+            NOW_MS + 1,
+        )
+        .unwrap();
+
+        let terminal: (Option<i64>, bool, bool, i64, i64) = connection
+            .query_row(
+                "SELECT message_id, delete_requested, placement_active,
+                        (SELECT count(*) FROM remote_change_intent_imap_sources),
+                        (SELECT count(*) FROM message_tombstone_imap_locations)
+                 FROM remote_change_intents",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(terminal, (None, true, false, 2, 2));
+        let target_key: String = connection
+            .query_row("SELECT target_key FROM remote_change_intents", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(target_key, "message-1");
+    }
+
+    #[test]
+    fn journal_resource_limit_rolls_back_archive_and_statistics() {
+        let mut connection = database();
+        insert_message(&connection, 1, &[1, 4]);
+        connection
+            .execute(
+                "UPDATE remote_journal_usage SET child_count = 65536 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        let before_stats = stored_stats(&connection);
+
+        let error = mutate(
+            &mut connection,
+            MessageMutation::archive(MessageId::new(1).unwrap()),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind, FailureKind::ResourceLimit);
+        assert_eq!(roles(&connection, 1), ["inbox", "label"]);
+        assert_eq!(intent_count(&connection), 0);
+        assert_eq!(stored_stats(&connection), before_stats);
+        let revision: i64 = connection
+            .query_row("SELECT revision FROM messages WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(revision, 0);
+    }
+
+    #[test]
+    fn undo_collapses_placement_without_temporary_child_capacity() {
+        let mut connection = database();
+        insert_message(&connection, 1, &[1, 4]);
+        let id = MessageId::new(1).unwrap();
+        let MutationOutcome::MovedToTrash { undo, .. } =
+            mutate(&mut connection, MessageMutation::move_to_trash(id)).unwrap()
+        else {
+            panic!("expected Trash result");
+        };
+        connection
+            .execute(
+                "UPDATE remote_journal_usage SET child_count = 65536 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+
+        mutate_at(
+            &mut connection,
+            MessageMutation::undo_trash(undo.token),
+            NOW_MS + 1,
+        )
+        .unwrap();
+
+        assert_eq!(roles(&connection, 1), ["inbox", "label"]);
+        assert_eq!(intent_count(&connection), 0);
+        let child_count: i64 = connection
+            .query_row(
+                "SELECT child_count FROM remote_journal_usage WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(child_count, 65_533);
+    }
+
+    #[test]
+    fn oversized_provider_payload_rolls_back_the_complete_flag_merge() {
+        let mut connection = database();
+        insert_message(&connection, 1, &[1]);
+        connection
+            .execute(
+                "INSERT INTO remote_change_intents
+                 (account_id, message_id, target_key, local_revision,
+                  reconcile_requested, state, not_before_ms, created_at_ms, updated_at_ms)
+                 VALUES (1, 1, 'message-1', 0, 1, 'reconcile', ?1, ?1, ?1)",
+                [NOW_MS],
+            )
+            .unwrap();
+        let intent_id = connection.last_insert_rowid();
+        let long_mailbox = "m".repeat(512);
+        let long_email_id = "e".repeat(512);
+        for index in 0..256_i64 {
+            let folder_key = format!("{index:03}-{}", "f".repeat(508));
+            connection
+                .execute(
+                    "INSERT INTO remote_change_intent_imap_sources
+                     (intent_id, folder_key, mailbox_object_id, uid_validity, uid,
+                      modseq, email_id, remote_seen, remote_flagged)
+                     VALUES (?1, ?2, ?3, 7, ?4, 11, ?5, 0, 0)",
+                    params![
+                        intent_id,
+                        folder_key,
+                        long_mailbox,
+                        index + 1,
+                        long_email_id
+                    ],
+                )
+                .unwrap();
+        }
+        let before_stats = stored_stats(&connection);
+
+        let error = mutate(
+            &mut connection,
+            MessageMutation::set_unread(MessageId::new(1).unwrap(), false),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind, FailureKind::ResourceLimit);
+        let message: (bool, i64) = connection
+            .query_row(
+                "SELECT unread, revision FROM messages WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(message, (true, 0));
+        let intent: (i64, i64, Option<bool>, Option<bool>) = connection
+            .query_row(
+                "SELECT intent_version, local_revision, unread_base, unread_desired
+                 FROM remote_change_intents WHERE id = ?1",
+                [intent_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(intent, (1, 0, None, None));
+        let usage: (i64, i64) = connection
+            .query_row(
+                "SELECT child_count,
+                        (SELECT count(*) FROM remote_change_intent_imap_sources)
+                 FROM remote_journal_usage WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(usage, (256, 256));
+        assert_eq!(stored_stats(&connection), before_stats);
+    }
+
+    #[test]
+    fn stats_failure_rolls_back_the_message_and_journal() {
+        let mut connection = database();
+        insert_message(&connection, 1, &[1]);
+        insert_imap_location(&connection, 1, 1, 47);
+        connection
+            .execute(
+                "UPDATE account_mailbox_stats
+                 SET starred_total = 9223372036854775807
+                 WHERE account_id = 1",
+                [],
+            )
+            .unwrap();
+
+        let error = mutate(
+            &mut connection,
+            MessageMutation::set_starred(MessageId::new(1).unwrap(), true),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind, FailureKind::Conflict);
+        let (starred, revision): (bool, i64) = connection
+            .query_row(
+                "SELECT starred, revision FROM messages WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(!starred);
+        assert_eq!(revision, 0);
+        assert_eq!(intent_count(&connection), 0);
+    }
+
+    #[test]
+    fn legacy_message_edit_stays_reconcile_pending() {
+        let mut connection = database();
+        insert_message(&connection, 1, &[1]);
+        insert_imap_location(&connection, 1, 1, 48);
+        connection
+            .execute(
+                "UPDATE messages
+                 SET revision = 5, legacy_reconcile_revision = 5
+                 WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO remote_account_reconciliations
+                 (account_id, reason, requested_at_ms)
+                 VALUES (1, 'legacy_journal_bootstrap', 0)",
+                [],
+            )
+            .unwrap();
+
+        mutate(
+            &mut connection,
+            MessageMutation::set_starred(MessageId::new(1).unwrap(), true),
+        )
+        .unwrap();
+
+        let intent: (i64, bool, String, i64, i64) = connection
+            .query_row(
+                "SELECT local_revision, reconcile_requested, state,
+                        (SELECT legacy_reconcile_revision FROM messages WHERE id = 1),
+                        (SELECT count(*) FROM remote_account_reconciliations
+                         WHERE account_id = 1)
+                 FROM remote_change_intents",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(intent, (6, true, "reconcile".into(), 5, 1));
     }
 }
