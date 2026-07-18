@@ -116,11 +116,11 @@ fn migrate_with(
 mod tests {
     use std::collections::BTreeSet;
 
-    use rusqlite::{params, Connection, ErrorCode};
+    use rusqlite::{Connection, ErrorCode, params};
 
     use super::{
-        enable_foreign_keys, migrate, migrate_with, Migration, MigrationError,
-        LATEST_SCHEMA_VERSION,
+        LATEST_SCHEMA_VERSION, Migration, MigrationError, enable_foreign_keys, migrate,
+        migrate_with,
     };
 
     const TABLES: &[&str] = &[
