@@ -2,6 +2,7 @@ use std::{any::Any, fmt, fs, path::PathBuf, sync::Arc, thread, time::Duration};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select_biased};
 use rusqlite::{Connection, InterruptHandle, OpenFlags, limits::Limit};
+use tokio::sync::mpsc;
 
 use super::{
     domain::{DbFailure, DbReply, Generation, MessageId, PageSpec, RequestId, Tagged},
@@ -82,15 +83,12 @@ impl From<TrySendError<Request>> for SubmitError {
 }
 
 pub(crate) struct DatabaseReplies {
-    replies: Receiver<DbReply>,
+    replies: mpsc::Receiver<DbReply>,
 }
 
 impl DatabaseReplies {
-    pub(crate) fn recv_timeout(
-        &self,
-        timeout: Duration,
-    ) -> Result<DbReply, crossbeam_channel::RecvTimeoutError> {
-        self.replies.recv_timeout(timeout)
+    pub(crate) async fn recv(&mut self) -> Option<DbReply> {
+        self.replies.recv().await
     }
 }
 
@@ -131,7 +129,7 @@ fn spawn_target(
     StartError,
 > {
     let (request_tx, request_rx) = bounded(request_capacity);
-    let (reply_tx, reply_rx) = bounded(reply_capacity);
+    let (reply_tx, reply_rx) = mpsc::channel(reply_capacity);
     let (shutdown_tx, shutdown_rx) = bounded(1);
     let (startup_tx, startup_rx) = bounded(1);
     let worker = thread::Builder::new()
@@ -175,7 +173,7 @@ struct Started {
 fn run_actor(
     target: Target,
     requests: Receiver<Request>,
-    replies: Sender<DbReply>,
+    replies: mpsc::Sender<DbReply>,
     shutdown: Receiver<()>,
     startup: Sender<Result<Started, DbFailure>>,
 ) -> Result<(), DbFailure> {
@@ -242,11 +240,27 @@ fn run_actor(
             }
         };
 
-        select_biased! {
-            recv(shutdown) -> _ => return Ok(()),
-            send(replies, reply) -> sent => if sent.is_err() {
-                return Ok(());
-            },
+        if !send_reply(&replies, &shutdown, reply) {
+            return Ok(());
+        }
+    }
+}
+
+fn send_reply(
+    replies: &mpsc::Sender<DbReply>,
+    shutdown: &Receiver<()>,
+    mut reply: DbReply,
+) -> bool {
+    loop {
+        match replies.try_send(reply) {
+            Ok(()) => return true,
+            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            Err(mpsc::error::TrySendError::Full(pending)) => reply = pending,
+        }
+
+        match shutdown.recv_timeout(Duration::from_millis(1)) {
+            Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return false,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
         }
     }
 }
@@ -492,6 +506,19 @@ mod tests {
         PageSpec::new(AccountScope::All, FolderScope::Inbox, None, None, 50).unwrap()
     }
 
+    fn receive_reply(replies: &mut DatabaseReplies) -> DbReply {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(1), replies.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            })
+    }
+
     fn temporary_database_path() -> PathBuf {
         static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
         std::env::temp_dir().join(format!(
@@ -510,7 +537,7 @@ mod tests {
     #[test]
     fn actor_owns_connection_and_returns_bounded_page() {
         let caller_thread = thread::current().id();
-        let (client, replies, runtime, info) =
+        let (client, mut replies, runtime, info) =
             spawn_target(Target::Memory, REQUEST_CAPACITY, REPLY_CAPACITY).unwrap();
         assert_ne!(info.actor_thread, caller_thread);
         assert_eq!(info.schema_version, LATEST_SCHEMA_VERSION);
@@ -519,7 +546,7 @@ mod tests {
         client
             .try_query_mailbox(RequestId::new(1).unwrap(), Generation::new(3), empty_spec())
             .unwrap();
-        let reply = replies.recv_timeout(Duration::from_secs(1)).unwrap();
+        let reply = receive_reply(&mut replies);
         let DbReply::Mailbox(reply) = reply else {
             panic!("expected mailbox reply");
         };
@@ -680,13 +707,13 @@ mod tests {
             .unwrap();
         drop(connection);
 
-        let (client, replies, runtime, info) =
+        let (client, mut replies, runtime, info) =
             spawn_target(Target::File(path.clone()), 1, 1).unwrap();
         assert!(info.wal_enabled);
         client
             .try_query_mailbox(RequestId::new(1).unwrap(), Generation::new(0), empty_spec())
             .unwrap();
-        let DbReply::Mailbox(reply) = replies.recv_timeout(Duration::from_secs(1)).unwrap() else {
+        let DbReply::Mailbox(reply) = receive_reply(&mut replies) else {
             panic!("expected mailbox reply");
         };
         assert_eq!(reply.result.unwrap().rows.len(), 1);
