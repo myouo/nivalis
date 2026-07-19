@@ -196,6 +196,21 @@ pub(crate) struct AccountUnreadDto {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AccountSummaryDto {
+    pub(crate) id: i64,
+    pub(crate) name: Box<str>,
+    pub(crate) address: Box<str>,
+    pub(crate) state: Box<str>,
+    pub(crate) accent_rgb: u32,
+    pub(crate) inbox_unread: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AccountDirectory {
+    pub(crate) rows: Box<[AccountSummaryDto]>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct MailboxStatsDto {
     pub(crate) selected_total: Option<u64>,
     pub(crate) inbox_unread: u64,
@@ -348,6 +363,7 @@ pub(crate) struct Tagged<T> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DbReply {
+    Accounts(Tagged<AccountDirectory>),
     Mailbox(Tagged<MailboxPage>),
     Message(Tagged<Option<MessageDetail>>),
     Mutation(Tagged<MutationOutcome>),

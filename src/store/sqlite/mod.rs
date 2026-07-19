@@ -15,6 +15,8 @@ pub(crate) use actor::{
 pub(crate) use actor::{
     RemoteReportExecutionFailure, RemoteReportReply, RemoteReportSubmitFailure,
 };
+#[allow(unused_imports)]
+pub(crate) use domain::{AccountDirectory, AccountSummaryDto};
 pub(crate) use domain::{AccountScope, FolderScope};
 pub(crate) use domain::{
     AccountStatsDelta, DbReply, Generation, MailboxPage, MessageDetail, MessageId, MessageMutation,

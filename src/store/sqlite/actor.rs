@@ -18,7 +18,7 @@ use super::{
     },
     migrations::migrate,
     mutation::mutate_message,
-    query::{open_message, query_mailbox},
+    query::{open_message, query_account_directory, query_mailbox},
     remote::{
         RemoteClaimOutcome, RemoteReportOutcome, RemoteReportSubmission, ReportTransition,
         claim_remote, report_remote,
@@ -31,6 +31,10 @@ const SQLITE_CACHE_KIB: i64 = 1024;
 const SQLITE_MAX_VALUE_BYTES: i32 = 2 * 1024 * 1024;
 
 enum Request {
+    QueryAccountDirectory {
+        request_id: RequestId,
+        generation: Generation,
+    },
     QueryMailbox {
         request_id: RequestId,
         generation: Generation,
@@ -67,6 +71,17 @@ pub(crate) struct DatabaseClient {
 }
 
 impl DatabaseClient {
+    pub(crate) fn try_query_account_directory(
+        &self,
+        request_id: RequestId,
+        generation: Generation,
+    ) -> Result<(), SubmitError> {
+        self.try_submit(Request::QueryAccountDirectory {
+            request_id,
+            generation,
+        })
+    }
+
     pub(crate) fn try_query_mailbox(
         &self,
         request_id: RequestId,
@@ -421,6 +436,14 @@ fn run_actor(
             },
         };
         let reply = match request {
+            Request::QueryAccountDirectory {
+                request_id,
+                generation,
+            } => DbReply::Accounts(Tagged {
+                request_id,
+                generation,
+                result: query_account_directory(&connection),
+            }),
             Request::QueryMailbox {
                 request_id,
                 generation,
@@ -971,6 +994,24 @@ mod tests {
         intent_id
     }
 
+    fn seed_account_directory(path: &std::path::Path) {
+        remove_database_files(path);
+        let mut connection = Connection::open(path).unwrap();
+        configure(&mut connection).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO accounts
+                     (id, provider, remote_key, name, address, sort_order, state, accent_rgb)
+                 VALUES
+                     (2, 'imap', 'two', 'Two', 'two@example.test', 1, 'active', 2),
+                     (1, 'jmap', 'one', 'One', 'one@example.test', 0, 'offline', 1);
+                 UPDATE account_mailbox_stats
+                 SET inbox_total = CASE account_id WHEN 1 THEN 3 ELSE 5 END,
+                     inbox_unread = CASE account_id WHEN 1 THEN 3 ELSE 5 END;",
+            )
+            .unwrap();
+    }
+
     #[test]
     fn actor_owns_connection_and_returns_bounded_page() {
         let caller_thread = thread::current().id();
@@ -989,6 +1030,34 @@ mod tests {
         };
         assert_eq!(reply.result.unwrap().rows.len(), 0);
         runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn account_directory_round_trip_preserves_identity_and_order() {
+        let path = temporary_database_path();
+        seed_account_directory(&path);
+        let (client, mut replies, runtime, _info) =
+            spawn_target(Target::File(path.clone()), REQUEST_CAPACITY, REPLY_CAPACITY).unwrap();
+        let request_id = RequestId::new(7).unwrap();
+        let generation = Generation::new(4);
+
+        client
+            .try_query_account_directory(request_id, generation)
+            .unwrap();
+        let DbReply::Accounts(reply) = receive_reply(&mut replies) else {
+            panic!("expected account directory reply");
+        };
+
+        assert_eq!(reply.request_id, request_id);
+        assert_eq!(reply.generation, generation);
+        let directory = reply.result.unwrap();
+        assert_eq!(directory.rows.len(), 2);
+        assert_eq!(directory.rows[0].id, 1);
+        assert_eq!(directory.rows[0].inbox_unread, 3);
+        assert_eq!(directory.rows[1].id, 2);
+        assert_eq!(directory.rows[1].inbox_unread, 5);
+        runtime.shutdown().unwrap();
+        remove_database_files(&path);
     }
 
     #[test]
@@ -1361,6 +1430,10 @@ mod tests {
 
         assert_eq!(
             client.try_query_mailbox(RequestId::new(2).unwrap(), Generation::new(0), empty_spec(),),
+            Err(SubmitError::Busy)
+        );
+        assert_eq!(
+            client.try_query_account_directory(RequestId::new(3).unwrap(), Generation::new(0),),
             Err(SubmitError::Busy)
         );
         assert!(matches!(client.try_claim_remote(1), Err(SubmitError::Busy)));

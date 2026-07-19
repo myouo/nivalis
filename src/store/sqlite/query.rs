@@ -6,10 +6,18 @@ use rusqlite::{
 };
 
 use super::domain::{
-    DbFailure, FolderScope, MailSummaryDto, MailboxPage, MessageDetail, MessageId, PageCursor,
-    PageSpec,
+    AccountDirectory, AccountSummaryDto, DbFailure, FolderScope, MAX_ACCOUNT_STATS, MailSummaryDto,
+    MailboxPage, MessageDetail, MessageId, PageCursor, PageSpec,
 };
 use super::stats::query_mailbox_stats;
+
+const ACCOUNT_DIRECTORY_SQL: &str = "
+    SELECT a.id, a.name, a.address, a.state, a.accent_rgb,
+           s.account_id, s.inbox_unread, s.dirty
+      FROM accounts AS a
+      LEFT JOIN account_mailbox_stats AS s ON s.account_id = a.id
+     ORDER BY a.sort_order, a.id
+     LIMIT ?1";
 
 const MAILBOX_SELECT: &str = "
     SELECT m.id, m.account_id, m.sender_name, m.sender_address, m.subject, m.preview,
@@ -24,6 +32,72 @@ const OPEN_MESSAGE_SQL: &str = "
       FROM messages AS m
       LEFT JOIN message_content AS c ON c.message_id = m.id
      WHERE m.id = ?1";
+
+pub(super) fn query_account_directory(
+    connection: &Connection,
+) -> Result<AccountDirectory, DbFailure> {
+    let row_limit = i64::try_from(MAX_ACCOUNT_STATS + 1)
+        .map_err(|_| DbFailure::resource_limit("account directory limit is invalid"))?;
+    let mut statement = connection
+        .prepare(ACCOUNT_DIRECTORY_SQL)
+        .map_err(DbFailure::database)?;
+    let mapped = statement
+        .query_map([row_limit], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, Option<bool>>(7)?,
+            ))
+        })
+        .map_err(DbFailure::database)?;
+
+    let mut rows = Vec::with_capacity(MAX_ACCOUNT_STATS + 1);
+    for row in mapped {
+        let (id, name, address, state, accent_rgb, stats_account_id, inbox_unread, dirty) =
+            row.map_err(DbFailure::database)?;
+        let (Some(stats_account_id), Some(inbox_unread), Some(dirty)) =
+            (stats_account_id, inbox_unread, dirty)
+        else {
+            return Err(DbFailure::conflict(
+                "mail account is missing its statistics row",
+            ));
+        };
+        if stats_account_id != id {
+            return Err(DbFailure::conflict(
+                "mail account statistics identity does not match",
+            ));
+        }
+        if dirty {
+            return Err(DbFailure::conflict(
+                "mailbox statistics are stale and must be rebuilt",
+            ));
+        }
+        rows.push(AccountSummaryDto {
+            id,
+            name: name.into_boxed_str(),
+            address: address.into_boxed_str(),
+            state: state.into_boxed_str(),
+            accent_rgb: u32::try_from(accent_rgb)
+                .map_err(|_| DbFailure::resource_limit("invalid account accent color"))?,
+            inbox_unread: u64::try_from(inbox_unread)
+                .map_err(|_| DbFailure::resource_limit("invalid negative inbox statistic"))?,
+        });
+    }
+    if rows.len() > MAX_ACCOUNT_STATS {
+        return Err(DbFailure::resource_limit(format!(
+            "mail account count exceeds the {MAX_ACCOUNT_STATS}-account limit"
+        )));
+    }
+
+    Ok(AccountDirectory {
+        rows: rows.into_boxed_slice(),
+    })
+}
 
 pub(super) fn query_mailbox(
     connection: &Connection,
@@ -230,13 +304,18 @@ mod tests {
 
     use super::*;
     use crate::store::sqlite::{
-        domain::{AccountScope, FolderScope, PageSpec},
+        domain::{AccountScope, FailureKind, FolderScope, PageSpec},
         migrations::migrate,
     };
 
-    fn seeded_connection(count: i64) -> Connection {
+    fn empty_connection() -> Connection {
         let mut connection = Connection::open_in_memory().unwrap();
         migrate(&mut connection).unwrap();
+        connection
+    }
+
+    fn seeded_connection(count: i64) -> Connection {
+        let connection = empty_connection();
         connection
             .execute(
                 "INSERT INTO accounts
@@ -277,6 +356,136 @@ mod tests {
         }
         super::super::stats::rebuild_account(&connection, 1).unwrap();
         connection
+    }
+
+    #[test]
+    fn account_directory_is_stably_sorted_and_uses_only_persistent_stats() {
+        let connection = empty_connection();
+        connection
+            .execute_batch(
+                "INSERT INTO accounts
+                     (id, provider, remote_key, name, address, sort_order, state, accent_rgb)
+                 VALUES
+                     (2, 'imap', 'two', 'Two', 'two@example.test', 10, 'active', 258),
+                     (3, 'jmap', 'three', 'Three', 'three@example.test', 0, 'offline', 515),
+                     (1, 'imap', 'one', 'One', 'one@example.test', 10, 'auth_required', 1);
+                 UPDATE account_mailbox_stats
+                 SET inbox_total = CASE account_id
+                         WHEN 1 THEN 4 WHEN 2 THEN 6 ELSE 2 END,
+                     inbox_unread = CASE account_id
+                     WHEN 1 THEN 4 WHEN 2 THEN 6 ELSE 2 END;",
+            )
+            .unwrap();
+
+        let directory = query_account_directory(&connection).unwrap();
+
+        assert!(!ACCOUNT_DIRECTORY_SQL.contains("messages"));
+        assert!(!ACCOUNT_DIRECTORY_SQL.contains("folders"));
+        assert!(!ACCOUNT_DIRECTORY_SQL.contains("count("));
+        assert_eq!(
+            directory.rows.as_ref(),
+            [
+                AccountSummaryDto {
+                    id: 3,
+                    name: "Three".into(),
+                    address: "three@example.test".into(),
+                    state: "offline".into(),
+                    accent_rgb: 515,
+                    inbox_unread: 2,
+                },
+                AccountSummaryDto {
+                    id: 1,
+                    name: "One".into(),
+                    address: "one@example.test".into(),
+                    state: "auth_required".into(),
+                    accent_rgb: 1,
+                    inbox_unread: 4,
+                },
+                AccountSummaryDto {
+                    id: 2,
+                    name: "Two".into(),
+                    address: "two@example.test".into(),
+                    state: "active".into(),
+                    accent_rgb: 258,
+                    inbox_unread: 6,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn account_directory_rejects_dirty_or_missing_statistics() {
+        let connection = empty_connection();
+        connection
+            .execute(
+                "INSERT INTO accounts
+                     (id, provider, remote_key, name, address, state, accent_rgb)
+                 VALUES (1, 'imap', 'one', 'One', 'one@example.test', 'active', 0)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE account_mailbox_stats SET dirty = 1 WHERE account_id = 1",
+                [],
+            )
+            .unwrap();
+
+        let failure = query_account_directory(&connection).unwrap_err();
+        assert_eq!(failure.kind, FailureKind::Conflict);
+
+        connection
+            .execute("DELETE FROM account_mailbox_stats WHERE account_id = 1", [])
+            .unwrap();
+        let failure = query_account_directory(&connection).unwrap_err();
+        assert_eq!(failure.kind, FailureKind::Conflict);
+    }
+
+    #[test]
+    fn account_directory_detects_legacy_overflow_with_one_extra_row() {
+        let connection = empty_connection();
+        connection
+            .execute("DROP TRIGGER reject_account_limit_insert", [])
+            .unwrap();
+        for id in 1..=i64::try_from(MAX_ACCOUNT_STATS + 1).unwrap() {
+            connection
+                .execute(
+                    "INSERT INTO accounts
+                         (id, provider, remote_key, name, address, state, accent_rgb)
+                     VALUES (?1, 'imap', ?2, 'Account', 'user@example.test', 'active', 0)",
+                    params![id, format!("account-{id}")],
+                )
+                .unwrap();
+        }
+
+        let failure = query_account_directory(&connection).unwrap_err();
+
+        assert_eq!(failure.kind, FailureKind::ResourceLimit);
+        assert!(failure.message.contains("64-account limit"));
+    }
+
+    #[test]
+    fn account_directory_accepts_the_exact_account_limit() {
+        let connection = empty_connection();
+        for id in 1..=i64::try_from(MAX_ACCOUNT_STATS).unwrap() {
+            connection
+                .execute(
+                    "INSERT INTO accounts
+                         (id, provider, remote_key, name, address, state, accent_rgb)
+                     VALUES (?1, 'imap', ?2, 'Account', 'user@example.test', 'active', 0)",
+                    params![id, format!("account-{id}")],
+                )
+                .unwrap();
+        }
+
+        let directory = query_account_directory(&connection).unwrap();
+
+        assert_eq!(directory.rows.len(), MAX_ACCOUNT_STATS);
+        assert_eq!(directory.rows.first().map(|account| account.id), Some(1));
+        assert_eq!(
+            directory.rows.last().map(|account| account.id),
+            Some(i64::try_from(MAX_ACCOUNT_STATS).unwrap())
+        );
     }
 
     #[test]

@@ -11,8 +11,8 @@ pub(crate) use crate::store::sqlite::{
 };
 #[allow(unused_imports)]
 pub(crate) use message::{
-    MailboxLoadError, MailboxQuery, MessageLoadError, MessageQuery, MutationRequest,
-    MutationSubmitError,
+    AccountDirectoryLoadError, AccountDirectoryQuery, MailboxLoadError, MailboxQuery,
+    MessageLoadError, MessageQuery, MutationRequest, MutationSubmitError,
 };
 
 pub(crate) fn spawn(

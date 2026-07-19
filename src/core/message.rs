@@ -1,6 +1,6 @@
 use crate::store::sqlite::{
-    Generation, MailboxPage, MessageDetail, MessageId, MessageMutation, MutationOutcome, PageSpec,
-    RequestId, Tagged,
+    AccountDirectory, Generation, MailboxPage, MessageDetail, MessageId, MessageMutation,
+    MutationOutcome, PageSpec, RequestId, Tagged,
 };
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::mpsc;
@@ -23,6 +23,8 @@ pub(super) enum Command {
         operation_id: OperationId,
     },
     #[cfg_attr(not(test), allow(dead_code))]
+    QueryAccountDirectory(AccountDirectoryQuery),
+    #[cfg_attr(not(test), allow(dead_code))]
     QueryMailbox(MailboxQuery),
     #[cfg_attr(not(test), allow(dead_code))]
     OpenMessage(MessageQuery),
@@ -34,6 +36,12 @@ pub(super) enum Command {
 pub(crate) enum Event {
     SyncFinished {
         operation_id: OperationId,
+    },
+    AccountsLoaded(Tagged<AccountDirectory>),
+    AccountsLoadRejected {
+        request_id: RequestId,
+        generation: Generation,
+        reason: AccountDirectoryLoadError,
     },
     MailboxLoaded(Tagged<MailboxPage>),
     MailboxLoadRejected {
@@ -53,6 +61,35 @@ pub(crate) enum Event {
         generation: Generation,
         reason: MutationSubmitError,
     },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AccountDirectoryQuery {
+    pub(super) request_id: RequestId,
+    pub(super) generation: Generation,
+}
+
+impl AccountDirectoryQuery {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn new(request_id: RequestId, generation: Generation) -> Self {
+        Self {
+            request_id,
+            generation,
+        }
+    }
+
+    pub(super) fn key(&self) -> AccountDirectoryRequestKey {
+        AccountDirectoryRequestKey {
+            request_id: self.request_id,
+            generation: self.generation,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct AccountDirectoryRequestKey {
+    pub(super) request_id: RequestId,
+    pub(super) generation: Generation,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -144,6 +181,12 @@ pub(super) struct MessageRequestKey {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AccountDirectoryLoadError {
+    Busy,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MailboxLoadError {
     Busy,
     Unavailable,
@@ -163,6 +206,7 @@ pub(crate) enum MutationSubmitError {
 
 enum EventEnvelope {
     Control(Event),
+    AccountsReady,
     MailboxReady,
     MessageReady,
 }
@@ -175,6 +219,7 @@ struct LatestEvent {
 
 pub(super) struct EventSender {
     events: mpsc::Sender<EventEnvelope>,
+    accounts: Arc<Mutex<LatestEvent>>,
     mailbox: Arc<Mutex<LatestEvent>>,
     message: Arc<Mutex<LatestEvent>>,
 }
@@ -182,6 +227,11 @@ pub(super) struct EventSender {
 impl EventSender {
     pub(super) async fn send(&self, event: Event) -> Result<(), ()> {
         let envelope = if matches!(
+            &event,
+            Event::AccountsLoaded(_) | Event::AccountsLoadRejected { .. }
+        ) {
+            replace_latest(&self.accounts, event, EventEnvelope::AccountsReady)
+        } else if matches!(
             &event,
             Event::MailboxLoaded(_) | Event::MailboxLoadRejected { .. }
         ) {
@@ -205,6 +255,7 @@ impl EventSender {
 
 pub(crate) struct EventReceiver {
     events: mpsc::Receiver<EventEnvelope>,
+    accounts: Arc<Mutex<LatestEvent>>,
     mailbox: Arc<Mutex<LatestEvent>>,
     message: Arc<Mutex<LatestEvent>>,
 }
@@ -214,6 +265,11 @@ impl EventReceiver {
         loop {
             match self.events.recv().await? {
                 EventEnvelope::Control(event) => return Some(event),
+                EventEnvelope::AccountsReady => {
+                    if let Some(event) = take_latest(&self.accounts) {
+                        return Some(event);
+                    }
+                }
                 EventEnvelope::MailboxReady => {
                     if let Some(event) = take_latest(&self.mailbox) {
                         return Some(event);
@@ -233,6 +289,11 @@ impl EventReceiver {
         loop {
             match self.events.blocking_recv()? {
                 EventEnvelope::Control(event) => return Some(event),
+                EventEnvelope::AccountsReady => {
+                    if let Some(event) = take_latest(&self.accounts) {
+                        return Some(event);
+                    }
+                }
                 EventEnvelope::MailboxReady => {
                     if let Some(event) = take_latest(&self.mailbox) {
                         return Some(event);
@@ -260,16 +321,19 @@ impl EventReceiver {
 
 pub(super) fn event_channel(capacity: usize) -> (EventSender, EventReceiver) {
     let (sender, receiver) = mpsc::channel(capacity);
+    let accounts = Arc::new(Mutex::new(LatestEvent::default()));
     let mailbox = Arc::new(Mutex::new(LatestEvent::default()));
     let message = Arc::new(Mutex::new(LatestEvent::default()));
     (
         EventSender {
             events: sender,
+            accounts: accounts.clone(),
             mailbox: mailbox.clone(),
             message: message.clone(),
         },
         EventReceiver {
             events: receiver,
+            accounts,
             mailbox,
             message,
         },
@@ -314,6 +378,16 @@ impl CoreHandle {
     pub(crate) fn try_send_sync(&self, operation_id: OperationId) -> Result<(), SubmitError> {
         self.commands
             .try_send(Command::SyncNow { operation_id })
+            .map_err(SubmitError::from)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn try_query_account_directory(
+        &self,
+        query: AccountDirectoryQuery,
+    ) -> Result<(), SubmitError> {
+        self.commands
+            .try_send(Command::QueryAccountDirectory(query))
             .map_err(SubmitError::from)
     }
 
@@ -415,27 +489,72 @@ mod tests {
     }
 
     #[test]
-    fn mailbox_and_message_results_use_independent_slots() {
+    fn account_directory_event_slot_keeps_only_the_latest_result() {
+        let (sender, mut receiver) = event_channel(4);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        runtime
+            .block_on(sender.send(Event::AccountsLoadRejected {
+                request_id: RequestId::new(1).unwrap(),
+                generation: Generation::new(1),
+                reason: AccountDirectoryLoadError::Busy,
+            }))
+            .unwrap();
+        runtime
+            .block_on(sender.send(Event::AccountsLoadRejected {
+                request_id: RequestId::new(2).unwrap(),
+                generation: Generation::new(2),
+                reason: AccountDirectoryLoadError::Unavailable,
+            }))
+            .unwrap();
+
+        assert_eq!(receiver.len(), 1);
+        assert_eq!(
+            receiver.blocking_recv(),
+            Some(Event::AccountsLoadRejected {
+                request_id: RequestId::new(2).unwrap(),
+                generation: Generation::new(2),
+                reason: AccountDirectoryLoadError::Unavailable,
+            })
+        );
+        assert!(receiver.is_empty());
+    }
+
+    #[test]
+    fn account_mailbox_and_message_results_use_independent_slots() {
         let (sender, mut receiver) = event_channel(4);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
         runtime
-            .block_on(sender.send(Event::MailboxLoadRejected {
+            .block_on(sender.send(Event::AccountsLoadRejected {
                 request_id: RequestId::new(1).unwrap(),
                 generation: Generation::new(1),
+                reason: AccountDirectoryLoadError::Busy,
+            }))
+            .unwrap();
+        runtime
+            .block_on(sender.send(Event::MailboxLoadRejected {
+                request_id: RequestId::new(2).unwrap(),
+                generation: Generation::new(2),
                 reason: MailboxLoadError::Busy,
             }))
             .unwrap();
         runtime
             .block_on(sender.send(Event::MessageLoadRejected {
-                request_id: RequestId::new(2).unwrap(),
-                generation: Generation::new(2),
+                request_id: RequestId::new(3).unwrap(),
+                generation: Generation::new(3),
                 reason: MessageLoadError::Busy,
             }))
             .unwrap();
 
-        assert_eq!(receiver.len(), 2);
+        assert_eq!(receiver.len(), 3);
+        assert!(matches!(
+            receiver.blocking_recv(),
+            Some(Event::AccountsLoadRejected { .. })
+        ));
         assert!(matches!(
             receiver.blocking_recv(),
             Some(Event::MailboxLoadRejected { .. })

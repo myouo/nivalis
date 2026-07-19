@@ -1,7 +1,8 @@
 use super::message::{
-    COMMAND_CAPACITY, Command, CoreHandle, EVENT_CAPACITY, Event, EventReceiver, EventSender,
-    MailboxLoadError, MailboxQuery, MailboxRequestKey, MessageLoadError, MessageQuery,
-    MessageRequestKey, MutationRequest, MutationSubmitError, event_channel,
+    AccountDirectoryLoadError, AccountDirectoryQuery, AccountDirectoryRequestKey, COMMAND_CAPACITY,
+    Command, CoreHandle, EVENT_CAPACITY, Event, EventReceiver, EventSender, MailboxLoadError,
+    MailboxQuery, MailboxRequestKey, MessageLoadError, MessageQuery, MessageRequestKey,
+    MutationRequest, MutationSubmitError, event_channel,
 };
 use crate::store::sqlite::{
     self, DatabaseClient, DatabaseInfo, DatabaseReplies, DatabaseRuntime, DatabaseSubmitError,
@@ -120,6 +121,7 @@ async fn run_core(
     let mut shutdown = Box::pin(shutdown);
     let mut active_sync: Option<(super::OperationId, Pin<Box<time::Sleep>>)> = None;
     let mut pending_sync = None;
+    let mut accounts = AccountDirectorySchedule::default();
     let mut mailbox = MailboxSchedule::default();
     let mut message = MessageSchedule::default();
     let mut active_mutations = 0_usize;
@@ -160,6 +162,20 @@ async fn run_core(
                         let _ = sync_started.try_send(());
                     }
                     active_sync = Some((operation_id, Box::pin(time::sleep(sync_delay))));
+                }
+            }
+            CoreInput::Command(Command::QueryAccountDirectory(query)) => {
+                if let Some(query) = accounts.enqueue(query)
+                    && let Some(event) = submit_account_directory(&database, &mut accounts, query)
+                    && !send_event(&events, &mut shutdown, event).await
+                {
+                    return finish_accepted_mutations(
+                        &mut commands,
+                        &database,
+                        &mut database_replies,
+                        active_mutations,
+                    )
+                    .await;
                 }
             }
             CoreInput::Command(Command::QueryMailbox(query)) => {
@@ -205,6 +221,40 @@ async fn run_core(
                                 &mut database_replies,
                                 active_mutations,
                                 Some(request),
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+            CoreInput::Database(DbReply::Accounts(reply)) => {
+                let key = AccountDirectoryRequestKey {
+                    request_id: reply.request_id,
+                    generation: reply.generation,
+                };
+                match accounts.complete(key) {
+                    AccountDirectoryCompletion::Ignore => {}
+                    AccountDirectoryCompletion::Publish => {
+                        if !send_event(&events, &mut shutdown, Event::AccountsLoaded(reply)).await {
+                            return finish_accepted_mutations(
+                                &mut commands,
+                                &database,
+                                &mut database_replies,
+                                active_mutations,
+                            )
+                            .await;
+                        }
+                    }
+                    AccountDirectoryCompletion::Dispatch(query) => {
+                        if let Some(event) =
+                            submit_account_directory(&database, &mut accounts, query)
+                            && !send_event(&events, &mut shutdown, event).await
+                        {
+                            return finish_accepted_mutations(
+                                &mut commands,
+                                &database,
+                                &mut database_replies,
+                                active_mutations,
                             )
                             .await;
                         }
@@ -506,6 +556,69 @@ async fn send_event(
 }
 
 #[derive(Default)]
+struct AccountDirectorySchedule {
+    active: Option<AccountDirectoryRequestKey>,
+    pending: Option<AccountDirectoryQuery>,
+}
+
+impl AccountDirectorySchedule {
+    fn enqueue(&mut self, query: AccountDirectoryQuery) -> Option<AccountDirectoryQuery> {
+        if self.active.is_some() {
+            self.pending = Some(query);
+            None
+        } else {
+            self.active = Some(query.key());
+            Some(query)
+        }
+    }
+
+    fn complete(&mut self, key: AccountDirectoryRequestKey) -> AccountDirectoryCompletion {
+        if self.active != Some(key) {
+            return AccountDirectoryCompletion::Ignore;
+        }
+
+        self.active = None;
+        if let Some(query) = self.pending.take() {
+            self.active = Some(query.key());
+            AccountDirectoryCompletion::Dispatch(query)
+        } else {
+            AccountDirectoryCompletion::Publish
+        }
+    }
+
+    fn submission_failed(&mut self, key: AccountDirectoryRequestKey) {
+        if self.active == Some(key) {
+            self.active = None;
+        }
+    }
+}
+
+enum AccountDirectoryCompletion {
+    Ignore,
+    Publish,
+    Dispatch(AccountDirectoryQuery),
+}
+
+fn submit_account_directory(
+    database: &DatabaseClient,
+    schedule: &mut AccountDirectorySchedule,
+    query: AccountDirectoryQuery,
+) -> Option<Event> {
+    let key = query.key();
+    let reason = match database.try_query_account_directory(query.request_id, query.generation) {
+        Ok(()) => return None,
+        Err(DatabaseSubmitError::Busy) => AccountDirectoryLoadError::Busy,
+        Err(DatabaseSubmitError::Closed) => AccountDirectoryLoadError::Unavailable,
+    };
+    schedule.submission_failed(key);
+    Some(Event::AccountsLoadRejected {
+        request_id: key.request_id,
+        generation: key.generation,
+        reason,
+    })
+}
+
+#[derive(Default)]
 struct MailboxSchedule {
     active: Option<MailboxRequestKey>,
     pending: Option<MailboxQuery>,
@@ -734,8 +847,8 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> Arc<str> {
 mod tests {
     use super::*;
     use crate::core::{
-        AccountScope, FolderScope, Generation, MailboxQuery, MessageId, MessageQuery, OperationId,
-        PageSpec, RequestId,
+        AccountDirectoryQuery, AccountScope, FolderScope, Generation, MailboxQuery, MessageId,
+        MessageQuery, OperationId, PageSpec, RequestId,
     };
     use rusqlite::Connection;
     use std::{
@@ -746,6 +859,13 @@ mod tests {
 
     fn test_database() -> DatabaseParts {
         sqlite::spawn_in_memory().unwrap()
+    }
+
+    fn account_directory_query(request_id: u64, generation: u64) -> AccountDirectoryQuery {
+        AccountDirectoryQuery::new(
+            RequestId::new(request_id).unwrap(),
+            Generation::new(generation),
+        )
     }
 
     fn mailbox_query(request_id: u64, generation: u64) -> MailboxQuery {
@@ -913,6 +1033,22 @@ mod tests {
     }
 
     #[test]
+    fn account_directory_round_trip_preserves_request_identity() {
+        let (core, mut events, runtime) = spawn_with_delay(Duration::from_millis(1)).unwrap();
+        let query = account_directory_query(6, 2);
+
+        core.try_query_account_directory(query).unwrap();
+
+        let Some(Event::AccountsLoaded(reply)) = events.blocking_recv() else {
+            panic!("expected account directory");
+        };
+        assert_eq!(reply.request_id, RequestId::new(6).unwrap());
+        assert_eq!(reply.generation, Generation::new(2));
+        assert!(reply.result.unwrap().rows.is_empty());
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
     fn message_query_round_trip_preserves_request_identity() {
         let (core, mut events, runtime) = spawn_with_delay(Duration::from_millis(1)).unwrap();
 
@@ -1046,6 +1182,50 @@ mod tests {
         assert!(matches!(
             schedule.complete(latest_key),
             MailboxCompletion::Publish
+        ));
+    }
+
+    #[test]
+    fn account_directory_schedule_replaces_obsolete_pending_query() {
+        let mut schedule = AccountDirectorySchedule::default();
+        let first = account_directory_query(1, 1);
+        let first_key = first.key();
+        let obsolete = account_directory_query(2, 2);
+        let latest = account_directory_query(3, 3);
+        let latest_key = latest.key();
+
+        assert!(schedule.enqueue(first).is_some());
+        assert!(schedule.enqueue(obsolete).is_none());
+        assert!(schedule.enqueue(latest).is_none());
+
+        let AccountDirectoryCompletion::Dispatch(next) = schedule.complete(first_key) else {
+            panic!("latest pending account query should be dispatched");
+        };
+        assert_eq!(next.key(), latest_key);
+        assert!(matches!(
+            schedule.complete(latest_key),
+            AccountDirectoryCompletion::Publish
+        ));
+    }
+
+    #[test]
+    fn account_directory_schedule_accepts_retry_after_submission_failure() {
+        let mut schedule = AccountDirectorySchedule::default();
+        let failed = account_directory_query(1, 1);
+        let failed_key = failed.key();
+
+        assert!(schedule.enqueue(failed).is_some());
+        schedule.submission_failed(failed_key);
+
+        let retry = account_directory_query(2, 1);
+        let retry_key = retry.key();
+        assert_eq!(
+            schedule.enqueue(retry).map(|query| query.key()),
+            Some(retry_key)
+        );
+        assert!(matches!(
+            schedule.complete(retry_key),
+            AccountDirectoryCompletion::Publish
         ));
     }
 
