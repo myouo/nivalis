@@ -29,7 +29,7 @@ Status: complete.
 
 Status: in progress.
 
-Checkpoint: SQLite accounts, bounded bidirectional keyset pages, persistent counters, selected details, ordered local writes/undo, external-content FTS, and exact-key obsolete-query interruption now drive the production UI. The `0d3453c` release proves the 90MiB hard idle gate, repeated normal runs below the preferred 50MiB target, and less-than-2x growth across two exact-count 10,000-transition pagination soaks. The retained historical outlier still prevents an unconditional 50MiB guarantee. Controller integration tests and fresh release-memory coverage of the activated write/search paths remain before M1 can close.
+Checkpoint: SQLite accounts, bounded bidirectional keyset pages, persistent counters, selected details, ordered local writes/undo, external-content FTS, and exact-key obsolete-query interruption now drive the production UI. A file-backed vertical test covers their success, empty, and repairable failure states. The `0d3453c` release proves the 90MiB hard idle gate, repeated normal runs below the preferred 50MiB target, and less-than-2x growth across two exact-count 10,000-transition pagination soaks, but it predates the activated write/search paths. Fresh release-memory coverage of those paths remains before M1 can close; the retained historical outlier still prevents an unconditional 50MiB guarantee.
 
 Recorded follow-ups that do not block M1: evaluate a resumable batched FTS rebuild before supporting upgrades of very large pre-existing databases, and profile a CJK-aware or trigram tokenizer before promising arbitrary substring search. The current migration is atomic and the current search contract is Unicode case-folded literal phrase matching.
 

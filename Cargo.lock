@@ -2819,6 +2819,7 @@ name = "nivalis-mail"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
+ "i-slint-backend-testing",
  "rusqlite",
  "slint",
  "slint-build",

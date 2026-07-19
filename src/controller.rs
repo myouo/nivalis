@@ -1043,9 +1043,13 @@ impl Controller {
             )
         };
         if let Some(ui) = self.ui.upgrade() {
-            let mailbox_ready = self.catalog.borrow().is_some()
-                && !ui.get_mailbox_loading()
-                && !ui.get_mailbox_error();
+            let has_accounts = self
+                .catalog
+                .borrow()
+                .as_ref()
+                .is_some_and(|catalog| catalog.len() > 0);
+            let mailbox_ready =
+                has_accounts && !ui.get_mailbox_loading() && !ui.get_mailbox_error();
             ui.set_mutation_loading(blocked);
             ui.set_undo_loading(request_pending);
             ui.set_mail_actions_enabled(mailbox_ready);
@@ -1305,6 +1309,190 @@ fn mutation_rejection(error: MutationSubmitError) -> UserError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{core, store::sqlite};
+    use rusqlite::Connection;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            mpsc,
+        },
+        thread,
+        time::Instant,
+    };
+
+    const CONTROLLER_TIMEOUT: Duration = Duration::from_secs(5);
+    static NEXT_DATABASE_ID: AtomicU64 = AtomicU64::new(1);
+
+    struct TestDatabase {
+        directory: PathBuf,
+        path: PathBuf,
+    }
+
+    impl TestDatabase {
+        fn new(label: &str) -> Self {
+            let unique = NEXT_DATABASE_ID.fetch_add(1, Ordering::Relaxed);
+            let directory = std::env::temp_dir().join(format!(
+                "nivalis-controller-{label}-{}-{unique}",
+                std::process::id()
+            ));
+            let path = directory.join("mail.sqlite3");
+            let (client, replies, runtime, _info) =
+                sqlite::spawn(path.clone()).expect("initialize controller test database");
+            drop(client);
+            drop(replies);
+            runtime
+                .shutdown()
+                .expect("close initialized controller test database");
+            Self { directory, path }
+        }
+
+        fn seed_bounded_mailbox(&self) {
+            let connection = Connection::open(&self.path).expect("open controller fixture");
+            connection
+                .execute_batch(include_str!("../scripts/fixtures/memory.sql"))
+                .expect("seed bounded controller fixture");
+            connection
+                .execute_batch(
+                    "WITH RECURSIVE sequence(id) AS (
+                         VALUES (1)
+                         UNION ALL
+                         SELECT id + 1 FROM sequence WHERE id < 64
+                     )
+                     INSERT INTO folders (id, account_id, remote_key, name, role)
+                     SELECT 1000 + id, id, 'archive', 'Archive', 'archive' FROM sequence
+                     UNION ALL
+                     SELECT 2000 + id, id, 'trash', 'Trash', 'trash' FROM sequence;",
+                )
+                .expect("add mutation target folders");
+        }
+
+        fn seed_dirty_statistics(&self) {
+            let connection = Connection::open(&self.path).expect("open dirty controller fixture");
+            connection
+                .execute_batch(
+                    "PRAGMA foreign_keys = ON;
+                     INSERT INTO accounts (
+                         id, provider, remote_key, name, address, sort_order, state, accent_rgb
+                     ) VALUES (
+                         1, 'imap', 'dirty-account', 'Dirty account',
+                         'dirty@example.test', 1, 'active', 0
+                     );
+                     INSERT INTO messages (
+                         id, account_id, remote_key, sender_name, sender_address,
+                         subject, preview, received_at_ms
+                     ) VALUES (
+                         1, 1, 'dirty-message', 'Sender', 'sender@example.test',
+                         'Unreconciled message', 'Preview', 1700000000000
+                     );",
+                )
+                .expect("seed dirty controller fixture");
+        }
+    }
+
+    impl Drop for TestDatabase {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    struct ControllerHarness {
+        ui: AppWindow,
+        controller: Rc<Controller>,
+        events: mpsc::Receiver<Event>,
+        event_worker: Option<thread::JoinHandle<()>>,
+        runtime: Option<core::CoreRuntime>,
+    }
+
+    impl ControllerHarness {
+        fn start(path: &Path) -> Self {
+            let (core, mut core_events, runtime) =
+                core::spawn(path.to_path_buf()).expect("start production core");
+            let (event_tx, events) = mpsc::channel();
+            let event_worker = thread::spawn(move || {
+                while let Some(event) = core_events.blocking_recv() {
+                    if event_tx.send(event).is_err() {
+                        break;
+                    }
+                }
+            });
+            let ui = AppWindow::new().expect("create test AppWindow");
+            let controller = Rc::new(Controller::new(&ui, core));
+            controller.install_handlers(&ui);
+            controller.start();
+            Self {
+                ui,
+                controller,
+                events,
+                event_worker: Some(event_worker),
+                runtime: Some(runtime),
+            }
+        }
+
+        fn drive_until(&mut self, label: &str, ready: impl Fn(&AppWindow) -> bool) {
+            self.drive_until_controller(label, |ui, _controller| ready(ui));
+        }
+
+        fn drive_until_controller(
+            &mut self,
+            label: &str,
+            ready: impl Fn(&AppWindow, &Controller) -> bool,
+        ) {
+            let deadline = Instant::now() + CONTROLLER_TIMEOUT;
+            while !ready(&self.ui, &self.controller) {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let event = self
+                    .events
+                    .recv_timeout(remaining)
+                    .unwrap_or_else(|error| panic!("controller did not reach {label}: {error}"));
+                self.controller.handle_event(event);
+            }
+        }
+
+        fn shutdown(mut self) {
+            self.runtime
+                .take()
+                .expect("controller runtime")
+                .shutdown()
+                .expect("stop controller runtime");
+            self.event_worker
+                .take()
+                .expect("controller event worker")
+                .join()
+                .expect("join controller event worker");
+        }
+    }
+
+    fn model_contains(ui: &AppWindow, id: &str) -> bool {
+        let mails = ui.get_mails();
+        (0..mails.row_count()).any(|index| {
+            mails
+                .row_data(index)
+                .is_some_and(|summary| summary.id.as_str() == id)
+        })
+    }
+
+    fn model_summary(ui: &AppWindow, id: &str) -> MailSummary {
+        let mails = ui.get_mails();
+        (0..mails.row_count())
+            .find_map(|index| {
+                mails
+                    .row_data(index)
+                    .filter(|summary| summary.id.as_str() == id)
+            })
+            .unwrap_or_else(|| panic!("mailbox does not contain message {id}"))
+    }
+
+    fn mailbox_ready(ui: &AppWindow, row_count: usize, page: i32) -> bool {
+        !ui.get_initial_loading()
+            && !ui.get_mailbox_loading()
+            && !ui.get_mailbox_navigation_loading()
+            && !ui.get_mutation_loading()
+            && !ui.get_mailbox_error()
+            && ui.get_mailbox_page_number() == page
+            && ui.get_mails().row_count() == row_count
+    }
 
     fn summary(id: i64, unread: bool, starred: bool) -> MailSummary {
         MailSummary {
@@ -1450,5 +1638,167 @@ mod tests {
             assert!(!error.detail.contains("secret"));
             assert!(!error.detail.contains("sqlite"));
         }
+    }
+
+    #[test]
+    fn production_controller_drives_sqlite_success_empty_and_error_states() {
+        i_slint_backend_testing::init_no_event_loop();
+
+        let database = TestDatabase::new("mailbox");
+        database.seed_bounded_mailbox();
+        let mut harness = ControllerHarness::start(&database.path);
+        harness.drive_until("initial bounded mailbox", |ui| mailbox_ready(ui, 50, 1));
+
+        assert!(harness.ui.get_has_accounts());
+        assert!(harness.ui.get_mail_actions_enabled());
+        assert_eq!(harness.ui.get_accounts().row_count(), 65);
+        assert_eq!(harness.ui.get_message_total(), 51);
+        assert!(harness.ui.get_has_next_mailbox_page());
+        assert!(model_contains(&harness.ui, "51"));
+
+        harness.ui.invoke_next_mailbox_page();
+        harness.drive_until("second mailbox page", |ui| mailbox_ready(ui, 1, 2));
+        assert!(model_contains(&harness.ui, "1"));
+        assert!(harness.ui.get_has_previous_mailbox_page());
+
+        harness.ui.invoke_previous_mailbox_page();
+        harness.drive_until("first mailbox page", |ui| mailbox_ready(ui, 50, 1));
+        assert!(model_contains(&harness.ui, "51"));
+
+        harness.ui.invoke_switch_account("1".into());
+        harness.drive_until("single-account mailbox", |ui| mailbox_ready(ui, 1, 1));
+        assert_eq!(harness.ui.get_active_account_id().as_str(), "1");
+        assert!(model_contains(&harness.ui, "1"));
+
+        harness.ui.invoke_switch_account("".into());
+        harness.drive_until("all-account mailbox", |ui| mailbox_ready(ui, 50, 1));
+        assert!(harness.ui.get_active_account_id().is_empty());
+
+        harness.ui.set_search_query("message 49".into());
+        harness.ui.invoke_query_mail("message 49".into());
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(200));
+        harness.drive_until("FTS mailbox result", |ui| mailbox_ready(ui, 1, 1));
+        assert!(model_contains(&harness.ui, "49"));
+
+        harness.ui.set_search_query("".into());
+        harness.ui.invoke_query_mail("".into());
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(200));
+        harness.drive_until("cleared FTS mailbox", |ui| mailbox_ready(ui, 50, 1));
+
+        harness.ui.set_detail_open(true);
+        harness.ui.invoke_select_mail("51".into());
+        harness.drive_until("selected message detail", |ui| {
+            !ui.get_detail_loading() && ui.get_selected_mail().id.as_str() == "51"
+        });
+        assert_eq!(harness.ui.get_selected_mail().body.as_str().len(), 65_536);
+
+        assert!(model_summary(&harness.ui, "51").starred);
+        harness.ui.invoke_toggle_star("51".into());
+        harness.drive_until("star mutation refresh", |ui| {
+            mailbox_ready(ui, 50, 1) && !model_summary(ui, "51").starred
+        });
+
+        assert!(!model_summary(&harness.ui, "50").unread);
+        harness.ui.invoke_mark_unread("50".into());
+        harness.drive_until("unread mutation refresh", |ui| {
+            mailbox_ready(ui, 50, 1) && model_summary(ui, "50").unread
+        });
+
+        harness.ui.invoke_archive("51".into());
+        harness.drive_until("archive mutation refresh", |ui| {
+            mailbox_ready(ui, 50, 1) && !model_contains(ui, "51")
+        });
+
+        harness.ui.invoke_delete_mail("49".into());
+        harness.drive_until("Trash mutation refresh", |ui| {
+            mailbox_ready(ui, 49, 1) && !model_contains(ui, "49") && ui.get_snackbar_can_undo()
+        });
+        harness.ui.invoke_undo_delete();
+        harness.drive_until("Trash undo refresh", |ui| {
+            mailbox_ready(ui, 50, 1) && model_contains(ui, "49") && !ui.get_snackbar_can_undo()
+        });
+
+        harness.ui.invoke_delete_mail("48".into());
+        harness.drive_until("permanent-delete setup", |ui| {
+            mailbox_ready(ui, 49, 1) && !model_contains(ui, "48")
+        });
+        harness.ui.invoke_filter_folder("Trash".into());
+        harness.drive_until("Trash folder", |ui| mailbox_ready(ui, 1, 1));
+        assert!(model_contains(&harness.ui, "48"));
+        harness.ui.invoke_delete_mail("48".into());
+        harness.drive_until("permanent deletion", |ui| mailbox_ready(ui, 0, 1));
+
+        harness.ui.invoke_filter_folder("Archive".into());
+        harness.drive_until("Archive folder", |ui| mailbox_ready(ui, 1, 1));
+        assert!(model_contains(&harness.ui, "51"));
+        harness.shutdown();
+
+        let connection = Connection::open(&database.path).expect("inspect controller database");
+        let persisted = connection
+            .query_row(
+                "SELECT
+                     (SELECT starred FROM messages WHERE id = 51),
+                     (SELECT unread FROM messages WHERE id = 50),
+                     (SELECT count(*) FROM messages WHERE id = 48),
+                     (SELECT count(*)
+                        FROM message_tombstones
+                       WHERE account_id = 48 AND remote_key = 'message-48'),
+                     (SELECT f.role
+                        FROM message_folders AS mf
+                        JOIN folders AS f ON f.id = mf.folder_id
+                       WHERE mf.message_id = 49)",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, bool>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .expect("read persisted controller outcomes");
+        assert_eq!(persisted, (false, true, 0, 1, "inbox".to_owned()));
+        drop(connection);
+
+        let empty_database = TestDatabase::new("empty");
+        let mut empty = ControllerHarness::start(&empty_database.path);
+        empty.drive_until("empty mailbox", |ui| mailbox_ready(ui, 0, 1));
+        assert!(!empty.ui.get_has_accounts());
+        assert!(!empty.ui.get_mail_actions_enabled());
+        assert_eq!(empty.ui.get_status_text().as_str(), "Local cache is empty");
+        empty.shutdown();
+
+        let dirty_database = TestDatabase::new("dirty");
+        dirty_database.seed_dirty_statistics();
+        let mut dirty = ControllerHarness::start(&dirty_database.path);
+        dirty.drive_until_controller("dirty-statistics error", |ui, controller| {
+            ui.get_mailbox_error()
+                && !ui.get_initial_loading()
+                && !ui.get_mailbox_loading()
+                && !controller.state.borrow().accounts_pending()
+                && !controller.state.borrow().mailbox_pending()
+        });
+        assert!(!dirty.ui.get_has_accounts());
+        assert!(!dirty.ui.get_mail_actions_enabled());
+        assert_eq!(
+            dirty.ui.get_mailbox_error_title().as_str(),
+            "Local mail needs attention"
+        );
+        assert_eq!(
+            dirty.ui.get_mailbox_error_detail().as_str(),
+            "Stored mailbox state is inconsistent. Retry after the local cache has been repaired."
+        );
+
+        let connection = Connection::open(&dirty_database.path).expect("open repair connection");
+        sqlite::rebuild_account_stats_for_test(&connection, 1)
+            .expect("repair dirty mailbox statistics");
+        drop(connection);
+        dirty.ui.invoke_retry_mailbox();
+        dirty.drive_until("repaired mailbox retry", |ui| mailbox_ready(ui, 0, 1));
+        assert!(dirty.ui.get_has_accounts());
+        assert!(dirty.ui.get_mail_actions_enabled());
+        dirty.shutdown();
     }
 }
