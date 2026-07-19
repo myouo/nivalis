@@ -166,6 +166,11 @@ mod tests {
 
     use rusqlite::{Connection, ErrorCode, params};
 
+    use crate::store::sqlite::{
+        domain::{AccountScope, FolderScope, PageSpec},
+        query::query_mailbox,
+    };
+
     use super::{
         LATEST_SCHEMA_VERSION, MIGRATIONS, Migration, MigrationError, enable_foreign_keys, migrate,
         migrate_with,
@@ -390,15 +395,43 @@ mod tests {
 
         let bounds = connection
             .query_row(
-                "SELECT max(length(CAST(preview AS BLOB))),
+                "SELECT min(length(CAST(preview AS BLOB))),
+                        max(length(CAST(preview AS BLOB))),
+                        min(length(CAST(reader_excerpt AS BLOB))),
                         max(length(CAST(reader_excerpt AS BLOB)))
                  FROM messages
                  JOIN message_content ON message_content.message_id = messages.id",
                 [],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
             )
             .expect("read fixture text bounds");
-        assert_eq!(bounds, (2_048, 65_536));
+        assert_eq!(bounds, (2_048, 2_048, 65_536, 65_536));
+
+        let first_spec =
+            PageSpec::new(AccountScope::All, FolderScope::Inbox, None, None, 50).unwrap();
+        let first_page = query_mailbox(&connection, &first_spec).expect("query first fixture page");
+        assert_eq!(first_page.rows.len(), 50);
+        let next_cursor = first_page.next_cursor.expect("fixture has a second page");
+
+        let second_spec = PageSpec::new(
+            AccountScope::All,
+            FolderScope::Inbox,
+            None,
+            Some(next_cursor),
+            50,
+        )
+        .unwrap();
+        let second_page =
+            query_mailbox(&connection, &second_spec).expect("query second fixture page");
+        assert_eq!(second_page.rows.len(), 1);
+        assert!(second_page.next_cursor.is_none());
 
         let integrity: String = connection
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))

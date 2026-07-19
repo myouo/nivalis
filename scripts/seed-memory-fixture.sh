@@ -47,18 +47,38 @@ counts=$(sqlite3 -separator '|' "$database" \
             (SELECT count(*) FROM message_content),
             (SELECT count(*) FROM account_mailbox_stats WHERE dirty);')
 bounds=$(sqlite3 -separator '|' "$database" \
-    'SELECT max(length(CAST(preview AS BLOB))),
+    'SELECT min(length(CAST(preview AS BLOB))),
+            max(length(CAST(preview AS BLOB))),
+            min(length(CAST(reader_excerpt AS BLOB))),
             max(length(CAST(reader_excerpt AS BLOB)))
      FROM messages
      JOIN message_content ON message_content.message_id = messages.id;')
+projection=$(sqlite3 -separator '|' "$database" \
+    "WITH ordered AS (
+         SELECT m.id
+           FROM messages AS m
+          WHERE EXISTS (
+                    SELECT 1
+                      FROM message_folders AS mf
+                      JOIN folders AS f
+                        ON f.id = mf.folder_id AND f.account_id = mf.account_id
+                     WHERE mf.message_id = m.id
+                       AND mf.account_id = m.account_id
+                       AND f.role = 'inbox'
+                )
+          ORDER BY m.received_at_ms DESC, m.id DESC
+     )
+     SELECT (SELECT count(*) FROM (SELECT id FROM ordered LIMIT 50)),
+            (SELECT count(*) FROM (SELECT id FROM ordered LIMIT 1 OFFSET 50));")
 
 if [[ "$integrity" != "ok" || -n "$foreign_key_violations" ]]; then
     printf 'Seeded memory fixture failed SQLite integrity checks\n' >&2
     exit 1
 fi
-if [[ "$counts" != "64|64|51|51|0" || "$bounds" != "2048|65536" ]]; then
+if [[ "$counts" != "64|64|51|51|0" || "$bounds" != "2048|2048|65536|65536" || "$projection" != "50|1" ]]; then
     printf 'Seeded memory fixture did not preserve its resource bounds\n' >&2
     exit 1
 fi
 
-printf 'Seeded %s (%s; preview/detail bounds %s bytes)\n' "$database" "$counts" "$bounds"
+printf 'Seeded %s (%s; preview/detail min/max %s bytes; pages %s)\n' \
+    "$database" "$counts" "$bounds" "$projection"
