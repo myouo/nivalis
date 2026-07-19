@@ -6,32 +6,32 @@ Nivalis uses the following Linux release acceptance criteria:
 
 - Default idle resident set size (RSS) below 90MiB.
 - Stretch target: default idle RSS below 50MiB at the tested viewport.
-- Settled PSS and RSS after bounded interaction or maximize/restore stress below 2x their pre-stress baselines.
+- Settled RSS, PSS, RSS+Swap, and PSS+SwapPss after bounded work below 2x their pre-workload baselines.
 - Idle CPU returns to 0% over a 10-second interval after startup or stress settles.
 
-RSS includes every resident shared page mapped by the process. PSS divides shared pages by their current number of mappers. USS is `Private_Clean + Private_Dirty`. The benchmark records all three from `/proc/<pid>/smaps_rollup`; RSS is the conservative release gate, while PSS and USS distinguish shared mappings from private growth.
+RSS includes every resident shared page mapped by the process. PSS divides shared pages by their current number of mappers. USS is `Private_Clean + Private_Dirty`. Swap and SwapPss expose pages displaced by host memory pressure so a falling resident set cannot hide retained allocation. The benchmark records these values from `/proc/<pid>/smaps_rollup`, retains the largest sampled RSS or reported VmHWM, and rejects a changed process start identity.
 
 These numbers are machine- and viewport-specific. Software framebuffer memory grows with physical pixel area, and PSS varies with the set of concurrently running processes.
 
 ## Configuration
 
 - Measurement date and host: 2026-07-19, Linux 7.1.2-zen3-1-zen x86_64, Rust 1.96.1.
-- Release-code revision: `0d3453c5860e1efcdb90cd9e61819dba030e5695`, schema v8. Bidirectional controller pagination landed at `2d7f26d`; exact query-count and memory-gate coverage landed at `0d3453c`.
-- Production build: `cargo build --locked --release`, stripped, `opt-level = "s"`, 19,410,424 bytes (18.51MiB), SHA-256 `2f74e875620a6ca2f005c9521accf74652aa0a37b68729892180a254a434081c`.
-- Pagination build: `cargo build --locked --release --features bench-harness`, stripped, 19,425,528 bytes (18.53MiB), SHA-256 `4547ace84c4d4b2895cb2eb0cb0c86484c706608563e11c65d919f43d50a69f4`.
+- Release-code revision: `a74b8bb95e17c801d5aa72dde33bf84f69718cce`, schema v9.
+- Production build: `cargo build --locked --release`, stripped, `opt-level = "s"`, 19,432,824 bytes (18.53MiB), SHA-256 `13f56756e327013b9901f3d78646ccc370f891c623f1f1cc5b22bfd324784fb4`.
+- Benchmark build: `cargo build --locked --release --features bench-harness`, stripped, 19,457,016 bytes (18.56MiB), SHA-256 `5495ad55799ae46238371ca1aae02f396d1b26a1012376de17a7114d02bc1ab4`.
 - UI state: light theme, three-pane inbox, 64 accounts, one account warning, 51 inbox messages, and bounded 50-row plus one-row pages connected through First/Next/Previous keyset navigation.
-- Data bounds: all 51 stored previews are exactly 2,048 bytes and all 51 reader excerpts are exactly 65,536 bytes. The 3.7MiB private fixture passes SQLite integrity and foreign-key checks; the production query returns 50 rows plus a cursor, then the remaining row without another cursor.
+- Data bounds: all 51 stored previews are exactly 2,048 bytes and all 51 reader excerpts are exactly 65,536 bytes. The 3.7MiB private fixture passes SQLite, foreign-key, and FTS integrity checks; the production query returns 50 rows plus a cursor, then one row without another cursor, while `message 51` has exactly one FTS hit at row 51.
 - Backend state: active bounded Tokio core and single-connection SQLite actor, WAL mode, 1MiB page cache limit, persistent statistics, and real account/mailbox/detail projections.
 - Default renderer: `winit` + `skia-software` (Skia CPU rasterization and partial rendering).
 - GPU override: `NIVALIS_RENDERER=skia`.
 - X11 viewport: 1200x900 physical pixels, scale factor 1.
 - Native Wayland baseline: default 1200x800 logical window, forced scale factor 1 for repeatability.
-- Sampling: fresh process, `/proc/<pid>/smaps_rollup`, interval CPU from `/proc/<pid>/stat`; the harness verifies the requested X11 geometry and fails if interaction stress does not finish.
+- Sampling: fresh process, `/proc/<pid>/smaps_rollup`, process-identity and interval CPU data from `/proc/<pid>/stat`; the harness verifies X11 geometry, exact stress completion, a five-second quiet grace, and a separate ten-second zero-CPU window. The 14-column CSV includes RSS, PSS, USS, Anonymous, Swap, SwapPss, reported VmHWM, and a cross-sample resident peak.
 
 Committed samples use one CSV per measured code revision. The `test_case` column identifies each workload and repeat without multiplying evidence files:
 
-- [`docs/measurements/2026-07-19-0d3453c.csv`](docs/measurements/2026-07-19-0d3453c.csv), SHA-256 `8179f3a68222ee829b002779bbf901d378ce740d9a3fb1ee18c97c297e6e9684`; [completion log](docs/measurements/2026-07-19-0d3453c.log), SHA-256 `3c198c469c098d11ac20683c4bf4525b182809a663c01d95d3e5c5575bbe1dc9`.
-- [`docs/measurements/2026-07-19-d19cec5.csv`](docs/measurements/2026-07-19-d19cec5.csv), SHA-256 `e76adb4b34e5554165cde279294bcba37958db30c980ed082244a8999c6c97b2`; [completion log](docs/measurements/2026-07-19-d19cec5.log), SHA-256 `84a84b28096be3e9e89e8368006a6ab49ffeb4d641dee07421fb9725852bc385`.
+- [`docs/measurements/2026-07-19-a74b8bb.csv`](docs/measurements/2026-07-19-a74b8bb.csv), SHA-256 `58dd1f44a27f9a186e25a82c9fbd6bda0d63d80b12a1ef916f216f3728e8cdb9`; [completion log](docs/measurements/2026-07-19-a74b8bb.log), SHA-256 `115a6f1b129385713602b6d0b101d9c94c40cabda2b8f06b293c00f8588d0554`.
+- Older `0d3453c` and `d19cec5` files remain committed as schema-v8 historical evidence. They do not contain swap columns and are not attributed to the current binary.
 
 ## Idle Results
 
@@ -39,6 +39,7 @@ Values below are the worst stable samples across the stated fresh-process runs.
 
 | Renderer | Platform | Runs | RSS | PSS | USS | Result |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
+| Skia software, `a74b8bb` schema-v9 fixture | X11 | 3 | 37.75MiB | 24.34MiB | 20.75MiB | Hard gate and tested target pass |
 | Skia software, `0d3453c` bounded fixture | X11 | 3 | 37.51MiB | 24.63MiB | 21.23MiB | Hard gate pass; repeated target |
 | Skia software, `d19cec5` bounded fixture | X11 | 3 + 300s soak | 37.60MiB | 24.60MiB | 20.77MiB | Historical local-read gate |
 | Skia software, retained outlier | X11 | 1 historical | 68.62MiB | Not retained | Not retained | Hard gate pass; target fail |
@@ -46,36 +47,26 @@ Values below are the worst stable samples across the stated fresh-process runs.
 | Skia software | Wayland | 3 historical | 41.5MiB | 22.4MiB | 17.5MiB | Pre-SQLite reference |
 | Skia OpenGL | X11 | 1 historical | 248.0MiB | 81.9MiB | 34.0MiB | Pre-SQLite reference; RSS stretch fail |
 
-The `0d3453c` matrix uses three fresh production processes sampled at 5, 10, 20, and 30 seconds. Their RSS values were stable at 38,308KiB (37.41MiB), 38,408KiB (37.51MiB), and 38,156KiB (37.26MiB); the largest PSS/USS/VmHWM values were 25,220/21,740/38,408KiB. Interval CPU was 0.00% from 10 seconds onward in every run. All three exact-binary runs meet the preferred 50MiB target with the maximum account catalog, a full visible page, maximum previews, and available maximum excerpts. The hard 90MiB release gate is proved; the target is not an unconditional guarantee because of the retained outlier below. The separate five-minute `d19cec5` pure-idle soak remains historical evidence rather than being attributed to this newer binary.
+The `a74b8bb` matrix uses three fresh production processes sampled at 5, 10, 20, and 30 seconds, followed by the quiet grace and dedicated 10-second CPU sample at 45 seconds. Their largest RSS values were 38,264, 38,316, and 38,660KiB; the matrix maxima were 24,921KiB PSS and 21,252KiB USS, with zero Swap. All three final CPU intervals were 0.00%. This exact matrix meets both the 90MiB hard gate and preferred 50MiB target, but the target remains conditional because of the retained historical outlier below.
 
 During investigation of the preceding `73d1fdb` artifact, one populated-cache soak reported 70,264KiB (68.62MiB) RSS through 120 seconds before dropping to 61,684KiB at 300 seconds. It stayed below the hard gate but exceeded the preferred target. The value did not reproduce in the next four scripted fresh-process runs, two manual fully visible runs, the repeated five-minute soak, or the exact-binary matrix above. It remains an unexplained RSS outlier rather than being discarded; PSS and USS were not retained, so its ownership cannot be inferred. The Wayland and OpenGL rows remain historical and require refresh before use as current backend gates.
 
 ## Growth Results
 
-| Scenario | Baseline RSS/PSS/USS | Settled RSS/PSS/USS | Growth RSS/PSS/USS | Result |
-| --- | --- | --- | --- | --- |
-| 10,000 keyset transitions, repeat 1, X11, 300s | 37.21/24.50/21.13MiB | 37.46/24.81/21.46MiB | 0.68%/1.26%/1.57% | Hard/growth pass |
-| 10,000 keyset transitions, repeat 2, X11, 300s | 37.16/24.35/20.96MiB | 37.44/24.55/21.32MiB | 0.75%/0.84%/1.73% | Hard/growth pass |
-| 10,000 bounded UI/SQLite actions, `d19cec5`, X11, 300s | 37.59/24.69/20.87MiB | 45.05/32.16/28.34MiB | 19.85%/30.22%/35.77% | Historical local-read pass |
-| Resize 1200x900 to 3840x2400 and restore, populated X11 | 37.46/24.50/20.71MiB | 68.53/40.52/21.66MiB | 82.91%/65.36%/4.60% | Hard/growth pass |
-| 10,000 former demo-controller actions, X11, 300s | 37.61/23.90/20.67MiB | 42.10/28.39/25.16MiB | 11.93%/18.80%/21.75% | Historical pre-cutover pass |
-| Native Wayland maximize and restore | 38.5/20.0/15.5MiB | 64.2/33.0/15.9MiB | 66.7%/65.3%/2.6% | Historical pass |
+The baseline and settled columns show `RSS/PSS + Swap/SwapPss` in KiB. Growth shows resident `RSS/PSS`, followed by swap-inclusive `RSS+Swap/PSS+SwapPss`.
 
-The current pagination workload waits for the exact seeded first-page signature, records a query-counter baseline, and alternates 5,000 `After` and 5,000 `Before` keyset queries. Every reply must match the expected 50-row or one-row page before the next transition begins. Each measured run reported exactly one completion marker with `transitions=10000 after=5000 before=5000 final_page=1`; extra First queries, stale results, timeouts, counter regressions, or mismatched pages fail closed. The state machine retains one request, two counter snapshots, and no page history.
+| Scenario | Baseline | Settled | Growth | Peak RSS | Result |
+| --- | --- | --- | --- | ---: | --- |
+| 1,000 write/search cycles, repeat 1 | 38,200/24,528 + 0/0 | 35,780/22,002 + 11,024/2,904 | -6.34%/-10.30%; +22.52%/+1.54% | 39,100 | Pass |
+| 1,000 write/search cycles, repeat 2 | 38,100/24,578 + 7,612/0 | 8,404/688 + 32,428/9,380 | -77.94%/-97.20%; -10.68%/-59.04% | 38,100 | Pass |
+| 10,000 keyset transitions, repeat 1 | 33,948/21,579 + 11,992/0 | 17,784/7,452 + 22,968/6,112 | -47.61%/-65.47%; -11.29%/-37.14% | 33,948 | Pass |
+| 10,000 keyset transitions, repeat 2 | 34,088/23,138 + 11,968/0 | 23,552/10,276 + 20,632/4,948 | -30.91%/-55.59%; -4.06%/-34.20% | 34,088 | Pass |
 
-Repeat 1 completed the 10,000 transitions in 147.900 seconds after the configured 15-second delay. RSS rose from 38,104KiB at 5 seconds to a peak and final value of 38,364KiB; VmHWM was 38,364KiB. CPU was 0.00% in every measured interval from 210 through 300 seconds.
+Each write/search run completed exactly 1,000 star transactions, 1,000 deterministic one-hit FTS queries, 1,000 clears, and 3,000 authoritative First queries. They took 372.577 and 375.187 seconds, or 2.684 and 2.665 cycles per second. Each pagination run completed exactly 5,000 `After` and 5,000 `Before` transitions, returned to page one, and took 153.117 and 146.391 seconds, or 65.310 and 68.310 transitions per second. All four logs contain one completion marker and no error marker; every dedicated post-workload CPU interval is 0.00%.
 
-Repeat 2 completed in 147.534 seconds after the same delay. RSS rose from 38,052KiB to 38,336KiB at 300 seconds; VmHWM was 38,336KiB. CPU returned to 0.00% in every measured interval from 210 through 290 seconds. The retained 290-300 second interval measured 5.69% and RSS added 16KiB, so this report does not claim continuously zero CPU through the endpoint; it does prove multiple post-stress zero-CPU intervals and remains far inside both memory gates.
+The largest resident peak was 39,100KiB and the largest sampled `RSS+Swap` was 47,244KiB. Across the complete idle and stress matrix, the worst settled ratios were 1.000x RSS, 1.00004x PSS, 1.22524x `RSS+Swap`, and 1.01542x `PSS+SwapPss`, all below the 2x gate. Significant host swapping occurred, so the lower settled resident values are not claimed as deallocation or an optimization gain; the swap-inclusive totals determine the growth conclusion.
 
-This two-page fixture proves bounded bidirectional controller navigation, exact SQLite query classes, and stable post-navigation residency. It does not prove deep-page behavior in a large mailbox, mutations, FTS, provider traffic, MIME, or attachments. Those paths require their own instrumented workloads when activated.
-
-The historical `d19cec5` deterministic run cycles real folder queries, conditional overlays, and valid rows from the live Slint model; visible rows repeatedly load the bounded 64KiB SQLite reader detail. It also exercises search input and debounce-timer churn, but it does not count executed SQLite searches and therefore cannot prove coverage of a non-empty query. That path remains outside this gate until the M1 FTS workload adds explicit execution instrumentation.
-
-The first historical `d19cec5` exact-binary run completed 10,000 steps in 111.063 seconds. RSS remained 45,768KiB from 120 through 150 seconds, and the explicit 120-130, 130-140, and 140-150 second intervals each measured 0.00% CPU. The 150-180 second interval later averaged 8.96% and RSS rose by 320KiB, so that short run alone is not treated as settled evidence.
-
-The historical `d19cec5` exact-binary extended repeat completed in 110.502 seconds. RSS was exactly 46,136KiB from 90 through 300 seconds. CPU was 0.00% for the 120-130, 130-140, 140-150, 150-180, 180-190, 190-200, 200-210, 210-240, 240-270, and 270-300 second intervals. Its final values and growth determine that historical table row; the earlier late-activity observation remains in the committed short-run samples rather than being discarded.
-
-The populated 3840x2400 production resize began at 5 seconds and restored to 1200x900 at 10 seconds. The measured high-resolution peak was 68.53/40.53/21.67MiB RSS/PSS/USS during the 6-12 second samples, or +82.91%/+65.41%/+4.66%. At 60 seconds the retained surface was 68.53/40.52/21.66MiB, so the table reports the settled values while separately exposing the almost identical transient peak. RSS stayed below the 90MiB hard gate and below 2x baseline but exceeded the 50MiB normal-idle target; the small USS change is consistent with retained surface mappings rather than equivalent private-heap growth.
+This gate covers bounded controller writes, one deterministic FTS result, clear-search refreshes, and exact two-page navigation. It does not cover Archive, Trash, undo, permanent deletion, large FTS rebuilds or result sets, CJK tokenization, large-mailbox deep paging, protocols, MIME, attachments, or multi-account synchronization. Those paths receive fresh workload gates in their owning milestones. Older controller, resize, Wayland, and OpenGL measurements remain in the committed historical CSV files and are not attributed to `a74b8bb`.
 
 ## Historical Release Profile A/B
 
@@ -91,78 +82,126 @@ The `performance` profile remains available when the extra 2.5% measured active 
 
 ## Reproduce
 
-Build a production binary, initialize an isolated database, and seed the schema-checked bounded fixture. The workflow requires `sqlite3`; X11 measurement also requires `xdotool` for window discovery and geometry control. The seed script refuses to touch a database that already contains an account:
+Check out the measured revision before running this procedure. The workflow requires `sqlite3`; X11 measurement also requires `xdotool` for window discovery and geometry control. Preserve the production binary before the benchmark build replaces Cargo's release output, and verify both exact binaries:
 
 ```bash
+set -euo pipefail
+revision=a74b8bb95e17c801d5aa72dde33bf84f69718cce
+[[ $(git rev-parse HEAD) == "$revision" ]]
+work=$(mktemp -d /tmp/nivalis-memory-a74b8bb.XXXXXX)
+
 cargo build --locked --release
-fixture_dir=$(mktemp -d /tmp/nivalis-memory.XXXXXX)
-NIVALIS_MEMORY_DATA_DIR="$fixture_dir" NIVALIS_MEMORY_SAMPLES="1" \
-  scripts/measure-memory.sh target/release/nivalis-mail \
-  > /tmp/nivalis-memory-init.csv
-scripts/seed-memory-fixture.sh "$fixture_dir"
+install -m 755 target/release/nivalis-mail "$work/nivalis-mail-production"
+production_bytes=$(stat -c %s "$work/nivalis-mail-production")
+production_sha256=$(sha256sum "$work/nivalis-mail-production" | cut -d' ' -f1)
+[[ $production_bytes == 19432824 ]]
+[[ $production_sha256 == 13f56756e327013b9901f3d78646ccc370f891c623f1f1cc5b22bfd324784fb4 ]]
+
+cargo build --locked --release --features bench-harness
+install -m 755 target/release/nivalis-mail "$work/nivalis-mail-bench"
+bench_bytes=$(stat -c %s "$work/nivalis-mail-bench")
+bench_sha256=$(sha256sum "$work/nivalis-mail-bench" | cut -d' ' -f1)
+[[ $bench_bytes == 19457016 ]]
+[[ $bench_sha256 == 5495ad55799ae46238371ca1aae02f396d1b26a1012376de17a7114d02bc1ab4 ]]
 ```
 
-Run three fresh X11 processes with the release-gate sample points:
+Initialize one schema-checked base fixture with the production binary, then leave it unopened. Create one copy for idle and one copy for each stress repeat before measuring anything:
 
 ```bash
-NIVALIS_MEMORY_DATA_DIR="$fixture_dir" NIVALIS_MEMORY_TEST_CASE=idle \
+fixture_base="$work/fixture-base"
+mkdir -p "$fixture_base"
+NIVALIS_MEMORY_DATA_DIR="$fixture_base" NIVALIS_MEMORY_SAMPLES="1" \
+  scripts/measure-memory.sh "$work/nivalis-mail-production" \
+  > "$work/fixture-init.csv"
+scripts/seed-memory-fixture.sh "$fixture_base" | tee "$work/fixture-seed.log"
+
+for case_id in idle write-search-1 write-search-2 pagination-1 pagination-2; do
+  cp -a "$fixture_base" "$work/$case_id"
+done
+```
+
+Run three fresh production processes against the dedicated idle copy:
+
+```bash
+NIVALIS_MEMORY_DATA_DIR="$work/idle" NIVALIS_MEMORY_TEST_CASE=idle \
 NIVALIS_MEMORY_RUNS=3 \
 NIVALIS_MEMORY_SAMPLES="5 10 20 30" NIVALIS_MEMORY_HARD_GATE=1 \
 NIVALIS_MEMORY_HARD_CAP_KIB=92160 NIVALIS_MEMORY_GROWTH_LIMIT_PERCENT=100 \
-  scripts/measure-memory.sh target/release/nivalis-mail \
-  > /tmp/nivalis-memory-idle.csv
+NIVALIS_MEMORY_LOG="$work/idle.log" \
+  scripts/measure-memory.sh "$work/nivalis-mail-production" \
+  > "$work/idle.csv"
 ```
 
-Optionally run a fresh five-minute pure-idle soak. The committed `0d3453c` CSV does not attribute the historical `d19cec5` soak to the newer binary, so this optional output is not part of the merge below:
+The 5- and 10-second samples establish each pre-workload baseline before the explicit 15-second delay. Run the star-write/single-hit-FTS/clear workload twice against its independent fixture copies:
 
 ```bash
-NIVALIS_MEMORY_DATA_DIR="$fixture_dir" \
-NIVALIS_MEMORY_TEST_CASE=idle-soak \
-NIVALIS_MEMORY_SAMPLES="30 60 120 180 300" \
-  scripts/measure-memory.sh target/release/nivalis-mail \
-  > /tmp/nivalis-memory-soak.csv
+for run in 1 2; do
+  case_id="write-search-$run"
+  NIVALIS_MEMORY_DATA_DIR="$work/$case_id" \
+  NIVALIS_MEMORY_TEST_CASE="$case_id" \
+  NIVALIS_STRESS_SCENARIO=write-search NIVALIS_STRESS_STEPS=1000 \
+  NIVALIS_STRESS_DELAY_MS=15000 NIVALIS_STRESS_INTERVAL_MS=2 \
+  NIVALIS_STRESS_TRANSITION_TIMEOUT_MS=5000 \
+  NIVALIS_MEMORY_LOG="$work/${case_id}.log" \
+  NIVALIS_MEMORY_SAMPLES="5 10 60 120 240 360 420 480 600 720" \
+  NIVALIS_MEMORY_HARD_GATE=1 NIVALIS_MEMORY_HARD_CAP_KIB=92160 \
+  NIVALIS_MEMORY_GROWTH_LIMIT_PERCENT=100 \
+    scripts/measure-memory.sh "$work/nivalis-mail-bench" \
+    > "$work/${case_id}.csv"
+done
 ```
 
-Run the 10,000-transition pagination scenario twice in fresh processes and inspect each completion log before merging the CSV rows under distinct `test_case` values. The 5- and 10-second samples establish the pre-stress baseline before the explicit 15-second delay:
+Run the exact-count bidirectional pagination workload twice:
 
 ```bash
-cargo build --locked --release --features bench-harness
-NIVALIS_MEMORY_DATA_DIR="$fixture_dir" \
-NIVALIS_MEMORY_TEST_CASE=pagination-1 \
-NIVALIS_STRESS_SCENARIO=pagination NIVALIS_STRESS_STEPS=10000 \
-NIVALIS_STRESS_DELAY_MS=15000 NIVALIS_STRESS_INTERVAL_MS=2 \
-NIVALIS_STRESS_TRANSITION_TIMEOUT_MS=5000 \
-NIVALIS_MEMORY_LOG=/tmp/nivalis-memory-pagination-run-1.log \
-NIVALIS_MEMORY_SAMPLES="5 10 20 30 60 90 120 150 180 210 240 270 280 290 300" \
-NIVALIS_MEMORY_HARD_GATE=1 NIVALIS_MEMORY_HARD_CAP_KIB=92160 \
-NIVALIS_MEMORY_GROWTH_LIMIT_PERCENT=100 \
-  scripts/measure-memory.sh target/release/nivalis-mail \
-  > /tmp/nivalis-memory-pagination-run-1.csv
+for run in 1 2; do
+  case_id="pagination-$run"
+  NIVALIS_MEMORY_DATA_DIR="$work/$case_id" \
+  NIVALIS_MEMORY_TEST_CASE="$case_id" \
+  NIVALIS_STRESS_SCENARIO=pagination NIVALIS_STRESS_STEPS=10000 \
+  NIVALIS_STRESS_DELAY_MS=15000 NIVALIS_STRESS_INTERVAL_MS=2 \
+  NIVALIS_STRESS_TRANSITION_TIMEOUT_MS=5000 \
+  NIVALIS_MEMORY_LOG="$work/${case_id}.log" \
+  NIVALIS_MEMORY_SAMPLES="5 10 60 120 180 240 300 360" \
+  NIVALIS_MEMORY_HARD_GATE=1 NIVALIS_MEMORY_HARD_CAP_KIB=92160 \
+  NIVALIS_MEMORY_GROWTH_LIMIT_PERCENT=100 \
+    scripts/measure-memory.sh "$work/nivalis-mail-bench" \
+    > "$work/${case_id}.csv"
+done
+```
 
-# Repeat with NIVALIS_MEMORY_TEST_CASE=pagination-2 and run-2 output paths.
+Verify one result marker and no error marker in every stress log, then build one CSV and one completion log for the measured revision. Timing and memory samples naturally vary on a rerun, so recompute their hashes rather than expecting the committed evidence hashes:
 
+```bash
 awk 'FNR == 1 && NR != 1 { next } { print }' \
-  /tmp/nivalis-memory-idle.csv \
-  /tmp/nivalis-memory-pagination-run-1.csv \
-  /tmp/nivalis-memory-pagination-run-2.csv \
-  > /tmp/nivalis-memory-0d3453c.csv
+  "$work/idle.csv" \
+  "$work/write-search-1.csv" \
+  "$work/write-search-2.csv" \
+  "$work/pagination-1.csv" \
+  "$work/pagination-2.csv" \
+  > "$work/2026-07-19-a74b8bb.csv"
+
+for case_id in write-search-1 write-search-2 pagination-1 pagination-2; do
+  [[ $(grep -c '^NIVALIS_STRESS_RESULT ' "$work/${case_id}.log") == 1 ]]
+  ! grep -q '^NIVALIS_STRESS_ERROR ' "$work/${case_id}.log"
+done
+
+{
+  printf 'release_code_revision=%s\n' "$revision"
+  printf 'production_bytes=%s\nproduction_sha256=%s\n' \
+    "$production_bytes" "$production_sha256"
+  printf 'bench_bytes=%s\nbench_sha256=%s\n' "$bench_bytes" "$bench_sha256"
+  printf '%s\n' 'fixture=64|64|51|51|0 preview_detail=2048|2048|65536|65536 pages=50|1 ids=51..2|1 fts=51|1|51|51'
+  for case_id in write-search-1 write-search-2 pagination-1 pagination-2; do
+    grep '^NIVALIS_STRESS_RESULT ' "$work/${case_id}.log"
+  done
+} > "$work/2026-07-19-a74b8bb.log"
+
+sha256sum "$work/2026-07-19-a74b8bb.csv" \
+  "$work/2026-07-19-a74b8bb.log"
 ```
 
-Run the production 3840x2400 resize and restore scenario:
-
-```bash
-cargo build --locked --release
-NIVALIS_MEMORY_DATA_DIR="$fixture_dir" NIVALIS_RESIZE_STRESS_WIDTH=3840 \
-NIVALIS_MEMORY_TEST_CASE=resize-3840x2400 \
-NIVALIS_RESIZE_STRESS_HEIGHT=2400 \
-NIVALIS_RESIZE_STRESS_AT=5 \
-NIVALIS_RESIZE_STRESS_DURATION=5 \
-NIVALIS_MEMORY_SAMPLES="3 6 9 12 15 30 60" \
-  scripts/measure-memory.sh target/release/nivalis-mail \
-  > /tmp/nivalis-memory-resize.csv
-```
-
-The script creates and removes an isolated private data directory unless `NIVALIS_MEMORY_DATA_DIR` is set to an absolute persistent path. Measurement CSV is written to standard output and should be redirected as above. Set `NIVALIS_MEMORY_LOG` to retain application output; otherwise the temporary log is removed.
+The hard gate also enforces the default five-second quiet grace and separate ten-second CPU settle interval. The script creates and removes an isolated private data directory unless `NIVALIS_MEMORY_DATA_DIR` is set to an absolute persistent path. Measurement CSV is written to standard output and should be redirected as above. Set `NIVALIS_MEMORY_LOG` to retain application output; otherwise the temporary log is removed.
 
 ## Implementation Notes
 
@@ -175,5 +214,5 @@ The script creates and removes an isolated private data directory unless `NIVALI
 - SQLite mailbox replies retain one 50-row page plus persistent counters and at most 64 per-account unread values. Statistic rebuilds aggregate in SQLite and do not materialize mailbox-wide Rust collections.
 - The measured database directory was mode `0700`; SQLite, WAL, and shared-memory files were mode `0600`. Thread inspection showed `nivalis-core` and `nivalis-sqlite` without an additional reply-bridge thread.
 - A 2,048-byte stored preview and 64KiB reader-excerpt boundary prevent malformed content from multiplying text layout work. Full-body loading remains unavailable until the bounded file-content pipeline is connected.
-- The current local-read and pagination gate covers the SQLite-controller projection path at its account, page, preview, reader-excerpt, bidirectional keyset, and exact query-count bounds. It does not exercise deep pages in a large mailbox, IMAP/JMAP sessions, MIME parsing, attachment transfers, multi-account synchronization, controller mutations, FTS, or provider payloads. Each newly activated path requires an appropriate fresh soak before release.
+- The M1 gate covers the SQLite-controller projection path at its account, page, preview, reader-excerpt, star-write, deterministic FTS, clear-search, bidirectional keyset, and exact query-count bounds. It does not exercise deep pages in a large mailbox, large FTS rebuilds or result sets, CJK tokenization, Archive/Trash/undo/permanent-delete soaks, protocols, MIME, attachment transfers, multi-account synchronization, or provider payloads. Each newly activated path requires an appropriate fresh soak before release.
 - A production IMAP/JMAP adapter must keep the page boundary, store message bodies and attachments on disk, and bound rendered quoted history. Loading arbitrary multi-megabyte bodies into one text paragraph cannot satisfy a fixed process-memory ceiling.

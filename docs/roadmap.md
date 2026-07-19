@@ -4,7 +4,7 @@
 
 Nivalis Mail will be a reliable, multi-account desktop mail client built with Rust, Slint, and Skia. It must receive, search, read, organize, compose, and send real mail without a WebView while keeping its release working set predictable.
 
-The reference Linux release gate is a warm-idle RSS below 90 MiB, with 50 MiB as the target at 1200x900 using the default Skia software renderer. Settled RSS and PSS after a bounded workload must remain below twice their pre-workload baselines. A milestone cannot inherit an earlier memory result when it activates a previously unmeasured dependency or execution path.
+The reference Linux release gate is a warm-idle RSS below 90 MiB, with 50 MiB as the target at 1200x900 using the default Skia software renderer. Settled RSS, PSS, RSS+Swap, and PSS+SwapPss after a bounded workload must remain below twice their pre-workload baselines. A milestone cannot inherit an earlier memory result when it activates a previously unmeasured dependency or execution path.
 
 ## Delivery rules
 
@@ -27,11 +27,11 @@ Status: complete.
 
 ## M1: SQLite single source of truth
 
-Status: in progress.
+Status: complete.
 
-Checkpoint: SQLite accounts, bounded bidirectional keyset pages, persistent counters, selected details, ordered local writes/undo, external-content FTS, and exact-key obsolete-query interruption now drive the production UI. A file-backed vertical test covers their success, empty, and repairable failure states. The `0d3453c` release proves the 90MiB hard idle gate, repeated normal runs below the preferred 50MiB target, and less-than-2x growth across two exact-count 10,000-transition pagination soaks, but it predates the activated write/search paths. Fresh release-memory coverage of those paths remains before M1 can close; the retained historical outlier still prevents an unconditional 50MiB guarantee.
+Checkpoint: SQLite accounts, bounded bidirectional keyset pages, persistent counters, selected details, ordered local writes/undo, external-content FTS, and exact-key obsolete-query interruption drive the production UI. A file-backed vertical test covers success, empty, and repairable failure states. Release-code revision `a74b8bb` closes the memory gate with three production idle runs, two exact-count 1,000-cycle star-write/single-hit-FTS/clear soaks, and two exact-count 10,000-transition pagination soaks. The matrix peaks at 38,660KiB idle RSS and 39,100KiB workload RSS; all resident and swap-inclusive settled totals remain below 2x baseline and all dedicated CPU windows return 0.00%. The retained historical outlier still prevents an unconditional 50MiB guarantee outside this matrix.
 
-Recorded follow-ups that do not block M1: evaluate a resumable batched FTS rebuild before supporting upgrades of very large pre-existing databases, and profile a CJK-aware or trigram tokenizer before promising arbitrary substring search. The current migration is atomic and the current search contract is Unicode case-folded literal phrase matching.
+Recorded follow-ups that do not block M1: evaluate a resumable batched FTS rebuild before large existing-database upgrades; profile a CJK-aware or trigram tokenizer before promising arbitrary substring search; add direct unit driving for every benchmark state transition; and reuse the production query entry in the fixture identity test. The current migration is atomic and the current search contract is Unicode case-folded literal phrase matching.
 
 Acceptance criteria:
 

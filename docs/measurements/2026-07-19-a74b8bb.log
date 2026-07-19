@@ -1,0 +1,10 @@
+release_code_revision=a74b8bb95e17c801d5aa72dde33bf84f69718cce
+production_bytes=19432824
+production_sha256=13f56756e327013b9901f3d78646ccc370f891c623f1f1cc5b22bfd324784fb4
+bench_bytes=19457016
+bench_sha256=5495ad55799ae46238371ca1aae02f396d1b26a1012376de17a7114d02bc1ab4
+fixture=64|64|51|51|0 preview_detail=2048|2048|65536|65536 pages=50|1 ids=51..2|1 fts=51|1|51|51
+NIVALIS_STRESS_RESULT scenario=write-search cycles=1000 writes=1000 searches=1000 clears=1000 first_queries=3000 after_queries=0 before_queries=0 target_id=51 final_page=1 final_query=empty final_starred=true elapsed_ms=372577
+NIVALIS_STRESS_RESULT scenario=write-search cycles=1000 writes=1000 searches=1000 clears=1000 first_queries=3000 after_queries=0 before_queries=0 target_id=51 final_page=1 final_query=empty final_starred=true elapsed_ms=375187
+NIVALIS_STRESS_RESULT scenario=pagination transitions=10000 after=5000 before=5000 final_page=1 elapsed_ms=153117
+NIVALIS_STRESS_RESULT scenario=pagination transitions=10000 after=5000 before=5000 final_page=1 elapsed_ms=146391
