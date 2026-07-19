@@ -1,0 +1,8 @@
+release_code_revision=8c005c8324f3e566dfd3700612c8a5856ebb04ec
+production_bytes=19487096
+production_sha256=f415e5725a04d528bd0937384f8f4a9556000c764978ed053fabe73a04f128bb
+bench_bytes=19956600
+bench_sha256=15e2eaa3c9c482cdcbe434d33b9ac563aa3e414d878c77b6203fe9095300e175
+fixture=64|64|51|51|0 preview_detail=2048|2048|65536|65536 pages=50|1 ids=51..2|1 fts=51|1|51|51
+NIVALIS_STRESS_RESULT scenario=content cycles=10000 imports=10000 body_opens=10000 attachment_opens=10000 gc_runs=10000 gc_examined=19999 gc_removed=19998 gc_missing=1 files_per_import=2 target_id=51 elapsed_ms=35515
+content_postcondition=generation=10000 file_gc=0 file_staging=0 live_bodies=1 live_attachments=1

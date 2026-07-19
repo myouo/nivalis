@@ -46,7 +46,9 @@ Acceptance criteria:
 
 ## M2: bounded local content pipeline
 
-Status: pending.
+Status: complete.
+
+Checkpoint: bounded MIME parsing writes one normalized body and at most 32 attachments through fixed buffers into private files. The SQLite actor atomically advances the message content generation, replaces all references, queues superseded files, and later rechecks and collects at most 16 orphan candidates per run. The end-to-end actor test imports, opens, closes, replaces, and collects real content. Release-code revision `8c005c8` closes the memory gate with three production idle runs and one exact-count 10,000-cycle import/open/close/collection workload: idle peaked at 38,492KiB RSS, the workload peaked at 39,684KiB, settled growth was 2.57% RSS and 3.51% PSS with zero swap, and every final CPU window returned 0.00%.
 
 Acceptance criteria:
 
