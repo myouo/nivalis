@@ -8,6 +8,7 @@ const WORK_ACCOUNT: i32 = 1;
 const PERSONAL_ACCOUNT: i32 = 2;
 const READING_ACCOUNT: i32 = 3;
 const PAGE_SIZE: usize = 50;
+#[cfg(test)]
 const PREVIEW_MAX_CHARS: usize = 280;
 const BODY_PREVIEW_MAX_CHARS: usize = 16_384;
 const ACCOUNT_MODEL_ROWS: usize = ACCOUNT_PROFILES.len() + 1;
@@ -29,7 +30,7 @@ const ACCOUNT_PROFILES: [AccountProfile; 3] = [
         name: "Work",
         address: "you@northstar.studio",
         initials: "NW",
-        status: "Up to date",
+        status: "Local sample",
         accent: (50, 96, 78),
         has_error: false,
     },
@@ -38,7 +39,7 @@ const ACCOUNT_PROFILES: [AccountProfile; 3] = [
         name: "Personal",
         address: "hello@nivalis.local",
         initials: "NP",
-        status: "Sign-in required",
+        status: "Sample sign-in issue",
         accent: (145, 78, 82),
         has_error: true,
     },
@@ -47,7 +48,7 @@ const ACCOUNT_PROFILES: [AccountProfile; 3] = [
         name: "Reading",
         address: "reader@nivalis.local",
         initials: "NR",
-        status: "Up to date",
+        status: "Local sample",
         accent: (174, 99, 42),
         has_error: false,
     },
@@ -134,12 +135,8 @@ impl MailRecord {
         }
     }
 
-    fn to_detail(&self, full_body: bool) -> MailDetail {
-        let (body, body_truncated) = if full_body {
-            (self.body.clone(), false)
-        } else {
-            bounded_text(&self.body, BODY_PREVIEW_MAX_CHARS)
-        };
+    fn to_detail(&self) -> MailDetail {
+        let (body, body_truncated) = bounded_text(&self.body, BODY_PREVIEW_MAX_CHARS);
         MailDetail {
             id: self.id,
             sender: self.sender.clone(),
@@ -178,6 +175,7 @@ pub struct MailStore {
     active_folder: Folder,
     query: String,
     selected_id: Option<i32>,
+    #[cfg(test)]
     next_id: i32,
     last_deleted: Option<DeletedMail>,
     account_labels: [SharedString; ACCOUNT_MODEL_ROWS],
@@ -398,6 +396,7 @@ impl MailStore {
             active_folder: Folder::Inbox,
             query: String::new(),
             selected_id: Some(1),
+            #[cfg(test)]
             next_id: 13,
             last_deleted: None,
             account_labels: [
@@ -419,10 +418,10 @@ impl MailStore {
         accounts.push(AccountItem {
             id: ALL_ACCOUNTS,
             name: "All inboxes".into(),
-            address: "3 connected accounts".into(),
+            address: "3 local sample accounts".into(),
             initials: "AI".into(),
             unread_count: stats.account_unread[0],
-            status: "1 account needs attention".into(),
+            status: "Sample data: 1 account warning".into(),
             avatar_color: Color::from_rgb_u8(51, 82, 68),
             has_error: ACCOUNT_PROFILES.iter().any(|account| account.has_error),
         });
@@ -455,7 +454,7 @@ impl MailStore {
 
     pub fn active_account_detail(&self) -> &'static str {
         self.active_profile()
-            .map_or("3 connected accounts", |account| account.address)
+            .map_or("3 local sample accounts", |account| account.address)
     }
 
     pub fn active_account_initials(&self) -> &'static str {
@@ -579,7 +578,8 @@ impl MailStore {
         }
     }
 
-    pub fn send(&mut self, recipient: &str, subject: &str, body: &str) -> i32 {
+    #[cfg(test)]
+    pub fn insert_test_sent_mail(&mut self, recipient: &str, subject: &str, body: &str) -> i32 {
         let id = self.next_id;
         self.next_id += 1;
         let normalized_body = body.trim();
@@ -641,14 +641,7 @@ impl MailStore {
     pub fn selected(&self) -> MailDetail {
         self.selected_id
             .and_then(|id| self.messages.iter().find(|mail| mail.id == id))
-            .map(|mail| mail.to_detail(false))
-            .unwrap_or_default()
-    }
-
-    pub fn selected_full(&self) -> MailDetail {
-        self.selected_id
-            .and_then(|id| self.messages.iter().find(|mail| mail.id == id))
-            .map(|mail| mail.to_detail(true))
+            .map(MailRecord::to_detail)
             .unwrap_or_default()
     }
 
@@ -818,6 +811,7 @@ fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
         .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
+#[cfg(test)]
 fn first_line_preview(body: &str) -> SharedString {
     let line = body.lines().next().unwrap_or_default().trim();
     let Some((end, _)) = line.char_indices().nth(PREVIEW_MAX_CHARS) else {
@@ -860,7 +854,7 @@ mod tests {
         let existing = store.filtered_count();
 
         for index in 0..75 {
-            store.send(
+            store.insert_test_sent_mail(
                 "recipient@example.com",
                 &format!("Bounded page {index}"),
                 "The full body stays in the store, not in each visible summary.",
@@ -877,7 +871,7 @@ mod tests {
         store.set_folder("Sent");
         let mut newest_id = 0;
         for index in 0..75 {
-            newest_id = store.send(
+            newest_id = store.insert_test_sent_mail(
                 "recipient@example.com",
                 &format!("Bounded page {index}"),
                 "A bounded summary body.",
@@ -990,7 +984,7 @@ mod tests {
     #[test]
     fn sent_preview_uses_first_line_after_leading_whitespace() {
         let mut store = MailStore::demo();
-        let id = store.send(
+        let id = store.insert_test_sent_mail(
             "friend@example.com",
             "Hello",
             "\n\n  First line\nSecond line",
@@ -1012,7 +1006,7 @@ mod tests {
     fn long_single_line_body_has_a_bounded_utf8_preview() {
         let mut store = MailStore::demo();
         let body = "界".repeat(PREVIEW_MAX_CHARS + 40);
-        let id = store.send("friend@example.com", "Long body", &body);
+        let id = store.insert_test_sent_mail("friend@example.com", "Long body", &body);
         store.set_folder("Sent");
 
         let sent = store
@@ -1028,20 +1022,16 @@ mod tests {
     }
 
     #[test]
-    fn unusually_large_body_is_shaped_only_after_explicit_loading() {
+    fn unusually_large_body_is_bounded_in_the_reader_projection() {
         let mut store = MailStore::demo();
         let body = "界".repeat(BODY_PREVIEW_MAX_CHARS + 100);
-        let id = store.send("friend@example.com", "Large body", &body);
+        let id = store.insert_test_sent_mail("friend@example.com", "Large body", &body);
         store.set_folder("Sent");
         store.select(id);
 
         let bounded = store.selected();
         assert!(bounded.body_truncated);
         assert_eq!(bounded.body.chars().count(), BODY_PREVIEW_MAX_CHARS);
-
-        let full = store.selected_full();
-        assert!(!full.body_truncated);
-        assert_eq!(full.body.as_str(), body);
     }
 
     #[test]
@@ -1157,7 +1147,7 @@ mod tests {
     fn sent_mail_uses_the_active_account() {
         let mut store = MailStore::demo();
         assert!(store.set_account(2));
-        let id = store.send("friend@example.com", "Hello", "From personal");
+        let id = store.insert_test_sent_mail("friend@example.com", "Hello", "From personal");
         store.set_folder("Sent");
 
         let sent = store

@@ -4,7 +4,6 @@ import { AccountItem } from "models.slint";
 import {
     MaterialIcon, MIconButton, NavDestination, WideNavItem
 } from "components.slint";
-import { ComposeAction } from "actions.slint";
 import { AccountAvatar } from "shared.slint";
 
 export component TitleBarButton inherits Rectangle {
@@ -237,7 +236,6 @@ export component NavigationPane inherits Rectangle {
     in property <int> starred-count: 0;
     in property <int> draft-count: 0;
     callback collapsed(bool);
-    callback compose;
     callback folder-selected(string);
     callback open-accounts;
     callback open-settings;
@@ -270,8 +268,7 @@ export component NavigationPane inherits Rectangle {
             clicked => { root.open-accounts(); }
         }
         Rectangle { height: 6px; }
-        ComposeAction { clicked => { root.compose(); } }
-        Rectangle { height: 4px; }
+        Rectangle { height: 8px; }
         WideNavItem { icon: "inbox"; label: "Inbox"; selected: root.active-folder == "Inbox"; count: root.inbox-count; clicked => { root.folder-selected("Inbox"); } }
         WideNavItem { icon: "star"; label: "Starred"; selected: root.active-folder == "Starred"; count: root.starred-count; clicked => { root.folder-selected("Starred"); } }
         WideNavItem { icon: "draft"; label: "Drafts"; selected: root.active-folder == "Drafts"; count: root.draft-count; clicked => { root.folder-selected("Drafts"); } }
@@ -291,8 +288,7 @@ export component NavigationPane inherits Rectangle {
         padding-bottom: 8px;
         spacing: 2px;
         NavDestination { icon: "menu"; label: "Expand navigation"; clicked => { root.collapsed(false); } }
-        ComposeAction { compact: true; clicked => { root.compose(); } }
-        Rectangle { height: 4px; }
+        Rectangle { height: 8px; }
         NavDestination { icon: "inbox"; label: "Inbox"; selected: root.active-folder == "Inbox"; badge: root.inbox-count; clicked => { root.folder-selected("Inbox"); } }
         NavDestination { icon: "star"; label: "Starred"; selected: root.active-folder == "Starred"; badge: root.starred-count; clicked => { root.folder-selected("Starred"); } }
         NavDestination { icon: "draft"; label: "Drafts"; selected: root.active-folder == "Drafts"; badge: root.draft-count; clicked => { root.folder-selected("Drafts"); } }

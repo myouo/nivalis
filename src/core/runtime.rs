@@ -21,14 +21,8 @@ use std::{
 };
 use tokio::{runtime::Builder, sync::mpsc, sync::oneshot, time};
 
-const SYNC_DELAY: Duration = Duration::from_millis(900);
 const COMMAND_BURST_LIMIT: u8 = 8;
 const SHUTDOWN_QUERY_INTERRUPT_INTERVAL: Duration = Duration::from_millis(10);
-
-#[cfg(test)]
-type SyncStarted = Option<std::sync::mpsc::SyncSender<()>>;
-#[cfg(not(test))]
-type SyncStarted = ();
 
 type DatabaseParts = (
     DatabaseClient,
@@ -41,29 +35,18 @@ pub(crate) fn spawn(
     database_path: PathBuf,
 ) -> Result<(CoreHandle, EventReceiver, CoreRuntime), StartError> {
     let database = sqlite::spawn(database_path).map_err(StartError::Database)?;
-    #[cfg(test)]
-    {
-        spawn_with_options(SYNC_DELAY, EVENT_CAPACITY, database, None)
-    }
-    #[cfg(not(test))]
-    {
-        spawn_with_options(SYNC_DELAY, EVENT_CAPACITY, database, ())
-    }
+    spawn_with_options(EVENT_CAPACITY, database)
 }
 
 #[cfg(test)]
-fn spawn_with_delay(
-    sync_delay: Duration,
-) -> Result<(CoreHandle, EventReceiver, CoreRuntime), StartError> {
+fn spawn_for_test() -> Result<(CoreHandle, EventReceiver, CoreRuntime), StartError> {
     let database = sqlite::spawn_in_memory().map_err(StartError::Database)?;
-    spawn_with_options(sync_delay, EVENT_CAPACITY, database, None)
+    spawn_with_options(EVENT_CAPACITY, database)
 }
 
 fn spawn_with_options(
-    sync_delay: Duration,
     event_capacity: usize,
     database: DatabaseParts,
-    sync_started: SyncStarted,
 ) -> Result<(CoreHandle, EventReceiver, CoreRuntime), StartError> {
     let (database, database_replies, database_runtime, _database_info) = database;
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CAPACITY);
@@ -83,8 +66,6 @@ fn spawn_with_options(
                 shutdown_rx,
                 database,
                 database_replies,
-                sync_delay,
-                sync_started,
             ));
             let database_result =
                 database_runtime
@@ -115,12 +96,8 @@ async fn run_core(
     shutdown: oneshot::Receiver<()>,
     database: DatabaseClient,
     mut database_replies: DatabaseReplies,
-    sync_delay: Duration,
-    _sync_started: SyncStarted,
 ) -> Result<(), RuntimeError> {
     let mut shutdown = Box::pin(shutdown);
-    let mut active_sync: Option<(super::OperationId, Pin<Box<time::Sleep>>)> = None;
-    let mut pending_sync = None;
     let mut accounts = AccountDirectorySchedule::default();
     let mut mailbox = MailboxSchedule::default();
     let mut message = MessageSchedule::default();
@@ -132,7 +109,6 @@ async fn run_core(
             &mut shutdown,
             &mut commands,
             &mut database_replies,
-            &mut active_sync,
             command_streak < COMMAND_BURST_LIMIT,
         )
         .await;
@@ -153,17 +129,6 @@ async fn run_core(
                 .await;
             }
             CoreInput::DatabaseClosed => return Err(RuntimeError::DatabaseClosed),
-            CoreInput::Command(Command::SyncNow { operation_id }) => {
-                if active_sync.is_some() {
-                    pending_sync = Some(operation_id);
-                } else {
-                    #[cfg(test)]
-                    if let Some(sync_started) = &_sync_started {
-                        let _ = sync_started.try_send(());
-                    }
-                    active_sync = Some((operation_id, Box::pin(time::sleep(sync_delay))));
-                }
-            }
             CoreInput::Command(Command::QueryAccountDirectory(query)) => {
                 if let Some(query) = accounts.enqueue(query)
                     && let Some(event) = submit_account_directory(&database, &mut accounts, query)
@@ -353,23 +318,6 @@ async fn run_core(
                     };
                 }
             }
-            CoreInput::SyncElapsed => {
-                let Some((operation_id, _)) = active_sync.take() else {
-                    continue;
-                };
-                if !send_event(&events, &mut shutdown, Event::SyncFinished { operation_id }).await {
-                    return finish_accepted_mutations(
-                        &mut commands,
-                        &database,
-                        &mut database_replies,
-                        active_mutations,
-                    )
-                    .await;
-                }
-                if let Some(operation_id) = pending_sync.take() {
-                    active_sync = Some((operation_id, Box::pin(time::sleep(sync_delay))));
-                }
-            }
         }
     }
 }
@@ -491,14 +439,12 @@ enum CoreInput {
     DatabaseClosed,
     Command(Command),
     Database(DbReply),
-    SyncElapsed,
 }
 
 async fn next_input(
     shutdown: &mut Pin<Box<oneshot::Receiver<()>>>,
     commands: &mut mpsc::Receiver<Command>,
     database_replies: &mut DatabaseReplies,
-    active_sync: &mut Option<(super::OperationId, Pin<Box<time::Sleep>>)>,
     commands_first: bool,
 ) -> CoreInput {
     poll_fn(|context| {
@@ -518,12 +464,6 @@ async fn next_input(
             Poll::Ready(Some(reply)) => return Poll::Ready(CoreInput::Database(reply)),
             Poll::Ready(None) => return Poll::Ready(CoreInput::DatabaseClosed),
             Poll::Pending => {}
-        }
-
-        if let Some((_, delay)) = active_sync
-            && delay.as_mut().poll(context).is_ready()
-        {
-            return Poll::Ready(CoreInput::SyncElapsed);
         }
 
         if !commands_first {
@@ -848,7 +788,7 @@ mod tests {
     use super::*;
     use crate::core::{
         AccountDirectoryQuery, AccountScope, FolderScope, Generation, MailboxQuery, MessageId,
-        MessageQuery, OperationId, PageSpec, RequestId,
+        MessageQuery, PageSpec, RequestId,
     };
     use rusqlite::Connection;
     use std::{
@@ -932,93 +872,23 @@ mod tests {
     }
 
     #[test]
-    fn sync_round_trip_preserves_operation_id() {
-        let (core, mut events, runtime) = spawn_with_delay(Duration::from_millis(1)).unwrap();
-        let operation_id = OperationId::new(42);
-
-        core.try_send_sync(operation_id).unwrap();
-
-        assert_eq!(
-            events.blocking_recv(),
-            Some(Event::SyncFinished { operation_id })
-        );
-        runtime.shutdown().unwrap();
-    }
-
-    #[test]
-    fn shutdown_interrupts_pending_sync() {
-        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
-        let (core, _events, runtime) = spawn_with_options(
-            Duration::from_secs(5),
-            EVENT_CAPACITY,
-            test_database(),
-            Some(started_tx),
-        )
-        .unwrap();
-        core.try_send_sync(OperationId::new(1)).unwrap();
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        let started = Instant::now();
-
-        runtime.shutdown().unwrap();
-
-        assert!(started.elapsed() < Duration::from_secs(1));
-    }
-
-    #[test]
-    fn mailbox_query_completes_while_sync_is_active() {
-        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
-        let (core, mut events, runtime) = spawn_with_options(
-            Duration::from_secs(5),
-            EVENT_CAPACITY,
-            test_database(),
-            Some(started_tx),
-        )
-        .unwrap();
-        core.try_send_sync(OperationId::new(1)).unwrap();
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-
-        core.try_query_mailbox(mailbox_query(5, 5)).unwrap();
-
-        let event = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap()
-            .block_on(async {
-                tokio::time::timeout(Duration::from_secs(1), events.recv())
-                    .await
-                    .unwrap()
-            });
-        assert!(matches!(event, Some(Event::MailboxLoaded(_))));
-        runtime.shutdown().unwrap();
-    }
-
-    #[test]
     fn full_event_queue_applies_backpressure_without_stopping_core() {
-        let (core, mut events, runtime) =
-            spawn_with_options(Duration::from_millis(1), 1, test_database(), None).unwrap();
-        let first = OperationId::new(1);
-        let second = OperationId::new(2);
-        core.try_send_sync(first).unwrap();
-        core.try_send_sync(second).unwrap();
+        let (core, mut events, runtime) = spawn_with_options(1, test_database()).unwrap();
+        core.try_mutate(mutation_request(1, 0, 1)).unwrap();
+        core.try_mutate(mutation_request(2, 0, 1)).unwrap();
 
-        assert_eq!(
-            events.blocking_recv(),
-            Some(Event::SyncFinished {
-                operation_id: first
-            })
-        );
-        assert_eq!(
-            events.blocking_recv(),
-            Some(Event::SyncFinished {
-                operation_id: second
-            })
-        );
+        for request_id in [1, 2] {
+            let Some(Event::MutationFinished(reply)) = events.blocking_recv() else {
+                panic!("expected mutation result");
+            };
+            assert_eq!(reply.request_id, RequestId::new(request_id).unwrap());
+        }
         runtime.shutdown().unwrap();
     }
 
     #[test]
     fn mailbox_query_round_trip_preserves_request_identity() {
-        let (core, mut events, runtime) = spawn_with_delay(Duration::from_millis(1)).unwrap();
+        let (core, mut events, runtime) = spawn_for_test().unwrap();
         let query = mailbox_query(7, 3);
 
         core.try_query_mailbox(query).unwrap();
@@ -1034,7 +904,7 @@ mod tests {
 
     #[test]
     fn account_directory_round_trip_preserves_request_identity() {
-        let (core, mut events, runtime) = spawn_with_delay(Duration::from_millis(1)).unwrap();
+        let (core, mut events, runtime) = spawn_for_test().unwrap();
         let query = account_directory_query(6, 2);
 
         core.try_query_account_directory(query).unwrap();
@@ -1050,7 +920,7 @@ mod tests {
 
     #[test]
     fn message_query_round_trip_preserves_request_identity() {
-        let (core, mut events, runtime) = spawn_with_delay(Duration::from_millis(1)).unwrap();
+        let (core, mut events, runtime) = spawn_for_test().unwrap();
 
         core.try_open_message(message_query(8, 4, 1)).unwrap();
 
@@ -1065,7 +935,7 @@ mod tests {
 
     #[test]
     fn mutation_round_trip_preserves_request_identity_and_failure() {
-        let (core, mut events, runtime) = spawn_with_delay(Duration::from_millis(1)).unwrap();
+        let (core, mut events, runtime) = spawn_for_test().unwrap();
 
         core.try_mutate(mutation_request(9, 5, 1)).unwrap();
 
@@ -1085,8 +955,7 @@ mod tests {
         seed_file_database(&path);
 
         let database = sqlite::spawn(path.clone()).unwrap();
-        let (core, _events, runtime) =
-            spawn_with_options(Duration::from_secs(5), EVENT_CAPACITY, database, None).unwrap();
+        let (core, _events, runtime) = spawn_with_options(EVENT_CAPACITY, database).unwrap();
         core.try_mutate(mutation_request(1, 0, 1)).unwrap();
 
         runtime.shutdown().unwrap();
@@ -1108,8 +977,7 @@ mod tests {
         let (started_tx, started_rx) = crossbeam_channel::bounded(1);
         database.0.try_run_long_query(started_tx).unwrap();
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        let (core, _events, runtime) =
-            spawn_with_options(Duration::from_secs(5), EVENT_CAPACITY, database, None).unwrap();
+        let (core, _events, runtime) = spawn_with_options(EVENT_CAPACITY, database).unwrap();
         core.try_mutate(mutation_request(1, 0, 1)).unwrap();
         let started = Instant::now();
 
@@ -1138,14 +1006,17 @@ mod tests {
                 )
                 .unwrap();
         }
-        let (core, events, runtime) =
-            spawn_with_options(Duration::from_millis(1), 1, database, None).unwrap();
-        core.try_send_sync(OperationId::new(1)).unwrap();
+        let (core, events, runtime) = spawn_with_options(1, database).unwrap();
+        core.try_mutate(mutation_request(1, 0, 1)).unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
         while events.is_empty() && Instant::now() < deadline {
             thread::yield_now();
         }
-        assert_eq!(events.len(), 1, "sync result should fill the event queue");
+        assert_eq!(
+            events.len(),
+            1,
+            "busy mutation rejection should fill the event queue"
+        );
         core.try_mutate(mutation_request(2, 0, 1)).unwrap();
         thread::sleep(Duration::from_millis(20));
 
@@ -1267,13 +1138,12 @@ mod tests {
 
         let (command_tx, mut commands) = mpsc::channel(1);
         command_tx
-            .try_send(Command::SyncNow {
-                operation_id: OperationId::new(1),
-            })
+            .try_send(Command::QueryAccountDirectory(account_directory_query(
+                1, 1,
+            )))
             .unwrap();
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
         let mut shutdown = Box::pin(shutdown_rx);
-        let mut active_sync = None;
         let input = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
@@ -1281,7 +1151,6 @@ mod tests {
                 &mut shutdown,
                 &mut commands,
                 &mut database_replies,
-                &mut active_sync,
                 false,
             ));
 
@@ -1290,15 +1159,18 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_interrupts_mailbox_event_backpressure() {
-        let (core, events, runtime) =
-            spawn_with_options(Duration::from_millis(1), 1, test_database(), None).unwrap();
-        core.try_send_sync(OperationId::new(1)).unwrap();
+    fn shutdown_interrupts_query_event_backpressure() {
+        let (core, events, runtime) = spawn_with_options(1, test_database()).unwrap();
+        core.try_mutate(mutation_request(1, 0, 1)).unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
         while events.is_empty() && Instant::now() < deadline {
             thread::yield_now();
         }
-        assert_eq!(events.len(), 1, "sync event should fill the event queue");
+        assert_eq!(
+            events.len(),
+            1,
+            "mutation event should fill the event queue"
+        );
         core.try_query_mailbox(mailbox_query(4, 4)).unwrap();
         thread::sleep(Duration::from_millis(20));
         let started = Instant::now();

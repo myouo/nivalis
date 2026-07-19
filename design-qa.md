@@ -1,5 +1,7 @@
 **Comparison Target**
 
+> Historical evidence: these captures predate the M1 capability-gating change. Simulated synchronization, in-memory delivery, composer/reply controls, fabricated attachment metadata, and explicit full-body loading have since been removed. Visual QA must be recaptured after the SQLite controller cutover before M1 is accepted.
+
 - Source visual truth: `/home/myo/.codex/generated_images/019f7333-2b07-7833-8482-7b297eb72cba/exec-1df1096f-60fe-408f-9ae2-49891ebe4b81.png`
 - Normalized source: `artifacts/nivalis-reference-1200x900.png`
 - Implementation screenshot: `artifacts/nivalis-mail-memory-optimized.png`
@@ -48,14 +50,14 @@
 6. UI modularization moved models, controls, shell, mailbox, reader, composer, states, and overlays behind explicit Slint module boundaries while keeping `AppWindow` as the state and conditional-instantiation root.
    Regression evidence: `artifacts/nivalis-ui-split-comparison.png` compares the prior memory-optimized build with the modular build at the same 1200 x 900 state. Pixel RMSE is exactly 0, and the composer still opens with recipient focus and closes through Escape.
 
-**Primary Interactions Tested**
+**Historical Interactions Tested**
 
 - `Ctrl+N` opens the composer.
 - The composer automatically focuses the recipient field; typed text enters that field.
 - `Escape` closes the composer and returns to the inbox.
 - At 720 x 760, selecting a message transitions from the compact list to the full-width reader.
 - Window minimize, maximize/restore, close, and drag callbacks are wired to Slint's native window API.
-- Store tests cover search, account/folder filtering, selection, read/star/archive/delete/undo, compose/send, sync, and loading/error state transitions.
+- Store tests covered search, account/folder filtering, selection, read/star/archive/delete/undo, test-fixture sent rows, and loading/error state transitions.
 - This is a native Slint application, so browser console checks do not apply. The native process remained responsive during capture and keyboard testing.
 
 **Release Measurements**
@@ -84,4 +86,4 @@
 - [x] Verify core keyboard flow and accessible focus behavior.
 - [x] Compare full and focused regions against the source at the same viewport.
 
-final result: passed
+historical result: passed; current M1 visual regression pending

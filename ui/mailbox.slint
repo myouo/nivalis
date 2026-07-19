@@ -128,11 +128,11 @@ export component MailboxPane inherits Rectangle {
     in property <bool> wide-sidebar: true;
     in property <string> active-folder: "Inbox";
     in property <string> active-account-name;
+    in property <string> data-source-label: "Local sample";
     in property <int> active-account-id: 0;
     in property <bool> active-account-error: false;
     in property <int> inbox-count: 0;
     in property <string> status-text;
-    in property <bool> syncing: false;
     in property <bool> initial-loading: false;
     in property <[MailSummary]> mails;
     in property <int> selected-id: -1;
@@ -146,7 +146,6 @@ export component MailboxPane inherits Rectangle {
     callback select-mail(int);
     callback query-mail(string);
     callback toggle-star(int);
-    callback sync;
 
     preferred-width: root.compact-layout ? 0px : (root.wide-sidebar ? 408px : 372px);
     min-width: root.compact-layout ? 0px : 340px;
@@ -169,14 +168,13 @@ export component MailboxPane inherits Rectangle {
                     horizontal-stretch: 1;
                     Text { text: root.active-folder; color: Theme.on-surface; font-family: Theme.body-font; font-size: 18px; font-weight: 500; vertical-alignment: center; }
                     Text {
-                        text: root.active-account-name + "  ·  " + root.inbox-count + " unread  ·  " + root.status-text;
+                        text: root.active-account-name + "  ·  " + root.data-source-label + "  ·  " + root.inbox-count + " unread  ·  " + root.status-text;
                         color: Theme.on-surface-variant;
                         font-family: Theme.body-font;
                         font-size: 10px;
                         overflow: elide;
                     }
                 }
-                MButton { label: "Refresh"; icon: "refresh"; enabled: !root.syncing; loading: root.syncing; clicked => { root.sync(); } }
                 MIconButton { icon: "more_horiz"; label: "More inbox actions"; selected: root.more-menu-open; clicked => { root.more-menu-open = true; } }
             }
         }
@@ -210,7 +208,7 @@ export component MailboxPane inherits Rectangle {
                                 font-family: Theme.body-font;
                                 font-size: 12px;
                                 single-line: true;
-                                accessible-label: "Search people, subjects, and message text";
+                                accessible-label: "Search senders, subjects, and message previews";
                                 accessible-placeholder-text: "Search mail";
                                 edited => { root.query-mail(root.search-query); }
                             }
@@ -241,8 +239,8 @@ export component MailboxPane inherits Rectangle {
         if root.active-account-error && !root.error-banner-dismissed: Rectangle {
             height: 48px;
             accessible-role: region;
-            accessible-label: "Account error. Personal account needs attention.";
-            accessible-live-region: assertive;
+            accessible-label: "Sample account warning.";
+            accessible-live-region: polite;
             Rectangle {
                 x: 8px;
                 y: 4px;
@@ -258,16 +256,16 @@ export component MailboxPane inherits Rectangle {
                 padding-right: 8px;
                 spacing: 7px;
                 MaterialIcon { name: "warning"; width: 19px; size: 17px; icon-color: Theme.warning; }
-                Text { text: "Personal account needs attention"; color: Theme.on-tertiary-container; font-family: Theme.body-font; font-size: 10px; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
-                MButton { width: 112px; label: "Review account"; variant: "text"; clicked => { root.account-menu-open = true; } }
+                Text { text: "Sample account warning"; color: Theme.on-tertiary-container; font-family: Theme.body-font; font-size: 10px; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                MButton { width: 124px; label: "View sample account"; variant: "text"; clicked => { root.account-menu-open = true; } }
                 MIconButton { icon: "close"; label: "Dismiss account warning"; compact-visual: true; clicked => { root.error-banner-dismissed = true; } }
             }
         }
 
-        if root.syncing || root.initial-loading: Rectangle {
+        if root.initial-loading: Rectangle {
             height: 2px;
             background: Theme.surface-container-highest;
-            Rectangle { width: root.initial-loading ? 62% : 38%; height: parent.height; background: Theme.primary; }
+            Rectangle { width: 62%; height: parent.height; background: Theme.primary; }
         }
 
         if root.initial-loading: VerticalLayout {
@@ -302,12 +300,12 @@ export component MailboxPane inherits Rectangle {
 
         if !root.initial-loading && root.mails.length == 0: EmptyState {
             title: root.search-query == "" ? "No messages here" : "No matching messages";
-            detail: root.search-query == "" ? "New messages will appear when they arrive." : "Try another sender, subject, or keyword.";
+            detail: root.search-query == "" ? "No cached messages are available in this folder." : "Try another sender, subject, or preview keyword.";
             icon: root.search-query == "" ? "mail" : "search";
-            action-label: root.search-query == "" ? "Sync now" : "Clear search";
+            action-label: root.search-query == "" ? "" : "Clear search";
             action => {
-                if (root.search-query == "") { root.sync(); }
-                else { root.search-query = ""; root.query-mail(""); }
+                root.search-query = "";
+                root.query-mail("");
             }
         }
 

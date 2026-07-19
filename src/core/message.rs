@@ -8,20 +8,8 @@ use tokio::sync::mpsc;
 pub(crate) const COMMAND_CAPACITY: usize = 64;
 pub(crate) const EVENT_CAPACITY: usize = 128;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct OperationId(u64);
-
-impl OperationId {
-    pub(crate) fn new(value: u64) -> Self {
-        Self(value)
-    }
-}
-
 #[derive(Debug)]
 pub(super) enum Command {
-    SyncNow {
-        operation_id: OperationId,
-    },
     #[cfg_attr(not(test), allow(dead_code))]
     QueryAccountDirectory(AccountDirectoryQuery),
     #[cfg_attr(not(test), allow(dead_code))]
@@ -34,9 +22,6 @@ pub(super) enum Command {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Event {
-    SyncFinished {
-        operation_id: OperationId,
-    },
     AccountsLoaded(Tagged<AccountDirectory>),
     AccountsLoadRejected {
         request_id: RequestId,
@@ -375,12 +360,6 @@ impl CoreHandle {
         Self { commands }
     }
 
-    pub(crate) fn try_send_sync(&self, operation_id: OperationId) -> Result<(), SubmitError> {
-        self.commands
-            .try_send(Command::SyncNow { operation_id })
-            .map_err(SubmitError::from)
-    }
-
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn try_query_account_directory(
         &self,
@@ -432,14 +411,21 @@ impl From<mpsc::error::TrySendError<Command>> for SubmitError {
 mod tests {
     use super::*;
 
+    fn account_directory_query(request_id: u64) -> AccountDirectoryQuery {
+        AccountDirectoryQuery::new(RequestId::new(request_id).unwrap(), Generation::new(0))
+    }
+
     #[test]
     fn full_command_queue_is_reported_as_busy() {
         let (sender, _receiver) = mpsc::channel(1);
         let handle = CoreHandle::new(sender);
 
-        assert_eq!(handle.try_send_sync(OperationId::new(1)), Ok(()));
         assert_eq!(
-            handle.try_send_sync(OperationId::new(2)),
+            handle.try_query_account_directory(account_directory_query(1)),
+            Ok(())
+        );
+        assert_eq!(
+            handle.try_query_account_directory(account_directory_query(2)),
             Err(SubmitError::Busy)
         );
     }
@@ -451,7 +437,7 @@ mod tests {
         drop(receiver);
 
         assert_eq!(
-            handle.try_send_sync(OperationId::new(1)),
+            handle.try_query_account_directory(account_directory_query(1)),
             Err(SubmitError::Closed)
         );
     }

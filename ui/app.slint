@@ -3,7 +3,6 @@ import "../assets/fonts/MaterialSymbolsRounded-Subset.ttf";
 import { Theme } from "theme.slint";
 import { MailboxPane } from "mailbox.slint";
 import { ReaderPane } from "reader.slint";
-import { ComposerOverlay } from "composer.slint";
 import {
     NavigationPane, TitleBar
 } from "shell.slint";
@@ -38,21 +37,16 @@ export component AppWindow inherits Window {
     in property <int> draft-count: 0;
     in property <int> active-account-id: 0;
     in property <string> active-account-name: "All inboxes";
-    in property <string> active-account-detail: "3 connected accounts";
+    in property <string> data-source-label: "Local sample";
+    in property <string> active-account-detail: "Local sample accounts";
     in property <string> active-account-initials: "AI";
     in property <color> active-account-color: Theme.primary;
     in property <bool> active-account-error: true;
     in property <string> active-folder: "Inbox";
     in-out property <string> search-query: "";
-    in-out property <bool> composer-open: false;
     in-out property <bool> detail-open: false;
-    in-out property <bool> syncing: false;
     in-out property <bool> initial-loading: false;
-    in-out property <string> status-text: "Updated just now";
-    in-out property <string> compose-to: "";
-    in-out property <string> compose-subject: "";
-    in-out property <string> compose-body: "";
-    in-out property <string> composer-error: "";
+    in-out property <string> status-text: "Local preview";
     in-out property <bool> account-menu-open: false;
     in-out property <bool> settings-open: false;
     in-out property <bool> more-menu-open: false;
@@ -67,20 +61,17 @@ export component AppWindow inherits Window {
 
     private property <bool> compact-layout: false;
     private property <bool> wide-sidebar: true;
-    private property <bool> short-window: false;
     private property <length> navigation-width: 248px;
     private property <bool> sidebar-collapsed: false;
     private property <bool> filter-menu-open: false;
     private property <bool> error-banner-dismissed: false;
     private property <bool> is-maximized: false;
-    private property <bool> blocking-overlay-open: root.account-menu-open || root.settings-open || root.more-menu-open || root.filter-menu-open || root.message-menu-open || root.composer-open || root.delete-dialog-open;
 
     changed width => {
         root.compact-layout = root.width < 760px;
         root.wide-sidebar = root.width >= 1080px && !root.sidebar-collapsed;
         root.navigation-width = root.wide-sidebar ? 248px : 54px;
     }
-    changed height => { root.short-window = root.height < 660px; }
     changed sidebar-collapsed => {
         root.wide-sidebar = root.width >= 1080px && !root.sidebar-collapsed;
         root.navigation-width = root.wide-sidebar ? 248px : 54px;
@@ -94,11 +85,8 @@ export component AppWindow inherits Window {
     callback archive(int);
     callback delete-mail(int);
     callback mark-unread(int);
-    callback send-message(string, string, string) -> bool;
-    callback sync;
     callback switch-account(int);
     callback undo-delete;
-    callback load-full-message(int);
     callback window-minimize;
     callback window-maximize(bool);
     callback window-close;
@@ -107,15 +95,6 @@ export component AppWindow inherits Window {
     app-focus := FocusScope {
         focus-on-tab-navigation: false;
 
-        KeyBinding {
-            keys: @keys(Control + N);
-            activated => {
-                if (!root.blocking-overlay-open) {
-                    root.composer-error = "";
-                    root.composer-open = true;
-                }
-            }
-        }
         key-pressed(event) => {
             if (event.text == Key.Escape) {
                 if (root.delete-dialog-open) { root.delete-dialog-open = false; }
@@ -124,7 +103,6 @@ export component AppWindow inherits Window {
                 else if (root.settings-open) { root.settings-open = false; }
                 else if (root.filter-menu-open) { root.filter-menu-open = false; }
                 else if (root.more-menu-open) { root.more-menu-open = false; }
-                else if (root.composer-open) { root.composer-open = false; }
                 else if (root.compact-layout && root.detail-open) { root.detail-open = false; }
                 else { return reject; }
                 return accept;
@@ -170,7 +148,6 @@ export component AppWindow inherits Window {
                         starred-count: root.starred-count;
                         draft-count: root.draft-count;
                         collapsed(value) => { root.sidebar-collapsed = value; }
-                        compose => { root.composer-error = ""; root.composer-open = true; }
                         folder-selected(folder) => { root.filter-folder(folder); root.detail-open = false; }
                         open-accounts => { root.account-menu-open = true; }
                         open-settings => { root.settings-open = true; }
@@ -192,11 +169,11 @@ export component AppWindow inherits Window {
                                 wide-sidebar: root.wide-sidebar;
                                 active-folder: root.active-folder;
                                 active-account-name: root.active-account-name;
+                                data-source-label: root.data-source-label;
                                 active-account-id: root.active-account-id;
                                 active-account-error: root.active-account-error;
                                 inbox-count: root.inbox-count;
                                 status-text: root.status-text;
-                                syncing: root.syncing;
                                 initial-loading: root.initial-loading;
                                 mails: root.mails;
                                 selected-id: root.selected-id;
@@ -210,7 +187,6 @@ export component AppWindow inherits Window {
                                 select-mail(id) => { root.select-mail(id); }
                                 query-mail(query) => { root.query-mail(query); }
                                 toggle-star(id) => { root.toggle-star(id); }
-                                sync => { root.sync(); }
                             }
 
                             if !root.compact-layout || root.detail-open: ReaderPane {
@@ -219,18 +195,12 @@ export component AppWindow inherits Window {
                                 selected-id: root.selected-id;
                                 selected-mail: root.selected-mail;
                                 detail-open <=> root.detail-open;
-                                composer-open <=> root.composer-open;
-                                compose-to <=> root.compose-to;
-                                compose-subject <=> root.compose-subject;
-                                compose-body <=> root.compose-body;
-                                composer-error <=> root.composer-error;
                                 delete-dialog-open <=> root.delete-dialog-open;
                                 message-menu-open <=> root.message-menu-open;
                                 filter-folder(folder) => { root.filter-folder(folder); }
                                 toggle-star(id) => { root.toggle-star(id); }
                                 archive(id) => { root.archive(id); }
                                 mark-unread(id) => { root.mark-unread(id); }
-                                load-full-message(id) => { root.load-full-message(id); }
                             }
                         }
                     }
@@ -271,7 +241,6 @@ export component AppWindow inherits Window {
         more-menu-open <=> root.more-menu-open;
         account-menu-open <=> root.account-menu-open;
         settings-open <=> root.settings-open;
-        sync => { root.sync(); }
     }
 
     if root.settings-open: SettingsOverlay {
@@ -294,21 +263,6 @@ export component AppWindow inherits Window {
         delete-dialog-open <=> root.delete-dialog-open;
         toggle-star(id) => { root.toggle-star(id); }
         mark-unread(id) => { root.mark-unread(id); }
-    }
-
-    if root.composer-open: ComposerOverlay {
-        width: parent.width;
-        height: parent.height;
-        compact-layout: root.compact-layout;
-        short-window: root.short-window;
-        composer-open <=> root.composer-open;
-        compose-to <=> root.compose-to;
-        compose-subject <=> root.compose-subject;
-        compose-body <=> root.compose-body;
-        composer-error <=> root.composer-error;
-        send-message(to, subject, body) => {
-            return root.send-message(to, subject, body);
-        }
     }
 
     if root.delete-dialog-open: DeleteDialog {

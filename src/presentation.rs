@@ -122,7 +122,8 @@ mod tests {
         store.set_folder("Sent");
         let mut newest_id = 0;
         for index in 0..75 {
-            newest_id = store.send("to@example.com", &format!("Message {index}"), "Body");
+            newest_id =
+                store.insert_test_sent_mail("to@example.com", &format!("Message {index}"), "Body");
         }
         let model = VecModel::from(store.view().rows);
         assert_eq!(model.row_count(), 50);

@@ -42,10 +42,10 @@ pub(crate) fn install_memory_stress(ui: &AppWindow) -> Option<Rc<Timer>> {
                 if current >= steps {
                     ui.set_settings_open(false);
                     ui.set_account_menu_open(false);
-                    ui.set_composer_open(false);
-                    ui.set_compose_to("".into());
-                    ui.set_compose_subject("".into());
-                    ui.set_compose_body("".into());
+                    ui.set_more_menu_open(false);
+                    ui.set_message_menu_open(false);
+                    ui.set_delete_dialog_open(false);
+                    ui.set_detail_open(false);
                     ui.set_search_query("".into());
                     ui.invoke_query_mail("".into());
                     ui.set_status_text("Memory stress complete".into());
@@ -78,21 +78,18 @@ pub(crate) fn install_memory_stress(ui: &AppWindow) -> Option<Rc<Timer>> {
                     }
                     4 => {
                         ui.set_account_menu_open(false);
-                        ui.set_composer_open(true);
-                        ui.set_compose_to("stress@example.com".into());
-                        ui.set_compose_subject("Bounded interaction stress".into());
-                        if current == 4 {
-                            ui.set_compose_body("x".repeat(64 * 1024).into());
-                        }
+                        ui.set_more_menu_open(true);
                     }
                     5 => {
-                        ui.set_composer_open(false);
-                        ui.set_compose_to("".into());
-                        ui.set_compose_subject("".into());
-                        ui.set_compose_body("".into());
+                        ui.set_more_menu_open(false);
+                        ui.set_message_menu_open(true);
                     }
-                    6 => ui.invoke_sync(),
+                    6 => {
+                        ui.set_message_menu_open(false);
+                        ui.set_delete_dialog_open(true);
+                    }
                     _ => {
+                        ui.set_delete_dialog_open(false);
                         let query = if current % 16 == 7 { "maya" } else { "" };
                         ui.set_search_query(query.into());
                         ui.invoke_query_mail(query.into());

@@ -1,7 +1,7 @@
 mod message;
 mod runtime;
 
-pub(crate) use message::{CoreHandle, Event, EventReceiver, OperationId, SubmitError};
+pub(crate) use message::{CoreHandle, Event, EventReceiver};
 pub(crate) use runtime::{CoreRuntime, StartError};
 
 #[allow(unused_imports)]
@@ -12,7 +12,7 @@ pub(crate) use crate::store::sqlite::{
 #[allow(unused_imports)]
 pub(crate) use message::{
     AccountDirectoryLoadError, AccountDirectoryQuery, MailboxLoadError, MailboxQuery,
-    MessageLoadError, MessageQuery, MutationRequest, MutationSubmitError,
+    MessageLoadError, MessageQuery, MutationRequest, MutationSubmitError, SubmitError,
 };
 
 pub(crate) fn spawn(

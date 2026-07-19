@@ -88,7 +88,6 @@ export component InboxMoreMenuOverlay inherits Rectangle {
     in-out property <bool> more-menu-open: false;
     in-out property <bool> account-menu-open: false;
     in-out property <bool> settings-open: false;
-    callback sync;
 
     z: 22;
     background: transparent;
@@ -97,7 +96,7 @@ export component InboxMoreMenuOverlay inherits Rectangle {
         x: root.navigation-width + (root.compact-layout ? parent.width - root.navigation-width - 226px : (root.wide-sidebar ? 178px : 142px));
         y: 88px;
         width: 218px;
-        height: 160px;
+        height: 116px;
         border-radius: 8px;
         border-width: 1px;
         border-color: Theme.outline;
@@ -106,7 +105,6 @@ export component InboxMoreMenuOverlay inherits Rectangle {
         VerticalLayout {
             padding: 9px;
             spacing: 2px;
-            MButton { label: "Sync all accounts"; icon: "refresh"; clicked => { root.sync(); root.more-menu-open = false; } }
             MButton { label: "Account status"; icon: "account_circle"; clicked => { root.more-menu-open = false; root.account-menu-open = true; } }
             MButton { label: "Display settings"; icon: "settings"; clicked => { root.more-menu-open = false; root.settings-open = true; } }
         }
@@ -208,7 +206,7 @@ export component MessageMenuOverlay inherits Rectangle {
             spacing: 2px;
             MButton { label: root.selected-mail.starred ? "Remove star" : "Add star"; icon: root.selected-mail.starred ? "star" : "star_outline"; clicked => { root.toggle-star(root.selected-id); root.message-menu-open = false; } }
             MButton { label: "Mark unread"; icon: "mark_email_unread"; clicked => { root.mark-unread(root.selected-id); root.message-menu-open = false; } }
-            MButton { label: root.active-folder == "Trash" ? "Delete permanently" : "Move to trash"; icon: "delete"; variant: "danger"; clicked => { root.message-menu-open = false; root.delete-dialog-open = true; } }
+            MButton { label: root.active-folder == "Trash" ? "Remove from sample" : "Move sample to trash"; icon: "delete"; variant: "danger"; clicked => { root.message-menu-open = false; root.delete-dialog-open = true; } }
         }
     }
 }
@@ -233,14 +231,14 @@ export component DeleteDialog inherits Rectangle {
         border-color: Theme.outline;
         background: Theme.surface;
         accessible-role: region;
-        accessible-label: root.active-folder == "Trash" ? "Confirm permanent deletion" : "Confirm moving message to trash";
+        accessible-label: root.active-folder == "Trash" ? "Confirm removing a local sample message" : "Confirm moving a local sample message to trash";
         VerticalLayout {
             padding: 20px;
             spacing: 10px;
             MaterialIcon { name: "delete"; width: 32px; height: 32px; size: 24px; icon-color: Theme.error; }
-            Text { text: root.active-folder == "Trash" ? "Delete this message forever?" : "Move this message to trash?"; color: Theme.on-surface; font-family: Theme.body-font; font-size: 18px; font-weight: 500; wrap: word-wrap; }
+            Text { text: root.active-folder == "Trash" ? "Remove this local sample message?" : "Move this local sample message to trash?"; color: Theme.on-surface; font-family: Theme.body-font; font-size: 18px; font-weight: 500; wrap: word-wrap; }
             Text {
-                text: root.active-folder == "Trash" ? "This permanently removes the message and cannot be undone." : "The message leaves this mailbox. You can undo from the confirmation message.";
+                text: root.active-folder == "Trash" ? "This removes it from the current sample only. Sample data returns after restart." : "This only changes the current local sample. You can undo from the confirmation message.";
                 color: Theme.on-surface-variant;
                 font-family: Theme.body-font;
                 font-size: 11px;
@@ -252,7 +250,7 @@ export component DeleteDialog inherits Rectangle {
                 Rectangle { horizontal-stretch: 1; }
                 MButton { label: "Keep message"; clicked => { root.delete-dialog-open = false; } }
                 MButton {
-                    label: root.active-folder == "Trash" ? "Delete permanently" : "Move to trash";
+                    label: root.active-folder == "Trash" ? "Remove from sample" : "Move sample to trash";
                     icon: "delete";
                     variant: "danger-filled";
                     clicked => { root.delete-dialog-open = false; root.delete-mail(root.selected-id); root.detail-open = false; }
