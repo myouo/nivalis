@@ -85,8 +85,12 @@ fi
 stress_scenario=${NIVALIS_STRESS_SCENARIO:-mixed}
 if [[ -n "$stress_steps" && "$stress_scenario" != "mixed" &&
     "$stress_scenario" != "pagination" && "$stress_scenario" != "write-search" &&
-    "$stress_scenario" != "content" ]]; then
+    "$stress_scenario" != "content" && "$stress_scenario" != "account-diagnostic" ]]; then
     printf 'Unsupported NIVALIS_STRESS_SCENARIO: %s\n' "$stress_scenario" >&2
+    exit 1
+fi
+if [[ "$stress_scenario" == "account-diagnostic" && "$stress_steps" != "1" ]]; then
+    printf 'account-diagnostic stress requires NIVALIS_STRESS_STEPS=1\n' >&2
     exit 1
 fi
 if [[ -n "$stress_steps" &&
@@ -404,7 +408,14 @@ for ((run = 1; run <= runs; run++)); do
             exit 1
         fi
         stress_result=${stress_results[0]}
-        if [[ "$stress_scenario" == "pagination" ]]; then
+        if [[ "$stress_scenario" == "account-diagnostic" ]]; then
+            account_diagnostic_pattern='^NIVALIS_STRESS_RESULT scenario=account-diagnostic cycles=1 outcome=(ready|authentication) removed=1 elapsed_ms=(0|[1-9][0-9]*)$'
+            if [[ ! "$stress_result" =~ $account_diagnostic_pattern ]]; then
+                printf 'Account-diagnostic stress completion marker has an invalid format: %s\n' \
+                    "$stress_result" >&2
+                exit 1
+            fi
+        elif [[ "$stress_scenario" == "pagination" ]]; then
             pagination_pattern='^NIVALIS_STRESS_RESULT scenario=pagination transitions=([1-9][0-9]*) after=([1-9][0-9]*) before=([1-9][0-9]*) final_page=1 elapsed_ms=(0|[1-9][0-9]*)$'
             if [[ ! "$stress_result" =~ $pagination_pattern ]]; then
                 printf 'Pagination stress completion marker has an invalid format: %s\n' \

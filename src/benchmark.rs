@@ -8,11 +8,13 @@ use crate::{
 };
 use slint::{ComponentHandle, Model, SharedString, Timer, TimerMode};
 use std::cell::{Cell, RefCell};
+use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use zeroize::Zeroizing;
 
 pub(crate) fn install_memory_stress(
     ui: &AppWindow,
@@ -38,6 +40,7 @@ pub(crate) fn install_memory_stress(
         Ok("pagination") => install_pagination_stress(ui, steps, delay, interval),
         Ok("write-search") => install_write_search_stress(ui, steps, delay, interval),
         Ok("content") => install_content_stress(ui, database, content_path, steps, delay),
+        Ok("account-diagnostic") => install_account_diagnostic_stress(ui, steps, delay, interval),
         Ok("mixed") | Err(_) => install_mixed_stress(ui, steps, delay, interval),
         Ok(scenario) => {
             eprintln!(
@@ -46,6 +49,343 @@ pub(crate) fn install_memory_stress(
             None
         }
     }
+}
+
+const ACCOUNT_DIAGNOSTIC_SECRET_LIMIT: u64 = 16 * 1024;
+const ACCOUNT_DIAGNOSTIC_DEFAULT_TIMEOUT_MS: u64 = 45_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccountDiagnosticExpectation {
+    Ready,
+    Authentication,
+}
+
+impl AccountDiagnosticExpectation {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "ready" => Some(Self::Ready),
+            "authentication" => Some(Self::Authentication),
+            _ => None,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Authentication => "authentication",
+        }
+    }
+}
+
+struct AccountDiagnosticConfig {
+    name: String,
+    address: String,
+    login: String,
+    host: String,
+    port: String,
+    secret: Zeroizing<Vec<u8>>,
+    expected: AccountDiagnosticExpectation,
+}
+
+impl AccountDiagnosticConfig {
+    fn load() -> Result<Self, &'static str> {
+        let secret_path = required_account_diagnostic_env("NIVALIS_STRESS_ACCOUNT_SECRET_FILE")?;
+        Ok(Self {
+            name: std::env::var("NIVALIS_STRESS_ACCOUNT_NAME")
+                .unwrap_or_else(|_| "Memory diagnostic".into()),
+            address: required_account_diagnostic_env("NIVALIS_STRESS_ACCOUNT_ADDRESS")?,
+            login: required_account_diagnostic_env("NIVALIS_STRESS_ACCOUNT_LOGIN")?,
+            host: required_account_diagnostic_env("NIVALIS_STRESS_ACCOUNT_IMAP_HOST")?,
+            port: std::env::var("NIVALIS_STRESS_ACCOUNT_IMAP_PORT")
+                .unwrap_or_else(|_| "993".into()),
+            secret: read_account_diagnostic_secret(&PathBuf::from(secret_path))?,
+            expected: std::env::var("NIVALIS_STRESS_ACCOUNT_EXPECTED_RESULT")
+                .ok()
+                .as_deref()
+                .and_then(AccountDiagnosticExpectation::parse)
+                .ok_or("invalid_expected_result")?,
+        })
+    }
+}
+
+fn required_account_diagnostic_env(name: &str) -> Result<String, &'static str> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .ok_or("configuration_unavailable")
+}
+
+fn read_account_diagnostic_secret(
+    path: &std::path::Path,
+) -> Result<Zeroizing<Vec<u8>>, &'static str> {
+    if !path.is_absolute() {
+        return Err("secret_path_not_absolute");
+    }
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| "secret_file_unavailable")?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err("secret_file_invalid");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err("secret_file_permissions");
+        }
+    }
+    if metadata.len() == 0 || metadata.len() > ACCOUNT_DIAGNOSTIC_SECRET_LIMIT {
+        return Err("secret_file_size");
+    }
+
+    let mut secret = Zeroizing::new(Vec::with_capacity(
+        usize::try_from(metadata.len()).map_err(|_| "secret_file_size")?,
+    ));
+    File::open(path)
+        .map_err(|_| "secret_file_unavailable")?
+        .take(ACCOUNT_DIAGNOSTIC_SECRET_LIMIT + 1)
+        .read_to_end(&mut secret)
+        .map_err(|_| "secret_file_unavailable")?;
+    if secret.len() as u64 != metadata.len()
+        || secret.is_empty()
+        || secret.len() as u64 > ACCOUNT_DIAGNOSTIC_SECRET_LIMIT
+        || std::str::from_utf8(&secret).is_err()
+    {
+        return Err("secret_file_invalid");
+    }
+    Ok(secret)
+}
+
+#[derive(Debug)]
+enum AccountDiagnosticPhase {
+    WaitingForInitialState,
+    Diagnosing {
+        expected: AccountDiagnosticExpectation,
+    },
+    WaitingForCatalog {
+        account_id: SharedString,
+        outcome: Result<AccountDiagnosticExpectation, &'static str>,
+    },
+    Removing {
+        account_id: SharedString,
+        outcome: Result<AccountDiagnosticExpectation, &'static str>,
+    },
+    WaitingForRemoval {
+        account_id: SharedString,
+        outcome: Result<AccountDiagnosticExpectation, &'static str>,
+    },
+    Complete,
+}
+
+struct AccountDiagnosticStress {
+    phase: AccountDiagnosticPhase,
+    started: Instant,
+    deadline: Instant,
+}
+
+fn install_account_diagnostic_stress(
+    ui: &AppWindow,
+    cycles: usize,
+    delay: u64,
+    interval: u64,
+) -> Option<Rc<Timer>> {
+    if cycles != 1 {
+        eprintln!(
+            "NIVALIS_STRESS_ERROR scenario=account-diagnostic reason=cycles_must_equal_one cycles={cycles}"
+        );
+        return None;
+    }
+    let timeout = std::env::var("NIVALIS_STRESS_TRANSITION_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(ACCOUNT_DIAGNOSTIC_DEFAULT_TIMEOUT_MS)
+        .max(1);
+    let timer = Rc::new(Timer::default());
+    let timer_weak = Rc::downgrade(&timer);
+    let ui_weak = ui.as_weak();
+
+    Timer::single_shot(Duration::from_millis(delay), move || {
+        let Some(timer) = timer_weak.upgrade() else {
+            return;
+        };
+        let started = Instant::now();
+        let state = Rc::new(RefCell::new(AccountDiagnosticStress {
+            phase: AccountDiagnosticPhase::WaitingForInitialState,
+            started,
+            deadline: started + Duration::from_millis(timeout),
+        }));
+        let state_for_timer = state.clone();
+        let timer_for_callback = Rc::downgrade(&timer);
+        timer.start(
+            TimerMode::Repeated,
+            Duration::from_millis(interval.max(25)),
+            move || {
+                let Some(timer) = timer_for_callback.upgrade() else {
+                    return;
+                };
+                let Some(ui) = ui_weak.upgrade() else {
+                    return;
+                };
+                let mut state = state_for_timer.borrow_mut();
+                if Instant::now() >= state.deadline {
+                    fail_account_diagnostic_stress(&ui, &timer, "operation_timeout");
+                    state.phase = AccountDiagnosticPhase::Complete;
+                    return;
+                }
+
+                match &mut state.phase {
+                    AccountDiagnosticPhase::WaitingForInitialState => {
+                        if ui.get_initial_loading() || ui.get_mailbox_loading() {
+                            return;
+                        }
+                        if ui.get_has_accounts() {
+                            fail_account_diagnostic_stress(&ui, &timer, "fixture_not_empty");
+                            state.phase = AccountDiagnosticPhase::Complete;
+                            return;
+                        }
+                        let config = match AccountDiagnosticConfig::load() {
+                            Ok(config) => config,
+                            Err(reason) => {
+                                fail_account_diagnostic_stress(&ui, &timer, reason);
+                                state.phase = AccountDiagnosticPhase::Complete;
+                                return;
+                            }
+                        };
+                        let secret = match std::str::from_utf8(&config.secret) {
+                            Ok(secret) => SharedString::from(secret),
+                            Err(_) => {
+                                fail_account_diagnostic_stress(
+                                    &ui,
+                                    &timer,
+                                    "secret_file_invalid",
+                                );
+                                state.phase = AccountDiagnosticPhase::Complete;
+                                return;
+                            }
+                        };
+                        let expected = config.expected;
+                        ui.invoke_add_account(
+                            config.name.into(),
+                            config.address.into(),
+                            config.login.into(),
+                            config.host.into(),
+                            config.port.into(),
+                            secret,
+                        );
+                        state.phase = AccountDiagnosticPhase::Diagnosing { expected };
+                    }
+                    AccountDiagnosticPhase::Diagnosing { expected } => {
+                        if ui.get_account_operation_loading() {
+                            return;
+                        }
+                        let account_id = ui.get_managed_account_id();
+                        if account_id.is_empty() {
+                            fail_account_diagnostic_stress(
+                                &ui,
+                                &timer,
+                                "account_identity_missing",
+                            );
+                            state.phase = AccountDiagnosticPhase::Complete;
+                            return;
+                        }
+                        let observed = classify_account_diagnostic(
+                            ui.get_managed_account_status().as_str(),
+                            ui.get_managed_account_has_error(),
+                        );
+                        let outcome = if observed == Some(*expected) {
+                            Ok(*expected)
+                        } else {
+                            Err("diagnostic_mismatch")
+                        };
+                        state.phase = AccountDiagnosticPhase::WaitingForCatalog {
+                            account_id,
+                            outcome,
+                        };
+                    }
+                    AccountDiagnosticPhase::WaitingForCatalog {
+                        account_id,
+                        outcome,
+                    } => {
+                        if !account_model_contains(&ui, account_id.as_str()) {
+                            return;
+                        }
+                        let account_id = account_id.clone();
+                        let outcome = *outcome;
+                        ui.invoke_remove_account(account_id.clone());
+                        state.phase = AccountDiagnosticPhase::Removing {
+                            account_id,
+                            outcome,
+                        };
+                    }
+                    AccountDiagnosticPhase::Removing {
+                        account_id,
+                        outcome,
+                    } => {
+                        if ui.get_account_operation_loading() {
+                            return;
+                        }
+                        if !ui.get_account_operation_error().is_empty() {
+                            fail_account_diagnostic_stress(&ui, &timer, "removal_failed");
+                            state.phase = AccountDiagnosticPhase::Complete;
+                            return;
+                        }
+                        state.phase = AccountDiagnosticPhase::WaitingForRemoval {
+                            account_id: account_id.clone(),
+                            outcome: *outcome,
+                        };
+                    }
+                    AccountDiagnosticPhase::WaitingForRemoval {
+                        account_id,
+                        outcome,
+                    } => {
+                        if account_model_contains(&ui, account_id.as_str()) {
+                            return;
+                        }
+                        match outcome {
+                            Ok(outcome) => {
+                                ui.set_status_text("Account diagnostic memory stress complete".into());
+                                eprintln!(
+                                    "NIVALIS_STRESS_RESULT scenario=account-diagnostic cycles=1 outcome={} removed=1 elapsed_ms={}",
+                                    outcome.label(),
+                                    state.started.elapsed().as_millis()
+                                );
+                                stop_stress(&ui, &timer);
+                            }
+                            Err(reason) => fail_account_diagnostic_stress(&ui, &timer, reason),
+                        }
+                        state.phase = AccountDiagnosticPhase::Complete;
+                    }
+                    AccountDiagnosticPhase::Complete => {}
+                }
+            },
+        );
+    });
+
+    Some(timer)
+}
+
+fn classify_account_diagnostic(
+    status: &str,
+    has_error: bool,
+) -> Option<AccountDiagnosticExpectation> {
+    match (status, has_error) {
+        ("Connected", false) => Some(AccountDiagnosticExpectation::Ready),
+        ("Sign-in was rejected", true) => Some(AccountDiagnosticExpectation::Authentication),
+        _ => None,
+    }
+}
+
+fn account_model_contains(ui: &AppWindow, account_id: &str) -> bool {
+    let accounts = ui.get_accounts();
+    (0..accounts.row_count()).any(|index| {
+        accounts
+            .row_data(index)
+            .is_some_and(|account| account.id.as_str() == account_id)
+    })
+}
+
+fn fail_account_diagnostic_stress(ui: &AppWindow, timer: &Timer, reason: &str) {
+    ui.set_status_text("Account diagnostic memory stress failed".into());
+    eprintln!("NIVALIS_STRESS_ERROR scenario=account-diagnostic reason={reason}");
+    stop_stress(ui, timer);
 }
 
 const CONTENT_TARGET_MESSAGE_ID: i64 = 51;
@@ -1085,6 +1425,74 @@ pub(crate) fn install_maximize_stress(ui: &AppWindow) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_diagnostic_result_classification_is_strict() {
+        assert_eq!(
+            AccountDiagnosticExpectation::parse("ready"),
+            Some(AccountDiagnosticExpectation::Ready)
+        );
+        assert_eq!(
+            AccountDiagnosticExpectation::parse("authentication"),
+            Some(AccountDiagnosticExpectation::Authentication)
+        );
+        assert_eq!(AccountDiagnosticExpectation::parse("offline"), None);
+        assert_eq!(
+            classify_account_diagnostic("Connected", false),
+            Some(AccountDiagnosticExpectation::Ready)
+        );
+        assert_eq!(
+            classify_account_diagnostic("Sign-in was rejected", true),
+            Some(AccountDiagnosticExpectation::Authentication)
+        );
+        assert_eq!(classify_account_diagnostic("Connected", true), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn account_diagnostic_secret_file_is_private_bounded_and_utf8() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "nivalis-account-diagnostic-secret-{}-{timestamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("secret");
+        std::fs::write(&path, b"one-time-app-password").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let secret = read_account_diagnostic_secret(&path).unwrap();
+        assert_eq!(&*secret, b"one-time-app-password");
+        drop(secret);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(matches!(
+            read_account_diagnostic_secret(&path),
+            Err("secret_file_permissions")
+        ));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&path, [0xff]).unwrap();
+        assert!(matches!(
+            read_account_diagnostic_secret(&path),
+            Err("secret_file_invalid")
+        ));
+        std::fs::write(
+            &path,
+            vec![b'x'; usize::try_from(ACCOUNT_DIAGNOSTIC_SECRET_LIMIT).unwrap() + 1],
+        )
+        .unwrap();
+        assert!(matches!(
+            read_account_diagnostic_secret(&path),
+            Err("secret_file_size")
+        ));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn content_fixture_projects_one_bounded_body_and_attachment() {
