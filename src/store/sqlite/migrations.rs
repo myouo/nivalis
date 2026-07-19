@@ -2,7 +2,7 @@ use std::{error::Error, fmt};
 
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(crate) const LATEST_SCHEMA_VERSION: u32 = 8;
+pub(crate) const LATEST_SCHEMA_VERSION: u32 = 9;
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -42,6 +42,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 8,
         sql: include_str!("../../../migrations/0008_remote_lease_reservations.sql"),
+    },
+    Migration {
+        version: 9,
+        sql: include_str!("../../../migrations/0009_message_search.sql"),
     },
 ];
 
@@ -172,8 +176,8 @@ mod tests {
     };
 
     use super::{
-        LATEST_SCHEMA_VERSION, MIGRATIONS, Migration, MigrationError, enable_foreign_keys, migrate,
-        migrate_with,
+        LATEST_SCHEMA_VERSION, MIGRATIONS, Migration, MigrationError, enable_foreign_keys,
+        enable_recursive_triggers, migrate, migrate_with,
     };
 
     const MEMORY_FIXTURE_SQL: &str = include_str!("../../../scripts/fixtures/memory.sql");
@@ -201,6 +205,13 @@ mod tests {
         "sync_state",
         "trash_undo",
         "trash_undo_folders",
+    ];
+
+    const FTS_TABLES: &[&str] = &[
+        "message_search",
+        "message_search_config",
+        "message_search_data",
+        "message_search_idx",
     ];
 
     const MAILBOX_STATS_COLUMNS: &[&str] = &[
@@ -314,7 +325,39 @@ mod tests {
             .expect("query tables")
             .collect::<Result<Vec<_>, _>>()
             .expect("collect tables");
-        assert_eq!(tables, TABLES);
+        let mut expected_tables = TABLES.iter().chain(FTS_TABLES).copied().collect::<Vec<_>>();
+        expected_tables.sort_unstable();
+        assert_eq!(tables, expected_tables);
+
+        let fts5_enabled: bool = connection
+            .query_row(
+                "SELECT sqlite_compileoption_used('ENABLE_FTS5')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read bundled SQLite FTS5 support");
+        assert!(fts5_enabled);
+
+        let message_search_sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'message_search'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read message search schema");
+        assert!(message_search_sql.contains("content = 'messages'"));
+        assert!(message_search_sql.contains("content_rowid = 'id'"));
+        assert!(message_search_sql.contains("columnsize = 0"));
+
+        let search_triggers: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema
+                 WHERE type = 'trigger' AND name LIKE 'sync_message_search_%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count message search triggers");
+        assert_eq!(search_triggers, 3);
 
         let stats_columns = connection
             .prepare("PRAGMA table_info(account_mailbox_stats)")
@@ -494,6 +537,64 @@ mod tests {
             schema_version(&connection),
             i64::from(LATEST_SCHEMA_VERSION)
         );
+    }
+
+    #[test]
+    fn v9_backfills_and_tracks_external_message_search() {
+        let mut connection = memory_connection();
+        enable_foreign_keys(&connection).expect("enable foreign keys");
+        enable_recursive_triggers(&connection).expect("enable recursive triggers");
+        migrate_with(&mut connection, &MIGRATIONS[..8], 8).expect("create v8 schema");
+        insert_account(&connection, 1, "user@example.test");
+        connection
+            .execute(
+                "INSERT INTO messages
+                 (id, account_id, remote_key, sender_name, sender_address,
+                  subject, preview, received_at_ms)
+                 VALUES (100, 1, 'legacy', 'Ada Lovelace', 'ada@example.test',
+                         'Legacy launch plan', 'Backfilled preview token', 100)",
+                [],
+            )
+            .expect("seed a pre-FTS message");
+
+        migrate(&mut connection).expect("upgrade v8 schema to v9");
+
+        let matching_rows = |query: &str| {
+            connection
+                .query_row(
+                    "SELECT count(*) FROM message_search
+                     WHERE message_search MATCH ?1",
+                    [query],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("query message search index")
+        };
+        assert_eq!(schema_version(&connection), 9);
+        assert_eq!(matching_rows("\"legacy launch\""), 1);
+        assert_eq!(matching_rows("\"backfilled preview\""), 1);
+
+        connection
+            .execute(
+                "UPDATE messages
+                 SET subject = 'Current release notes', preview = 'Updated index token'
+                 WHERE id = 100",
+                [],
+            )
+            .expect("update indexed message text");
+        assert_eq!(matching_rows("\"legacy launch\""), 0);
+        assert_eq!(matching_rows("\"current release\""), 1);
+
+        connection
+            .execute("DELETE FROM messages WHERE id = 100", [])
+            .expect("delete indexed message");
+        assert_eq!(matching_rows("\"current release\""), 0);
+        connection
+            .execute(
+                "INSERT INTO message_search(message_search, rank)
+                 VALUES ('integrity-check', 1)",
+                [],
+            )
+            .expect("verify FTS index against external message content");
     }
 
     #[test]

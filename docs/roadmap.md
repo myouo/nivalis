@@ -22,14 +22,16 @@ Status: complete.
 - Modular native Slint interface with adaptive navigation, reader, composer, feedback states, themes, keyboard support, and accessibility semantics.
 - Winit + Skia software default renderer, bounded presentation models, and conditional overlay instantiation.
 - One Tokio current-thread core, one SQLite actor, bounded command/reply channels, fair scheduling, cancellation, and shutdown draining.
-- SQLite schema v8 with keyset queries, bounded excerpts, transactional local mutations, persistent statistics, durable remote desired state, versioned claim/report fencing, and placement-rebase reservations.
+- SQLite schema v9 with keyset queries, external-content FTS, bounded excerpts, transactional local mutations, persistent statistics, durable remote desired state, versioned claim/report fencing, and placement-rebase reservations.
 - Rust 1.95 CI and a measured schema-v8 release baseline below the idle and settled-growth targets.
 
 ## M1: SQLite single source of truth
 
 Status: in progress.
 
-Checkpoint: SQLite accounts, bounded bidirectional keyset pages, persistent counters, selected details, and ordered local writes/undo now drive the production UI. The `0d3453c` release proves the 90MiB hard idle gate, repeated normal runs below the preferred 50MiB target, and less-than-2x growth across two exact-count 10,000-transition pagination soaks. The retained historical outlier still prevents an unconditional 50MiB guarantee. FTS/interruption, controller integration tests, and fresh release-memory coverage of the newly activated write/search paths remain before M1 can close.
+Checkpoint: SQLite accounts, bounded bidirectional keyset pages, persistent counters, selected details, ordered local writes/undo, and external-content FTS now drive the production UI. The `0d3453c` release proves the 90MiB hard idle gate, repeated normal runs below the preferred 50MiB target, and less-than-2x growth across two exact-count 10,000-transition pagination soaks. The retained historical outlier still prevents an unconditional 50MiB guarantee. Precise obsolete-query interruption, controller integration tests, and fresh release-memory coverage of the activated write/search paths remain before M1 can close.
+
+Recorded follow-ups that do not block M1: evaluate a resumable batched FTS rebuild before supporting upgrades of very large pre-existing databases, and profile a CJK-aware or trigram tokenizer before promising arbitrary substring search. The current migration is atomic and the current search contract is Unicode case-folded literal phrase matching.
 
 Acceptance criteria:
 

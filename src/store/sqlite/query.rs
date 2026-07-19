@@ -281,14 +281,15 @@ fn mailbox_query(spec: &PageSpec) -> (String, Vec<Value>) {
     }
 
     if let Some(search) = spec.search.as_deref() {
-        parameters.push(Value::Text(like_pattern(search)));
+        parameters.push(Value::Text(fts_phrase(search)));
         let parameter = parameters.len();
         write!(
             sql,
-            " AND (m.sender_name LIKE ?{parameter} ESCAPE '\\' COLLATE NOCASE \
-             OR m.sender_address LIKE ?{parameter} ESCAPE '\\' COLLATE NOCASE \
-             OR m.subject LIKE ?{parameter} ESCAPE '\\' COLLATE NOCASE \
-             OR m.preview LIKE ?{parameter} ESCAPE '\\' COLLATE NOCASE)"
+            " AND EXISTS (
+                SELECT 1 FROM message_search
+                 WHERE message_search.rowid = m.id
+                   AND message_search MATCH ?{parameter}
+            )"
         )
         .expect("writing SQL to a String cannot fail");
     }
@@ -356,17 +357,17 @@ pub(super) fn open_message(
         .map_err(DbFailure::database)
 }
 
-fn like_pattern(search: &str) -> String {
-    let mut pattern = String::with_capacity(search.len() + 2);
-    pattern.push('%');
+fn fts_phrase(search: &str) -> String {
+    let mut phrase = String::with_capacity(search.len() + 2);
+    phrase.push('"');
     for character in search.chars() {
-        if matches!(character, '%' | '_' | '\\') {
-            pattern.push('\\');
+        if character == '"' {
+            phrase.push('"');
         }
-        pattern.push(character);
+        phrase.push(character);
     }
-    pattern.push('%');
-    pattern
+    phrase.push('"');
+    phrase
 }
 
 #[cfg(test)]
@@ -806,28 +807,120 @@ mod tests {
     }
 
     #[test]
-    fn search_treats_like_metacharacters_as_text() {
+    fn search_treats_fts_operators_and_metacharacters_as_text() {
         let connection = seeded_connection(1);
         connection
             .execute(
                 "UPDATE messages
-                 SET subject = 'Unrelated', preview = 'Budget 100%_final\\copy'",
+                 SET subject = 'Unrelated', preview = 'Budget 100%_final\\copy OR quarter'",
                 [],
             )
             .unwrap();
-        let spec = PageSpec::new(
+        for search in ["%_final\\", "OR quarter", "100%_final\\copy"] {
+            let spec = PageSpec::new(
+                AccountScope::All,
+                FolderScope::Inbox,
+                Some(search),
+                PageBoundary::First,
+                50,
+            )
+            .unwrap();
+
+            let page = query_mailbox(&connection, &spec).unwrap();
+
+            assert_eq!(page.rows.len(), 1, "search: {search}");
+            assert_eq!(page.stats.selected_total, None);
+        }
+    }
+
+    #[test]
+    fn fts_phrase_quotes_user_syntax() {
+        assert_eq!(fts_phrase("alpha OR beta"), "\"alpha OR beta\"");
+        assert_eq!(fts_phrase("say \"hello\""), "\"say \"\"hello\"\"\"");
+    }
+
+    #[test]
+    fn fts_search_keeps_keyset_pages_bounded() {
+        let connection = seeded_connection(101);
+        let first_spec = PageSpec::new(
             AccountScope::All,
             FolderScope::Inbox,
-            Some("%_final\\"),
+            Some("Ada"),
             PageBoundary::First,
             50,
         )
         .unwrap();
+        let first = query_mailbox(&connection, &first_spec).unwrap();
+        assert_eq!(first.rows.len(), 50);
 
-        let page = query_mailbox(&connection, &spec).unwrap();
+        let second_spec = PageSpec::new(
+            AccountScope::All,
+            FolderScope::Inbox,
+            Some("Ada"),
+            PageBoundary::After(first.next_cursor.unwrap()),
+            50,
+        )
+        .unwrap();
+        let second = query_mailbox(&connection, &second_spec).unwrap();
+        assert_eq!(second.rows.len(), 50);
 
-        assert_eq!(page.rows.len(), 1);
-        assert_eq!(page.stats.selected_total, None);
+        let third_spec = PageSpec::new(
+            AccountScope::All,
+            FolderScope::Inbox,
+            Some("Ada"),
+            PageBoundary::After(second.next_cursor.unwrap()),
+            50,
+        )
+        .unwrap();
+        let third = query_mailbox(&connection, &third_spec).unwrap();
+        assert_eq!(third.rows.len(), 1);
+        assert!(third.next_cursor.is_none());
+
+        let mut ids = message_ids(&first);
+        ids.extend(message_ids(&second));
+        ids.extend(message_ids(&third));
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 101);
+    }
+
+    #[test]
+    fn search_plan_uses_fts_probe_without_temporary_sorting() {
+        let connection = seeded_connection(1);
+        let spec = PageSpec::new(
+            AccountScope::account(1).unwrap(),
+            FolderScope::Inbox,
+            Some("Status"),
+            PageBoundary::First,
+            50,
+        )
+        .unwrap();
+        let (sql, parameters) = mailbox_query(&spec);
+        assert!(!sql.contains(" LIKE "));
+
+        let plan = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map(params_from_iter(parameters.iter()), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("idx_messages_account_time")),
+            "unexpected query plan: {plan:?}"
+        );
+        assert!(
+            plan.iter().any(|step| step.contains("VIRTUAL TABLE INDEX")),
+            "unexpected query plan: {plan:?}"
+        );
+        assert!(
+            plan.iter().all(|step| !step.contains("USE TEMP B-TREE")),
+            "search must not materialize an unbounded temporary sort: {plan:?}"
+        );
     }
 
     #[test]
