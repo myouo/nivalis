@@ -1,6 +1,6 @@
 use crate::core::{
     AccountDirectoryQuery, AccountScope, FolderScope, Generation, MailboxQuery, MessageId,
-    MessageQuery, PageSpec, RequestId,
+    MessageQuery, PageBoundary, PageSpec, RequestId,
 };
 use crate::store::sqlite::{MailboxPage, MessageDetail, PageCursor, Tagged};
 use crate::ui_identity::{AccountKey, EntityKey};
@@ -151,7 +151,7 @@ impl ReadSession {
             account_scope(self.account)?,
             self.folder,
             (!search.is_empty()).then_some(search),
-            None,
+            PageBoundary::First,
             PAGE_SIZE,
         )
         .map_err(|_| SessionError::InvalidSearch)?;
@@ -293,7 +293,7 @@ impl ReadSession {
             account_scope(self.account)?,
             self.folder,
             (!self.search.is_empty()).then_some(self.search.as_ref()),
-            after,
+            after.map_or(PageBoundary::First, PageBoundary::After),
             PAGE_SIZE,
         )
         .map_err(|_| SessionError::InvalidSearch)
@@ -431,6 +431,7 @@ mod tests {
                     })
                     .collect::<Vec<_>>()
                     .into_boxed_slice(),
+                previous_cursor: None,
                 next_cursor: None,
                 stats: MailboxStatsDto {
                     selected_total: Some(u64::try_from(ids.len()).unwrap()),

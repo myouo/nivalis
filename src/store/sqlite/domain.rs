@@ -130,12 +130,19 @@ impl PageCursor {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PageBoundary {
+    First,
+    After(PageCursor),
+    Before(PageCursor),
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct PageSpec {
     pub(super) account: AccountScope,
     pub(super) folder: FolderScope,
     pub(super) search: Option<Box<str>>,
-    pub(super) after: Option<PageCursor>,
+    pub(super) boundary: PageBoundary,
     pub(super) limit: u8,
 }
 
@@ -144,7 +151,7 @@ impl PageSpec {
         account: AccountScope,
         folder: FolderScope,
         search: Option<&str>,
-        after: Option<PageCursor>,
+        boundary: PageBoundary,
         limit: u8,
     ) -> Result<Self, ValidationError> {
         if !(1..=MAX_PAGE_SIZE).contains(&limit) {
@@ -169,7 +176,7 @@ impl PageSpec {
             account,
             folder,
             search,
-            after,
+            boundary,
             limit,
         })
     }
@@ -222,6 +229,7 @@ pub(crate) struct MailboxStatsDto {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct MailboxPage {
     pub(crate) rows: Box<[MailSummaryDto]>,
+    pub(crate) previous_cursor: Option<PageCursor>,
     pub(crate) next_cursor: Option<PageCursor>,
     pub(crate) stats: MailboxStatsDto,
 }
@@ -472,13 +480,22 @@ mod tests {
 
     #[test]
     fn page_spec_enforces_memory_bounds_before_enqueue() {
-        assert!(PageSpec::new(AccountScope::All, FolderScope::Inbox, None, None, 0).is_err());
+        assert!(
+            PageSpec::new(
+                AccountScope::All,
+                FolderScope::Inbox,
+                None,
+                PageBoundary::First,
+                0,
+            )
+            .is_err()
+        );
         assert!(
             PageSpec::new(
                 AccountScope::All,
                 FolderScope::Inbox,
                 Some(&"x".repeat(MAX_SEARCH_BYTES + 1)),
-                None,
+                PageBoundary::First,
                 MAX_PAGE_SIZE,
             )
             .is_err()
@@ -488,7 +505,7 @@ mod tests {
                 AccountScope::All,
                 FolderScope::Inbox,
                 Some("  release status  "),
-                None,
+                PageBoundary::First,
                 MAX_PAGE_SIZE,
             )
             .is_ok()

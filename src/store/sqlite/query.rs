@@ -7,7 +7,7 @@ use rusqlite::{
 
 use super::domain::{
     AccountDirectory, AccountSummaryDto, DbFailure, FolderScope, MAX_ACCOUNT_STATS, MailSummaryDto,
-    MailboxPage, MessageDetail, MessageId, PageCursor, PageSpec,
+    MailboxPage, MessageDetail, MessageId, PageBoundary, PageCursor, PageSpec,
 };
 use super::stats::query_mailbox_stats;
 
@@ -129,19 +129,31 @@ pub(super) fn query_mailbox(
 
     let has_more = rows.len() > usize::from(spec.limit);
     rows.truncate(usize::from(spec.limit));
-    let next_cursor = has_more
-        .then(|| rows.last())
-        .flatten()
-        .map(|row| PageCursor {
-            received_at_ms: row.received_at_ms,
-            message_id: row.id,
-        });
+    if matches!(spec.boundary, PageBoundary::Before(_)) {
+        rows.reverse();
+    }
+
+    let first_cursor = rows.first().map(page_cursor);
+    let last_cursor = rows.last().map(page_cursor);
+    let (previous_cursor, next_cursor) = match spec.boundary {
+        PageBoundary::First => (None, has_more.then_some(last_cursor).flatten()),
+        PageBoundary::After(_) => (first_cursor, has_more.then_some(last_cursor).flatten()),
+        PageBoundary::Before(_) => (has_more.then_some(first_cursor).flatten(), last_cursor),
+    };
 
     Ok(MailboxPage {
         rows: rows.into_boxed_slice(),
+        previous_cursor,
         next_cursor,
         stats,
     })
+}
+
+fn page_cursor(row: &MailSummaryDto) -> PageCursor {
+    PageCursor {
+        received_at_ms: row.received_at_ms,
+        message_id: row.id,
+    }
 }
 
 fn mailbox_query(spec: &PageSpec) -> (String, Vec<Value>) {
@@ -238,23 +250,33 @@ fn mailbox_query(spec: &PageSpec) -> (String, Vec<Value>) {
         .expect("writing SQL to a String cannot fail");
     }
 
-    if let Some(cursor) = spec.after {
+    if let PageBoundary::After(cursor) | PageBoundary::Before(cursor) = spec.boundary {
         parameters.push(Value::Integer(cursor.received_at_ms));
         let time_parameter = parameters.len();
         parameters.push(Value::Integer(cursor.message_id.get()));
         let id_parameter = parameters.len();
+        let comparison = if matches!(spec.boundary, PageBoundary::Before(_)) {
+            ">"
+        } else {
+            "<"
+        };
         write!(
             sql,
-            " AND (m.received_at_ms, m.id) < (?{time_parameter}, ?{id_parameter})"
+            " AND (m.received_at_ms, m.id) {comparison} (?{time_parameter}, ?{id_parameter})"
         )
         .expect("writing SQL to a String cannot fail");
     }
 
     parameters.push(Value::Integer(i64::from(spec.limit) + 1));
+    let order = if matches!(spec.boundary, PageBoundary::Before(_)) {
+        "ASC"
+    } else {
+        "DESC"
+    };
     write!(
         sql,
-        " ORDER BY m.received_at_ms DESC, m.id DESC LIMIT ?{}",
-        parameters.len()
+        " ORDER BY m.received_at_ms {order}, m.id {order} LIMIT ?{}",
+        parameters.len(),
     )
     .expect("writing SQL to a String cannot fail");
     (sql, parameters)
@@ -362,6 +384,25 @@ mod tests {
         }
         super::super::stats::rebuild_account(&connection, 1).unwrap();
         connection
+    }
+
+    fn same_timestamp_connection(count: i64) -> Connection {
+        let connection = seeded_connection(count);
+        connection
+            .execute("UPDATE messages SET received_at_ms = 10_000", [])
+            .unwrap();
+        super::super::stats::rebuild_account(&connection, 1).unwrap();
+        connection
+    }
+
+    fn inbox_page(connection: &Connection, boundary: PageBoundary, limit: u8) -> MailboxPage {
+        let spec =
+            PageSpec::new(AccountScope::All, FolderScope::Inbox, None, boundary, limit).unwrap();
+        query_mailbox(connection, &spec).unwrap()
+    }
+
+    fn message_ids(page: &MailboxPage) -> Vec<i64> {
+        page.rows.iter().map(|row| row.id.get()).collect()
     }
 
     #[test]
@@ -497,28 +538,209 @@ mod tests {
     #[test]
     fn keyset_pages_are_bounded_and_do_not_repeat_rows() {
         let connection = seeded_connection(51);
-        let first_spec =
-            PageSpec::new(AccountScope::All, FolderScope::Inbox, None, None, 50).unwrap();
+        let first_spec = PageSpec::new(
+            AccountScope::All,
+            FolderScope::Inbox,
+            None,
+            PageBoundary::First,
+            50,
+        )
+        .unwrap();
         let first = query_mailbox(&connection, &first_spec).unwrap();
         assert_eq!(first.rows.len(), 50);
         assert_eq!(first.stats.selected_total, Some(51));
         assert_eq!(first.stats.inbox_unread, 51);
         assert_eq!(first.stats.account_unread.len(), 1);
+        assert!(first.previous_cursor.is_none());
         let cursor = first.next_cursor.expect("second page cursor");
 
         let second_spec = PageSpec::new(
             AccountScope::All,
             FolderScope::Inbox,
             None,
-            Some(cursor),
+            PageBoundary::After(cursor),
             50,
         )
         .unwrap();
         let second = query_mailbox(&connection, &second_spec).unwrap();
         assert_eq!(second.rows.len(), 1);
         assert_eq!(second.stats.selected_total, Some(51));
+        assert!(second.previous_cursor.is_some());
         assert!(second.next_cursor.is_none());
         assert!(!first.rows.iter().any(|row| row.id == second.rows[0].id));
+    }
+
+    #[test]
+    fn bidirectional_keyset_round_trip_handles_equal_timestamps() {
+        let connection = same_timestamp_connection(151);
+        let mut boundary = PageBoundary::First;
+        let mut forward = Vec::new();
+
+        let mut previous_cursor = loop {
+            let page = inbox_page(&connection, boundary, 50);
+            assert!(page.rows.len() <= 50);
+            assert!(
+                page.rows
+                    .windows(2)
+                    .all(|rows| rows[0].id.get() > rows[1].id.get())
+            );
+            if forward.is_empty() {
+                assert!(page.previous_cursor.is_none());
+            } else {
+                assert!(page.previous_cursor.is_some());
+            }
+
+            let next_cursor = page.next_cursor;
+            let page_previous_cursor = page.previous_cursor;
+            forward.push(message_ids(&page));
+            let Some(cursor) = next_cursor else {
+                break page_previous_cursor;
+            };
+            boundary = PageBoundary::After(cursor);
+        };
+
+        assert_eq!(
+            forward.iter().map(Vec::len).collect::<Vec<_>>(),
+            [50, 50, 50, 1]
+        );
+        assert_eq!(
+            forward.iter().flatten().copied().collect::<Vec<_>>(),
+            (1_i64..=151).rev().collect::<Vec<_>>()
+        );
+
+        let mut backward = Vec::new();
+        while let Some(cursor) = previous_cursor {
+            let page = inbox_page(&connection, PageBoundary::Before(cursor), 50);
+            assert!(page.rows.len() <= 50);
+            assert!(page.next_cursor.is_some());
+            previous_cursor = page.previous_cursor;
+            backward.push(message_ids(&page));
+        }
+
+        assert_eq!(
+            backward,
+            forward[..forward.len() - 1]
+                .iter()
+                .rev()
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn bidirectional_keyset_round_trip_handles_mixed_timestamps() {
+        let connection = seeded_connection(121);
+        let mut boundary = PageBoundary::First;
+        let mut forward = Vec::new();
+
+        let mut previous_cursor = loop {
+            let page = inbox_page(&connection, boundary, 50);
+            let next_cursor = page.next_cursor;
+            let page_previous_cursor = page.previous_cursor;
+            forward.push(message_ids(&page));
+            let Some(cursor) = next_cursor else {
+                break page_previous_cursor;
+            };
+            boundary = PageBoundary::After(cursor);
+        };
+
+        assert_eq!(
+            forward.iter().map(Vec::len).collect::<Vec<_>>(),
+            [50, 50, 21]
+        );
+        assert_eq!(
+            forward.iter().flatten().copied().collect::<Vec<_>>(),
+            (1_i64..=121).collect::<Vec<_>>()
+        );
+
+        let mut backward = Vec::new();
+        while let Some(cursor) = previous_cursor {
+            let page = inbox_page(&connection, PageBoundary::Before(cursor), 50);
+            previous_cursor = page.previous_cursor;
+            backward.push(message_ids(&page));
+        }
+        assert_eq!(
+            backward,
+            forward[..forward.len() - 1]
+                .iter()
+                .rev()
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn underfull_first_page_has_no_navigation_cursors() {
+        let connection = same_timestamp_connection(7);
+
+        let page = inbox_page(&connection, PageBoundary::First, 50);
+
+        assert_eq!(message_ids(&page), (1_i64..=7).rev().collect::<Vec<_>>());
+        assert!(page.previous_cursor.is_none());
+        assert!(page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn deleted_keyset_boundaries_remain_bounded_without_repeats() {
+        let connection = same_timestamp_connection(101);
+        let first = inbox_page(&connection, PageBoundary::First, 50);
+        let first_ids = message_ids(&first);
+        let forward_boundary = first.next_cursor.expect("second page cursor");
+        connection
+            .execute(
+                "DELETE FROM messages WHERE id = ?1",
+                [forward_boundary.message_id.get()],
+            )
+            .unwrap();
+        super::super::stats::rebuild_account(&connection, 1).unwrap();
+
+        let second = inbox_page(&connection, PageBoundary::After(forward_boundary), 50);
+        let second_ids = message_ids(&second);
+        assert_eq!(second.rows.len(), 50);
+        assert!(second_ids.windows(2).all(|ids| ids[0] > ids[1]));
+        assert!(!second_ids.iter().any(|id| first_ids.contains(id)));
+
+        let backward_boundary = second.previous_cursor.expect("first page cursor");
+        connection
+            .execute(
+                "DELETE FROM messages WHERE id = ?1",
+                [backward_boundary.message_id.get()],
+            )
+            .unwrap();
+        super::super::stats::rebuild_account(&connection, 1).unwrap();
+
+        let previous = inbox_page(&connection, PageBoundary::Before(backward_boundary), 50);
+        let previous_ids = message_ids(&previous);
+        assert_eq!(previous.rows.len(), 49);
+        assert!(previous_ids.windows(2).all(|ids| ids[0] > ids[1]));
+        assert!(!previous_ids.iter().any(|id| second_ids.contains(id)));
+        assert!(previous.previous_cursor.is_none());
+        assert!(previous.next_cursor.is_some());
+    }
+
+    #[test]
+    fn before_query_uses_ascending_scan_for_nearest_rows() {
+        let spec = PageSpec::new(
+            AccountScope::All,
+            FolderScope::Inbox,
+            None,
+            PageBoundary::Before(PageCursor::new(10_000, 37).unwrap()),
+            50,
+        )
+        .unwrap();
+
+        let (sql, parameters) = mailbox_query(&spec);
+
+        assert!(sql.contains("(m.received_at_ms, m.id) >"));
+        assert!(sql.contains("ORDER BY m.received_at_ms ASC, m.id ASC"));
+        assert_eq!(
+            parameters,
+            [
+                Value::Integer(10_000),
+                Value::Integer(37),
+                Value::Integer(51)
+            ]
+        );
     }
 
     #[test]
@@ -535,7 +757,7 @@ mod tests {
             AccountScope::All,
             FolderScope::Inbox,
             Some("%_final\\"),
-            None,
+            PageBoundary::First,
             50,
         )
         .unwrap();
@@ -601,7 +823,7 @@ mod tests {
             AccountScope::account(1).unwrap(),
             FolderScope::Inbox,
             None,
-            None,
+            PageBoundary::First,
             50,
         )
         .unwrap();
@@ -665,7 +887,8 @@ mod tests {
         super::super::stats::rebuild_account(&connection, 1).unwrap();
 
         for folder in [FolderScope::Starred, FolderScope::Unread] {
-            let spec = PageSpec::new(AccountScope::All, folder, None, None, 50).unwrap();
+            let spec =
+                PageSpec::new(AccountScope::All, folder, None, PageBoundary::First, 50).unwrap();
             let page = query_mailbox(&connection, &spec).unwrap();
             assert_eq!(page.rows.len(), 1);
             assert_eq!(page.rows[0].id, MessageId::new(1).unwrap());
@@ -674,7 +897,14 @@ mod tests {
             assert_eq!(page.stats.starred_total, 1);
         }
 
-        let trash = PageSpec::new(AccountScope::All, FolderScope::Trash, None, None, 50).unwrap();
+        let trash = PageSpec::new(
+            AccountScope::All,
+            FolderScope::Trash,
+            None,
+            PageBoundary::First,
+            50,
+        )
+        .unwrap();
         let page = query_mailbox(&connection, &trash).unwrap();
         assert_eq!(page.rows.len(), 1);
         assert_eq!(page.rows[0].id, MessageId::new(2).unwrap());

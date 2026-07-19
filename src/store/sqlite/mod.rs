@@ -18,7 +18,7 @@ pub(crate) use actor::{
 #[allow(unused_imports)]
 pub(crate) use domain::{
     AccountDirectory, AccountSummaryDto, AccountUnreadDto, MailSummaryDto, MailboxStatsDto,
-    PageCursor,
+    PageBoundary, PageCursor,
 };
 pub(crate) use domain::{AccountScope, FolderScope};
 pub(crate) use domain::{

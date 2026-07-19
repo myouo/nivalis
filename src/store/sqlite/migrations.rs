@@ -167,7 +167,7 @@ mod tests {
     use rusqlite::{Connection, ErrorCode, params};
 
     use crate::store::sqlite::{
-        domain::{AccountScope, FolderScope, PageSpec},
+        domain::{AccountScope, FolderScope, PageBoundary, PageSpec},
         query::query_mailbox,
     };
 
@@ -414,8 +414,14 @@ mod tests {
             .expect("read fixture text bounds");
         assert_eq!(bounds, (2_048, 2_048, 65_536, 65_536));
 
-        let first_spec =
-            PageSpec::new(AccountScope::All, FolderScope::Inbox, None, None, 50).unwrap();
+        let first_spec = PageSpec::new(
+            AccountScope::All,
+            FolderScope::Inbox,
+            None,
+            PageBoundary::First,
+            50,
+        )
+        .unwrap();
         let first_page = query_mailbox(&connection, &first_spec).expect("query first fixture page");
         assert_eq!(first_page.rows.len(), 50);
         let next_cursor = first_page.next_cursor.expect("fixture has a second page");
@@ -424,7 +430,7 @@ mod tests {
             AccountScope::All,
             FolderScope::Inbox,
             None,
-            Some(next_cursor),
+            PageBoundary::After(next_cursor),
             50,
         )
         .unwrap();

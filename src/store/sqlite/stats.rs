@@ -341,6 +341,7 @@ mod tests {
     use rusqlite::Connection;
 
     use super::*;
+    use crate::store::sqlite::PageBoundary;
     use crate::store::sqlite::{
         domain::{FailureKind, PageSpec},
         migrations::migrate,
@@ -478,7 +479,14 @@ mod tests {
     #[test]
     fn raw_mailbox_writes_are_detected_until_stats_are_rebuilt() {
         let connection = database();
-        let inbox = PageSpec::new(AccountScope::All, FolderScope::Inbox, None, None, 50).unwrap();
+        let inbox = PageSpec::new(
+            AccountScope::All,
+            FolderScope::Inbox,
+            None,
+            PageBoundary::First,
+            50,
+        )
+        .unwrap();
 
         connection
             .execute("UPDATE messages SET starred = 0 WHERE id = 1", [])
@@ -496,7 +504,14 @@ mod tests {
     #[test]
     fn mailbox_stats_are_scoped_bounded_and_skip_search_counts() {
         let connection = database();
-        let inbox = PageSpec::new(AccountScope::All, FolderScope::Inbox, None, None, 50).unwrap();
+        let inbox = PageSpec::new(
+            AccountScope::All,
+            FolderScope::Inbox,
+            None,
+            PageBoundary::First,
+            50,
+        )
+        .unwrap();
         let stats = query_mailbox_stats(&connection, &inbox).unwrap();
         assert_eq!(stats.selected_total, Some(1));
         assert_eq!(stats.inbox_unread, 1);
@@ -507,7 +522,7 @@ mod tests {
             AccountScope::account(1).unwrap(),
             FolderScope::Inbox,
             Some("message"),
-            None,
+            PageBoundary::First,
             50,
         )
         .unwrap();

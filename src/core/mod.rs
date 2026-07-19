@@ -7,7 +7,7 @@ pub(crate) use runtime::{CoreRuntime, StartError};
 #[allow(unused_imports)]
 pub(crate) use crate::store::sqlite::{
     AccountScope, AccountStatsDelta, FolderScope, Generation, MessageId, MessageMutation,
-    MutationOutcome, PageSpec, RequestId, UndoToken,
+    MutationOutcome, PageBoundary, PageSpec, RequestId, UndoToken,
 };
 #[allow(unused_imports)]
 pub(crate) use message::{

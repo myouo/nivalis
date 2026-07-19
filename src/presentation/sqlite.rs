@@ -132,6 +132,7 @@ impl AccountCatalog {
         Ok(ProjectedMailbox {
             rows,
             stats,
+            previous_cursor: page.previous_cursor,
             next_cursor: page.next_cursor,
         })
     }
@@ -304,6 +305,7 @@ pub(crate) struct ProjectedMailboxStats {
 pub(crate) struct ProjectedMailbox {
     pub(crate) rows: Vec<MailSummary>,
     pub(crate) stats: ProjectedMailboxStats,
+    pub(crate) previous_cursor: Option<PageCursor>,
     pub(crate) next_cursor: Option<PageCursor>,
 }
 
@@ -516,6 +518,7 @@ mod tests {
     fn page(rows: Vec<MailSummaryDto>, selected_total: Option<u64>) -> MailboxPage {
         MailboxPage {
             rows: rows.into_boxed_slice(),
+            previous_cursor: None,
             next_cursor: None,
             stats: stats(selected_total),
         }
@@ -531,6 +534,24 @@ mod tests {
         assert_eq!(catalog.account_items()[1].id, "9223372036854775807");
         assert_eq!(projected.rows[0].id, "9223372036854775807");
         assert_eq!(projected.rows[0].account_id, "9223372036854775807");
+    }
+
+    #[test]
+    fn mailbox_projection_preserves_navigation_cursors() {
+        let catalog = catalog_with([1]);
+        let previous_cursor = PageCursor::new(2_000, 2).unwrap();
+        let next_cursor = PageCursor::new(1_000, 1).unwrap();
+        let projected = catalog
+            .project_mailbox(MailboxPage {
+                rows: Box::new([]),
+                previous_cursor: Some(previous_cursor),
+                next_cursor: Some(next_cursor),
+                stats: stats(Some(0)),
+            })
+            .unwrap();
+
+        assert_eq!(projected.previous_cursor, Some(previous_cursor));
+        assert_eq!(projected.next_cursor, Some(next_cursor));
     }
 
     #[test]
@@ -598,6 +619,7 @@ mod tests {
         let overflow = catalog
             .project_mailbox(MailboxPage {
                 rows: Box::new([]),
+                previous_cursor: None,
                 next_cursor: None,
                 stats: MailboxStatsDto {
                     selected_total: Some(u64::try_from(i32::MAX).unwrap() + 1),

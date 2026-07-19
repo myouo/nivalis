@@ -788,7 +788,7 @@ mod tests {
     use super::*;
     use crate::core::{
         AccountDirectoryQuery, AccountScope, FolderScope, Generation, MailboxQuery, MessageId,
-        MessageQuery, PageSpec, RequestId,
+        MessageQuery, PageBoundary, PageSpec, RequestId,
     };
     use rusqlite::Connection;
     use std::{
@@ -812,7 +812,14 @@ mod tests {
         MailboxQuery::new(
             RequestId::new(request_id).unwrap(),
             Generation::new(generation),
-            PageSpec::new(AccountScope::All, FolderScope::Inbox, None, None, 50).unwrap(),
+            PageSpec::new(
+                AccountScope::All,
+                FolderScope::Inbox,
+                None,
+                PageBoundary::First,
+                50,
+            )
+            .unwrap(),
         )
     }
 
@@ -1002,7 +1009,14 @@ mod tests {
                 .try_query_mailbox(
                     RequestId::new(100 + offset).unwrap(),
                     Generation::new(0),
-                    PageSpec::new(AccountScope::All, FolderScope::Inbox, None, None, 1).unwrap(),
+                    PageSpec::new(
+                        AccountScope::All,
+                        FolderScope::Inbox,
+                        None,
+                        PageBoundary::First,
+                        1,
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
         }

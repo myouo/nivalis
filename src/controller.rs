@@ -293,10 +293,15 @@ impl Controller {
         let ProjectedMailbox {
             rows,
             stats,
+            previous_cursor,
             next_cursor,
         } = projected;
         let row_count = rows.len();
         let has_more = next_cursor.is_some();
+        debug_assert!(
+            previous_cursor.is_none(),
+            "the read-only controller only requests the first mailbox page"
+        );
         debug_assert_eq!(has_more, self.state.borrow().next_cursor().is_some());
         self.mail_model.set_vec(rows);
         self.apply_stats(stats);

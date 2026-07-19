@@ -875,13 +875,20 @@ mod tests {
 
     use super::*;
     use crate::store::sqlite::{
-        domain::{AccountScope, FailureKind, FolderScope, MessageMutation},
+        domain::{AccountScope, FailureKind, FolderScope, MessageMutation, PageBoundary},
         migrations::LATEST_SCHEMA_VERSION,
         remote::{RemoteCheckpoint, RemoteImapSource, RemoteReport, RemoteWorkMode},
     };
 
     fn empty_spec() -> PageSpec {
-        PageSpec::new(AccountScope::All, FolderScope::Inbox, None, None, 50).unwrap()
+        PageSpec::new(
+            AccountScope::All,
+            FolderScope::Inbox,
+            None,
+            PageBoundary::First,
+            50,
+        )
+        .unwrap()
     }
 
     fn receive_reply(replies: &mut DatabaseReplies) -> DbReply {
