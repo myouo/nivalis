@@ -4,6 +4,8 @@ mod benchmark;
 mod content;
 mod controller;
 mod core;
+#[allow(dead_code)]
+mod credentials;
 mod platform;
 mod presentation;
 mod store;
