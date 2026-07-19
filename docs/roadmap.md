@@ -77,22 +77,27 @@ Acceptance criteria:
 - Rustls and platform trust verification are mandatory. Authentication, permission, certificate, timeout, and offline failures have distinct recovery guidance.
 - Accepted setup and removal work drains safely, connection diagnostics are cancellable and bounded, unit and file-backed integration tests cover their fences and recovery, and the opt-in release benchmark crosses the real keyring/TLS UI lifecycle.
 
-Recorded mainline boundary: account creation must commit its SQLite locator before storing a secret; failures preserve the fenced account ID and generation for backend retry. Until credential-store retry UI is implemented, the visible recovery path is removal followed by re-add. Removal coordination must resume `removing_credentials` after restart, accept only `Deleted` or `AlreadyMissing`, and never confirm locked, ambiguous, cancelled, or unavailable failures. M3 bounds message, attachment, and staging cleanup. Before M4 enables real synchronization, folder, tombstone, and provider-state children must join restart-safe bounded cleanup, and legacy cache rebinding must verify remote identity or clear/reconcile old state.
+Recorded mainline boundary: account creation must commit its SQLite locator before storing a secret; failures preserve the fenced account ID and generation for backend retry. Until credential-store retry UI is implemented, the visible recovery path is removal followed by re-add. Removal coordination resumes `removing_credentials` after restart, accepts only `Deleted` or `AlreadyMissing`, and never confirms locked, ambiguous, cancelled, or unavailable failures. Account removal now bounds message, attachment, staging, folder, tombstone, and provider-state cleanup. Legacy cache rebinding remains disabled unless remote identity can be verified or old state can be cleared and reconciled.
 
-Recorded deferrals that do not block M3: update/reconfigure, disable/re-enable, and credential-store retry UI remain product-completeness gaps rather than a reason to subdivide this milestone. OAuth2 PKCE/device authorization and IMAP XOAUTH2/OAUTHBEARER remain provider-coverage work and must reuse the same keyring and shared Rustls stack before an OAuth-only provider is advertised. M4 owns folder discovery, UIDVALIDITY, incremental receive, reconnect, IDLE, and synchronization reconciliation. Provider auto-discovery and preset breadth, proxy support, custom certificate authorities, pinning, client certificates, exhaustive provider compatibility, and deeper DNS/cancellation/timeout race testing remain network hardening for M7. Cross-platform credential packaging, ACL behavior, and desktop prompt integration also remain M7 work; no platform may silently fall back to SQLite or plaintext files.
+Recorded deferrals that do not block M3: update/reconfigure, disable/re-enable, and credential-store retry UI remain product-completeness gaps rather than a reason to subdivide this milestone. OAuth2 PKCE/device authorization and IMAP XOAUTH2/OAUTHBEARER remain provider-coverage work and must reuse the same keyring and shared Rustls stack before an OAuth-only provider is advertised. Provider auto-discovery and preset breadth, proxy support, custom certificate authorities, pinning, client certificates, exhaustive provider compatibility, and deeper DNS/cancellation/timeout race testing remain network hardening for M7. Cross-platform credential packaging, ACL behavior, and desktop prompt integration also remain M7 work; no platform may silently fall back to SQLite or plaintext files.
 
-## M4: IMAP receive and synchronization
+## M4: bounded IMAP receive
 
-Status: pending.
+Status: complete.
+
+Checkpoint: the production UI can manually synchronize one selected app-password IMAP account's INBOX. One request reads at most 16 UIDs, one 1MiB literal per message, 4MiB of page literals, and 4.5MiB total under one 45-second deadline. Envelope staging, MIME import, private-file publication, and cursor advancement are fenced by account configuration generation and UIDVALIDITY; the cursor advances only after every accepted content import commits. A retry preserves staged metadata and skips content already committed by an earlier partial attempt. Success refreshes the SQLite-backed account and mailbox projections; loading, actionable failure, and `has_more` feedback remain explicit.
+
+The vertical test imports one fetched message, opens and closes its body stream, removes the account references, and runs the bounded janitor until the body and attachment are gone. Oversized input is rejected without staging or cursor advancement, and a partial retry does not import the completed prefix twice. Release-code revision `d5a6c43ce7f5096cbb46052d1a477e0cc1db4063` closes the scoped memory gate: three production idle runs peak at 32,556KiB RSS, while one loopback add/diagnose/receive/import/open/close/remove lifecycle peaks and settles at 37,024KiB RSS. From the 10-second baseline to the 135-second settled sample it grows 12.67% RSS and 17.13% PSS; RSS+Swap grows 9.04%, final CPU is 0.00%, and both the 90MiB hard gate and 50MiB target pass despite host swap pressure.
 
 Acceptance criteria:
 
-- Capability discovery, folder discovery, UIDVALIDITY, incremental fetch, reconnect backoff, and bounded IMAP IDLE are implemented.
-- Incoming state, locators, cursors, persistent statistics, legacy reconciliation, tombstones, and pending local desired dimensions merge atomically.
-- Provider execution consumes one fenced claim at a time and reports every durable checkpoint through the existing actor contract.
-- Connection loss and ambiguous MOVE/COPY outcomes reconcile before replay. Offline changes survive restart and converge after reconnection.
-- Real provider state cannot activate until account removal covers every provider-owned child set with bounded restart recovery and legacy cache reuse verifies remote identity.
-- Representative large-mailbox and multi-hour synchronization soaks remain within the memory contract.
+- A selected configured account can fetch and display a real INBOX message without loading an unbounded mailbox or MIME tree into memory.
+- Network bytes, message count, literal size, page size, total work, deadline, SQLite staging, file publication, and janitor work all have enforced finite limits.
+- Account generation, UIDVALIDITY, content generation, and cursor fences prevent stale or partial work from becoming the visible committed state.
+- Loading, success, more-mail, empty, and actionable failure feedback are driven by the production core rather than simulated UI state.
+- Focused unit, loopback protocol, actor, end-to-end lifecycle, release idle, and release receive-memory gates pass.
+
+Recorded follow-ups that do not block M4: automatic paging and sparse-UID/ESEARCH traversal; folders beyond INBOX; automatic UIDVALIDITY reset and cache rebuild; reconnect/backoff and bounded IDLE; explicit user cancellation; graceful handling of one oversized or malformed message without blocking later mail; outbound desired-state execution and full incoming/outgoing merge and reconciliation; and ambiguous MOVE/COPY recovery. M6 owns the scheduling and convergence work needed before multi-account synchronization is complete. Real providers, large mailboxes, repeated reconnects, and multi-hour soaks remain M7 release gates rather than reasons to delay the first usable receive slice.
 
 ## M5: drafts, outbox, and SMTP
 

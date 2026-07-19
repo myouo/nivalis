@@ -1,4 +1,0 @@
-NIVALIS_MEMORY_TEST_CASE=pagination-1
-NIVALIS_STRESS_RESULT scenario=pagination transitions=10000 after=5000 before=5000 final_page=1 elapsed_ms=147900
-NIVALIS_MEMORY_TEST_CASE=pagination-2
-NIVALIS_STRESS_RESULT scenario=pagination transitions=10000 after=5000 before=5000 final_page=1 elapsed_ms=147534
