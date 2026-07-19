@@ -6,6 +6,7 @@ export component EmptyState inherits Rectangle {
     in property <string> detail;
     in property <string> icon;
     in property <string> action-label;
+    in property <string> action-variant: "outlined";
     callback action;
 
     accessible-role: region;
@@ -16,6 +17,6 @@ export component EmptyState inherits Rectangle {
         MaterialIcon { name: root.icon; height: 38px; size: 26px; icon-color: Theme.on-surface-variant; }
         Text { text: root.title; color: Theme.on-surface; font-family: Theme.body-font; font-size: 14px; font-weight: 500; horizontal-alignment: center; }
         Text { text: root.detail; color: Theme.on-surface-variant; font-family: Theme.body-font; font-size: 11px; horizontal-alignment: center; wrap: word-wrap; }
-        if root.action-label != "": MButton { label: root.action-label; variant: "outlined"; clicked => { root.action(); } }
+        if root.action-label != "": MButton { label: root.action-label; variant: root.action-variant; clicked => { root.action(); } }
     }
 }

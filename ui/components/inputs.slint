@@ -8,6 +8,9 @@ export component LabeledTextField inherits Rectangle {
     in property <string> helper: "";
     in property <string> error: "";
     in property <bool> multiline: false;
+    in property <bool> enabled: true;
+    in property <InputType> input-type: InputType.text;
+    callback edited(string);
     forward-focus: field;
 
     height: multiline ? 138px : (error != "" || helper != "" ? 68px : 54px);
@@ -26,21 +29,25 @@ export component LabeledTextField inherits Rectangle {
             height: root.multiline ? 98px : 34px;
             border-radius: 4px;
             border-width: field.has-focus ? 2px : 1px;
-            border-color: root.error != "" ? Theme.error : field.has-focus ? Theme.primary : Theme.outline;
-            background: Theme.surface;
+            border-color: root.error != "" ? Theme.error : field.has-focus ? Theme.primary : root.enabled ? Theme.outline : Theme.outline-variant;
+            background: root.enabled ? Theme.surface : Theme.surface-container-high;
             field := TextInput {
                 x: 10px;
                 y: root.multiline ? 8px : 0px;
                 width: parent.width - 20px;
                 height: root.multiline ? parent.height - 16px : parent.height;
                 text <=> root.value;
-                color: Theme.on-surface;
+                enabled: root.enabled;
+                input-type: root.input-type;
+                color: root.enabled ? Theme.on-surface : Theme.on-surface-variant;
                 font-family: Theme.body-font;
                 font-size: 12px;
                 single-line: !root.multiline;
                 wrap: root.multiline ? word-wrap : no-wrap;
                 accessible-label: root.label;
                 accessible-placeholder-text: root.placeholder;
+                accessible-enabled: root.enabled;
+                edited => { root.edited(self.text); }
             }
             if root.value == "" && !field.has-focus: Text {
                 x: 11px;
@@ -48,7 +55,7 @@ export component LabeledTextField inherits Rectangle {
                 width: parent.width - 22px;
                 height: root.multiline ? 22px : parent.height;
                 text: root.placeholder;
-                color: Theme.on-surface-variant;
+                color: root.enabled ? Theme.on-surface-variant : Theme.outline;
                 font-family: Theme.body-font;
                 font-size: 12px;
                 vertical-alignment: root.multiline ? top : center;

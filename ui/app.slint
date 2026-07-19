@@ -7,8 +7,9 @@ import {
     NavigationPane, TitleBar
 } from "shell.slint";
 import {
-    AccountMenuOverlay, DeleteDialog, FilterMenuOverlay, InboxMoreMenuOverlay,
-    MessageMenuOverlay, SettingsOverlay, Snackbar
+    AccountMenuOverlay, AccountRemoveDialog, AccountSetupOverlay, AccountStatusOverlay,
+    DeleteDialog, FilterMenuOverlay, InboxMoreMenuOverlay, MessageMenuOverlay,
+    SettingsOverlay, Snackbar
 } from "overlays.slint";
 import { MaterialIcon } from "components.slint";
 import { EmptyState } from "states.slint";
@@ -67,6 +68,17 @@ export component AppWindow inherits Window {
     in property <string> detail-error-detail: "";
     in-out property <string> status-text: "Local cache";
     in-out property <bool> account-menu-open: false;
+    in-out property <bool> account-setup-open: false;
+    in-out property <bool> account-status-open: false;
+    in-out property <bool> account-remove-open: false;
+    in property <bool> account-operation-loading: false;
+    in property <string> account-operation-stage: "";
+    in-out property <string> account-operation-error: "";
+    in property <string> managed-account-id: "";
+    in property <string> managed-account-name: "";
+    in property <string> managed-account-address: "";
+    in property <string> managed-account-status: "Not checked";
+    in property <bool> managed-account-has-error: false;
     in-out property <bool> settings-open: false;
     in-out property <bool> more-menu-open: false;
     in-out property <bool> message-menu-open: false;
@@ -109,6 +121,11 @@ export component AppWindow inherits Window {
     callback next-mailbox-page;
     callback retry-detail;
     callback switch-account(string);
+    callback add-account(string, string, string, string, string, string);
+    callback manage-account(string);
+    callback diagnose-account(string);
+    callback remove-account(string);
+    callback cancel-account-operation;
     callback undo-delete;
     callback window-minimize;
     callback window-maximize(bool);
@@ -120,7 +137,17 @@ export component AppWindow inherits Window {
 
         key-pressed(event) => {
             if (event.text == Key.Escape) {
-                if (root.delete-dialog-open) {
+                if (root.account-remove-open) {
+                    if (!root.account-operation-loading) { root.account-remove-open = false; }
+                }
+                else if (root.account-setup-open) {
+                    if (!root.account-operation-loading) { root.account-setup-open = false; }
+                }
+                else if (root.account-status-open) {
+                    if (root.account-operation-loading) { root.cancel-account-operation(); }
+                    else { root.account-status-open = false; }
+                }
+                else if (root.delete-dialog-open) {
                     if (!root.mutation-loading) { root.delete-dialog-open = false; }
                 }
                 else if (root.message-menu-open) { root.message-menu-open = false; }
@@ -207,9 +234,11 @@ export component AppWindow inherits Window {
 
                         if !root.has-accounts && !root.initial-loading && !root.mailbox-loading && !root.mailbox-error: EmptyState {
                             title: "No mail accounts";
-                            detail: "No accounts have been added. Account setup is not available yet.";
+                            detail: "Add an account to check its connection and start receiving mail.";
                             icon: "account_circle";
-                            action-label: "";
+                            action-label: "Add account";
+                            action-variant: "filled";
+                            action => { root.account-operation-error = ""; root.account-setup-open = true; }
                         }
 
                         if root.has-accounts: HorizontalLayout {
@@ -291,6 +320,53 @@ export component AppWindow inherits Window {
         settings-open <=> root.settings-open;
         detail-open <=> root.detail-open;
         switch-account(id) => { root.switch-account(id); }
+        open-account-setup => { root.account-operation-error = ""; root.account-setup-open = true; }
+        manage-account(id) => {
+            root.manage-account(id);
+            root.account-status-open = true;
+        }
+    }
+
+    if root.account-setup-open: AccountSetupOverlay {
+        width: parent.width;
+        height: parent.height;
+        account-setup-open <=> root.account-setup-open;
+        operation-loading: root.account-operation-loading;
+        operation-stage: root.account-operation-stage;
+        operation-error <=> root.account-operation-error;
+        add-account(name, address, login, host, port, password) => {
+            root.add-account(name, address, login, host, port, password);
+        }
+    }
+
+    if root.account-status-open: AccountStatusOverlay {
+        width: parent.width;
+        height: parent.height;
+        account-status-open <=> root.account-status-open;
+        account-remove-open <=> root.account-remove-open;
+        operation-loading: root.account-operation-loading;
+        operation-stage: root.account-operation-stage;
+        operation-error <=> root.account-operation-error;
+        account-id: root.managed-account-id;
+        account-name: root.managed-account-name;
+        account-address: root.managed-account-address;
+        account-status: root.managed-account-status;
+        account-has-error: root.managed-account-has-error;
+        diagnose-account(id) => { root.diagnose-account(id); }
+        cancel-operation => { root.cancel-account-operation(); }
+    }
+
+    if root.account-remove-open: AccountRemoveDialog {
+        width: parent.width;
+        height: parent.height;
+        account-remove-open <=> root.account-remove-open;
+        operation-loading: root.account-operation-loading;
+        operation-stage: root.account-operation-stage;
+        operation-error <=> root.account-operation-error;
+        account-id: root.managed-account-id;
+        account-name: root.managed-account-name;
+        account-address: root.managed-account-address;
+        remove-account(id) => { root.remove-account(id); }
     }
 
     if root.filter-menu-open: FilterMenuOverlay {

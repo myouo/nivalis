@@ -1,8 +1,8 @@
-import { Palette } from "std-widgets.slint";
+import { ListView, Palette } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { AccountItem, MailDetail } from "models.slint";
 import {
-    MButton, MaterialIcon, MIconButton, SettingsToggle, WideNavItem
+    LabeledTextField, MButton, MaterialIcon, MIconButton, SettingsToggle, WideNavItem
 } from "components.slint";
 import { AccountMenuRow } from "shell.slint";
 
@@ -14,15 +14,17 @@ export component AccountMenuOverlay inherits Rectangle {
     in-out property <bool> settings-open: false;
     in-out property <bool> detail-open: false;
     callback switch-account(string);
+    callback open-account-setup;
+    callback manage-account(string);
 
     z: 20;
     background: transparent;
     TouchArea { clicked => { root.account-menu-open = false; } }
     Rectangle {
         x: root.wide-sidebar ? 12px : 58px;
-        y: 82px;
+        y: parent.height < 520px ? 12px : 82px;
         width: 340px;
-        height: 346px;
+        height: parent.height < 520px ? parent.height - 24px : 414px;
         border-radius: 8px;
         border-width: 1px;
         border-color: Theme.outline;
@@ -38,13 +40,408 @@ export component AccountMenuOverlay inherits Rectangle {
                 Text { text: "Choose an account"; color: Theme.on-surface; font-family: Theme.body-font; font-size: 16px; font-weight: 500; vertical-alignment: center; horizontal-stretch: 1; }
                 MIconButton { icon: "close"; label: "Close account switcher"; compact-visual: true; clicked => { root.account-menu-open = false; } }
             }
-            for account in root.accounts: AccountMenuRow {
-                account: account;
-                selected: root.active-account-id == account.id;
-                clicked(id) => { root.switch-account(id); root.account-menu-open = false; root.detail-open = false; }
+            account-list := ListView {
+                horizontal-stretch: 1;
+                vertical-stretch: 1;
+                for account in root.accounts: AccountMenuRow {
+                    width: account-list.width;
+                    account: account;
+                    selected: root.active-account-id == account.id;
+                    clicked(id) => { root.switch-account(id); root.account-menu-open = false; root.detail-open = false; }
+                }
+            }
+            MButton {
+                label: "Add account";
+                variant: "filled";
+                clicked => { root.account-menu-open = false; root.open-account-setup(); }
+            }
+            MButton {
+                label: "Manage selected account";
+                icon: "settings";
+                variant: "tonal";
+                enabled: root.active-account-id != "";
+                clicked => { root.account-menu-open = false; root.manage-account(root.active-account-id); }
+            }
+            MButton { label: "Display settings"; icon: "settings"; clicked => { root.account-menu-open = false; root.settings-open = true; } }
+        }
+    }
+}
+
+export component AccountSetupOverlay inherits Rectangle {
+    in-out property <bool> account-setup-open: false;
+    in property <bool> operation-loading: false;
+    in property <string> operation-stage: "";
+    in-out property <string> operation-error: "";
+    callback add-account(string, string, string, string, string, string);
+
+    private property <string> account-name: "";
+    private property <string> account-address: "";
+    private property <string> account-password: "";
+    private property <string> account-login: "";
+    private property <string> account-host: "";
+    private property <string> account-port: "993";
+    private property <bool> server-settings-open: false;
+    private property <bool> validation-visible: false;
+    private property <bool> login-follows-address: true;
+    private property <bool> required-fields-ready: root.account-name != "" && root.account-address != "" && root.account-password != "" && root.account-login != "" && root.account-host != "" && root.account-port != "";
+
+    z: 32;
+    background: Theme.scrim;
+    TouchArea { }
+
+    panel := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: parent.width < 644px ? parent.width - 24px : 620px;
+        height: root.server-settings-open ? (parent.height < 584px ? parent.height - 24px : 560px) : (parent.height < 504px ? parent.height - 24px : 470px);
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.outline;
+        background: Theme.surface;
+        accessible-role: form;
+        accessible-label: root.operation-loading ? "Adding mail account. " + root.operation-stage : "Add a mail account";
+
+        VerticalLayout {
+            padding: 18px;
+            spacing: 5px;
+
+            HorizontalLayout {
+                height: 48px;
+                VerticalLayout {
+                    alignment: center;
+                    Text { text: "Add a mail account"; color: Theme.on-surface; font-family: Theme.body-font; font-size: 20px; font-weight: 600; }
+                    Text { text: "Connect with an email address and app password."; color: Theme.on-surface-variant; font-family: Theme.body-font; font-size: 10px; }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                MIconButton {
+                    icon: "close";
+                    label: "Close account setup";
+                    busy: root.operation-loading;
+                    clicked => { root.account-setup-open = false; }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 10px;
+                LabeledTextField {
+                    horizontal-stretch: 1;
+                    label: "Account name";
+                    placeholder: "Personal";
+                    value <=> root.account-name;
+                    enabled: !root.operation-loading;
+                    error: root.validation-visible && root.account-name == "" ? "Enter an account name" : "";
+                }
+                LabeledTextField {
+                    horizontal-stretch: 1;
+                    label: "Email address";
+                    placeholder: "you@example.com";
+                    value <=> root.account-address;
+                    enabled: !root.operation-loading;
+                    error: root.validation-visible && root.account-address == "" ? "Enter an email address" : "";
+                    edited(value) => {
+                        if (root.login-follows-address) { root.account-login = value; }
+                    }
+                }
+            }
+
+            LabeledTextField {
+                label: "App password";
+                placeholder: "Password from your email provider";
+                helper: "Stored in your system credential service, not the mailbox database.";
+                value <=> root.account-password;
+                enabled: !root.operation-loading;
+                input-type: InputType.password;
+                error: root.validation-visible && root.account-password == "" ? "Enter an app password" : "";
+            }
+
+            LabeledTextField {
+                label: "IMAP host";
+                placeholder: "imap.example.com";
+                value <=> root.account-host;
+                enabled: !root.operation-loading;
+                error: root.validation-visible && root.account-host == "" ? "Enter the IMAP host" : "";
+            }
+
+            MButton {
+                label: root.server-settings-open ? "Hide server settings" : "Server settings";
+                icon: root.server-settings-open ? "expand_less" : "expand_more";
+                variant: "tonal";
+                enabled: !root.operation-loading;
+                clicked => { root.server-settings-open = !root.server-settings-open; }
+            }
+
+            if root.server-settings-open: HorizontalLayout {
+                spacing: 10px;
+                LabeledTextField {
+                    horizontal-stretch: 1;
+                    label: "IMAP login";
+                    placeholder: "Usually your full email address";
+                    value <=> root.account-login;
+                    enabled: !root.operation-loading;
+                    error: root.validation-visible && root.account-login == "" ? "Enter the IMAP login" : "";
+                    edited(value) => { root.login-follows-address = value == ""; }
+                }
+                LabeledTextField {
+                    width: 112px;
+                    label: "Port";
+                    placeholder: "993";
+                    value <=> root.account-port;
+                    enabled: !root.operation-loading;
+                    error: root.validation-visible && root.account-port == "" ? "Enter a port" : "";
+                }
+            }
+
+            if root.operation-loading || root.operation-error != "": Rectangle {
+                height: 42px;
+                border-radius: 4px;
+                background: root.operation-error != "" ? Theme.error-container : Theme.primary-container;
+                accessible-role: region;
+                accessible-live-region: polite;
+                accessible-label: root.operation-error != "" ? "Account could not be added. " + root.operation-error : root.operation-stage;
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    spacing: 8px;
+                    MaterialIcon {
+                        name: root.operation-error != "" ? "error" : "progress_activity";
+                        width: 22px;
+                        size: 18px;
+                        icon-color: root.operation-error != "" ? Theme.error : Theme.primary;
+                    }
+                    Text {
+                        text: root.operation-error != "" ? root.operation-error : root.operation-stage;
+                        color: root.operation-error != "" ? Theme.on-error-container : Theme.on-primary-container;
+                        font-family: Theme.body-font;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+
+            Rectangle { vertical-stretch: 1; }
+            HorizontalLayout {
+                spacing: 8px;
+                Rectangle { horizontal-stretch: 1; }
+                MButton {
+                    label: "Cancel";
+                    enabled: !root.operation-loading;
+                    clicked => { root.account-setup-open = false; }
+                }
+                MButton {
+                    label: "Add account";
+                    variant: "filled";
+                    loading: root.operation-loading;
+                    clicked => {
+                        root.validation-visible = true;
+                        if (root.required-fields-ready) {
+                            root.add-account(root.account-name, root.account-address, root.account-login, root.account-host, root.account-port, root.account-password);
+                            root.account-password = "";
+                        } else {
+                            root.server-settings-open = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component AccountStatusOverlay inherits Rectangle {
+    in-out property <bool> account-status-open: false;
+    in-out property <bool> account-remove-open: false;
+    in property <bool> operation-loading: false;
+    in property <string> operation-stage: "";
+    in-out property <string> operation-error: "";
+    in property <string> account-id: "";
+    in property <string> account-name: "";
+    in property <string> account-address: "";
+    in property <string> account-status: "Not checked";
+    in property <bool> account-has-error: false;
+    callback diagnose-account(string);
+    callback cancel-operation;
+
+    z: 34;
+    background: Theme.scrim;
+    TouchArea { }
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: parent.width < 564px ? parent.width - 24px : 540px;
+        height: parent.height < 464px ? parent.height - 24px : 440px;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.outline;
+        background: Theme.surface;
+        accessible-role: region;
+        accessible-label: "Account status for " + root.account-name + ". " + root.account-status;
+        VerticalLayout {
+            padding: 20px;
+            spacing: 10px;
+            HorizontalLayout {
+                height: 48px;
+                VerticalLayout {
+                    alignment: center;
+                    Text { text: "Account status"; color: Theme.on-surface; font-family: Theme.body-font; font-size: 20px; font-weight: 600; }
+                    Text { text: "Review and verify this mail connection."; color: Theme.on-surface-variant; font-family: Theme.body-font; font-size: 10px; }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                MIconButton { icon: "close"; label: "Close account status"; busy: root.operation-loading; clicked => { root.account-status-open = false; } }
+            }
+
+            Rectangle {
+                height: 70px;
+                border-radius: 6px;
+                background: Theme.surface-container-low;
+                HorizontalLayout {
+                    padding-left: 14px;
+                    padding-right: 14px;
+                    spacing: 12px;
+                    MaterialIcon { name: "account_circle"; width: 34px; size: 28px; icon-color: Theme.primary; }
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 2px;
+                        Text { text: root.account-name; color: Theme.on-surface; font-family: Theme.body-font; font-size: 14px; font-weight: 500; overflow: elide; }
+                        Text { text: root.account-address; color: Theme.on-surface-variant; font-family: Theme.body-font; font-size: 11px; overflow: elide; }
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 82px;
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: root.account-has-error || root.operation-error != "" ? Theme.error : Theme.outline-variant;
+                background: root.account-has-error || root.operation-error != "" ? Theme.error-container : Theme.surface-container;
+                accessible-role: region;
+                accessible-live-region: polite;
+                accessible-label: root.operation-loading ? (root.operation-stage == "" ? "Checking connection" : root.operation-stage) : root.operation-error != "" ? "Connection check failed. " + root.operation-error : (root.account-has-error ? "Connection needs attention. " : "Connection status. ") + root.account-status;
+                HorizontalLayout {
+                    padding: 14px;
+                    spacing: 12px;
+                    MaterialIcon {
+                        name: root.operation-loading ? "progress_activity" : root.account-has-error || root.operation-error != "" ? "error" : "check_circle";
+                        width: 26px;
+                        size: 21px;
+                        icon-color: root.account-has-error || root.operation-error != "" ? Theme.error : root.operation-loading ? Theme.primary : Theme.success;
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 3px;
+                        Text {
+                            text: root.operation-loading ? (root.operation-stage == "" ? "Checking connection" : root.operation-stage) : root.operation-error != "" ? "Connection check failed" : root.account-has-error ? "Connection needs attention" : "Connection ready";
+                            color: root.account-has-error || root.operation-error != "" ? Theme.on-error-container : Theme.on-surface;
+                            font-family: Theme.body-font;
+                            font-size: 12px;
+                            font-weight: 500;
+                        }
+                        Text {
+                            text: root.operation-error != "" ? root.operation-error : root.account-status;
+                            color: root.account-has-error || root.operation-error != "" ? Theme.on-error-container : Theme.on-surface-variant;
+                            font-family: Theme.body-font;
+                            font-size: 10px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+            }
+
+            Text {
+                text: "Connection checks verify TLS, sign-in, IMAP support, and read-only access to Inbox.";
+                color: Theme.on-surface-variant;
+                font-family: Theme.body-font;
+                font-size: 10px;
+                wrap: word-wrap;
             }
             Rectangle { vertical-stretch: 1; }
-            MButton { label: "Display settings"; icon: "settings"; variant: "tonal"; clicked => { root.account-menu-open = false; root.settings-open = true; } }
+            HorizontalLayout {
+                spacing: 8px;
+                MButton {
+                    label: "Remove account";
+                    icon: "delete";
+                    variant: "danger";
+                    enabled: !root.operation-loading && root.account-id != "";
+                    clicked => { root.operation-error = ""; root.account-remove-open = true; }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                if root.operation-loading: MButton { label: "Cancel check"; clicked => { root.cancel-operation(); } }
+                MButton {
+                    label: "Check connection";
+                    icon: "progress_activity";
+                    variant: "filled";
+                    enabled: root.account-id != "";
+                    loading: root.operation-loading;
+                    clicked => { root.diagnose-account(root.account-id); }
+                }
+            }
+        }
+    }
+}
+
+export component AccountRemoveDialog inherits Rectangle {
+    in-out property <bool> account-remove-open: false;
+    in property <bool> operation-loading: false;
+    in property <string> operation-stage: "";
+    in-out property <string> operation-error: "";
+    in property <string> account-id: "";
+    in property <string> account-name: "";
+    in property <string> account-address: "";
+    callback remove-account(string);
+
+    z: 46;
+    background: Theme.scrim;
+    TouchArea { }
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: parent.width < 484px ? parent.width - 24px : 460px;
+        height: 292px;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.outline;
+        background: Theme.surface;
+        accessible-role: region;
+        accessible-label: "Confirm removing " + root.account-name + " from Nivalis Mail";
+        VerticalLayout {
+            padding: 20px;
+            spacing: 10px;
+            MaterialIcon { name: "delete"; width: 32px; height: 32px; size: 24px; icon-color: Theme.error; }
+            Text { text: "Remove this account?"; color: Theme.on-surface; font-family: Theme.body-font; font-size: 18px; font-weight: 600; }
+            Text {
+                text: root.account-name + " (" + root.account-address + ") will be removed from this device. Messages kept only in its local cache may no longer be available.";
+                color: Theme.on-surface-variant;
+                font-family: Theme.body-font;
+                font-size: 11px;
+                wrap: word-wrap;
+            }
+            if root.operation-error != "": Text {
+                text: root.operation-error + " The account was not removed; try again.";
+                color: Theme.error;
+                font-family: Theme.body-font;
+                font-size: 10px;
+                wrap: word-wrap;
+                accessible-role: region;
+                accessible-live-region: assertive;
+            }
+            Rectangle { vertical-stretch: 1; }
+            HorizontalLayout {
+                spacing: 8px;
+                Rectangle { horizontal-stretch: 1; }
+                MButton {
+                    label: "Keep account";
+                    enabled: !root.operation-loading;
+                    clicked => { root.account-remove-open = false; }
+                }
+                MButton {
+                    label: root.operation-loading ? (root.operation-stage == "" ? "Removing account" : root.operation-stage) : "Remove account";
+                    icon: "delete";
+                    variant: "danger-filled";
+                    enabled: root.account-id != "";
+                    loading: root.operation-loading;
+                    clicked => { root.remove-account(root.account-id); }
+                }
+            }
         }
     }
 }
