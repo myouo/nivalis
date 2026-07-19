@@ -169,5 +169,22 @@ jobs:
             scripts/measure-memory.sh target/release/nivalis-mail \
             > "$work/pagination.csv"
 
+          xvfb-run -a -s '-screen 0 1280x1024x24' env \
+            NIVALIS_MEMORY_DATA_DIR="$work/data" \
+            NIVALIS_MEMORY_TEST_CASE=content-smoke \
+            NIVALIS_STRESS_SCENARIO=content \
+            NIVALIS_STRESS_STEPS=2 \
+            NIVALIS_STRESS_DELAY_MS=2000 \
+            NIVALIS_STRESS_INTERVAL_MS=2 \
+            NIVALIS_MEMORY_LOG="$work/content.log" \
+            NIVALIS_MEMORY_SAMPLES='1 5' \
+            NIVALIS_MEMORY_CPU_SETTLE_GATE=1 \
+            NIVALIS_MEMORY_CPU_SETTLE_GRACE_SECONDS=1 \
+            NIVALIS_MEMORY_CPU_SETTLE_SECONDS=5 \
+            NIVALIS_MEMORY_CPU_SETTLE_MAX_PERCENT=1.00 \
+            scripts/measure-memory.sh target/release/nivalis-mail \
+            > "$work/content.csv"
+
           awk -F, 'NF != 14 { exit 1 }' \
-            "$work/init.csv" "$work/write-search.csv" "$work/pagination.csv"
+            "$work/init.csv" "$work/write-search.csv" "$work/pagination.csv" \
+            "$work/content.csv"

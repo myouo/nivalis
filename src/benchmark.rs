@@ -1,11 +1,24 @@
-use crate::AppWindow;
-use crate::store::sqlite::{MailboxQueryCounts, mailbox_query_counts};
+use crate::{
+    AppWindow,
+    content::{ContentLimits, ContentStaging, FileKey, prepare_content},
+    store::sqlite::{
+        ContentImportSubmission, DatabaseClient, DatabaseSubmitError, FileGcOutcome,
+        MailboxQueryCounts, MessageId, mailbox_query_counts,
+    },
+};
 use slint::{ComponentHandle, Model, SharedString, Timer, TimerMode};
 use std::cell::{Cell, RefCell};
+use std::io::Read;
+use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-pub(crate) fn install_memory_stress(ui: &AppWindow) -> Option<Rc<Timer>> {
+pub(crate) fn install_memory_stress(
+    ui: &AppWindow,
+    database: DatabaseClient,
+    content_path: PathBuf,
+) -> Option<Rc<Timer>> {
     let steps = std::env::var("NIVALIS_STRESS_STEPS")
         .ok()?
         .parse::<usize>()
@@ -24,6 +37,7 @@ pub(crate) fn install_memory_stress(ui: &AppWindow) -> Option<Rc<Timer>> {
     match std::env::var("NIVALIS_STRESS_SCENARIO").as_deref() {
         Ok("pagination") => install_pagination_stress(ui, steps, delay, interval),
         Ok("write-search") => install_write_search_stress(ui, steps, delay, interval),
+        Ok("content") => install_content_stress(ui, database, content_path, steps, delay),
         Ok("mixed") | Err(_) => install_mixed_stress(ui, steps, delay, interval),
         Ok(scenario) => {
             eprintln!(
@@ -32,6 +46,264 @@ pub(crate) fn install_memory_stress(ui: &AppWindow) -> Option<Rc<Timer>> {
             None
         }
     }
+}
+
+const CONTENT_TARGET_MESSAGE_ID: i64 = 51;
+const CONTENT_TARGET_ACCOUNT_ID: i64 = 51;
+const CONTENT_ATTACHMENT_BYTES: usize = 256 * 1024;
+const CONTENT_GC_LIMIT: usize = 16;
+const CONTENT_BOUNDARY: &str = "nivalis-bounded-content-stress";
+
+struct ContentStressResult {
+    cycles: usize,
+    gc_examined: usize,
+    gc_removed: usize,
+    gc_missing: usize,
+    elapsed_ms: u128,
+}
+
+struct ContentCycle {
+    generation: i64,
+    gc: FileGcOutcome,
+}
+
+fn install_content_stress(
+    ui: &AppWindow,
+    database: DatabaseClient,
+    content_path: PathBuf,
+    cycles: usize,
+    delay: u64,
+) -> Option<Rc<Timer>> {
+    let staging = match ContentStaging::open(content_path) {
+        Ok(staging) => Arc::new(staging),
+        Err(_) => {
+            eprintln!("NIVALIS_STRESS_ERROR scenario=content reason=content_root_unavailable");
+            return None;
+        }
+    };
+    let timer = Rc::new(Timer::default());
+    let ui_weak = ui.as_weak();
+    timer.start(
+        TimerMode::SingleShot,
+        Duration::from_millis(delay),
+        move || {
+            let worker_ui = ui_weak.clone();
+            let worker_database = database.clone();
+            let worker_staging = staging.clone();
+            let worker = std::thread::Builder::new()
+                .name("nivalis-content-stress".into())
+                .spawn(move || {
+                    let result = run_content_stress(&worker_database, &worker_staging, cycles);
+                    let _ = worker_ui.upgrade_in_event_loop(move |ui| {
+                        match result {
+                            Ok(result) => {
+                                ui.set_status_text("Content memory stress complete".into());
+                                eprintln!(
+                                    "NIVALIS_STRESS_RESULT scenario=content cycles={} imports={} body_opens={} attachment_opens={} gc_runs={} gc_examined={} gc_removed={} gc_missing={} files_per_import=2 target_id={} elapsed_ms={}",
+                                    result.cycles,
+                                    result.cycles,
+                                    result.cycles,
+                                    result.cycles,
+                                    result.cycles,
+                                    result.gc_examined,
+                                    result.gc_removed,
+                                    result.gc_missing,
+                                    CONTENT_TARGET_MESSAGE_ID,
+                                    result.elapsed_ms
+                                );
+                            }
+                            Err((cycle, reason)) => {
+                                ui.set_status_text("Content memory stress failed".into());
+                                eprintln!(
+                                    "NIVALIS_STRESS_ERROR scenario=content cycle={} reason={reason}",
+                                    cycle + 1
+                                );
+                            }
+                        }
+                        finish_stress(&ui);
+                    });
+                });
+            if worker.is_err() {
+                eprintln!(
+                    "NIVALIS_STRESS_ERROR scenario=content reason=worker_start_failed"
+                );
+                if let Some(ui) = ui_weak.upgrade() {
+                    ui.set_status_text("Content memory stress failed".into());
+                    finish_stress(&ui);
+                }
+            }
+        },
+    );
+
+    Some(timer)
+}
+
+fn run_content_stress(
+    database: &DatabaseClient,
+    staging: &Arc<ContentStaging>,
+    cycles: usize,
+) -> Result<ContentStressResult, (usize, &'static str)> {
+    let message_id = MessageId::new(CONTENT_TARGET_MESSAGE_ID)
+        .expect("content benchmark message identity is positive");
+    let started = Instant::now();
+    let mut last_generation = None;
+    let mut gc_examined = 0_usize;
+    let mut gc_removed = 0_usize;
+    let mut gc_missing = 0_usize;
+    for cycle_index in 0..cycles {
+        let outcome = run_content_cycle(database, staging, message_id, cycle_index)
+            .map_err(|reason| (cycle_index, reason))?;
+        if last_generation
+            .is_some_and(|generation: i64| generation.checked_add(1) != Some(outcome.generation))
+        {
+            return Err((cycle_index, "generation_gap"));
+        }
+        let examined = usize::from(outcome.gc.examined);
+        let removed = usize::from(outcome.gc.removed);
+        let missing = usize::from(outcome.gc.missing);
+        let expected_gc_files = if cycle_index == 0 { 1..=2 } else { 2..=2 };
+        if !expected_gc_files.contains(&examined)
+            || examined != removed + missing
+            || outcome.gc.referenced != 0
+            || outcome.gc.invalid_keys != 0
+            || outcome.gc.io_errors != 0
+        {
+            return Err((cycle_index, "gc_mismatch"));
+        }
+        last_generation = Some(outcome.generation);
+        gc_examined += examined;
+        gc_removed += removed;
+        gc_missing += missing;
+    }
+    Ok(ContentStressResult {
+        cycles,
+        gc_examined,
+        gc_removed,
+        gc_missing,
+        elapsed_ms: started.elapsed().as_millis(),
+    })
+}
+
+fn run_content_cycle(
+    database: &DatabaseClient,
+    staging: &Arc<ContentStaging>,
+    message_id: MessageId,
+    cycle_index: usize,
+) -> Result<ContentCycle, &'static str> {
+    let raw = content_fixture(cycle_index);
+    let prepared = prepare_content(&raw, staging, ContentLimits::default())
+        .map_err(|_| "mime_prepare_failed")?;
+    drop(raw);
+    let published = prepared.publish().map_err(|_| "content_publish_failed")?;
+    let record = published.record();
+    let Some(body_key) = record.body_file_key.clone() else {
+        return Err("body_file_missing");
+    };
+    if record.attachments.len() != 1 {
+        return Err("attachment_count_mismatch");
+    }
+    let attachment = &record.attachments[0];
+    let attachment_key = attachment.file_key.clone();
+    let body_bytes = usize::try_from(record.body_byte_count).map_err(|_| "body_size_overflow")?;
+    let attachment_bytes =
+        usize::try_from(attachment.byte_count).map_err(|_| "attachment_size_overflow")?;
+    if attachment_bytes != CONTENT_ATTACHMENT_BYTES {
+        return Err("attachment_size_mismatch");
+    }
+
+    let submission = Box::new(ContentImportSubmission::new(
+        message_id,
+        CONTENT_TARGET_ACCOUNT_ID,
+        published,
+    ));
+    let import_reply = database
+        .try_import_content(submission)
+        .map_err(|failure| match failure.reason() {
+            DatabaseSubmitError::Busy => "content_import_busy",
+            DatabaseSubmitError::Closed => "content_import_closed",
+        })?
+        .blocking_recv()
+        .map_err(|_| "content_import_reply_closed")?
+        .map_err(|_| "content_import_failed")?;
+
+    read_published_file(staging, &body_key, body_bytes, "body_read_failed")?;
+    read_published_file(
+        staging,
+        &attachment_key,
+        attachment_bytes,
+        "attachment_read_failed",
+    )?;
+
+    let gc = database
+        .try_run_file_gc(staging, CONTENT_GC_LIMIT)
+        .map_err(|_| "content_gc_submit_failed")?
+        .blocking_recv()
+        .map_err(|_| "content_gc_reply_closed")?
+        .map_err(|_| "content_gc_failed")?;
+
+    Ok(ContentCycle {
+        generation: import_reply.generation,
+        gc,
+    })
+}
+
+fn content_fixture(cycle_index: usize) -> Vec<u8> {
+    const BODY_LINE: &[u8] = b"Bounded local content remains readable.\r\n";
+    const BODY_LINES: usize = 1_024;
+    let mut raw =
+        Vec::with_capacity(BODY_LINE.len() * BODY_LINES + CONTENT_ATTACHMENT_BYTES + 1_024);
+    raw.extend_from_slice(b"From: Memory Sender <memory@example.test>\r\n");
+    raw.extend_from_slice(b"To: Reader <reader@example.test>\r\n");
+    raw.extend_from_slice(format!("Subject: Bounded content cycle {cycle_index}\r\n").as_bytes());
+    raw.extend_from_slice(b"Date: Tue, 14 Nov 2023 22:13:20 +0000\r\n");
+    raw.extend_from_slice(b"MIME-Version: 1.0\r\n");
+    raw.extend_from_slice(
+        format!("Content-Type: multipart/mixed; boundary=\"{CONTENT_BOUNDARY}\"\r\n\r\n")
+            .as_bytes(),
+    );
+    raw.extend_from_slice(format!("--{CONTENT_BOUNDARY}\r\n").as_bytes());
+    raw.extend_from_slice(b"Content-Type: text/plain; charset=utf-8\r\n");
+    raw.extend_from_slice(b"Content-Transfer-Encoding: 8bit\r\n\r\n");
+    for _ in 0..BODY_LINES {
+        raw.extend_from_slice(BODY_LINE);
+    }
+    raw.extend_from_slice(format!("--{CONTENT_BOUNDARY}\r\n").as_bytes());
+    raw.extend_from_slice(b"Content-Type: application/octet-stream\r\n");
+    raw.extend_from_slice(b"Content-Disposition: attachment; filename=\"payload.bin\"\r\n");
+    raw.extend_from_slice(b"Content-Transfer-Encoding: binary\r\n\r\n");
+    let attachment_start = raw.len();
+    let attachment_end = attachment_start + CONTENT_ATTACHMENT_BYTES;
+    raw.resize(
+        attachment_end,
+        b'a' + u8::try_from(cycle_index % 26).unwrap_or(0),
+    );
+    raw.extend_from_slice(format!("\r\n--{CONTENT_BOUNDARY}--\r\n").as_bytes());
+    raw
+}
+
+fn read_published_file(
+    staging: &ContentStaging,
+    key: &FileKey,
+    expected_bytes: usize,
+    failure: &'static str,
+) -> Result<(), &'static str> {
+    let mut file = staging.open_file(key).map_err(|_| failure)?;
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total = 0_usize;
+    loop {
+        let read = file.read(&mut buffer).map_err(|_| failure)?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read)
+            .filter(|total| *total <= expected_bytes)
+            .ok_or(failure)?;
+    }
+    if total != expected_bytes {
+        return Err(failure);
+    }
+    Ok(())
 }
 
 fn install_mixed_stress(
@@ -755,6 +1027,10 @@ fn counter_mismatch(
 
 fn stop_stress(ui: &AppWindow, timer: &Timer) {
     timer.stop();
+    finish_stress(ui);
+}
+
+fn finish_stress(ui: &AppWindow) {
     if std::env::var("NIVALIS_STRESS_EXIT").as_deref() == Ok("1") {
         let _ = ui.hide();
         let _ = slint::quit_event_loop();
@@ -794,6 +1070,32 @@ pub(crate) fn install_maximize_stress(ui: &AppWindow) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_fixture_projects_one_bounded_body_and_attachment() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "nivalis-content-benchmark-{}-{timestamp}",
+            std::process::id()
+        ));
+        let staging = ContentStaging::open(root.clone()).unwrap();
+        let raw = content_fixture(7);
+        let prepared = prepare_content(&raw, &staging, ContentLimits::default()).unwrap();
+        let record = prepared.record();
+
+        assert!(record.body_byte_count > 0);
+        assert_eq!(record.attachments.len(), 1);
+        assert_eq!(
+            usize::try_from(record.attachments[0].byte_count).unwrap(),
+            CONTENT_ATTACHMENT_BYTES
+        );
+
+        drop(prepared);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn mailbox_query_deltas_are_checked_without_wrapping() {

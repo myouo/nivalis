@@ -22,8 +22,8 @@ if [[ ! -f "$database" ]]; then
 fi
 
 schema_version=$(sqlite3 "$database" 'PRAGMA user_version;')
-if [[ "$schema_version" != "9" ]]; then
-    printf 'Expected schema version 9, found %s\n' "$schema_version" >&2
+if [[ "$schema_version" != "10" ]]; then
+    printf 'Expected schema version 10, found %s\n' "$schema_version" >&2
     exit 1
 fi
 

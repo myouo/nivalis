@@ -85,7 +85,10 @@ SELECT
     replace(printf('%65536s', ''), ' ', 'b'),
     1,
     1048576,
-    'body-' || id || '.mime'
+    CASE
+        WHEN id = 51 THEN 'body/00000000000000000000000000000033.txt'
+        ELSE 'body-' || id || '.mime'
+    END
 FROM messages;
 
 UPDATE account_mailbox_stats AS stats

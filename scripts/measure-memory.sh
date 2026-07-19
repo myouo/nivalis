@@ -84,7 +84,8 @@ if [[ -n "$stress_steps" ]] && ! is_bounded_positive_decimal "$stress_steps" 214
 fi
 stress_scenario=${NIVALIS_STRESS_SCENARIO:-mixed}
 if [[ -n "$stress_steps" && "$stress_scenario" != "mixed" &&
-    "$stress_scenario" != "pagination" && "$stress_scenario" != "write-search" ]]; then
+    "$stress_scenario" != "pagination" && "$stress_scenario" != "write-search" &&
+    "$stress_scenario" != "content" ]]; then
     printf 'Unsupported NIVALIS_STRESS_SCENARIO: %s\n' "$stress_scenario" >&2
     exit 1
 fi
@@ -433,6 +434,32 @@ for ((run = 1; run <= runs; run++)); do
                 "${BASH_REMATCH[5]}" != "$expected_first_queries" ]]; then
                 printf 'Write-search stress completion counts do not match the requested cycles: %s\n' \
                     "$stress_result" >&2
+                exit 1
+            fi
+        elif [[ "$stress_scenario" == "content" ]]; then
+            content_pattern='^NIVALIS_STRESS_RESULT scenario=content cycles=([1-9][0-9]*) imports=([1-9][0-9]*) body_opens=([1-9][0-9]*) attachment_opens=([1-9][0-9]*) gc_runs=([1-9][0-9]*) gc_examined=([1-9][0-9]*) gc_removed=(0|[1-9][0-9]*) gc_missing=(0|[1-9][0-9]*) files_per_import=2 target_id=51 elapsed_ms=(0|[1-9][0-9]*)$'
+            if [[ ! "$stress_result" =~ $content_pattern ]]; then
+                printf 'Content stress completion marker has an invalid format: %s\n' \
+                    "$stress_result" >&2
+                exit 1
+            fi
+            if [[ "${BASH_REMATCH[1]}" != "$stress_steps" ||
+                "${BASH_REMATCH[2]}" != "$stress_steps" ||
+                "${BASH_REMATCH[3]}" != "$stress_steps" ||
+                "${BASH_REMATCH[4]}" != "$stress_steps" ||
+                "${BASH_REMATCH[5]}" != "$stress_steps" ]]; then
+                printf 'Content stress completion counts do not match the requested cycles: %s\n' \
+                    "$stress_result" >&2
+                exit 1
+            fi
+            gc_examined=${BASH_REMATCH[6]}
+            gc_removed=${BASH_REMATCH[7]}
+            gc_missing=${BASH_REMATCH[8]}
+            minimum_gc=$((2 * (stress_steps - 1) + 1))
+            maximum_gc=$((2 * stress_steps))
+            if ((gc_examined != gc_removed + gc_missing ||
+                gc_examined < minimum_gc || gc_examined > maximum_gc)); then
+                printf 'Content stress GC counts are inconsistent: %s\n' "$stress_result" >&2
                 exit 1
             fi
         else

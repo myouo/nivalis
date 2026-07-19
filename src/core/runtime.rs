@@ -31,11 +31,22 @@ type DatabaseParts = (
     DatabaseInfo,
 );
 
+#[cfg_attr(feature = "bench-harness", allow(dead_code))]
 pub(crate) fn spawn(
     database_path: PathBuf,
 ) -> Result<(CoreHandle, EventReceiver, CoreRuntime), StartError> {
     let database = sqlite::spawn(database_path).map_err(StartError::Database)?;
     spawn_with_options(EVENT_CAPACITY, database)
+}
+
+#[cfg(feature = "bench-harness")]
+pub(crate) fn spawn_with_database(
+    database_path: PathBuf,
+) -> Result<(CoreHandle, EventReceiver, CoreRuntime, DatabaseClient), StartError> {
+    let database = sqlite::spawn(database_path).map_err(StartError::Database)?;
+    let benchmark_database = database.0.clone();
+    let (core, events, runtime) = spawn_with_options(EVENT_CAPACITY, database)?;
+    Ok((core, events, runtime, benchmark_database))
 }
 
 #[cfg(test)]
