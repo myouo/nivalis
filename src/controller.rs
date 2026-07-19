@@ -4,6 +4,7 @@ use crate::presentation::{
     show_snackbar_after_event, update_mail_row,
 };
 use crate::store::MailStore;
+use crate::ui_identity::{AccountKey, EntityKey};
 use crate::{AccountItem, AppWindow, MailSummary};
 use slint::{ComponentHandle, ModelRc, Timer, TimerMode, VecModel};
 use std::{cell::RefCell, rc::Rc, time::Duration};
@@ -41,7 +42,10 @@ pub(crate) fn install(
         let store = store.clone();
         let mail_model = mail_model.clone();
         let account_model = account_model.clone();
-        ui.on_select_mail(move |id| {
+        ui.on_select_mail(move |key| {
+            let Some(id) = demo_message_id(key.as_str()) else {
+                return;
+            };
             store.borrow_mut().select(id);
             if let Some(ui) = ui_weak.upgrade() {
                 let store = store.borrow();
@@ -105,7 +109,10 @@ pub(crate) fn install(
         let store = store.clone();
         let mail_model = mail_model.clone();
         let account_model = account_model.clone();
-        ui.on_toggle_star(move |id| {
+        ui.on_toggle_star(move |key| {
+            let Some(id) = demo_message_id(key.as_str()) else {
+                return;
+            };
             store.borrow_mut().toggle_star(id);
             if let Some(ui) = ui_weak.upgrade() {
                 let store = store.borrow();
@@ -129,7 +136,10 @@ pub(crate) fn install(
         let mail_model = mail_model.clone();
         let account_model = account_model.clone();
         let snackbar_timer = snackbar_timer.clone();
-        ui.on_archive(move |id| {
+        ui.on_archive(move |key| {
+            let Some(id) = demo_message_id(key.as_str()) else {
+                return;
+            };
             store.borrow_mut().archive(id);
             if let Some(ui) = ui_weak.upgrade() {
                 ui.set_status_text("Local sample moved to archive".into());
@@ -152,7 +162,10 @@ pub(crate) fn install(
         let mail_model = mail_model.clone();
         let account_model = account_model.clone();
         let snackbar_timer = snackbar_timer.clone();
-        ui.on_delete_mail(move |id| {
+        ui.on_delete_mail(move |key| {
+            let Some(id) = demo_message_id(key.as_str()) else {
+                return;
+            };
             let can_undo = store.borrow_mut().delete(id);
             if let Some(ui) = ui_weak.upgrade() {
                 let message = if can_undo {
@@ -205,7 +218,10 @@ pub(crate) fn install(
         let store = store.clone();
         let mail_model = mail_model.clone();
         let account_model = account_model.clone();
-        ui.on_mark_unread(move |id| {
+        ui.on_mark_unread(move |key| {
+            let Some(id) = demo_message_id(key.as_str()) else {
+                return;
+            };
             store.borrow_mut().mark_unread(id);
             if let Some(ui) = ui_weak.upgrade() {
                 ui.set_status_text("Local sample marked unread".into());
@@ -227,7 +243,19 @@ pub(crate) fn install(
         let mail_model = mail_model.clone();
         let account_model = account_model.clone();
         let snackbar_timer = snackbar_timer.clone();
-        ui.on_switch_account(move |account_id| {
+        ui.on_switch_account(move |key| {
+            let Some(account_id) = demo_account_id(key.as_str()) else {
+                if let Some(ui) = ui_weak.upgrade() {
+                    ui.set_status_text("Account identity is invalid".into());
+                    show_snackbar(
+                        &ui,
+                        "This account can no longer be identified",
+                        false,
+                        &snackbar_timer,
+                    );
+                }
+                return;
+            };
             if !store.borrow_mut().set_account(account_id) {
                 if let Some(ui) = ui_weak.upgrade() {
                     ui.set_status_text("Account is no longer available".into());
@@ -273,4 +301,31 @@ pub(crate) fn install(
         }
         drop(core);
     })
+}
+
+fn demo_message_id(key: &str) -> Option<i32> {
+    i32::try_from(EntityKey::parse(key)?.get()).ok()
+}
+
+fn demo_account_id(key: &str) -> Option<i32> {
+    match AccountKey::parse(key)? {
+        AccountKey::All => Some(0),
+        AccountKey::Account(id) => i32::try_from(id.get()).ok(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn demo_boundary_never_truncates_database_identity() {
+        assert_eq!(demo_message_id("2147483647"), Some(i32::MAX));
+        assert_eq!(demo_message_id("2147483648"), None);
+        assert_eq!(demo_message_id("9223372036854775807"), None);
+        assert_eq!(demo_message_id("01"), None);
+
+        assert_eq!(demo_account_id(""), Some(0));
+        assert_eq!(demo_account_id("2147483648"), None);
+    }
 }

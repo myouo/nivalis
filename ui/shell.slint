@@ -113,7 +113,7 @@ export component AccountSwitcher inherits Rectangle {
 export component AccountMenuRow inherits Rectangle {
     in property <AccountItem> account;
     in property <bool> selected: false;
-    callback clicked(int);
+    callback clicked(string);
     forward-focus: focus;
 
     accessible-role: button;

@@ -11,8 +11,8 @@ export component MailRow inherits Rectangle {
     in property <bool> show-account: false;
     in property <int> item-index: 0;
     in property <int> item-count: 0;
-    callback opened(int);
-    callback starred(int);
+    callback opened(string);
+    callback starred(string);
     forward-focus: row-focus;
 
     accessible-role: list-item;
@@ -129,13 +129,13 @@ export component MailboxPane inherits Rectangle {
     in property <string> active-folder: "Inbox";
     in property <string> active-account-name;
     in property <string> data-source-label: "Local sample";
-    in property <int> active-account-id: 0;
+    in property <string> active-account-id: "";
     in property <bool> active-account-error: false;
     in property <int> inbox-count: 0;
     in property <string> status-text;
     in property <bool> initial-loading: false;
     in property <[MailSummary]> mails;
-    in property <int> selected-id: -1;
+    in property <string> selected-id: "";
     in property <int> message-total: 0;
     in-out property <string> search-query;
     in-out property <bool> detail-open: false;
@@ -143,9 +143,9 @@ export component MailboxPane inherits Rectangle {
     in-out property <bool> more-menu-open: false;
     in-out property <bool> filter-menu-open: false;
     in-out property <bool> error-banner-dismissed: false;
-    callback select-mail(int);
+    callback select-mail(string);
     callback query-mail(string);
-    callback toggle-star(int);
+    callback toggle-star(string);
 
     preferred-width: root.compact-layout ? 0px : (root.wide-sidebar ? 408px : 372px);
     min-width: root.compact-layout ? 0px : 340px;
@@ -290,7 +290,7 @@ export component MailboxPane inherits Rectangle {
             for mail[i] in root.mails: MailRow {
                 mail: mail;
                 selected: root.selected-id == mail.id;
-                show-account: root.active-account-id == 0;
+                show-account: root.active-account-id == "";
                 item-index: i;
                 item-count: root.mails.length;
                 opened(id) => { root.detail-open = true; root.select-mail(id); }

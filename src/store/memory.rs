@@ -1,6 +1,9 @@
 //! Bounded in-memory repository used by the interactive prototype and tests.
 
-use crate::{AccountItem, MailDetail, MailSummary};
+use crate::{
+    AccountItem, MailDetail, MailSummary,
+    ui_identity::{AccountKey, EntityKey},
+};
 use slint::{Color, SharedString};
 
 const ALL_ACCOUNTS: i32 = 0;
@@ -120,8 +123,8 @@ pub struct MailRecord {
 impl MailRecord {
     fn to_summary(&self, account_label: SharedString) -> MailSummary {
         MailSummary {
-            id: self.id,
-            account_id: self.account_id,
+            id: encode_entity_id(self.id),
+            account_id: encode_account_id(self.account_id),
             account_label,
             sender: self.sender.clone(),
             initials: self.initials.clone(),
@@ -138,7 +141,7 @@ impl MailRecord {
     fn to_detail(&self) -> MailDetail {
         let (body, body_truncated) = bounded_text(&self.body, BODY_PREVIEW_MAX_CHARS);
         MailDetail {
-            id: self.id,
+            id: encode_entity_id(self.id),
             sender: self.sender.clone(),
             email: self.email.clone(),
             initials: self.initials.clone(),
@@ -416,7 +419,7 @@ impl MailStore {
     pub fn accounts_with_stats(&self, stats: &MailStats) -> Vec<AccountItem> {
         let mut accounts = Vec::with_capacity(ACCOUNT_PROFILES.len() + 1);
         accounts.push(AccountItem {
-            id: ALL_ACCOUNTS,
+            id: encode_account_id(ALL_ACCOUNTS),
             name: "All inboxes".into(),
             address: "3 local sample accounts".into(),
             initials: "AI".into(),
@@ -430,7 +433,7 @@ impl MailStore {
                 .into_iter()
                 .enumerate()
                 .map(|(index, account)| AccountItem {
-                    id: account.id,
+                    id: encode_account_id(account.id),
                     name: account.name.into(),
                     address: account.address.into(),
                     initials: account.initials.into(),
@@ -795,6 +798,22 @@ fn account_model_index(id: i32) -> Option<usize> {
         .map(|index| index + 1)
 }
 
+fn entity_key(id: i32) -> EntityKey {
+    EntityKey::new(i64::from(id)).expect("in-memory entity IDs are positive")
+}
+
+fn encode_entity_id(id: i32) -> SharedString {
+    entity_key(id).encode()
+}
+
+fn encode_account_id(id: i32) -> SharedString {
+    if id == ALL_ACCOUNTS {
+        AccountKey::All.encode()
+    } else {
+        AccountKey::Account(entity_key(id)).encode()
+    }
+}
+
 fn color(rgb: (u8, u8, u8)) -> Color {
     Color::from_rgb_u8(rgb.0, rgb.1, rgb.2)
 }
@@ -834,7 +853,9 @@ fn bounded_text(text: &SharedString, max_chars: usize) -> (SharedString, bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{BODY_PREVIEW_MAX_CHARS, MailStore, PAGE_SIZE, PREVIEW_MAX_CHARS};
+    use super::{
+        BODY_PREVIEW_MAX_CHARS, MailStore, PAGE_SIZE, PREVIEW_MAX_CHARS, encode_entity_id,
+    };
 
     #[test]
     fn search_matches_sender_and_subject_case_insensitively() {
@@ -844,7 +865,7 @@ mod tests {
         let result = store.filtered();
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].id, 2);
+        assert_eq!(result[0].id, "2");
     }
 
     #[test]
@@ -879,20 +900,21 @@ mod tests {
         }
 
         let before = store.view();
+        let newest_key = encode_entity_id(newest_id);
         assert_eq!(before.rows.len(), PAGE_SIZE);
-        assert_eq!(before.rows[0].id, newest_id);
+        assert_eq!(before.rows[0].id, newest_key);
 
         assert!(store.delete(newest_id));
         let deleted = store.view();
         assert_eq!(deleted.rows.len(), PAGE_SIZE);
         assert_eq!(deleted.stats.message_total, before.stats.message_total - 1);
-        assert!(deleted.rows.iter().all(|mail| mail.id != newest_id));
+        assert!(deleted.rows.iter().all(|mail| mail.id != newest_key));
 
         assert_eq!(store.undo_delete(), Some(newest_id));
         let restored = store.view();
         assert_eq!(restored.rows.len(), PAGE_SIZE);
         assert_eq!(restored.stats.message_total, before.stats.message_total);
-        assert_eq!(restored.rows[0].id, newest_id);
+        assert_eq!(restored.rows[0].id, newest_key);
     }
 
     #[test]
@@ -901,6 +923,9 @@ mod tests {
         let summary = store.view().rows.remove(0);
         let detail = store.selected();
 
+        assert_eq!(summary.id, "1");
+        assert_eq!(summary.account_id, "1");
+        assert_eq!(detail.id, "1");
         assert_eq!(
             summary.sender.as_str().as_ptr(),
             store.messages[0].sender.as_str().as_ptr()
@@ -920,7 +945,7 @@ mod tests {
 
         assert_eq!(store.filtered().len(), before - 1);
         store.set_folder("Archive");
-        assert!(store.filtered().iter().any(|mail| mail.id == 1));
+        assert!(store.filtered().iter().any(|mail| mail.id == "1"));
     }
 
     #[test]
@@ -953,7 +978,7 @@ mod tests {
         store.toggle_star(1);
 
         assert_eq!(store.selected_id(), Some(3));
-        assert!(!store.filtered().iter().any(|mail| mail.id == 1));
+        assert!(!store.filtered().iter().any(|mail| mail.id == "1"));
     }
 
     #[test]
@@ -965,7 +990,7 @@ mod tests {
         store.delete(1);
 
         assert_eq!(store.starred_count(), before - 1);
-        assert!(!store.filtered().iter().any(|mail| mail.id == 1));
+        assert!(!store.filtered().iter().any(|mail| mail.id == "1"));
     }
 
     #[test]
@@ -990,11 +1015,12 @@ mod tests {
             "\n\n  First line\nSecond line",
         );
         store.set_folder("Sent");
+        let key = encode_entity_id(id);
 
         let sent = store
             .filtered()
             .into_iter()
-            .find(|mail| mail.id == id)
+            .find(|mail| mail.id == key)
             .expect("sent message should be visible");
 
         assert_eq!(sent.preview.as_str(), "First line");
@@ -1008,11 +1034,12 @@ mod tests {
         let body = "界".repeat(PREVIEW_MAX_CHARS + 40);
         let id = store.insert_test_sent_mail("friend@example.com", "Long body", &body);
         store.set_folder("Sent");
+        let key = encode_entity_id(id);
 
         let sent = store
             .filtered()
             .into_iter()
-            .find(|mail| mail.id == id)
+            .find(|mail| mail.id == key)
             .expect("sent message should be visible");
 
         assert_eq!(sent.preview.chars().count(), PREVIEW_MAX_CHARS + 3);
@@ -1056,10 +1083,10 @@ mod tests {
         assert_eq!(
             store
                 .filtered()
-                .iter()
-                .map(|mail| mail.id)
+                .into_iter()
+                .map(|mail| mail.id.to_string())
                 .collect::<Vec<_>>(),
-            [1, 2, 5, 8, 9, 11]
+            ["1", "2", "5", "8", "9", "11"]
         );
         assert_eq!(store.inbox_count(), 3);
         assert_eq!(store.starred_count(), 1);
@@ -1069,10 +1096,10 @@ mod tests {
         assert_eq!(
             store
                 .filtered()
-                .iter()
-                .map(|mail| mail.id)
+                .into_iter()
+                .map(|mail| mail.id.to_string())
                 .collect::<Vec<_>>(),
-            [4, 10, 12]
+            ["4", "10", "12"]
         );
         assert_eq!(store.inbox_count(), 1);
         assert_eq!(store.draft_count(), 1);
@@ -1091,10 +1118,10 @@ mod tests {
         assert_eq!(
             store
                 .filtered()
-                .iter()
-                .map(|mail| mail.id)
+                .into_iter()
+                .map(|mail| mail.id.to_string())
                 .collect::<Vec<_>>(),
-            [3]
+            ["3"]
         );
     }
 
@@ -1104,8 +1131,10 @@ mod tests {
         let accounts = store.accounts();
 
         assert_eq!(accounts.len(), 4);
+        assert_eq!(accounts[0].id, "");
         assert_eq!(accounts[0].unread_count, 4);
         assert!(accounts[0].has_error);
+        assert_eq!(accounts[1].id, "1");
         assert_eq!(accounts[1].name.as_str(), "Work");
         assert_eq!(accounts[1].unread_count, 3);
         assert_eq!(accounts[2].name.as_str(), "Personal");
@@ -1117,16 +1146,16 @@ mod tests {
         let mut store = MailStore::demo();
 
         assert!(store.delete(1));
-        assert!(!store.filtered().iter().any(|mail| mail.id == 1));
+        assert!(!store.filtered().iter().any(|mail| mail.id == "1"));
         store.set_folder("Trash");
-        assert!(store.filtered().iter().any(|mail| mail.id == 1));
+        assert!(store.filtered().iter().any(|mail| mail.id == "1"));
 
         assert_eq!(store.undo_delete(), Some(1));
-        assert!(!store.filtered().iter().any(|mail| mail.id == 1));
+        assert!(!store.filtered().iter().any(|mail| mail.id == "1"));
         assert_eq!(store.undo_delete(), None);
 
         store.set_folder("Inbox");
-        assert!(store.filtered().iter().any(|mail| mail.id == 1));
+        assert!(store.filtered().iter().any(|mail| mail.id == "1"));
     }
 
     #[test]
@@ -1137,10 +1166,10 @@ mod tests {
 
         assert!(!store.delete(1));
         assert_eq!(store.undo_delete(), None);
-        assert!(!store.filtered().iter().any(|mail| mail.id == 1));
+        assert!(!store.filtered().iter().any(|mail| mail.id == "1"));
 
         store.set_folder("Inbox");
-        assert!(!store.filtered().iter().any(|mail| mail.id == 1));
+        assert!(!store.filtered().iter().any(|mail| mail.id == "1"));
     }
 
     #[test]
@@ -1149,16 +1178,17 @@ mod tests {
         assert!(store.set_account(2));
         let id = store.insert_test_sent_mail("friend@example.com", "Hello", "From personal");
         store.set_folder("Sent");
+        let key = encode_entity_id(id);
 
         let sent = store
             .filtered()
             .into_iter()
-            .find(|mail| mail.id == id)
+            .find(|mail| mail.id == key)
             .expect("sent message should be visible in the active account");
-        assert_eq!(sent.account_id, 2);
+        assert_eq!(sent.account_id, "2");
         assert_eq!(sent.account_label.as_str(), "Personal");
 
         assert!(store.set_account(1));
-        assert!(!store.filtered().iter().any(|mail| mail.id == id));
+        assert!(!store.filtered().iter().any(|mail| mail.id == key));
     }
 }

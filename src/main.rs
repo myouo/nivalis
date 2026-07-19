@@ -5,6 +5,7 @@ mod core;
 mod platform;
 mod presentation;
 mod store;
+mod ui_identity;
 
 use slint::ComponentHandle;
 

@@ -9,15 +9,15 @@ import { AccountAvatar } from "shared.slint";
 export component ReaderPane inherits Rectangle {
     in property <bool> compact-layout: false;
     in property <length> window-width: 1200px;
-    in property <int> selected-id: -1;
+    in property <string> selected-id: "";
     in property <MailDetail> selected-mail;
     in-out property <bool> detail-open: false;
     in-out property <bool> delete-dialog-open: false;
     in-out property <bool> message-menu-open: false;
     callback filter-folder(string);
-    callback toggle-star(int);
-    callback archive(int);
-    callback mark-unread(int);
+    callback toggle-star(string);
+    callback archive(string);
+    callback mark-unread(string);
 
     horizontal-stretch: 1;
     background: Theme.surface;
@@ -26,7 +26,7 @@ export component ReaderPane inherits Rectangle {
 
     if !root.compact-layout: Rectangle { x: 0; width: 1px; height: parent.height; background: Theme.outline-variant; }
 
-    if root.selected-id < 0: EmptyState {
+    if root.selected-id == "": EmptyState {
         title: "Select a message";
         detail: "Choose a conversation from the inbox to read it here.";
         icon: "mail";
@@ -34,7 +34,7 @@ export component ReaderPane inherits Rectangle {
         action => { root.filter-folder("Inbox"); root.detail-open = false; }
     }
 
-    if root.selected-id >= 0: VerticalLayout {
+    if root.selected-id != "": VerticalLayout {
         spacing: 0px;
 
         Rectangle {

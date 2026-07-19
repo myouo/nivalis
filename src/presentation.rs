@@ -1,11 +1,12 @@
 use crate::store::{MailStats, MailStore, MailView};
+use crate::ui_identity::{AccountKey, EntityKey};
 use crate::{AccountItem, AppWindow, MailSummary};
 use slint::{ComponentHandle, Model, SharedString, Timer, TimerMode, VecModel};
 use std::{rc::Rc, time::Duration};
 
 pub(crate) fn refresh_selection(ui: &AppWindow, store: &MailStore) {
     ui.set_selected_mail(store.selected());
-    ui.set_selected_id(store.selected_id().unwrap_or(-1));
+    ui.set_selected_id(store.selected_id().map(demo_entity_key).unwrap_or_default());
 }
 
 pub(crate) fn refresh_folder(ui: &AppWindow, store: &MailStore) {
@@ -13,7 +14,7 @@ pub(crate) fn refresh_folder(ui: &AppWindow, store: &MailStore) {
 }
 
 pub(crate) fn refresh_account(ui: &AppWindow, store: &MailStore) {
-    ui.set_active_account_id(store.active_account_id());
+    ui.set_active_account_id(demo_account_key(store.active_account_id()));
     ui.set_active_account_name(store.active_account_name().into());
     ui.set_active_account_detail(store.active_account_detail().into());
     ui.set_active_account_initials(store.active_account_initials().into());
@@ -81,8 +82,9 @@ pub(crate) fn show_snackbar_after_event(ui: &AppWindow, message: &'static str, t
 }
 
 pub(crate) fn update_mail_row(model: &VecModel<MailSummary>, store: &MailStore, id: i32) {
+    let key = demo_entity_key(id);
     let Some(old_index) = (0..model.row_count())
-        .find(|index| model.row_data(*index).is_some_and(|mail| mail.id == id))
+        .find(|index| model.row_data(*index).is_some_and(|mail| mail.id == key))
     else {
         return;
     };
@@ -93,6 +95,18 @@ pub(crate) fn update_mail_row(model: &VecModel<MailSummary>, store: &MailStore, 
     if old_index == new_index {
         model.set_row_data(old_index, mail);
     }
+}
+
+fn demo_entity_key(id: i32) -> SharedString {
+    EntityKey::new(i64::from(id))
+        .expect("demo message IDs must be positive")
+        .encode()
+}
+
+fn demo_account_key(id: i32) -> SharedString {
+    AccountKey::from_scope_id(i64::from(id))
+        .expect("demo account IDs must be zero or positive")
+        .encode()
 }
 
 #[cfg(test)]
@@ -111,7 +125,7 @@ mod tests {
         assert_eq!(model.row_count(), original_count);
         let updated = (0..model.row_count())
             .filter_map(|index| model.row_data(index))
-            .find(|mail| mail.id == 2)
+            .find(|mail| mail.id == demo_entity_key(2))
             .expect("updated mail should remain in the model");
         assert!(updated.starred);
     }
@@ -135,7 +149,7 @@ mod tests {
         assert!(
             (0..model.row_count())
                 .filter_map(|index| model.row_data(index))
-                .all(|mail| mail.id != newest_id)
+                .all(|mail| mail.id != demo_entity_key(newest_id))
         );
     }
 }

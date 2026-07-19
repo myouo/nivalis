@@ -1,5 +1,5 @@
 export struct AccountItem {
-    id: int,
+    id: string,
     name: string,
     address: string,
     initials: string,
@@ -10,8 +10,8 @@ export struct AccountItem {
 }
 
 export struct MailSummary {
-    id: int,
-    account-id: int,
+    id: string,
+    account-id: string,
     account-label: string,
     sender: string,
     initials: string,
@@ -25,7 +25,7 @@ export struct MailSummary {
 }
 
 export struct MailDetail {
-    id: int,
+    id: string,
     sender: string,
     email: string,
     initials: string,

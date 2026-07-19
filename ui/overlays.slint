@@ -9,11 +9,11 @@ import { AccountMenuRow } from "shell.slint";
 export component AccountMenuOverlay inherits Rectangle {
     in property <bool> wide-sidebar: true;
     in property <[AccountItem]> accounts;
-    in property <int> active-account-id: 0;
+    in property <string> active-account-id: "";
     in-out property <bool> account-menu-open: false;
     in-out property <bool> settings-open: false;
     in-out property <bool> detail-open: false;
-    callback switch-account(int);
+    callback switch-account(string);
 
     z: 20;
     background: transparent;
@@ -181,12 +181,12 @@ export component SettingsOverlay inherits Rectangle {
 export component MessageMenuOverlay inherits Rectangle {
     in property <bool> compact-layout: false;
     in property <MailDetail> selected-mail;
-    in property <int> selected-id: -1;
+    in property <string> selected-id: "";
     in property <string> active-folder: "Inbox";
     in-out property <bool> message-menu-open: false;
     in-out property <bool> delete-dialog-open: false;
-    callback toggle-star(int);
-    callback mark-unread(int);
+    callback toggle-star(string);
+    callback mark-unread(string);
 
     z: 25;
     background: transparent;
@@ -213,10 +213,10 @@ export component MessageMenuOverlay inherits Rectangle {
 
 export component DeleteDialog inherits Rectangle {
     in property <string> active-folder: "Inbox";
-    in property <int> selected-id: -1;
+    in property <string> selected-id: "";
     in-out property <bool> delete-dialog-open: false;
     in-out property <bool> detail-open: false;
-    callback delete-mail(int);
+    callback delete-mail(string);
 
     z: 40;
     background: Theme.scrim;

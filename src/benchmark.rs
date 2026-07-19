@@ -1,5 +1,5 @@
 use crate::AppWindow;
-use slint::{ComponentHandle, Timer, TimerMode};
+use slint::{ComponentHandle, SharedString, Timer, TimerMode};
 use std::cell::Cell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -63,8 +63,8 @@ pub(crate) fn install_memory_stress(ui: &AppWindow) -> Option<Rc<Timer>> {
                     return;
                 }
 
-                const IDS: [i32; 10] = [1, 2, 3, 4, 5, 8, 9, 10, 11, 12];
-                let id = IDS[current % IDS.len()];
+                const IDS: [&str; 10] = ["1", "2", "3", "4", "5", "8", "9", "10", "11", "12"];
+                let id = SharedString::from(IDS[current % IDS.len()]);
                 match current % 8 {
                     0 => ui.invoke_select_mail(id),
                     1 => ui.invoke_toggle_star(id),
