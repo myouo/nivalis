@@ -29,6 +29,14 @@ pub(crate) use domain::{
     MessageId, MessageMutation, MutationOutcome, PageSpec, RequestId, Tagged, UndoToken,
 };
 
+#[cfg(test)]
+pub(crate) use domain::{MessageState, UndoReceipt};
+
+#[cfg(test)]
+pub(crate) fn undo_token_for_test(value: i64) -> UndoToken {
+    UndoToken::from_database(value).expect("test undo tokens are positive")
+}
+
 pub(crate) fn spawn(
     path: impl Into<std::path::PathBuf>,
 ) -> Result<

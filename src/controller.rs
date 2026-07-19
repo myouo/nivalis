@@ -829,6 +829,14 @@ fn session_error(error: SessionError) -> UserError {
             title: "Mailbox navigation is already running",
             detail: "Wait for the current page to finish loading before trying again.",
         },
+        SessionError::MutationRequestPending | SessionError::MutationRefreshPending => UserError {
+            title: "Message change is already running",
+            detail: "Wait for the mailbox to refresh before changing another message.",
+        },
+        SessionError::UndoUnavailable | SessionError::UndoExpired => UserError {
+            title: "Undo is no longer available",
+            detail: "The five-second undo period ended or a newer Trash action replaced it.",
+        },
         SessionError::NavigationUnavailable => UserError {
             title: "That mailbox page is unavailable",
             detail: "The mailbox may have changed. Refresh it and try again.",

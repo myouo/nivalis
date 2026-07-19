@@ -1,8 +1,9 @@
 use crate::core::{
     AccountDirectoryQuery, AccountScope, FolderScope, Generation, MailboxQuery, MessageId,
-    MessageQuery, PageBoundary, PageSpec, RequestId,
+    MessageMutation, MessageQuery, MutationOutcome, MutationRequest, PageBoundary, PageSpec,
+    RequestId, UndoToken,
 };
-use crate::store::sqlite::{MailboxPage, MessageDetail, PageCursor, Tagged};
+use crate::store::sqlite::{FailureKind, MailboxPage, MessageDetail, PageCursor, Tagged};
 use crate::ui_identity::{AccountKey, EntityKey};
 use std::{error::Error, fmt};
 
@@ -26,6 +27,20 @@ struct PendingMailbox {
     request: RequestStamp,
     intent: MailboxIntent,
     target_page: u64,
+    mutation_refresh: Option<RequestStamp>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingMutation {
+    request: RequestStamp,
+    intent: MutationIntent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UndoSlot {
+    message_id: MessageId,
+    token: UndoToken,
+    expires_at_ms: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +55,7 @@ pub(crate) struct MailboxAcceptance {
     request: RequestStamp,
     intent: MailboxIntent,
     target_page: u64,
+    mutation_refresh: Option<RequestStamp>,
 }
 
 impl MailboxAcceptance {
@@ -66,6 +82,7 @@ impl MailboxAcceptance {
             visible_ids: page.rows.iter().map(|row| row.id).collect(),
             previous_cursor: page.previous_cursor,
             next_cursor: page.next_cursor,
+            mutation_refresh: self.mutation_refresh,
         })
     }
 }
@@ -76,6 +93,76 @@ pub(crate) struct MailboxCommit {
     visible_ids: Box<[MessageId]>,
     previous_cursor: Option<PageCursor>,
     next_cursor: Option<PageCursor>,
+    mutation_refresh: Option<RequestStamp>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MailAction {
+    SetUnread(bool),
+    SetStarred(bool),
+    Archive,
+    Delete,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MutationIntent {
+    SetUnread { id: MessageId, unread: bool },
+    SetStarred { id: MessageId, starred: bool },
+    Archive { id: MessageId },
+    MoveToTrash { id: MessageId },
+    DeletePermanently { id: MessageId },
+    UndoTrash { id: MessageId, token: UndoToken },
+}
+
+impl MutationIntent {
+    fn message_id(self) -> MessageId {
+        match self {
+            Self::SetUnread { id, .. }
+            | Self::SetStarred { id, .. }
+            | Self::Archive { id }
+            | Self::MoveToTrash { id }
+            | Self::DeletePermanently { id }
+            | Self::UndoTrash { id, .. } => id,
+        }
+    }
+
+    fn mutation(self) -> MessageMutation {
+        match self {
+            Self::SetUnread { id, unread } => MessageMutation::set_unread(id, unread),
+            Self::SetStarred { id, starred } => MessageMutation::set_starred(id, starred),
+            Self::Archive { id } => MessageMutation::archive(id),
+            Self::MoveToTrash { id } => MessageMutation::move_to_trash(id),
+            Self::DeletePermanently { id } => MessageMutation::delete_permanently(id),
+            Self::UndoTrash { token, .. } => MessageMutation::undo_trash(token),
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MutationScope {
+    Current,
+    Changed,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MutationCompletion {
+    Stale,
+    Applied {
+        intent: MutationIntent,
+        scope: MutationScope,
+    },
+    Failed {
+        intent: MutationIntent,
+        scope: MutationScope,
+    },
+    OutcomeMismatch {
+        intent: MutationIntent,
+        scope: MutationScope,
+    },
 }
 
 pub(crate) struct ReadSession {
@@ -93,6 +180,9 @@ pub(crate) struct ReadSession {
     mailbox_request: Option<PendingMailbox>,
     latest_mailbox_request: Option<RequestStamp>,
     detail_request: Option<DetailStamp>,
+    pending_mutation: Option<PendingMutation>,
+    mutation_refresh: Option<RequestStamp>,
+    undo: Option<UndoSlot>,
 }
 
 impl ReadSession {
@@ -112,6 +202,9 @@ impl ReadSession {
             mailbox_request: None,
             latest_mailbox_request: None,
             detail_request: None,
+            pending_mutation: None,
+            mutation_refresh: None,
+            undo: None,
         }
     }
 
@@ -220,6 +313,128 @@ impl ReadSession {
         ))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn issue_message_action(
+        &mut self,
+        key: EntityKey,
+        action: MailAction,
+    ) -> Result<MutationRequest, SessionError> {
+        self.ensure_mutation_available()?;
+        let id = MessageId::new(key.get()).map_err(|_| SessionError::InvalidIdentity)?;
+        if !self.visible_ids.contains(&id) {
+            return Err(SessionError::MessageNotVisible);
+        }
+        let intent = match action {
+            MailAction::SetUnread(unread) => MutationIntent::SetUnread { id, unread },
+            MailAction::SetStarred(starred) => MutationIntent::SetStarred { id, starred },
+            MailAction::Archive => MutationIntent::Archive { id },
+            MailAction::Delete if self.folder == FolderScope::Trash => {
+                MutationIntent::DeletePermanently { id }
+            }
+            MailAction::Delete => MutationIntent::MoveToTrash { id },
+        };
+        self.issue_mutation(intent)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn issue_undo(&mut self, now_ms: i64) -> Result<MutationRequest, SessionError> {
+        self.ensure_mutation_available()?;
+        let Some(undo) = self.undo else {
+            return Err(SessionError::UndoUnavailable);
+        };
+        if now_ms > undo.expires_at_ms {
+            self.undo = None;
+            return Err(SessionError::UndoExpired);
+        }
+        self.issue_mutation(MutationIntent::UndoTrash {
+            id: undo.message_id,
+            token: undo.token,
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn complete_mutation(
+        &mut self,
+        reply: &Tagged<MutationOutcome>,
+    ) -> MutationCompletion {
+        let request = RequestStamp {
+            request_id: reply.request_id,
+            generation: reply.generation,
+        };
+        let Some(pending) = self
+            .pending_mutation
+            .filter(|pending| pending.request == request)
+        else {
+            return MutationCompletion::Stale;
+        };
+        self.pending_mutation = None;
+        let scope = self.mutation_scope(request);
+
+        match &reply.result {
+            Err(failure) => {
+                self.apply_mutation_failure(pending.intent, failure.kind);
+                MutationCompletion::Failed {
+                    intent: pending.intent,
+                    scope,
+                }
+            }
+            Ok(outcome) if mutation_outcome_matches(pending.intent, outcome) => {
+                self.apply_mutation_outcome(pending.intent, outcome);
+                self.require_mutation_refresh(request);
+                MutationCompletion::Applied {
+                    intent: pending.intent,
+                    scope,
+                }
+            }
+            Ok(_) => {
+                self.undo = None;
+                self.require_mutation_refresh(request);
+                MutationCompletion::OutcomeMismatch {
+                    intent: pending.intent,
+                    scope,
+                }
+            }
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn reject_mutation(
+        &mut self,
+        request_id: RequestId,
+        generation: Generation,
+    ) -> Option<(MutationIntent, MutationScope)> {
+        let request = RequestStamp {
+            request_id,
+            generation,
+        };
+        let pending = self
+            .pending_mutation
+            .filter(|pending| pending.request == request)?;
+        self.pending_mutation = None;
+        Some((pending.intent, self.mutation_scope(request)))
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn cancel_mutation_submission(&mut self) -> Option<MutationIntent> {
+        self.pending_mutation.take().map(|pending| pending.intent)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn mutation_blocks_actions(&self) -> bool {
+        self.pending_mutation.is_some() || self.mutation_refresh.is_some()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn undo_expires_at_ms(&mut self, now_ms: i64) -> Option<i64> {
+        let undo = self.undo?;
+        if now_ms > undo.expires_at_ms {
+            self.undo = None;
+            None
+        } else {
+            Some(undo.expires_at_ms)
+        }
+    }
+
     pub(crate) fn set_account(&mut self, account: AccountKey) -> Result<bool, SessionError> {
         account_scope(account)?;
         if self.account == account {
@@ -295,6 +510,7 @@ impl ReadSession {
             request,
             intent: pending.intent,
             target_page: pending.target_page,
+            mutation_refresh: pending.mutation_refresh,
         })
     }
 
@@ -313,6 +529,12 @@ impl ReadSession {
         self.page_number = commit.page_number;
         self.selected = None;
         self.detail_request = None;
+        if commit.mutation_refresh.is_some()
+            && self.mutation_refresh == commit.mutation_refresh
+            && commit.page_number == 1
+        {
+            self.mutation_refresh = None;
+        }
         true
     }
 
@@ -406,6 +628,9 @@ impl ReadSession {
         self.mailbox_request = None;
         self.latest_mailbox_request = None;
         self.detail_request = None;
+        self.pending_mutation = None;
+        self.mutation_refresh = None;
+        self.undo = None;
     }
 
     pub(crate) fn clear_selection(&mut self) {
@@ -439,6 +664,11 @@ impl ReadSession {
             request,
             intent,
             target_page,
+            mutation_refresh: if intent == MailboxIntent::First {
+                self.mutation_refresh
+            } else {
+                None
+            },
         });
         self.latest_mailbox_request = Some(request);
         Ok(MailboxQuery::new(
@@ -446,6 +676,72 @@ impl ReadSession {
             request.generation,
             spec,
         ))
+    }
+
+    fn ensure_mutation_available(&self) -> Result<(), SessionError> {
+        if self.pending_mutation.is_some() {
+            Err(SessionError::MutationRequestPending)
+        } else if self.mutation_refresh.is_some() {
+            Err(SessionError::MutationRefreshPending)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn issue_mutation(&mut self, intent: MutationIntent) -> Result<MutationRequest, SessionError> {
+        let request = self.next_stamp()?;
+        self.pending_mutation = Some(PendingMutation { request, intent });
+        Ok(MutationRequest::new(
+            request.request_id,
+            request.generation,
+            intent.mutation(),
+        ))
+    }
+
+    fn mutation_scope(&self, request: RequestStamp) -> MutationScope {
+        if request.generation == Generation::new(self.generation_value) {
+            MutationScope::Current
+        } else {
+            MutationScope::Changed
+        }
+    }
+
+    fn apply_mutation_failure(&mut self, intent: MutationIntent, kind: FailureKind) {
+        let clears_undo = kind == FailureKind::NotFound
+            || matches!(intent, MutationIntent::UndoTrash { .. }) && kind == FailureKind::Conflict;
+        if clears_undo {
+            self.clear_undo_for(intent.message_id());
+        }
+    }
+
+    fn apply_mutation_outcome(&mut self, intent: MutationIntent, outcome: &MutationOutcome) {
+        match (intent, outcome) {
+            (MutationIntent::MoveToTrash { id }, MutationOutcome::MovedToTrash { undo, .. }) => {
+                self.undo = Some(UndoSlot {
+                    message_id: id,
+                    token: undo.token,
+                    expires_at_ms: undo.expires_at_ms,
+                });
+            }
+            (MutationIntent::UndoTrash { id, .. }, MutationOutcome::Restored { .. })
+            | (
+                MutationIntent::DeletePermanently { id },
+                MutationOutcome::PermanentlyDeleted { .. },
+            ) => self.clear_undo_for(id),
+            _ => {}
+        }
+    }
+
+    fn clear_undo_for(&mut self, message_id: MessageId) {
+        if self.undo.is_some_and(|undo| undo.message_id == message_id) {
+            self.undo = None;
+        }
+    }
+
+    fn require_mutation_refresh(&mut self, request: RequestStamp) {
+        self.accounts_request = None;
+        self.invalidate_mailbox();
+        self.mutation_refresh = Some(request);
     }
 
     fn next_stamp(&mut self) -> Result<RequestStamp, SessionError> {
@@ -480,6 +776,27 @@ impl ReadSession {
     }
 }
 
+fn mutation_outcome_matches(intent: MutationIntent, outcome: &MutationOutcome) -> bool {
+    match (intent, outcome) {
+        (MutationIntent::SetUnread { id, unread }, MutationOutcome::Updated { state, .. }) => {
+            state.id == id && state.unread == unread
+        }
+        (MutationIntent::SetStarred { id, starred }, MutationOutcome::Updated { state, .. }) => {
+            state.id == id && state.starred == starred
+        }
+        (MutationIntent::Archive { id }, MutationOutcome::Archived { state, .. })
+        | (MutationIntent::MoveToTrash { id }, MutationOutcome::MovedToTrash { state, .. })
+        | (MutationIntent::UndoTrash { id, .. }, MutationOutcome::Restored { state, .. }) => {
+            state.id == id
+        }
+        (
+            MutationIntent::DeletePermanently { id },
+            MutationOutcome::PermanentlyDeleted { id: deleted, .. },
+        ) => id == *deleted,
+        _ => false,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DetailAcceptance {
     Stale,
@@ -495,6 +812,10 @@ pub(crate) enum SessionError {
     InvalidSearch,
     MessageNotVisible,
     MailboxRequestPending,
+    MutationRequestPending,
+    MutationRefreshPending,
+    UndoUnavailable,
+    UndoExpired,
     NavigationUnavailable,
     EmptyNavigationPage,
     MailboxPageTooLarge,
@@ -515,6 +836,14 @@ impl fmt::Display for SessionError {
             Self::MailboxRequestPending => {
                 formatter.write_str("a mailbox page request is already pending")
             }
+            Self::MutationRequestPending => {
+                formatter.write_str("a message change is already pending")
+            }
+            Self::MutationRefreshPending => {
+                formatter.write_str("message changes are waiting for a refreshed mailbox")
+            }
+            Self::UndoUnavailable => formatter.write_str("there is no Trash action to undo"),
+            Self::UndoExpired => formatter.write_str("the Trash undo period has expired"),
             Self::NavigationUnavailable => {
                 formatter.write_str("the requested mailbox page is unavailable")
             }
@@ -570,7 +899,10 @@ fn folder_label(folder: FolderScope) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::sqlite::{AccountUnreadDto, MailSummaryDto, MailboxStatsDto, MessageId};
+    use crate::store::sqlite::{
+        AccountStatsDelta, AccountUnreadDto, DbFailure, MailSummaryDto, MailboxStatsDto, MessageId,
+        MessageState, UndoReceipt, undo_token_for_test,
+    };
 
     fn request_id(value: u64) -> RequestId {
         RequestId::new(value).unwrap()
@@ -654,6 +986,82 @@ mod tests {
             body_byte_count: 4,
             body_file_key: None,
         }
+    }
+
+    fn stats_delta() -> AccountStatsDelta {
+        AccountStatsDelta {
+            account_id: 1,
+            inbox_total: 0,
+            inbox_unread: 0,
+            starred_total: 0,
+            sent_total: 0,
+            drafts_total: 0,
+            archive_total: 0,
+            trash_total: 0,
+        }
+    }
+
+    fn message_state(id: i64, unread: bool, starred: bool) -> MessageState {
+        MessageState {
+            id: MessageId::new(id).unwrap(),
+            account_id: 1,
+            revision: 1,
+            unread,
+            starred,
+        }
+    }
+
+    fn mutation_reply(
+        request_id_value: u64,
+        generation_value: u64,
+        outcome: MutationOutcome,
+    ) -> Tagged<MutationOutcome> {
+        Tagged {
+            request_id: request_id(request_id_value),
+            generation: Generation::new(generation_value),
+            result: Ok(outcome),
+        }
+    }
+
+    fn mutation_failure(
+        request_id_value: u64,
+        generation_value: u64,
+        kind: FailureKind,
+    ) -> Tagged<MutationOutcome> {
+        Tagged {
+            request_id: request_id(request_id_value),
+            generation: Generation::new(generation_value),
+            result: Err(DbFailure {
+                kind,
+                message: "test failure".into(),
+            }),
+        }
+    }
+
+    fn updated(id: i64, unread: bool, starred: bool) -> MutationOutcome {
+        MutationOutcome::Updated {
+            state: message_state(id, unread, starred),
+            changed: true,
+            stats_delta: stats_delta(),
+        }
+    }
+
+    fn moved_to_trash(id: i64, token: i64, expires_at_ms: i64) -> MutationOutcome {
+        MutationOutcome::MovedToTrash {
+            state: message_state(id, true, false),
+            undo: UndoReceipt {
+                token: undo_token_for_test(token),
+                expires_at_ms,
+            },
+            stats_delta: stats_delta(),
+        }
+    }
+
+    fn session_with_visible(ids: &[i64]) -> ReadSession {
+        let mut session = ReadSession::new();
+        session.issue_first_mailbox().unwrap();
+        commit_reply(&mut session, &mailbox_reply(1, 1, ids));
+        session
     }
 
     #[test]
@@ -967,6 +1375,274 @@ mod tests {
             Err(SessionError::PageNumberExhausted)
         );
         assert!(!session.mailbox_pending());
+    }
+
+    #[test]
+    fn mutation_requests_are_single_flight_and_exactly_fenced() {
+        let mut session = session_with_visible(&[1]);
+        let expected = MutationRequest::new(
+            request_id(2),
+            Generation::new(1),
+            MessageMutation::set_starred(MessageId::new(1).unwrap(), true),
+        );
+        assert_eq!(
+            session
+                .issue_message_action(EntityKey::new(1).unwrap(), MailAction::SetStarred(true))
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            session.issue_message_action(EntityKey::new(1).unwrap(), MailAction::Archive),
+            Err(SessionError::MutationRequestPending)
+        );
+        assert_eq!(
+            session.complete_mutation(&mutation_reply(9, 1, updated(1, true, true))),
+            MutationCompletion::Stale
+        );
+        assert_eq!(
+            session.reject_mutation(request_id(9), Generation::new(1)),
+            None
+        );
+        assert!(session.mutation_blocks_actions());
+        assert_eq!(
+            session.reject_mutation(request_id(2), Generation::new(1)),
+            Some((
+                MutationIntent::SetStarred {
+                    id: MessageId::new(1).unwrap(),
+                    starred: true,
+                },
+                MutationScope::Current,
+            ))
+        );
+        assert!(!session.mutation_blocks_actions());
+
+        assert_eq!(
+            session.issue_message_action(EntityKey::new(2).unwrap(), MailAction::Archive),
+            Err(SessionError::MessageNotVisible)
+        );
+        assert_eq!(
+            session
+                .issue_message_action(EntityKey::new(1).unwrap(), MailAction::Archive)
+                .unwrap(),
+            MutationRequest::new(
+                request_id(3),
+                Generation::new(1),
+                MessageMutation::archive(MessageId::new(1).unwrap()),
+            )
+        );
+    }
+
+    #[test]
+    fn scope_change_preserves_a_write_and_requires_a_new_authoritative_first_page() {
+        let mut session = session_with_visible(&[1]);
+        session
+            .issue_message_action(EntityKey::new(1).unwrap(), MailAction::SetStarred(true))
+            .unwrap();
+        assert!(session.set_folder("Archive").unwrap());
+
+        assert_eq!(
+            session.complete_mutation(&mutation_reply(2, 1, updated(1, true, true))),
+            MutationCompletion::Applied {
+                intent: MutationIntent::SetStarred {
+                    id: MessageId::new(1).unwrap(),
+                    starred: true,
+                },
+                scope: MutationScope::Changed,
+            }
+        );
+        assert!(session.mutation_blocks_actions());
+        assert_eq!(
+            session.issue_message_action(EntityKey::new(1).unwrap(), MailAction::SetUnread(false)),
+            Err(SessionError::MutationRefreshPending)
+        );
+
+        session.issue_first_mailbox().unwrap();
+        commit_reply(&mut session, &mailbox_reply(3, 2, &[1]));
+        assert!(!session.mutation_blocks_actions());
+        assert_eq!(
+            session
+                .issue_message_action(EntityKey::new(1).unwrap(), MailAction::Archive)
+                .unwrap(),
+            MutationRequest::new(
+                request_id(4),
+                Generation::new(2),
+                MessageMutation::archive(MessageId::new(1).unwrap()),
+            )
+        );
+    }
+
+    #[test]
+    fn a_page_staged_before_mutation_success_cannot_clear_the_refresh_barrier() {
+        let mut session = session_with_visible(&[1]);
+        session.issue_first_mailbox().unwrap();
+        let old_reply = mailbox_reply(2, 1, &[1]);
+        let old_commit = session
+            .match_mailbox_reply(&old_reply)
+            .unwrap()
+            .stage(old_reply.result.as_ref().unwrap())
+            .unwrap();
+
+        session
+            .issue_message_action(EntityKey::new(1).unwrap(), MailAction::SetUnread(false))
+            .unwrap();
+        assert!(matches!(
+            session.complete_mutation(&mutation_reply(3, 1, updated(1, false, false))),
+            MutationCompletion::Applied { .. }
+        ));
+        assert!(!session.commit_mailbox(old_commit));
+        assert!(session.mutation_blocks_actions());
+
+        session.issue_first_mailbox().unwrap();
+        commit_reply(&mut session, &mailbox_reply(4, 1, &[1]));
+        assert!(!session.mutation_blocks_actions());
+    }
+
+    #[test]
+    fn mutation_outcome_kind_identity_and_desired_state_must_match() {
+        let mut session = session_with_visible(&[1]);
+        session
+            .issue_message_action(EntityKey::new(1).unwrap(), MailAction::SetStarred(true))
+            .unwrap();
+        assert_eq!(
+            session.complete_mutation(&mutation_reply(2, 1, updated(1, true, false))),
+            MutationCompletion::OutcomeMismatch {
+                intent: MutationIntent::SetStarred {
+                    id: MessageId::new(1).unwrap(),
+                    starred: true,
+                },
+                scope: MutationScope::Current,
+            }
+        );
+        assert!(session.mutation_blocks_actions());
+
+        session.issue_first_mailbox().unwrap();
+        commit_reply(&mut session, &mailbox_reply(3, 1, &[1]));
+        session
+            .issue_message_action(EntityKey::new(1).unwrap(), MailAction::Archive)
+            .unwrap();
+        assert!(matches!(
+            session.complete_mutation(&mutation_reply(4, 1, updated(1, true, false))),
+            MutationCompletion::OutcomeMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn trash_undo_uses_one_absolute_deadline_slot() {
+        let mut session = session_with_visible(&[1]);
+        session
+            .issue_message_action(EntityKey::new(1).unwrap(), MailAction::Delete)
+            .unwrap();
+        assert!(matches!(
+            session.complete_mutation(&mutation_reply(2, 1, moved_to_trash(1, 11, 100))),
+            MutationCompletion::Applied { .. }
+        ));
+        session.issue_first_mailbox().unwrap();
+        commit_reply(&mut session, &mailbox_reply(3, 1, &[1]));
+
+        assert_eq!(session.undo_expires_at_ms(100), Some(100));
+        assert_eq!(
+            session.issue_undo(100).unwrap(),
+            MutationRequest::new(
+                request_id(4),
+                Generation::new(1),
+                MessageMutation::undo_trash(undo_token_for_test(11)),
+            )
+        );
+        assert!(matches!(
+            session.cancel_mutation_submission(),
+            Some(MutationIntent::UndoTrash { .. })
+        ));
+        assert_eq!(session.issue_undo(101), Err(SessionError::UndoExpired));
+        assert_eq!(session.undo_expires_at_ms(101), None);
+        assert_eq!(session.issue_undo(101), Err(SessionError::UndoUnavailable));
+    }
+
+    #[test]
+    fn undo_conflict_clears_the_token_but_database_failure_preserves_it() {
+        let mut session = session_with_visible(&[1]);
+        session
+            .issue_message_action(EntityKey::new(1).unwrap(), MailAction::Delete)
+            .unwrap();
+        session.complete_mutation(&mutation_reply(2, 1, moved_to_trash(1, 11, 100)));
+        session.issue_first_mailbox().unwrap();
+        commit_reply(&mut session, &mailbox_reply(3, 1, &[1]));
+        session.issue_undo(50).unwrap();
+        assert!(matches!(
+            session.complete_mutation(&mutation_failure(4, 1, FailureKind::Database)),
+            MutationCompletion::Failed { .. }
+        ));
+        session.issue_undo(60).unwrap();
+        assert!(matches!(
+            session.complete_mutation(&mutation_failure(5, 1, FailureKind::Conflict)),
+            MutationCompletion::Failed { .. }
+        ));
+        assert_eq!(session.issue_undo(60), Err(SessionError::UndoUnavailable));
+    }
+
+    #[test]
+    fn newer_trash_receipt_replaces_the_slot_and_successful_undo_clears_it() {
+        let mut session = session_with_visible(&[1]);
+        session
+            .issue_message_action(EntityKey::new(1).unwrap(), MailAction::Delete)
+            .unwrap();
+        session.complete_mutation(&mutation_reply(2, 1, moved_to_trash(1, 11, 100)));
+        session.issue_first_mailbox().unwrap();
+        commit_reply(&mut session, &mailbox_reply(3, 1, &[1]));
+
+        session
+            .issue_message_action(EntityKey::new(1).unwrap(), MailAction::Delete)
+            .unwrap();
+        session.complete_mutation(&mutation_reply(4, 1, moved_to_trash(1, 22, 200)));
+        session.issue_first_mailbox().unwrap();
+        commit_reply(&mut session, &mailbox_reply(5, 1, &[1]));
+        assert_eq!(
+            session.issue_undo(150).unwrap(),
+            MutationRequest::new(
+                request_id(6),
+                Generation::new(1),
+                MessageMutation::undo_trash(undo_token_for_test(22)),
+            )
+        );
+        assert!(matches!(
+            session.complete_mutation(&mutation_reply(
+                6,
+                1,
+                MutationOutcome::Restored {
+                    state: message_state(1, true, false),
+                    stats_delta: stats_delta(),
+                },
+            )),
+            MutationCompletion::Applied { .. }
+        ));
+        session.issue_first_mailbox().unwrap();
+        commit_reply(&mut session, &mailbox_reply(7, 1, &[1]));
+        assert_eq!(session.issue_undo(150), Err(SessionError::UndoUnavailable));
+    }
+
+    #[test]
+    fn delete_action_uses_the_rust_session_folder_and_request_exhaustion_is_atomic() {
+        let mut session = session_with_visible(&[1]);
+        assert!(session.set_folder("Trash").unwrap());
+        session.issue_first_mailbox().unwrap();
+        commit_reply(&mut session, &mailbox_reply(2, 2, &[1]));
+        assert_eq!(
+            session
+                .issue_message_action(EntityKey::new(1).unwrap(), MailAction::Delete)
+                .unwrap(),
+            MutationRequest::new(
+                request_id(3),
+                Generation::new(2),
+                MessageMutation::delete_permanently(MessageId::new(1).unwrap()),
+            )
+        );
+        session.cancel_mutation_submission();
+
+        session.next_request_id = None;
+        assert_eq!(
+            session.issue_message_action(EntityKey::new(1).unwrap(), MailAction::Archive),
+            Err(SessionError::RequestIdExhausted)
+        );
+        assert!(!session.mutation_blocks_actions());
     }
 
     #[test]
