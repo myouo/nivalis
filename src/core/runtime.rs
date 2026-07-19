@@ -144,7 +144,14 @@ async fn run_core(
                 }
             }
             CoreInput::Command(Command::QueryMailbox(query)) => {
-                if let Some(query) = mailbox.enqueue(query)
+                let dispatch = match mailbox.enqueue(query) {
+                    MailboxEnqueue::Dispatch(query) => Some(query),
+                    MailboxEnqueue::Supersede(key) => {
+                        database.supersede_mailbox_query(key.request_id, key.generation);
+                        None
+                    }
+                };
+                if let Some(query) = dispatch
                     && let Some(event) = submit_mailbox(&database, &mut mailbox, query)
                     && !send_event(&events, &mut shutdown, event).await
                 {
@@ -191,6 +198,10 @@ async fn run_core(
                         }
                     }
                 }
+            }
+            #[cfg(test)]
+            CoreInput::Command(Command::Barrier(reached)) => {
+                let _ = reached.send(());
             }
             CoreInput::Database(DbReply::Accounts(reply)) => {
                 let key = AccountDirectoryRequestKey {
@@ -257,6 +268,27 @@ async fn run_core(
                             .await;
                         }
                     }
+                }
+            }
+            CoreInput::Database(DbReply::MailboxSuperseded {
+                request_id,
+                generation,
+            }) => {
+                let key = MailboxRequestKey {
+                    request_id,
+                    generation,
+                };
+                if let MailboxCompletion::Dispatch(query) = mailbox.complete(key)
+                    && let Some(event) = submit_mailbox(&database, &mut mailbox, query)
+                    && !send_event(&events, &mut shutdown, event).await
+                {
+                    return finish_accepted_mutations(
+                        &mut commands,
+                        &database,
+                        &mut database_replies,
+                        active_mutations,
+                    )
+                    .await;
                 }
             }
             CoreInput::Database(DbReply::Message(reply)) => {
@@ -565,13 +597,13 @@ struct MailboxSchedule {
 }
 
 impl MailboxSchedule {
-    fn enqueue(&mut self, query: MailboxQuery) -> Option<MailboxQuery> {
-        if self.active.is_some() {
+    fn enqueue(&mut self, query: MailboxQuery) -> MailboxEnqueue {
+        if let Some(active) = self.active {
             self.pending = Some(query);
-            None
+            MailboxEnqueue::Supersede(active)
         } else {
             self.active = Some(query.key());
-            Some(query)
+            MailboxEnqueue::Dispatch(query)
         }
     }
 
@@ -594,6 +626,11 @@ impl MailboxSchedule {
             self.active = None;
         }
     }
+}
+
+enum MailboxEnqueue {
+    Dispatch(MailboxQuery),
+    Supersede(MailboxRequestKey),
 }
 
 enum MailboxCompletion {
@@ -910,6 +947,36 @@ mod tests {
     }
 
     #[test]
+    fn superseded_mailbox_work_publishes_only_the_latest_query() {
+        let (database, replies, database_runtime, info) = test_database();
+        let control = database.clone();
+        let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        control.gate_next_mailbox_query(started_tx, release_rx);
+        let (core, mut events, runtime) =
+            spawn_with_options(EVENT_CAPACITY, (database, replies, database_runtime, info))
+                .unwrap();
+
+        core.try_query_mailbox(mailbox_query(1, 1)).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        core.try_query_mailbox(mailbox_query(2, 2)).unwrap();
+        core.try_query_mailbox(mailbox_query(3, 3)).unwrap();
+        let (barrier_tx, barrier_rx) = std::sync::mpsc::channel();
+        core.try_barrier(barrier_tx).unwrap();
+        barrier_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        release_tx.send(()).unwrap();
+
+        let Some(Event::MailboxLoaded(reply)) = events.blocking_recv() else {
+            panic!("expected the latest mailbox page");
+        };
+        assert_eq!(reply.request_id, RequestId::new(3).unwrap());
+        assert_eq!(reply.generation, Generation::new(3));
+        reply.result.unwrap();
+        assert!(events.is_empty());
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
     fn account_directory_round_trip_preserves_request_identity() {
         let (core, mut events, runtime) = spawn_for_test().unwrap();
         let query = account_directory_query(6, 2);
@@ -1056,9 +1123,18 @@ mod tests {
         let latest = mailbox_query(3, 3);
         let latest_key = latest.key();
 
-        assert!(schedule.enqueue(first).is_some());
-        assert!(schedule.enqueue(obsolete).is_none());
-        assert!(schedule.enqueue(latest).is_none());
+        let MailboxEnqueue::Dispatch(initial) = schedule.enqueue(first) else {
+            panic!("first mailbox query should be dispatched");
+        };
+        assert_eq!(initial.key(), first_key);
+        assert!(matches!(
+            schedule.enqueue(obsolete),
+            MailboxEnqueue::Supersede(key) if key == first_key
+        ));
+        assert!(matches!(
+            schedule.enqueue(latest),
+            MailboxEnqueue::Supersede(key) if key == first_key
+        ));
 
         let MailboxCompletion::Dispatch(next) = schedule.complete(first_key) else {
             panic!("latest pending query should be dispatched");

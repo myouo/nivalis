@@ -15,6 +15,7 @@ bench-harness = []
 crossbeam-channel = { version = "=0.5.16", default-features = false, features = ["std"] }
 rusqlite = { version = "=0.40.1", default-features = false, features = [
     "bundled",
+    "hooks",
     "limits",
 ] }
 slint = { version = "=1.17.1", default-features = false, features = [

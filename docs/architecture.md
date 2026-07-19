@@ -16,8 +16,8 @@ The primary constraints are predictable UI latency, safe processing of untrusted
 - Schema v8 provides bounded storage for mailbox-scoped IMAP locators, opaque account-scoped JMAP object states, compacted desired-state intents, frozen folder/locator snapshots, versioned lease metadata, and placement-rebase reservations. Local flags, placement changes, and terminal deletions reduce into this journal in the same immediate transaction as message state, undo/tombstone data, file-GC references, and statistics. Parent, child, reservation, and payload caps roll back the complete mutation on overflow; recursive triggers keep constant-time child and reservation usage counters consistent across replacement, recovery, and cascade paths. Legacy revisions retain indexed target-level reconciliation markers instead of unbounded migration backfill. The actor claims one complete intent and applies fully fenced reports through cancellable oneshot paths that bypass UI reply backpressure. Reports cover confirmation, satisfaction, progress renewal, retry, reconciliation, blocking, provider checkpoints, and merges with newer desired versions. Provider writes remain disabled until provider execution and synchronization merge/reconciliation are implemented.
 - Trash undo retains one five-second snapshot with at most 256 folder memberships. Permanent deletion creates a tombstone and queues only file keys with no remaining database reference; an eventual janitor must revalidate the private path and zero-reference invariant immediately before unlinking.
 - The visible controller starts with empty Slint models and consumes bounded SQLite account, mailbox, statistic, and selected-detail projections as its sole source of truth. First, Next, and Previous requests use bidirectional keyset cursors; the controller retains only the current page, at most 50 visible message IDs, two cursors, and a page number rather than page history. Request ID and generation fencing reject obsolete pages and details. Local flag, Archive, Trash, permanent-delete, and Trash-undo intents use one fixed-width pending slot and ordered mutation events. A successful write invalidates obsolete page/detail work and requires an authoritative first-page commit before another ordinary action. Undo retains one absolute deadline, can supersede a pending Trash refresh, and never extends that deadline. The in-memory repository is test-only.
-- Live SQLite search uses an external-content FTS5 index over the bounded sender, address, subject, and preview fields. Literal quoted-phrase parameters, correlated row-id probes, keyset ordering, and the 50-row result cap avoid raw FTS syntax and unbounded temporary sorting. Precise interruption of an active obsolete query remains required.
-- Controller-level FTS interruption and integration coverage, IMAP/SMTP, optional JMAP, MIME ingestion, OAuth2, and keyring integration remain planned backend work.
+- Live SQLite search uses an external-content FTS5 index over the bounded sender, address, subject, and preview fields. Literal quoted-phrase parameters, correlated row-id probes, keyset ordering, and the 50-row result cap avoid raw FTS syntax and unbounded temporary sorting. A fixed single-slot request-key fence interrupts or skips only the obsolete mailbox query; a SQLite progress hook closes the pre-statement interruption race without adding a cancellation queue.
+- Controller integration coverage, IMAP/SMTP, optional JMAP, MIME ingestion, OAuth2, and keyring integration remain planned backend work.
 
 ## Process topology
 
@@ -42,7 +42,7 @@ Initial capacities are deliberately modest and must be validated by profiling: 6
 - Search, selection, progress, unread-count, and provider status updates are replaceable and coalesced to the newest value.
 - Destructive actions, sends, authentication results, and durable state transitions are never silently dropped.
 - Producers await capacity or return an explicit busy result; no production path may use an unbounded channel.
-- Request generations and latest-value scheduling prevent obsolete search and selection results from reaching the UI. Active SQLite query interruption remains required before large-mailbox FTS ships.
+- Request generations, latest-value scheduling, and exact-key SQLite interruption prevent obsolete search and selection results from reaching the UI or consuming the actor after replacement.
 
 Only the selected message may materialize a full reader model. Mailbox pages remain capped at 50 summaries, matching the current virtualized `ListView` contract.
 
@@ -112,7 +112,7 @@ Every substantial dependency is added with `default-features = false`; release f
 
 - Slint keeps only `std`, Winit, Skia, accessibility, the required Winit compatibility layer, and `compat-1-2`.
 - Tokio uses a single current-thread runtime and no multithread scheduler, macros, process, signal, or filesystem feature unless required and measured.
-- Rusqlite disables defaults and enables only the bundled SQLite build plus runtime limits; one actor owns one connection with a 1MiB cache, mmap disabled, and SQLite worker threads set to zero.
+- Rusqlite disables defaults and enables only the bundled SQLite build, query hooks, and runtime limits; one actor owns one connection with a 1MiB cache, mmap disabled, and SQLite worker threads set to zero.
 - Crossbeam channel defaults are disabled and only `std` is enabled for bounded database requests, startup, and shutdown signals; bounded Tokio `mpsc` carries replies into the async core.
 - `async-imap` uses `runtime-tokio`; async-std and IMAP compression stay out of the baseline.
 - Lettre uses only message building, SMTP, Tokio/Rustls, `ring`, and the platform verifier; pooling and DKIM stay out.

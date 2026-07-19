@@ -18,6 +18,8 @@ pub(super) enum Command {
     OpenMessage(MessageQuery),
     #[cfg_attr(not(test), allow(dead_code))]
     Mutate(MutationRequest),
+    #[cfg(test)]
+    Barrier(std::sync::mpsc::Sender<()>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -388,6 +390,16 @@ impl CoreHandle {
     pub(crate) fn try_mutate(&self, request: MutationRequest) -> Result<(), SubmitError> {
         self.commands
             .try_send(Command::Mutate(request))
+            .map_err(SubmitError::from)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_barrier(
+        &self,
+        reached: std::sync::mpsc::Sender<()>,
+    ) -> Result<(), SubmitError> {
+        self.commands
+            .try_send(Command::Barrier(reached))
             .map_err(SubmitError::from)
     }
 }

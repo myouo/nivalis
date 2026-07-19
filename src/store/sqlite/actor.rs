@@ -2,7 +2,10 @@ use std::{
     any::Any,
     fmt, fs,
     path::PathBuf,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -29,6 +32,110 @@ const REQUEST_CAPACITY: usize = 16;
 const REPLY_CAPACITY: usize = 8;
 const SQLITE_CACHE_KIB: i64 = 1024;
 const SQLITE_MAX_VALUE_BYTES: i32 = 2 * 1024 * 1024;
+const MAILBOX_PROGRESS_OPS: i32 = 4096;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MailboxDbKey {
+    request_id: RequestId,
+    generation: Generation,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum MailboxQueryState {
+    #[default]
+    Idle,
+    Superseded(MailboxDbKey),
+    Active(MailboxDbKey),
+    ActiveSuperseded(MailboxDbKey),
+}
+
+impl MailboxQueryState {
+    fn begin(&mut self, key: MailboxDbKey) -> bool {
+        match *self {
+            Self::Idle => {
+                *self = Self::Active(key);
+                true
+            }
+            Self::Superseded(target) if target == key => {
+                *self = Self::Idle;
+                false
+            }
+            Self::Superseded(_) => {
+                *self = Self::Active(key);
+                true
+            }
+            Self::Active(_) | Self::ActiveSuperseded(_) => {
+                debug_assert!(false, "SQLite actor started overlapping mailbox queries");
+                false
+            }
+        }
+    }
+
+    fn supersede(&mut self, key: MailboxDbKey) -> (bool, bool) {
+        match *self {
+            Self::Idle => {
+                *self = Self::Superseded(key);
+                (true, false)
+            }
+            Self::Superseded(target) if target == key => (true, false),
+            Self::Active(target) if target == key => {
+                *self = Self::ActiveSuperseded(key);
+                (true, true)
+            }
+            Self::ActiveSuperseded(target) if target == key => (true, false),
+            Self::Superseded(_) | Self::Active(_) | Self::ActiveSuperseded(_) => (false, false),
+        }
+    }
+
+    fn finish(&mut self, key: MailboxDbKey) -> bool {
+        match *self {
+            Self::Active(target) if target == key => {
+                *self = Self::Idle;
+                false
+            }
+            Self::ActiveSuperseded(target) if target == key => {
+                *self = Self::Idle;
+                true
+            }
+            _ => {
+                debug_assert!(false, "SQLite actor finished an inactive mailbox query");
+                false
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct MailboxQueryControl {
+    state: Mutex<MailboxQueryState>,
+    interrupt_requested: AtomicBool,
+    #[cfg(test)]
+    progress_started: Mutex<Option<Sender<()>>>,
+}
+
+impl MailboxQueryControl {
+    fn begin(&self, key: MailboxDbKey) -> bool {
+        let mut state = lock_mailbox_state(&self.state);
+        let execute = state.begin(key);
+        self.interrupt_requested.store(false, Ordering::Release);
+        execute
+    }
+
+    fn finish(&self, key: MailboxDbKey) -> bool {
+        let mut state = lock_mailbox_state(&self.state);
+        let superseded = state.finish(key);
+        self.interrupt_requested.store(false, Ordering::Release);
+        superseded
+    }
+
+    fn should_interrupt(&self) -> bool {
+        #[cfg(test)]
+        if let Some(started) = lock_progress_started(&self.progress_started).take() {
+            let _ = started.send(());
+        }
+        self.interrupt_requested.load(Ordering::Acquire)
+    }
+}
 
 enum Request {
     QueryAccountDirectory {
@@ -39,6 +146,10 @@ enum Request {
         request_id: RequestId,
         generation: Generation,
         spec: PageSpec,
+        #[cfg(test)]
+        gate: Option<MailboxQueryGate>,
+        #[cfg(test)]
+        long_query: bool,
     },
     OpenMessage {
         request_id: RequestId,
@@ -62,11 +173,22 @@ enum Request {
     RunLongQuery { started: Sender<()> },
 }
 
+#[cfg(test)]
+struct MailboxQueryGate {
+    started: Sender<()>,
+    release: Receiver<()>,
+}
+
 #[derive(Clone)]
 pub(crate) struct DatabaseClient {
     requests: Sender<Request>,
     admission: Arc<Mutex<bool>>,
     interrupt: Arc<InterruptHandle>,
+    mailbox_control: Arc<MailboxQueryControl>,
+    #[cfg(test)]
+    next_mailbox_gate: Arc<Mutex<Option<MailboxQueryGate>>>,
+    #[cfg(test)]
+    next_mailbox_long: Arc<AtomicBool>,
     write_gate: Arc<Mutex<()>>,
 }
 
@@ -92,7 +214,32 @@ impl DatabaseClient {
             request_id,
             generation,
             spec,
+            #[cfg(test)]
+            gate: lock_mailbox_gate(&self.next_mailbox_gate).take(),
+            #[cfg(test)]
+            long_query: self.next_mailbox_long.swap(false, Ordering::AcqRel),
         })
+    }
+
+    pub(crate) fn supersede_mailbox_query(
+        &self,
+        request_id: RequestId,
+        generation: Generation,
+    ) -> bool {
+        let key = MailboxDbKey {
+            request_id,
+            generation,
+        };
+        let mut state = lock_mailbox_state(&self.mailbox_control.state);
+        let (matched, should_interrupt) = state.supersede(key);
+        if should_interrupt {
+            self.mailbox_control
+                .interrupt_requested
+                .store(true, Ordering::Release);
+            let _write_guard = lock_write_gate(&self.write_gate);
+            self.interrupt.interrupt();
+        }
+        matched
     }
 
     pub(crate) fn try_open_message(
@@ -202,6 +349,27 @@ impl DatabaseClient {
     #[cfg(test)]
     pub(crate) fn try_run_long_query(&self, started: Sender<()>) -> Result<(), SubmitError> {
         self.try_submit(Request::RunLongQuery { started })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gate_next_mailbox_query(&self, started: Sender<()>, release: Receiver<()>) {
+        let previous = lock_mailbox_gate(&self.next_mailbox_gate)
+            .replace(MailboxQueryGate { started, release });
+        assert!(previous.is_none(), "a mailbox query gate is already armed");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_next_mailbox_query_long(&self, progress_started: Sender<()>) {
+        let previous =
+            lock_progress_started(&self.mailbox_control.progress_started).replace(progress_started);
+        assert!(
+            previous.is_none(),
+            "a mailbox progress probe is already armed"
+        );
+        assert!(
+            !self.next_mailbox_long.swap(true, Ordering::AcqRel),
+            "a long mailbox query is already armed"
+        );
     }
 }
 
@@ -338,6 +506,12 @@ fn spawn_target(
     let actor_admission = admission.clone();
     let write_gate = Arc::new(Mutex::new(()));
     let actor_write_gate = write_gate.clone();
+    let mailbox_control = Arc::new(MailboxQueryControl::default());
+    let actor_mailbox_control = mailbox_control.clone();
+    #[cfg(test)]
+    let next_mailbox_gate = Arc::new(Mutex::new(None));
+    #[cfg(test)]
+    let next_mailbox_long = Arc::new(AtomicBool::new(false));
     let worker = thread::Builder::new()
         .name("nivalis-sqlite".into())
         .spawn(move || {
@@ -347,8 +521,11 @@ fn spawn_target(
                 reply_tx,
                 shutdown_rx,
                 startup_tx,
-                actor_admission,
-                actor_write_gate,
+                ActorControl {
+                    admission: actor_admission,
+                    write_gate: actor_write_gate,
+                    mailbox: actor_mailbox_control,
+                },
             )
         })
         .map_err(StartError::Thread)?;
@@ -367,6 +544,11 @@ fn spawn_target(
             requests: request_tx,
             admission: admission.clone(),
             interrupt: started.interrupt.clone(),
+            mailbox_control,
+            #[cfg(test)]
+            next_mailbox_gate,
+            #[cfg(test)]
+            next_mailbox_long,
             write_gate: write_gate.clone(),
         },
         DatabaseReplies { replies: reply_rx },
@@ -391,17 +573,29 @@ struct Started {
     interrupt: Arc<InterruptHandle>,
 }
 
+struct ActorControl {
+    admission: Arc<Mutex<bool>>,
+    write_gate: Arc<Mutex<()>>,
+    mailbox: Arc<MailboxQueryControl>,
+}
+
 fn run_actor(
     target: Target,
     requests: Receiver<Request>,
     replies: mpsc::Sender<DbReply>,
     shutdown: Receiver<()>,
     startup: Sender<Result<Started, DbFailure>>,
-    admission: Arc<Mutex<bool>>,
-    write_gate: Arc<Mutex<()>>,
+    control: ActorControl,
 ) -> Result<(), DbFailure> {
     let mut connection = match open_connection(target).and_then(|mut connection| {
         configure(&mut connection)?;
+        let progress_control = control.mailbox.clone();
+        connection
+            .progress_handler(
+                MAILBOX_PROGRESS_OPS,
+                Some(move || progress_control.should_interrupt()),
+            )
+            .map_err(DbFailure::database)?;
         Ok(connection)
     }) {
         Ok(connection) => connection,
@@ -422,11 +616,11 @@ fn run_actor(
     loop {
         let request = select_biased! {
             recv(shutdown) -> _ => {
-                close_admission(&admission);
+                close_admission(&control.admission);
                 return drain_accepted_writes(
                     &mut connection,
                     &requests,
-                    &write_gate,
+                    &control.write_gate,
                     None,
                 );
             },
@@ -448,11 +642,21 @@ fn run_actor(
                 request_id,
                 generation,
                 spec,
-            } => DbReply::Mailbox(Tagged {
+                #[cfg(test)]
+                gate,
+                #[cfg(test)]
+                long_query,
+            } => execute_mailbox_query(
+                &connection,
                 request_id,
                 generation,
-                result: query_mailbox(&connection, &spec),
-            }),
+                &spec,
+                &control.mailbox,
+                #[cfg(test)]
+                gate,
+                #[cfg(test)]
+                long_query,
+            ),
             Request::OpenMessage {
                 request_id,
                 generation,
@@ -469,17 +673,19 @@ fn run_actor(
             } => DbReply::Mutation(Tagged {
                 request_id,
                 generation,
-                result: execute_mutation(&mut connection, mutation, &write_gate),
+                result: execute_mutation(&mut connection, mutation, &control.write_gate),
             }),
             Request::ClaimRemote { account_id, reply } => {
                 if !reply.is_closed() {
-                    let result = execute_remote_claim(&mut connection, account_id, &write_gate);
+                    let result =
+                        execute_remote_claim(&mut connection, account_id, &control.write_gate);
                     let _ = reply.send(result);
                 }
                 continue;
             }
             Request::ReportRemote { submission, reply } => {
-                let result = execute_remote_report(&mut connection, submission, &write_gate);
+                let result =
+                    execute_remote_report(&mut connection, submission, &control.write_gate);
                 let _ = reply.send(result);
                 continue;
             }
@@ -501,14 +707,69 @@ fn run_actor(
         };
 
         if let Err(undelivered) = send_reply(&replies, &shutdown, reply) {
-            close_admission(&admission);
+            close_admission(&control.admission);
             return drain_accepted_writes(
                 &mut connection,
                 &requests,
-                &write_gate,
+                &control.write_gate,
                 mutation_failure(*undelivered),
             );
         }
+    }
+}
+
+fn execute_mailbox_query(
+    connection: &Connection,
+    request_id: RequestId,
+    generation: Generation,
+    spec: &PageSpec,
+    control: &MailboxQueryControl,
+    #[cfg(test)] gate: Option<MailboxQueryGate>,
+    #[cfg(test)] long_query: bool,
+) -> DbReply {
+    let key = MailboxDbKey {
+        request_id,
+        generation,
+    };
+    if !control.begin(key) {
+        return DbReply::MailboxSuperseded {
+            request_id,
+            generation,
+        };
+    }
+
+    #[cfg(test)]
+    if let Some(gate) = gate {
+        let _ = gate.started.send(());
+        let _ = gate.release.recv();
+    }
+
+    #[cfg(test)]
+    if long_query {
+        let _ = connection.query_row(
+            "WITH RECURSIVE counter(value) AS (
+                 VALUES(0)
+                 UNION ALL
+                 SELECT value + 1 FROM counter WHERE value < 1000000000
+             )
+             SELECT sum(value) FROM counter",
+            [],
+            |row| row.get::<_, i64>(0),
+        );
+    }
+
+    let result = query_mailbox(connection, spec);
+    if control.finish(key) {
+        DbReply::MailboxSuperseded {
+            request_id,
+            generation,
+        }
+    } else {
+        DbReply::Mailbox(Tagged {
+            request_id,
+            generation,
+            result,
+        })
     }
 }
 
@@ -597,6 +858,24 @@ fn lock_admission(admission: &Mutex<bool>) -> MutexGuard<'_, bool> {
     admission
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
+}
+
+fn lock_mailbox_state(state: &Mutex<MailboxQueryState>) -> MutexGuard<'_, MailboxQueryState> {
+    state.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+#[cfg(test)]
+fn lock_mailbox_gate(
+    gate: &Mutex<Option<MailboxQueryGate>>,
+) -> MutexGuard<'_, Option<MailboxQueryGate>> {
+    gate.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+#[cfg(test)]
+fn lock_progress_started(
+    started: &Mutex<Option<Sender<()>>>,
+) -> MutexGuard<'_, Option<Sender<()>>> {
+    started.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
 fn close_admission(admission: &Mutex<bool>) {
@@ -1040,6 +1319,123 @@ mod tests {
     }
 
     #[test]
+    fn mailbox_control_skips_only_the_matching_queued_query() {
+        let control = MailboxQueryControl::default();
+        let queued = MailboxDbKey {
+            request_id: RequestId::new(1).unwrap(),
+            generation: Generation::new(1),
+        };
+        let newer = MailboxDbKey {
+            request_id: RequestId::new(2).unwrap(),
+            generation: Generation::new(2),
+        };
+
+        assert_eq!(
+            lock_mailbox_state(&control.state).supersede(queued),
+            (true, false)
+        );
+        assert!(!control.begin(queued));
+        assert!(control.begin(newer));
+        assert!(!control.finish(newer));
+        assert!(!control.should_interrupt());
+    }
+
+    #[test]
+    fn targeted_mailbox_supersession_is_exact_and_actor_recovers() {
+        let (client, mut replies, runtime, _info) =
+            spawn_target(Target::Memory, REQUEST_CAPACITY, REPLY_CAPACITY).unwrap();
+        let request_id = RequestId::new(11).unwrap();
+        let generation = Generation::new(7);
+        let (started_tx, started_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        client.gate_next_mailbox_query(started_tx, release_rx);
+        client
+            .try_query_mailbox(request_id, generation, empty_spec())
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let mutation_id = RequestId::new(14).unwrap();
+        client
+            .try_mutate(
+                mutation_id,
+                Generation::new(10),
+                MessageMutation::set_unread(MessageId::new(1).unwrap(), false),
+            )
+            .unwrap();
+
+        assert!(!client.supersede_mailbox_query(RequestId::new(12).unwrap(), generation));
+        assert!(!client.supersede_mailbox_query(request_id, Generation::new(8)));
+        assert!(!client.mailbox_control.should_interrupt());
+        assert!(client.supersede_mailbox_query(request_id, generation));
+        assert!(client.mailbox_control.should_interrupt());
+        assert!(client.supersede_mailbox_query(request_id, generation));
+        release_tx.send(()).unwrap();
+
+        assert_eq!(
+            receive_reply(&mut replies),
+            DbReply::MailboxSuperseded {
+                request_id,
+                generation,
+            }
+        );
+        assert!(!client.mailbox_control.should_interrupt());
+
+        let DbReply::Mutation(mutation) = receive_reply(&mut replies) else {
+            panic!("expected the queued mutation after mailbox cancellation");
+        };
+        assert_eq!(mutation.request_id, mutation_id);
+        assert_eq!(mutation.result.unwrap_err().kind, FailureKind::NotFound);
+
+        let retry_id = RequestId::new(13).unwrap();
+        client
+            .try_query_mailbox(retry_id, Generation::new(9), empty_spec())
+            .unwrap();
+        let DbReply::Mailbox(retry) = receive_reply(&mut replies) else {
+            panic!("expected mailbox actor to accept a query after cancellation");
+        };
+        assert_eq!(retry.request_id, retry_id);
+        retry.result.unwrap();
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn targeted_mailbox_supersession_interrupts_a_running_vdbe() {
+        let (client, mut replies, runtime, _info) =
+            spawn_target(Target::Memory, REQUEST_CAPACITY, REPLY_CAPACITY).unwrap();
+        let request_id = RequestId::new(21).unwrap();
+        let generation = Generation::new(11);
+        let (progress_tx, progress_rx) = bounded(1);
+        client.run_next_mailbox_query_long(progress_tx);
+        client
+            .try_query_mailbox(request_id, generation, empty_spec())
+            .unwrap();
+        progress_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("long mailbox VDBE did not reach the progress callback");
+
+        let interrupted_at = Instant::now();
+        assert!(client.supersede_mailbox_query(request_id, generation));
+        assert_eq!(
+            receive_reply(&mut replies),
+            DbReply::MailboxSuperseded {
+                request_id,
+                generation,
+            }
+        );
+        assert!(interrupted_at.elapsed() < Duration::from_secs(1));
+        assert!(!client.mailbox_control.should_interrupt());
+
+        let retry_id = RequestId::new(22).unwrap();
+        client
+            .try_query_mailbox(retry_id, Generation::new(12), empty_spec())
+            .unwrap();
+        let DbReply::Mailbox(retry) = receive_reply(&mut replies) else {
+            panic!("expected mailbox actor recovery after VDBE interruption");
+        };
+        retry.result.unwrap();
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
     fn account_directory_round_trip_preserves_identity_and_order() {
         let path = temporary_database_path();
         seed_account_directory(&path);
@@ -1429,6 +1825,9 @@ mod tests {
             requests: sender,
             admission: Arc::new(Mutex::new(true)),
             interrupt: Arc::new(connection.get_interrupt_handle()),
+            mailbox_control: Arc::new(MailboxQueryControl::default()),
+            next_mailbox_gate: Arc::new(Mutex::new(None)),
+            next_mailbox_long: Arc::new(AtomicBool::new(false)),
             write_gate: Arc::new(Mutex::new(())),
         };
         client

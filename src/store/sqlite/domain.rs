@@ -377,6 +377,10 @@ pub(crate) struct Tagged<T> {
 pub(crate) enum DbReply {
     Accounts(Tagged<AccountDirectory>),
     Mailbox(Tagged<MailboxPage>),
+    MailboxSuperseded {
+        request_id: RequestId,
+        generation: Generation,
+    },
     Message(Tagged<Option<MessageDetail>>),
     Mutation(Tagged<MutationOutcome>),
 }
