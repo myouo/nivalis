@@ -13,13 +13,33 @@ resize_stress_width=${NIVALIS_RESIZE_STRESS_WIDTH:-0}
 resize_stress_height=${NIVALIS_RESIZE_STRESS_HEIGHT:-0}
 resize_stress_at=${NIVALIS_RESIZE_STRESS_AT:-5}
 resize_stress_duration=${NIVALIS_RESIZE_STRESS_DURATION:-5}
+log_file=${NIVALIS_MEMORY_LOG:-}
+data_dir=${NIVALIS_MEMORY_DATA_DIR:-${NIVALIS_DATA_DIR:-}}
+remove_log=0
+remove_data_dir=0
 
 if [[ ! -x "$binary" ]]; then
     printf 'Executable not found: %s\n' "$binary" >&2
     exit 1
 fi
 
-log_file=$(mktemp)
+if [[ -z "$log_file" ]]; then
+    log_file=$(mktemp)
+    remove_log=1
+else
+    : >"$log_file"
+fi
+if [[ -z "$data_dir" ]]; then
+    data_dir=$(mktemp -d)
+    remove_data_dir=1
+elif [[ "$data_dir" != /* ]]; then
+    printf 'NIVALIS_MEMORY_DATA_DIR must be an absolute path: %s\n' "$data_dir" >&2
+    exit 1
+else
+    mkdir -p "$data_dir"
+fi
+chmod 700 "$data_dir"
+
 pid=""
 resize_pid=""
 
@@ -32,7 +52,12 @@ cleanup() {
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
     fi
-    rm -f "$log_file"
+    if ((remove_log)); then
+        rm -f "$log_file"
+    fi
+    if ((remove_data_dir)); then
+        rm -rf -- "$data_dir"
+    fi
 }
 trap cleanup EXIT INT TERM
 
@@ -45,6 +70,7 @@ for ((run = 1; run <= runs; run++)); do
             SLINT_SCALE_FACTOR=1 \
             WINIT_X11_SCALE_FACTOR=1 \
             NIVALIS_RENDERER="$renderer" \
+            NIVALIS_DATA_DIR="$data_dir" \
             "$binary" >"$log_file" 2>&1 &
     elif [[ "$platform" == "wayland" ]]; then
         env -u DISPLAY \
@@ -52,6 +78,7 @@ for ((run = 1; run <= runs; run++)); do
             XDG_SESSION_TYPE=wayland \
             SLINT_SCALE_FACTOR=1 \
             NIVALIS_RENDERER="$renderer" \
+            NIVALIS_DATA_DIR="$data_dir" \
             "$binary" >"$log_file" 2>&1 &
     else
         printf 'Unsupported NIVALIS_MEMORY_PLATFORM: %s\n' "$platform" >&2
@@ -72,10 +99,31 @@ for ((run = 1; run <= runs; run++)); do
             fi
             sleep 0.1
         done
+        if [[ -z "$window_id" ]]; then
+            printf 'Could not find the X11 window for process %s\n' "$pid" >&2
+            cat "$log_file" >&2
+            exit 1
+        fi
     fi
 
     if [[ -n "$window_id" ]]; then
         xdotool windowsize "$window_id" "$width" "$height"
+        geometry_matches=0
+        for _ in {1..50}; do
+            geometry=$(xdotool getwindowgeometry --shell "$window_id")
+            actual_width=$(awk -F= '$1 == "WIDTH" { print $2 }' <<<"$geometry")
+            actual_height=$(awk -F= '$1 == "HEIGHT" { print $2 }' <<<"$geometry")
+            if [[ "$actual_width" == "$width" && "$actual_height" == "$height" ]]; then
+                geometry_matches=1
+                break
+            fi
+            sleep 0.1
+        done
+        if ((geometry_matches == 0)); then
+            printf 'X11 window did not reach %sx%s; last geometry was %sx%s\n' \
+                "$width" "$height" "$actual_width" "$actual_height" >&2
+            exit 1
+        fi
         if ((resize_stress_width > 0 && resize_stress_height > 0)); then
             (
                 sleep "$resize_stress_at"
@@ -126,6 +174,16 @@ for ((run = 1; run <= runs; run++)); do
             }
         ' "/proc/$pid/smaps_rollup"
     done
+
+    if [[ -n "${NIVALIS_STRESS_STEPS:-}" ]]; then
+        stress_result=$(grep 'NIVALIS_STRESS_RESULT' "$log_file" | tail -n 1 || true)
+        if [[ -z "$stress_result" ]]; then
+            printf 'Stress harness did not report completion before the last sample\n' >&2
+            cat "$log_file" >&2
+            exit 1
+        fi
+        printf '%s\n' "$stress_result" >&2
+    fi
 
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
