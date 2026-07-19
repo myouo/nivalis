@@ -130,7 +130,15 @@ pub(crate) enum StorageOperation {
     SyncTemporary,
     Publish,
     RemoveTemporary,
+    OpenPublished,
+    RemovePublished,
     SyncDirectory,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemoveOutcome {
+    Removed,
+    Missing,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -427,8 +435,88 @@ impl ContentStaging {
     }
 
     fn resolve(&self, key: &FileKey) -> Result<PathBuf, StorageError> {
-        let key = FileKey::parse(key.as_str())?;
-        Ok(self.root.join(key.as_str()))
+        self.published_location(key, StorageOperation::ValidateRoot)
+            .map(|(_, path)| path)
+    }
+
+    fn published_location(
+        &self,
+        key: &FileKey,
+        operation: StorageOperation,
+    ) -> Result<(&Path, PathBuf), StorageError> {
+        let key = FileKey::parse(key.as_str()).map_err(|_| StorageError::invalid(operation))?;
+        let directory = match key.kind() {
+            FileKind::Body => self.body.as_path(),
+            FileKind::Attachment => self.attachment.as_path(),
+        };
+        Ok((directory, directory.join(key.file_name())))
+    }
+
+    pub(crate) fn open_file(&self, key: &FileKey) -> Result<File, StorageError> {
+        let operation = StorageOperation::OpenPublished;
+        let (directory, path) = self.published_location(key, operation)?;
+        let directory_before = validate_published_directory(directory, operation)?;
+        let path_before =
+            fs::symlink_metadata(&path).map_err(|error| StorageError::new(operation, &error))?;
+        if path_before.file_type().is_symlink() || !path_before.is_file() {
+            return Err(StorageError::invalid(operation));
+        }
+
+        // TODO(M7): use directory-handle openat/O_NOFOLLOW to close the path race.
+        let file = OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .map_err(|error| StorageError::new(operation, &error))?;
+        let opened = file
+            .metadata()
+            .map_err(|error| StorageError::new(operation, &error))?;
+        let path_after =
+            fs::symlink_metadata(&path).map_err(|error| StorageError::new(operation, &error))?;
+        let directory_after = validate_published_directory(directory, operation)?;
+        if !opened.is_file()
+            || path_after.file_type().is_symlink()
+            || !path_after.is_file()
+            || !same_file_identity(&path_before, &opened)
+            || !same_file_identity(&opened, &path_after)
+            || !same_file_identity(&directory_before, &directory_after)
+        {
+            return Err(StorageError::invalid(operation));
+        }
+        Ok(file)
+    }
+
+    pub(crate) fn remove_published_file(
+        &self,
+        key: &FileKey,
+    ) -> Result<RemoveOutcome, StorageError> {
+        let operation = StorageOperation::RemovePublished;
+        let (directory, path) = self.published_location(key, operation)?;
+        let directory_before = validate_published_directory(directory, operation)?;
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(RemoveOutcome::Missing);
+            }
+            Err(error) => return Err(StorageError::new(operation, &error)),
+        };
+        if !metadata.is_file() && !metadata.file_type().is_symlink() {
+            return Err(StorageError::invalid(operation));
+        }
+
+        // TODO(M7): use directory-handle unlinkat to close the parent-swap race.
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(RemoveOutcome::Missing);
+            }
+            Err(error) => return Err(StorageError::new(operation, &error)),
+        }
+        sync_parent_directory(&path)?;
+        let directory_after = validate_published_directory(directory, operation)?;
+        if !same_file_identity(&directory_before, &directory_after) {
+            return Err(StorageError::invalid(operation));
+        }
+        Ok(RemoveOutcome::Removed)
     }
 
     pub(crate) fn stage_reader(
@@ -1316,6 +1404,31 @@ fn ensure_private_directory(path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
+fn validate_published_directory(
+    path: &Path,
+    operation: StorageOperation,
+) -> Result<fs::Metadata, StorageError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| StorageError::new(operation, &error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        Err(StorageError::invalid(operation))
+    } else {
+        Ok(metadata)
+    }
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.file_type() == right.file_type() && left.len() == right.len()
+}
+
 fn create_private_file(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -2151,6 +2264,93 @@ Content-Type: multipart/mixed; boundary=x\r\n\
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("body"), b"not a directory").unwrap();
         assert!(ContentStaging::open(root.clone()).is_err());
+        remove_root(&root);
+    }
+
+    #[test]
+    fn published_file_can_be_opened_and_removed_idempotently() {
+        let root = temporary_root("published-access");
+        let staging = ContentStaging::open(root.clone()).unwrap();
+        let staged = staging
+            .stage_reader(FileKind::Body, Cursor::new(b"stored body"), 64)
+            .unwrap();
+        let key = staged.key.clone();
+        let mut published = staged.publish().unwrap();
+        published.retained = true;
+
+        let mut opened = staging.open_file(&key).unwrap();
+        let mut body = String::new();
+        opened.read_to_string(&mut body).unwrap();
+        assert_eq!(body, "stored body");
+        drop(opened);
+
+        assert_eq!(
+            staging.remove_published_file(&key).unwrap(),
+            RemoveOutcome::Removed
+        );
+        assert_eq!(
+            staging.remove_published_file(&key).unwrap(),
+            RemoveOutcome::Missing
+        );
+        assert!(!staging.resolve(&key).unwrap().exists());
+
+        drop(published);
+        remove_root(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_access_rejects_escape_and_unlinks_symlink_only() {
+        use std::os::unix::fs::symlink;
+
+        let root = temporary_root("published-symlink");
+        let staging = ContentStaging::open(root.clone()).unwrap();
+        let malicious = FileKey("body/../outside.txt".into());
+        let open_error = staging.open_file(&malicious).unwrap_err();
+        assert_eq!(open_error.operation, StorageOperation::OpenPublished);
+        assert_eq!(open_error.kind, io::ErrorKind::InvalidInput);
+        let remove_error = staging.remove_published_file(&malicious).unwrap_err();
+        assert_eq!(remove_error.operation, StorageOperation::RemovePublished);
+        assert_eq!(remove_error.kind, io::ErrorKind::InvalidInput);
+
+        let external = temporary_root("published-external-target");
+        fs::write(&external, b"outside target").unwrap();
+        let key = FileKey::parse("body/11111111111111111111111111111111.txt").unwrap();
+        let link = staging.resolve(&key).unwrap();
+        symlink(&external, &link).unwrap();
+
+        let error = staging.open_file(&key).unwrap_err();
+        assert_eq!(error.operation, StorageOperation::OpenPublished);
+        assert_eq!(error.kind, io::ErrorKind::InvalidInput);
+        assert_eq!(fs::read(&external).unwrap(), b"outside target");
+        assert_eq!(
+            staging.remove_published_file(&key).unwrap(),
+            RemoveOutcome::Removed
+        );
+        assert!(fs::symlink_metadata(&link).is_err());
+        assert_eq!(fs::read(&external).unwrap(), b"outside target");
+
+        remove_root(&root);
+        fs::remove_file(external).unwrap();
+    }
+
+    #[test]
+    fn published_removal_rejects_and_preserves_directory() {
+        let root = temporary_root("published-directory");
+        let staging = ContentStaging::open(root.clone()).unwrap();
+        let key = FileKey::parse("attachment/22222222222222222222222222222222.bin").unwrap();
+        let path = staging.resolve(&key).unwrap();
+        fs::create_dir(&path).unwrap();
+
+        let remove_error = staging.remove_published_file(&key).unwrap_err();
+        assert_eq!(remove_error.operation, StorageOperation::RemovePublished);
+        assert_eq!(remove_error.kind, io::ErrorKind::InvalidInput);
+        assert!(path.is_dir());
+        let open_error = staging.open_file(&key).unwrap_err();
+        assert_eq!(open_error.operation, StorageOperation::OpenPublished);
+        assert_eq!(open_error.kind, io::ErrorKind::InvalidInput);
+        assert!(path.is_dir());
+
         remove_root(&root);
     }
 }
