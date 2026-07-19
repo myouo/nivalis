@@ -499,6 +499,11 @@ pub(super) fn update_account(
         Some(&input.credential_key),
     )?;
     require_mutable(&configuration)?;
+    if configuration.auth_kind != input.auth_kind {
+        return Err(DbFailure::conflict(
+            "account authentication kind cannot be changed in place",
+        ));
+    }
     increment_account_generation(
         &transaction,
         account_id,
@@ -1443,6 +1448,23 @@ mod tests {
         assert_eq!(updated.generation.get(), 2);
         assert_eq!(updated.name.as_ref(), "Updated");
         assert_eq!(updated.diagnostic, AccountDiagnostic::Never);
+
+        let mut changed_auth = changed.clone();
+        changed_auth.auth_kind = AccountAuthKind::OAuth2;
+        let failure = update_account(
+            &mut connection,
+            created.account_id,
+            updated.generation,
+            &changed_auth,
+        )
+        .expect_err("credential kind changes require an explicit rollover protocol");
+        assert_eq!(failure.kind, FailureKind::Conflict);
+        assert_eq!(
+            load_account_from(&connection, created.account_id)
+                .unwrap()
+                .generation,
+            updated.generation
+        );
 
         assert_eq!(
             record_diagnostic(
