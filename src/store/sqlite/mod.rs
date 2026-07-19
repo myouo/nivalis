@@ -7,6 +7,9 @@ mod query;
 pub(crate) mod remote;
 mod stats;
 
+#[cfg(feature = "bench-harness")]
+pub(crate) use query::{MailboxQueryCounts, mailbox_query_counts};
+
 pub(crate) use actor::{
     DatabaseClient, DatabaseInfo, DatabaseReplies, DatabaseRuntime, StartError,
     SubmitError as DatabaseSubmitError,

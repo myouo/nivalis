@@ -49,5 +49,8 @@ jobs:
       - name: Run tests
         run: cargo test --locked
 
+      - name: Run benchmark harness tests
+        run: cargo test --locked --features bench-harness
+
       - name: Lint all targets
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings

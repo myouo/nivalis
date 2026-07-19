@@ -1,4 +1,6 @@
 use std::fmt::Write;
+#[cfg(feature = "bench-harness")]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusqlite::{
     Connection, OptionalExtension, params_from_iter,
@@ -32,6 +34,44 @@ const OPEN_MESSAGE_SQL: &str = "
       FROM messages AS m
       LEFT JOIN message_content AS c ON c.message_id = m.id
      WHERE m.id = ?1";
+
+#[cfg(feature = "bench-harness")]
+static FIRST_MAILBOX_QUERY_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "bench-harness")]
+static AFTER_MAILBOX_QUERY_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "bench-harness")]
+static BEFORE_MAILBOX_QUERY_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "bench-harness")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MailboxQueryCounts {
+    pub(crate) first: u64,
+    pub(crate) after: u64,
+    pub(crate) before: u64,
+}
+
+#[cfg(feature = "bench-harness")]
+pub(crate) fn mailbox_query_counts() -> MailboxQueryCounts {
+    MailboxQueryCounts {
+        first: FIRST_MAILBOX_QUERY_COUNT.load(Ordering::Relaxed),
+        after: AFTER_MAILBOX_QUERY_COUNT.load(Ordering::Relaxed),
+        before: BEFORE_MAILBOX_QUERY_COUNT.load(Ordering::Relaxed),
+    }
+}
+
+#[cfg(feature = "bench-harness")]
+fn record_mailbox_query(boundary: PageBoundary) {
+    mailbox_query_counter(boundary).fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(feature = "bench-harness")]
+fn mailbox_query_counter(boundary: PageBoundary) -> &'static AtomicU64 {
+    match boundary {
+        PageBoundary::First => &FIRST_MAILBOX_QUERY_COUNT,
+        PageBoundary::After(_) => &AFTER_MAILBOX_QUERY_COUNT,
+        PageBoundary::Before(_) => &BEFORE_MAILBOX_QUERY_COUNT,
+    }
+}
 
 pub(super) fn query_account_directory(
     connection: &Connection,
@@ -141,12 +181,15 @@ pub(super) fn query_mailbox(
         PageBoundary::Before(_) => (has_more.then_some(first_cursor).flatten(), last_cursor),
     };
 
-    Ok(MailboxPage {
+    let page = MailboxPage {
         rows: rows.into_boxed_slice(),
         previous_cursor,
         next_cursor,
         stats,
-    })
+    };
+    #[cfg(feature = "bench-harness")]
+    record_mailbox_query(spec.boundary);
+    Ok(page)
 }
 
 fn page_cursor(row: &MailSummaryDto) -> PageCursor {
@@ -403,6 +446,25 @@ mod tests {
 
     fn message_ids(page: &MailboxPage) -> Vec<i64> {
         page.rows.iter().map(|row| row.id.get()).collect()
+    }
+
+    #[cfg(feature = "bench-harness")]
+    #[test]
+    fn mailbox_query_counter_mapping_is_exact_and_side_effect_free() {
+        let cursor = PageCursor::new(10_000, 37).unwrap();
+
+        assert!(std::ptr::eq(
+            mailbox_query_counter(PageBoundary::First),
+            &FIRST_MAILBOX_QUERY_COUNT
+        ));
+        assert!(std::ptr::eq(
+            mailbox_query_counter(PageBoundary::After(cursor)),
+            &AFTER_MAILBOX_QUERY_COUNT
+        ));
+        assert!(std::ptr::eq(
+            mailbox_query_counter(PageBoundary::Before(cursor)),
+            &BEFORE_MAILBOX_QUERY_COUNT
+        ));
     }
 
     #[test]

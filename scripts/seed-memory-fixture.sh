@@ -69,16 +69,21 @@ projection=$(sqlite3 -separator '|' "$database" \
           ORDER BY m.received_at_ms DESC, m.id DESC
      )
      SELECT (SELECT count(*) FROM (SELECT id FROM ordered LIMIT 50)),
-            (SELECT count(*) FROM (SELECT id FROM ordered LIMIT 1 OFFSET 50));")
+            (SELECT count(*) FROM (SELECT id FROM ordered LIMIT 1 OFFSET 50)),
+            (SELECT id FROM ordered LIMIT 1),
+            (SELECT id FROM ordered LIMIT 1 OFFSET 49),
+            (SELECT id FROM ordered LIMIT 1 OFFSET 50);")
 
 if [[ "$integrity" != "ok" || -n "$foreign_key_violations" ]]; then
     printf 'Seeded memory fixture failed SQLite integrity checks\n' >&2
     exit 1
 fi
-if [[ "$counts" != "64|64|51|51|0" || "$bounds" != "2048|2048|65536|65536" || "$projection" != "50|1" ]]; then
+if [[ "$counts" != "64|64|51|51|0" || "$bounds" != "2048|2048|65536|65536" || "$projection" != "50|1|51|2|1" ]]; then
     printf 'Seeded memory fixture did not preserve its resource bounds\n' >&2
     exit 1
 fi
 
-printf 'Seeded %s (%s; preview/detail min/max %s bytes; pages %s)\n' \
-    "$database" "$counts" "$bounds" "$projection"
+IFS='|' read -r first_count second_count first_id first_last_id second_id <<<"$projection"
+printf 'Seeded %s (%s; preview/detail min/max %s bytes; pages %s|%s; first IDs %s..%s; second ID %s)\n' \
+    "$database" "$counts" "$bounds" "$first_count" "$second_count" \
+    "$first_id" "$first_last_id" "$second_id"
