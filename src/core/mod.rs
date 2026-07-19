@@ -1,6 +1,12 @@
+mod account;
 mod message;
 mod runtime;
 
+#[allow(unused_imports)]
+pub(crate) use account::{
+    AccountConfigDraft, AccountOperation, AccountOperationFailure, AccountOperationReply,
+    AccountOperationSuccess, AccountSetupMode, AccountWorkflowFailureKind, AccountWorkflowStage,
+};
 pub(crate) use message::{CoreHandle, Event, EventReceiver};
 pub(crate) use runtime::{CoreRuntime, StartError};
 
@@ -11,8 +17,10 @@ pub(crate) use crate::store::sqlite::{
 };
 #[allow(unused_imports)]
 pub(crate) use message::{
-    AccountDirectoryLoadError, AccountDirectoryQuery, MailboxLoadError, MailboxQuery,
-    MessageLoadError, MessageQuery, MutationRequest, MutationSubmitError, SubmitError,
+    AccountDirectoryLoadError, AccountDirectoryQuery, AccountOperationResponse,
+    AccountOperationResponseError, AccountOperationSubmitError, AccountOperationSubmitFailure,
+    MailboxLoadError, MailboxQuery, MessageLoadError, MessageQuery, MutationRequest,
+    MutationSubmitError, SubmitError,
 };
 
 #[cfg_attr(feature = "bench-harness", allow(dead_code))]

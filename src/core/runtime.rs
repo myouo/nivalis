@@ -1,12 +1,19 @@
-use super::message::{
-    AccountDirectoryLoadError, AccountDirectoryQuery, AccountDirectoryRequestKey, COMMAND_CAPACITY,
-    Command, CoreHandle, EVENT_CAPACITY, Event, EventReceiver, EventSender, MailboxLoadError,
-    MailboxQuery, MailboxRequestKey, MessageLoadError, MessageQuery, MessageRequestKey,
-    MutationRequest, MutationSubmitError, event_channel,
+use super::{
+    account::{AccountDriverError, AccountWorkflows},
+    message::{
+        ACCOUNT_COMMAND_CAPACITY, AccountCommand, AccountDirectoryLoadError, AccountDirectoryQuery,
+        AccountDirectoryRequestKey, COMMAND_CAPACITY, Command, CoreHandle, EVENT_CAPACITY, Event,
+        EventReceiver, EventSender, MailboxLoadError, MailboxQuery, MailboxRequestKey,
+        MessageLoadError, MessageQuery, MessageRequestKey, MutationRequest, MutationSubmitError,
+        event_channel,
+    },
 };
-use crate::store::sqlite::{
-    self, DatabaseClient, DatabaseInfo, DatabaseReplies, DatabaseRuntime, DatabaseSubmitError,
-    DbReply,
+use crate::{
+    credentials::{self, CredentialClient, CredentialRuntime},
+    store::sqlite::{
+        self, DatabaseClient, DatabaseInfo, DatabaseReplies, DatabaseRuntime, DatabaseSubmitError,
+        DbReply,
+    },
 };
 use std::{
     collections::VecDeque,
@@ -30,6 +37,8 @@ type DatabaseParts = (
     DatabaseRuntime,
     DatabaseInfo,
 );
+
+type CredentialParts = (CredentialClient, CredentialRuntime);
 
 #[cfg_attr(feature = "bench-harness", allow(dead_code))]
 pub(crate) fn spawn(
@@ -59,8 +68,18 @@ fn spawn_with_options(
     event_capacity: usize,
     database: DatabaseParts,
 ) -> Result<(CoreHandle, EventReceiver, CoreRuntime), StartError> {
+    spawn_with_components(event_capacity, database, credentials::spawn())
+}
+
+fn spawn_with_components(
+    event_capacity: usize,
+    database: DatabaseParts,
+    credentials: CredentialParts,
+) -> Result<(CoreHandle, EventReceiver, CoreRuntime), StartError> {
     let (database, database_replies, database_runtime, _database_info) = database;
+    let (credentials, credential_runtime) = credentials;
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CAPACITY);
+    let (account_command_tx, account_command_rx) = mpsc::channel(ACCOUNT_COMMAND_CAPACITY);
     let (event_tx, event_rx) = event_channel(event_capacity);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let runtime = Builder::new_current_thread()
@@ -77,7 +96,15 @@ fn spawn_with_options(
                 shutdown_rx,
                 database,
                 database_replies,
+                account_command_rx,
+                credentials,
             ));
+            let credential_result =
+                credential_runtime
+                    .shutdown()
+                    .map_err(|error| RuntimeError::CredentialShutdown {
+                        message: Arc::from(error.to_string()),
+                    });
             let database_result =
                 database_runtime
                     .shutdown()
@@ -86,13 +113,13 @@ fn spawn_with_options(
                     });
             match core_result {
                 Err(error) => Err(error),
-                Ok(()) => database_result,
+                Ok(()) => credential_result.and(database_result),
             }
         })
         .map_err(StartError::Runtime)?;
 
     Ok((
-        CoreHandle::new(command_tx),
+        CoreHandle::new(command_tx, account_command_tx),
         event_rx,
         CoreRuntime {
             shutdown: Some(shutdown_tx),
@@ -107,6 +134,8 @@ async fn run_core(
     shutdown: oneshot::Receiver<()>,
     database: DatabaseClient,
     mut database_replies: DatabaseReplies,
+    account_commands: mpsc::Receiver<AccountCommand>,
+    credentials: CredentialClient,
 ) -> Result<(), RuntimeError> {
     let mut shutdown = Box::pin(shutdown);
     let mut accounts = AccountDirectorySchedule::default();
@@ -114,12 +143,16 @@ async fn run_core(
     let mut message = MessageSchedule::default();
     let mut active_mutations = 0_usize;
     let mut command_streak = 0_u8;
+    let mut account_commands = Some(account_commands);
+    let mut account_workflows = AccountWorkflows::new(database.clone(), credentials);
 
     loop {
         let input = next_input(
             &mut shutdown,
             &mut commands,
             &mut database_replies,
+            &mut account_commands,
+            &mut account_workflows,
             command_streak < COMMAND_BURST_LIMIT,
         )
         .await;
@@ -140,6 +173,14 @@ async fn run_core(
                 .await;
             }
             CoreInput::DatabaseClosed => return Err(RuntimeError::DatabaseClosed),
+            CoreInput::AccountCommandsClosed => account_commands = None,
+            CoreInput::AccountProgress => {}
+            CoreInput::AccountFailure(error) => return Err(error.into()),
+            CoreInput::AccountCommand(command) => {
+                account_workflows
+                    .start_user_operation(command.operation, command.reply)
+                    .map_err(RuntimeError::from)?;
+            }
             CoreInput::Command(Command::QueryAccountDirectory(query)) => {
                 if let Some(query) = accounts.enqueue(query)
                     && let Some(event) = submit_account_directory(&database, &mut accounts, query)
@@ -479,8 +520,12 @@ async fn finish_accepted_mutations_with(
 enum CoreInput {
     Shutdown,
     CommandsClosed,
+    AccountCommandsClosed,
     DatabaseClosed,
     Command(Command),
+    AccountCommand(AccountCommand),
+    AccountProgress,
+    AccountFailure(AccountDriverError),
     Database(DbReply),
 }
 
@@ -488,6 +533,8 @@ async fn next_input(
     shutdown: &mut Pin<Box<oneshot::Receiver<()>>>,
     commands: &mut mpsc::Receiver<Command>,
     database_replies: &mut DatabaseReplies,
+    account_commands: &mut Option<mpsc::Receiver<AccountCommand>>,
+    account_workflows: &mut AccountWorkflows,
     commands_first: bool,
 ) -> CoreInput {
     poll_fn(|context| {
@@ -507,6 +554,24 @@ async fn next_input(
             Poll::Ready(Some(reply)) => return Poll::Ready(CoreInput::Database(reply)),
             Poll::Ready(None) => return Poll::Ready(CoreInput::DatabaseClosed),
             Poll::Pending => {}
+        }
+
+        match account_workflows.poll_progress(context) {
+            Poll::Ready(Ok(())) => return Poll::Ready(CoreInput::AccountProgress),
+            Poll::Ready(Err(error)) => return Poll::Ready(CoreInput::AccountFailure(error)),
+            Poll::Pending => {}
+        }
+
+        if account_workflows.can_start_user_operation()
+            && let Some(account_commands) = account_commands.as_mut()
+        {
+            match account_commands.poll_recv(context) {
+                Poll::Ready(Some(command)) => {
+                    return Poll::Ready(CoreInput::AccountCommand(command));
+                }
+                Poll::Ready(None) => return Poll::Ready(CoreInput::AccountCommandsClosed),
+                Poll::Pending => {}
+            }
         }
 
         if !commands_first {
@@ -769,10 +834,23 @@ impl Drop for CoreRuntime {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RuntimeError {
     DatabaseClosed,
-    DatabaseShutdown { message: Arc<str> },
+    DatabaseShutdown {
+        message: Arc<str>,
+    },
+    CredentialShutdown {
+        message: Arc<str>,
+    },
+    AccountRecovery {
+        failure: crate::store::sqlite::FailureKind,
+    },
+    AccountWorkflowInvariant,
     MutationAccounting,
-    MutationDuringShutdown { message: Arc<str> },
-    ThreadPanicked { message: Arc<str> },
+    MutationDuringShutdown {
+        message: Arc<str>,
+    },
+    ThreadPanicked {
+        message: Arc<str>,
+    },
 }
 
 impl fmt::Display for RuntimeError {
@@ -781,6 +859,18 @@ impl fmt::Display for RuntimeError {
             Self::DatabaseClosed => formatter.write_str("SQLite actor stopped unexpectedly"),
             Self::DatabaseShutdown { message } => {
                 write!(formatter, "could not stop SQLite actor: {message}")
+            }
+            Self::CredentialShutdown { message } => {
+                write!(formatter, "could not stop credential actor: {message}")
+            }
+            Self::AccountRecovery { failure } => {
+                write!(
+                    formatter,
+                    "could not recover account lifecycle: {failure:?}"
+                )
+            }
+            Self::AccountWorkflowInvariant => {
+                formatter.write_str("account workflow entered an invalid state")
             }
             Self::MutationAccounting => {
                 formatter.write_str("SQLite mutation reply accounting became inconsistent")
@@ -796,6 +886,16 @@ impl fmt::Display for RuntimeError {
 }
 
 impl std::error::Error for RuntimeError {}
+
+impl From<AccountDriverError> for RuntimeError {
+    fn from(error: AccountDriverError) -> Self {
+        match error {
+            AccountDriverError::DatabaseClosed => Self::DatabaseClosed,
+            AccountDriverError::Recovery(failure) => Self::AccountRecovery { failure },
+            AccountDriverError::WorkflowRejected => Self::AccountWorkflowInvariant,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) enum StartError {
@@ -834,14 +934,29 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> Arc<str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{
-        AccountDirectoryQuery, AccountScope, FolderScope, Generation, MailboxQuery, MessageId,
-        MessageQuery, PageBoundary, PageSpec, RequestId,
+    use crate::{
+        core::{
+            AccountConfigDraft, AccountDirectoryQuery, AccountOperation, AccountOperationSuccess,
+            AccountScope, AccountSetupMode, FolderScope, Generation, MailboxQuery, MessageId,
+            MessageQuery, PageBoundary, PageSpec, RequestId,
+        },
+        credentials::{
+            CredentialDeleteOutcome, CredentialFailure, CredentialFailureKind, CredentialLocator,
+            CredentialOperation, CredentialOutcome, Secret,
+        },
+        store::sqlite::{
+            AccountAuthKind, AccountConfigInput, AccountLifecycle, AccountWrite,
+            AccountWriteOutcome, FailureKind,
+        },
     };
+    use keyring_core::CredentialStore;
     use rusqlite::Connection;
     use std::{
         fs,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+        },
         time::Instant,
     };
 
@@ -902,6 +1017,18 @@ mod tests {
         let _ = fs::remove_file(format!("{}-shm", path.display()));
     }
 
+    fn wait_for<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(3), future)
+                    .await
+                    .expect("test operation timed out")
+            })
+    }
+
     fn seed_file_database(path: &std::path::Path) {
         let (client, replies, database_runtime, _info) = sqlite::spawn(path.to_owned()).unwrap();
         drop(client);
@@ -955,6 +1082,463 @@ mod tests {
         assert_eq!(reply.generation, Generation::new(3));
         assert!(reply.result.unwrap().rows.is_empty());
         runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn restart_recovers_the_remove_after_credential_deletion_crash_window() {
+        let path = temporary_database_path();
+        remove_database_files(&path);
+        let store: Arc<CredentialStore> =
+            keyring_core::mock::Store::new().expect("create shared credential store");
+
+        let first_store = store.clone();
+        let credential_parts =
+            credentials::spawn_with_test_factory(move || Ok(first_store.clone()));
+        let credential_probe = credential_parts.0.clone();
+        let database = sqlite::spawn(path.clone()).unwrap();
+        let (core, _events, runtime) =
+            spawn_with_components(EVENT_CAPACITY, database, credential_parts).unwrap();
+        let setup = core
+            .try_account_operation(AccountOperation::Setup {
+                request_id: RequestId::new(40).unwrap(),
+                mode: AccountSetupMode::Create,
+                draft: AccountConfigDraft::new(
+                    "Personal",
+                    "user@example.test",
+                    "user@example.test",
+                    "imap.example.test",
+                    993,
+                    0x336699,
+                )
+                .unwrap(),
+                secret: Secret::new(b"restart-secret".to_vec()).unwrap(),
+            })
+            .unwrap();
+        let setup = wait_for(setup).unwrap();
+        assert_eq!(setup.request_id, RequestId::new(40).unwrap());
+        let AccountOperationSuccess::Configured {
+            account_id,
+            generation,
+        } = setup.result.unwrap()
+        else {
+            panic!("setup must configure an account")
+        };
+
+        let connection = Connection::open(&path).unwrap();
+        let credential_key: String = connection
+            .query_row(
+                "SELECT credential_key FROM account_connections WHERE account_id = ?1",
+                [account_id.get()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(connection);
+        let locator = CredentialLocator::parse(&credential_key).unwrap();
+        let loaded = wait_for(
+            credential_probe
+                .try_submit(CredentialOperation::Load {
+                    locator: locator.clone(),
+                })
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let CredentialOutcome::Loaded(secret) = loaded else {
+            panic!("setup must persist the credential")
+        };
+        assert_eq!(secret.expose(), b"restart-secret");
+        runtime.shutdown().unwrap();
+
+        let (database, replies, database_runtime, _) = sqlite::spawn(path.clone()).unwrap();
+        let removal = wait_for(
+            database
+                .try_write_account(Box::new(AccountWrite::BeginRemove {
+                    account_id,
+                    expected_generation: generation,
+                }))
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let AccountWriteOutcome::RemovalStarted(ticket) = removal else {
+            panic!("removal must enter the credential deletion stage")
+        };
+        drop(database);
+        drop(replies);
+        database_runtime.shutdown().unwrap();
+
+        let delete_store = store.clone();
+        let (delete_client, delete_runtime) =
+            credentials::spawn_with_test_factory(move || Ok(delete_store.clone()));
+        let deleted = wait_for(
+            delete_client
+                .try_submit(CredentialOperation::Delete {
+                    locator: CredentialLocator::parse(
+                        ticket
+                            .credential_key
+                            .as_deref()
+                            .expect("configured account has a credential key"),
+                    )
+                    .unwrap(),
+                })
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            deleted,
+            CredentialOutcome::Deleted(CredentialDeleteOutcome::Deleted)
+        ));
+        delete_runtime.shutdown().unwrap();
+
+        let connection = Connection::open(&path).unwrap();
+        let state: String = connection
+            .query_row(
+                "SELECT state FROM accounts WHERE id = ?1",
+                [account_id.get()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "removing_credentials");
+        drop(connection);
+
+        let (opened_tx, opened_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let opened = Arc::new(AtomicBool::new(false));
+        let recovery_store = store.clone();
+        let recovery_opened = opened.clone();
+        let credential_parts = credentials::spawn_with_test_factory(move || {
+            if !recovery_opened.swap(true, Ordering::AcqRel) {
+                opened_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("release blocked credential recovery");
+            }
+            Ok(recovery_store.clone())
+        });
+        let database = sqlite::spawn(path.clone()).unwrap();
+        let observer = database.0.clone();
+        let (core, mut events, runtime) =
+            spawn_with_components(EVENT_CAPACITY, database, credential_parts).unwrap();
+        opened_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("startup recovery must retry credential deletion");
+
+        core.try_query_mailbox(mailbox_query(41, 0)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while events.is_empty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        if events.is_empty() {
+            let _ = release_tx.send(());
+            panic!("mailbox query timed out while credentials were blocked");
+        }
+        let mailbox = events.blocking_recv();
+        release_tx.send(()).unwrap();
+        let Some(Event::MailboxLoaded(mailbox)) = mailbox else {
+            panic!("mailbox query must complete while credentials are blocked")
+        };
+        assert_eq!(mailbox.request_id, RequestId::new(41).unwrap());
+        assert!(mailbox.result.unwrap().rows.is_empty());
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match observer.try_load_account(account_id) {
+                Ok(receiver) => match wait_for(receiver) {
+                    Ok(Err(failure)) if failure.kind == FailureKind::NotFound => break,
+                    Ok(Ok(_)) => {}
+                    Ok(Err(failure)) => panic!("unexpected recovery failure: {:?}", failure.kind),
+                    Err(_) => panic!("database stopped before recovery completed"),
+                },
+                Err(DatabaseSubmitError::Busy) => {}
+                Err(DatabaseSubmitError::Closed) => {
+                    panic!("database stopped before recovery completed")
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "restart recovery did not remove the account"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        runtime.shutdown().unwrap();
+        drop(observer);
+        remove_database_files(&path);
+    }
+
+    #[test]
+    fn failed_credential_store_is_visible_and_retryable() {
+        let store: Arc<CredentialStore> =
+            keyring_core::mock::Store::new().expect("create shared credential store");
+        let first_open = Arc::new(AtomicBool::new(true));
+        let factory_store = store.clone();
+        let factory_first_open = first_open.clone();
+        let credential_parts = credentials::spawn_with_test_factory(move || {
+            if factory_first_open.swap(false, Ordering::AcqRel) {
+                Err(CredentialFailure {
+                    kind: CredentialFailureKind::Unavailable,
+                })
+            } else {
+                Ok(factory_store.clone())
+            }
+        });
+        let credential_probe = credential_parts.0.clone();
+        let database = test_database();
+        let observer = database.0.clone();
+        let (core, _events, runtime) =
+            spawn_with_components(EVENT_CAPACITY, database, credential_parts).unwrap();
+
+        let setup = wait_for(
+            core.try_account_operation(AccountOperation::Setup {
+                request_id: RequestId::new(42).unwrap(),
+                mode: AccountSetupMode::Create,
+                draft: AccountConfigDraft::new(
+                    "Retry account",
+                    "retry@example.test",
+                    "retry@example.test",
+                    "imap.example.test",
+                    993,
+                    0x335577,
+                )
+                .unwrap(),
+                secret: Secret::new(b"first-secret".to_vec()).unwrap(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let failure = setup.result.unwrap_err();
+        assert_eq!(
+            failure.stage,
+            crate::core::AccountWorkflowStage::StoreCredential
+        );
+        assert_eq!(
+            failure.kind,
+            crate::core::AccountWorkflowFailureKind::Credential(CredentialFailureKind::Unavailable)
+        );
+        let account_id = failure.account_id.expect("configuration must be durable");
+        let generation = failure
+            .generation
+            .expect("retry requires a generation fence");
+
+        let retried = wait_for(
+            core.try_account_operation(AccountOperation::RetryCredential {
+                request_id: RequestId::new(43).unwrap(),
+                account_id,
+                expected_generation: generation,
+                secret: Secret::new(b"retry-secret".to_vec()).unwrap(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            retried.result,
+            Ok(AccountOperationSuccess::Configured {
+                account_id,
+                generation,
+            })
+        );
+
+        let configuration = wait_for(observer.try_load_account(account_id).unwrap())
+            .unwrap()
+            .unwrap();
+        let crate::store::sqlite::AccountRecord::Configured(configuration) = configuration else {
+            panic!("retry must keep the configured account")
+        };
+        let loaded = wait_for(
+            credential_probe
+                .try_submit(CredentialOperation::Load {
+                    locator: CredentialLocator::parse(&configuration.credential_key).unwrap(),
+                })
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let CredentialOutcome::Loaded(secret) = loaded else {
+            panic!("retry must store the credential")
+        };
+        assert_eq!(secret.expose(), b"retry-secret");
+
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn remove_resumes_in_process_after_a_transient_credential_failure() {
+        let database = test_database();
+        let observer = database.0.clone();
+        let created = wait_for(
+            observer
+                .try_write_account(Box::new(AccountWrite::Create(
+                    AccountConfigInput::new(
+                        "0123456789abcdef0123456789abcdef",
+                        "Removal retry",
+                        "remove@example.test",
+                        AccountAuthKind::AppPassword,
+                        "remove@example.test",
+                        "imap.example.test",
+                        993,
+                        0x446688,
+                    )
+                    .unwrap(),
+                )))
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let AccountWriteOutcome::Saved(created) = created else {
+            panic!("account creation must return configuration")
+        };
+        let store: Arc<CredentialStore> =
+            keyring_core::mock::Store::new().expect("create shared credential store");
+        let first_open = Arc::new(AtomicBool::new(true));
+        let factory_store = store.clone();
+        let factory_first_open = first_open.clone();
+        let credential_parts = credentials::spawn_with_test_factory(move || {
+            if factory_first_open.swap(false, Ordering::AcqRel) {
+                Err(CredentialFailure {
+                    kind: CredentialFailureKind::Unavailable,
+                })
+            } else {
+                Ok(factory_store.clone())
+            }
+        });
+        let (core, _events, runtime) =
+            spawn_with_components(EVENT_CAPACITY, database, credential_parts).unwrap();
+
+        let first = wait_for(
+            core.try_account_operation(AccountOperation::Remove {
+                request_id: RequestId::new(44).unwrap(),
+                account_id: created.account_id,
+                expected_generation: created.generation,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let failure = first.result.unwrap_err();
+        assert_eq!(
+            failure.stage,
+            crate::core::AccountWorkflowStage::DeleteCredential
+        );
+        assert_eq!(
+            failure.kind,
+            crate::core::AccountWorkflowFailureKind::Credential(CredentialFailureKind::Unavailable)
+        );
+        let removal_generation = failure
+            .generation
+            .expect("failed delete must expose the durable removal fence");
+
+        let retried = wait_for(
+            core.try_account_operation(AccountOperation::Remove {
+                request_id: RequestId::new(45).unwrap(),
+                account_id: created.account_id,
+                expected_generation: removal_generation,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            retried.result,
+            Ok(AccountOperationSuccess::Removed {
+                account_id: created.account_id,
+            })
+        );
+        let missing = wait_for(observer.try_load_account(created.account_id).unwrap())
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(missing.kind, FailureKind::NotFound);
+
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn restart_purges_removing_cache_without_opening_credentials() {
+        let path = temporary_database_path();
+        remove_database_files(&path);
+        let (database, replies, database_runtime, _) = sqlite::spawn(path.clone()).unwrap();
+        let created = wait_for(
+            database
+                .try_write_account(Box::new(AccountWrite::Create(
+                    AccountConfigInput::new(
+                        "fedcba9876543210fedcba9876543210",
+                        "Cache recovery",
+                        "cache@example.test",
+                        AccountAuthKind::AppPassword,
+                        "cache@example.test",
+                        "imap.example.test",
+                        993,
+                        0x557799,
+                    )
+                    .unwrap(),
+                )))
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let AccountWriteOutcome::Saved(created) = created else {
+            panic!("account creation must return configuration")
+        };
+        let removal = wait_for(
+            database
+                .try_write_account(Box::new(AccountWrite::BeginRemove {
+                    account_id: created.account_id,
+                    expected_generation: created.generation,
+                }))
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let AccountWriteOutcome::RemovalStarted(removal) = removal else {
+            panic!("removal must start")
+        };
+        let confirmed = wait_for(
+            database
+                .try_write_account(Box::new(AccountWrite::ConfirmCredentialsRemoved {
+                    account_id: removal.account_id,
+                    expected_generation: removal.generation,
+                }))
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let AccountWriteOutcome::Saved(confirmed) = confirmed else {
+            panic!("credential confirmation must save the cache-removal state")
+        };
+        assert_eq!(confirmed.lifecycle, AccountLifecycle::RemovingCache);
+        drop(database);
+        drop(replies);
+        database_runtime.shutdown().unwrap();
+
+        let credential_parts = credentials::spawn_with_test_factory(|| {
+            panic!("cache-only recovery must not open credential storage")
+        });
+        let database = sqlite::spawn(path.clone()).unwrap();
+        let observer = database.0.clone();
+        let (_core, _events, runtime) =
+            spawn_with_components(EVENT_CAPACITY, database, credential_parts).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match observer.try_load_account(created.account_id) {
+                Ok(receiver) => match wait_for(receiver) {
+                    Ok(Err(failure)) if failure.kind == FailureKind::NotFound => break,
+                    Ok(Ok(_)) => {}
+                    Ok(Err(failure)) => panic!("unexpected recovery failure: {:?}", failure.kind),
+                    Err(_) => panic!("database stopped before cache recovery completed"),
+                },
+                Err(DatabaseSubmitError::Busy) => {}
+                Err(DatabaseSubmitError::Closed) => {
+                    panic!("database stopped before cache recovery completed")
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "restart recovery did not purge removing_cache"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        runtime.shutdown().unwrap();
+        drop(observer);
+        remove_database_files(&path);
     }
 
     #[test]
@@ -1245,6 +1829,10 @@ mod tests {
             .unwrap();
         let (_shutdown_tx, shutdown_rx) = oneshot::channel();
         let mut shutdown = Box::pin(shutdown_rx);
+        let (_account_tx, account_rx) = mpsc::channel(1);
+        let mut account_commands = Some(account_rx);
+        let (credential_client, credential_runtime) = credentials::spawn();
+        let mut account_workflows = AccountWorkflows::new(database.clone(), credential_client);
         let input = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
@@ -1252,10 +1840,13 @@ mod tests {
                 &mut shutdown,
                 &mut commands,
                 &mut database_replies,
+                &mut account_commands,
+                &mut account_workflows,
                 false,
             ));
 
         assert!(matches!(input, CoreInput::Database(DbReply::Mailbox(_))));
+        credential_runtime.shutdown().unwrap();
         database_runtime.shutdown().unwrap();
     }
 

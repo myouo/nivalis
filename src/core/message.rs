@@ -1,12 +1,26 @@
+use super::account::{AccountOperation, AccountOperationReply};
 use crate::store::sqlite::{
     AccountDirectory, Generation, MailboxPage, MessageDetail, MessageId, MessageMutation,
     MutationOutcome, PageSpec, RequestId, Tagged,
 };
-use std::sync::{Arc, Mutex, MutexGuard};
-use tokio::sync::mpsc;
+use std::{
+    fmt,
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex, MutexGuard},
+    task::{Context, Poll},
+};
+use tokio::sync::{mpsc, oneshot};
 
 pub(crate) const COMMAND_CAPACITY: usize = 64;
+pub(crate) const ACCOUNT_COMMAND_CAPACITY: usize = 4;
 pub(crate) const EVENT_CAPACITY: usize = 128;
+
+#[derive(Debug)]
+pub(super) struct AccountCommand {
+    pub(super) operation: AccountOperation,
+    pub(super) reply: oneshot::Sender<AccountOperationReply>,
+}
 
 #[derive(Debug)]
 pub(super) enum Command {
@@ -355,11 +369,40 @@ fn lock_latest(slot: &Mutex<LatestEvent>) -> MutexGuard<'_, LatestEvent> {
 #[derive(Clone)]
 pub(crate) struct CoreHandle {
     commands: mpsc::Sender<Command>,
+    account_commands: mpsc::Sender<AccountCommand>,
 }
 
 impl CoreHandle {
-    pub(super) fn new(commands: mpsc::Sender<Command>) -> Self {
-        Self { commands }
+    pub(super) fn new(
+        commands: mpsc::Sender<Command>,
+        account_commands: mpsc::Sender<AccountCommand>,
+    ) -> Self {
+        Self {
+            commands,
+            account_commands,
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn try_account_operation(
+        &self,
+        operation: AccountOperation,
+    ) -> Result<AccountOperationResponse, AccountOperationSubmitFailure> {
+        let (reply, receiver) = oneshot::channel();
+        match self
+            .account_commands
+            .try_send(AccountCommand { operation, reply })
+        {
+            Ok(()) => Ok(AccountOperationResponse { receiver }),
+            Err(mpsc::error::TrySendError::Full(command)) => Err(AccountOperationSubmitFailure {
+                reason: AccountOperationSubmitError::Busy,
+                operation: Box::new(command.operation),
+            }),
+            Err(mpsc::error::TrySendError::Closed(command)) => Err(AccountOperationSubmitFailure {
+                reason: AccountOperationSubmitError::Closed,
+                operation: Box::new(command.operation),
+            }),
+        }
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -404,6 +447,79 @@ impl CoreHandle {
     }
 }
 
+pub(crate) struct AccountOperationResponse {
+    receiver: oneshot::Receiver<AccountOperationReply>,
+}
+
+impl fmt::Debug for AccountOperationResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AccountOperationResponse(..)")
+    }
+}
+
+impl Future for AccountOperationResponse {
+    type Output = Result<AccountOperationReply, AccountOperationResponseError>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.receiver).poll(context) {
+            Poll::Ready(Ok(reply)) => Poll::Ready(Ok(reply)),
+            Poll::Ready(Err(_)) => Poll::Ready(Err(AccountOperationResponseError::CoreClosed)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AccountOperationResponseError {
+    CoreClosed,
+}
+
+impl fmt::Display for AccountOperationResponseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("the account operation stopped before producing a result")
+    }
+}
+
+impl std::error::Error for AccountOperationResponseError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AccountOperationSubmitError {
+    Busy,
+    Closed,
+}
+
+pub(crate) struct AccountOperationSubmitFailure {
+    reason: AccountOperationSubmitError,
+    operation: Box<AccountOperation>,
+}
+
+impl AccountOperationSubmitFailure {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn reason(&self) -> AccountOperationSubmitError {
+        self.reason
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn into_operation(self) -> AccountOperation {
+        *self.operation
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn into_parts(self) -> (AccountOperationSubmitError, AccountOperation) {
+        (self.reason, *self.operation)
+    }
+}
+
+impl fmt::Debug for AccountOperationSubmitFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AccountOperationSubmitFailure")
+            .field("reason", &self.reason)
+            .field("operation", self.operation.as_ref())
+            .finish()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SubmitError {
     Busy,
@@ -421,16 +537,57 @@ impl From<mpsc::error::TrySendError<Command>> for SubmitError {
 
 #[cfg(test)]
 mod tests {
+    use super::super::account::{AccountConfigDraft, AccountOperationSuccess, AccountSetupMode};
     use super::*;
+    use crate::{
+        credentials::Secret,
+        store::sqlite::{AccountGeneration, AccountId},
+    };
 
     fn account_directory_query(request_id: u64) -> AccountDirectoryQuery {
         AccountDirectoryQuery::new(RequestId::new(request_id).unwrap(), Generation::new(0))
     }
 
+    fn remove_account_operation(request_id: u64) -> AccountOperation {
+        AccountOperation::Remove {
+            request_id: RequestId::new(request_id).unwrap(),
+            account_id: AccountId::new(1).unwrap(),
+            expected_generation: AccountGeneration::new(1).unwrap(),
+        }
+    }
+
+    fn setup_account_operation(request_id: u64, secret: &[u8]) -> AccountOperation {
+        AccountOperation::Setup {
+            request_id: RequestId::new(request_id).unwrap(),
+            mode: AccountSetupMode::Create,
+            draft: AccountConfigDraft::new(
+                "Personal",
+                "user@example.test",
+                "user@example.test",
+                "imap.example.test",
+                993,
+                0x123456,
+            )
+            .unwrap(),
+            secret: Secret::new(secret.to_vec()).unwrap(),
+        }
+    }
+
+    fn handle_with_account_channel(
+        commands: mpsc::Sender<Command>,
+        account_capacity: usize,
+    ) -> (CoreHandle, mpsc::Receiver<AccountCommand>) {
+        let (account_commands, account_receiver) = mpsc::channel(account_capacity);
+        (
+            CoreHandle::new(commands, account_commands),
+            account_receiver,
+        )
+    }
+
     #[test]
     fn full_command_queue_is_reported_as_busy() {
         let (sender, _receiver) = mpsc::channel(1);
-        let handle = CoreHandle::new(sender);
+        let (handle, _account_receiver) = handle_with_account_channel(sender, 1);
 
         assert_eq!(
             handle.try_query_account_directory(account_directory_query(1)),
@@ -445,12 +602,96 @@ mod tests {
     #[test]
     fn closed_command_queue_is_reported() {
         let (sender, receiver) = mpsc::channel(1);
-        let handle = CoreHandle::new(sender);
+        let (handle, _account_receiver) = handle_with_account_channel(sender, 1);
         drop(receiver);
 
         assert_eq!(
             handle.try_query_account_directory(account_directory_query(1)),
             Err(SubmitError::Closed)
+        );
+    }
+
+    #[test]
+    fn account_commands_use_an_independent_bounded_queue() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let (handle, mut account_receiver) = handle_with_account_channel(sender, 1);
+        handle
+            .try_query_account_directory(account_directory_query(1))
+            .unwrap();
+
+        let _response = handle
+            .try_account_operation(remove_account_operation(2))
+            .unwrap();
+
+        let command = account_receiver.try_recv().unwrap();
+        assert_eq!(command.operation.request_id(), RequestId::new(2).unwrap());
+    }
+
+    #[test]
+    fn full_account_queue_returns_the_original_operation() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let (handle, _account_receiver) = handle_with_account_channel(sender, 1);
+        let _first = handle
+            .try_account_operation(remove_account_operation(1))
+            .unwrap();
+
+        let failure = handle
+            .try_account_operation(setup_account_operation(2, b"retry-secret"))
+            .unwrap_err();
+
+        assert_eq!(failure.reason(), AccountOperationSubmitError::Busy);
+        let (reason, operation) = failure.into_parts();
+        assert_eq!(reason, AccountOperationSubmitError::Busy);
+        let AccountOperation::Setup { secret, .. } = operation else {
+            panic!("expected the original setup operation");
+        };
+        assert_eq!(secret.expose(), b"retry-secret");
+    }
+
+    #[test]
+    fn closed_account_queue_returns_the_original_operation() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let (handle, account_receiver) = handle_with_account_channel(sender, 1);
+        drop(account_receiver);
+
+        let failure = handle
+            .try_account_operation(remove_account_operation(7))
+            .unwrap_err();
+
+        assert_eq!(failure.reason(), AccountOperationSubmitError::Closed);
+        assert_eq!(
+            failure.into_operation().request_id(),
+            RequestId::new(7).unwrap()
+        );
+    }
+
+    #[test]
+    fn account_operation_response_maps_reply_and_channel_close() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let (handle, mut account_receiver) = handle_with_account_channel(sender, 2);
+        let response = handle
+            .try_account_operation(remove_account_operation(8))
+            .unwrap();
+        let command = account_receiver.try_recv().unwrap();
+        let expected = AccountOperationReply {
+            request_id: RequestId::new(8).unwrap(),
+            result: Ok(AccountOperationSuccess::Removed {
+                account_id: AccountId::new(1).unwrap(),
+            }),
+        };
+        command.reply.send(expected).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        assert_eq!(runtime.block_on(response).unwrap(), expected);
+
+        let closed = handle
+            .try_account_operation(remove_account_operation(9))
+            .unwrap();
+        drop(account_receiver.try_recv().unwrap());
+        assert_eq!(
+            runtime.block_on(closed),
+            Err(AccountOperationResponseError::CoreClosed)
         );
     }
 

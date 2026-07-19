@@ -19,10 +19,11 @@ use crate::content::{ContentStaging, PublishedContent};
 
 use super::{
     account::{
-        AccountRecord, AccountWrite, AccountWriteOutcome, begin_account_removal, begin_diagnostic,
+        AccountRecord, AccountWrite, AccountWriteOutcome, PendingCacheRemoval,
+        PendingCredentialRemoval, begin_account_removal, begin_diagnostic,
         configure_existing_account, confirm_account_credentials_removed, create_account,
-        load_account, purge_removed_account, record_diagnostic, set_account_enabled,
-        update_account,
+        load_account, load_pending_cache_removals, load_pending_credential_removals,
+        purge_removed_account, record_diagnostic, set_account_enabled, update_account,
     },
     content::{
         ContentBatchToken, ContentManifest, ReserveContentRequest,
@@ -47,6 +48,9 @@ const SQLITE_CACHE_KIB: i64 = 1024;
 const SQLITE_MAX_VALUE_BYTES: i32 = 2 * 1024 * 1024;
 const MAILBOX_PROGRESS_OPS: i32 = 4096;
 const CONTENT_IMPORT_TTL_MS: i64 = 60 * 1_000;
+
+pub(crate) type PendingCredentialRemovalReply = Result<Box<[PendingCredentialRemoval]>, DbFailure>;
+pub(crate) type PendingCacheRemovalReply = Result<Box<[PendingCacheRemoval]>, DbFailure>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MailboxDbKey {
@@ -178,6 +182,12 @@ enum Request {
     LoadAccount {
         account_id: super::domain::AccountId,
         reply: oneshot::Sender<Result<AccountRecord, DbFailure>>,
+    },
+    LoadPendingCredentialRemovals {
+        reply: oneshot::Sender<PendingCredentialRemovalReply>,
+    },
+    LoadPendingCacheRemovals {
+        reply: oneshot::Sender<PendingCacheRemovalReply>,
     },
     WriteAccount {
         write: Box<AccountWrite>,
@@ -333,6 +343,22 @@ impl DatabaseClient {
     ) -> Result<oneshot::Receiver<Result<AccountRecord, DbFailure>>, SubmitError> {
         let (reply, receiver) = oneshot::channel();
         self.try_submit(Request::LoadAccount { account_id, reply })?;
+        Ok(receiver)
+    }
+
+    pub(crate) fn try_load_pending_credential_removals(
+        &self,
+    ) -> Result<oneshot::Receiver<PendingCredentialRemovalReply>, SubmitError> {
+        let (reply, receiver) = oneshot::channel();
+        self.try_submit(Request::LoadPendingCredentialRemovals { reply })?;
+        Ok(receiver)
+    }
+
+    pub(crate) fn try_load_pending_cache_removals(
+        &self,
+    ) -> Result<oneshot::Receiver<PendingCacheRemovalReply>, SubmitError> {
+        let (reply, receiver) = oneshot::channel();
+        self.try_submit(Request::LoadPendingCacheRemovals { reply })?;
         Ok(receiver)
     }
 
@@ -896,6 +922,18 @@ fn run_actor(
             Request::LoadAccount { account_id, reply } => {
                 if !reply.is_closed() {
                     let _ = reply.send(load_account(&connection, account_id));
+                }
+                continue;
+            }
+            Request::LoadPendingCredentialRemovals { reply } => {
+                if !reply.is_closed() {
+                    let _ = reply.send(load_pending_credential_removals(&connection));
+                }
+                continue;
+            }
+            Request::LoadPendingCacheRemovals { reply } => {
+                if !reply.is_closed() {
+                    let _ = reply.send(load_pending_cache_removals(&connection));
                 }
                 continue;
             }
@@ -1548,6 +1586,8 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
         time::Instant,
     };
+
+    use rusqlite::params;
 
     use super::*;
     use crate::{
@@ -2260,6 +2300,120 @@ mod tests {
         assert_eq!(missing.kind, FailureKind::NotFound);
         assert!(replies.is_empty());
         runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn pending_credential_removal_read_is_exact_and_uses_oneshot() {
+        let path = temporary_database_path();
+        remove_database_files(&path);
+        let mut connection = Connection::open(&path).unwrap();
+        configure(&mut connection).unwrap();
+        for (id, generation, state, auth_kind) in [
+            (7_i64, 13_i64, "removing_credentials", "oauth2"),
+            (2, 3, "active", "app_password"),
+            (11, 17, "removing_cache", "oauth2"),
+            (4, 19, "removing_credentials", "app_password"),
+        ] {
+            let credential_key = format!("{id:032x}");
+            connection
+                .execute(
+                    "INSERT INTO accounts
+                         (id, provider, remote_key, name, address, state, accent_rgb,
+                          configuration_generation)
+                     VALUES (?1, 'imap', ?2, ?2, ?2, ?3, 0, ?4)",
+                    params![id, format!("account-{id}"), state, generation],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO account_connections
+                         (account_id, credential_key, auth_kind, login_name, imap_host, imap_port)
+                     VALUES (?1, ?2, ?3, 'owner@example.test', 'imap.example.test', 993)",
+                    params![id, credential_key, auth_kind],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let (client, replies, runtime, _info) =
+            spawn_target(Target::File(path.clone()), REQUEST_CAPACITY, REPLY_CAPACITY).unwrap();
+        let pending =
+            receive_oneshot(client.try_load_pending_credential_removals().unwrap()).unwrap();
+
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].account_id.get(), 4);
+        assert_eq!(pending[0].configuration_generation.get(), 19);
+        assert_eq!(
+            pending[0].credential_key.as_ref(),
+            "00000000000000000000000000000004"
+        );
+        assert_eq!(
+            pending[0].auth_kind,
+            super::super::account::AccountAuthKind::AppPassword
+        );
+        assert_eq!(pending[1].account_id.get(), 7);
+        assert_eq!(pending[1].configuration_generation.get(), 13);
+        assert_eq!(
+            pending[1].credential_key.as_ref(),
+            "00000000000000000000000000000007"
+        );
+        assert_eq!(
+            pending[1].auth_kind,
+            super::super::account::AccountAuthKind::OAuth2
+        );
+        assert!(replies.is_empty());
+        runtime.shutdown().unwrap();
+        remove_database_files(&path);
+    }
+
+    #[test]
+    fn pending_cache_removal_read_includes_configured_and_legacy_accounts() {
+        let path = temporary_database_path();
+        remove_database_files(&path);
+        let mut connection = Connection::open(&path).unwrap();
+        configure(&mut connection).unwrap();
+        for (id, generation, state, has_configuration) in [
+            (9_i64, 21_i64, "removing_cache", true),
+            (2, 5, "removing_credentials", true),
+            (5, 11, "removing_cache", false),
+            (12, 31, "active", false),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO accounts
+                         (id, provider, remote_key, name, address, state, accent_rgb,
+                          configuration_generation)
+                     VALUES (?1, 'imap', ?2, ?2, ?2, ?3, 0, ?4)",
+                    params![id, format!("cache-account-{id}"), state, generation],
+                )
+                .unwrap();
+            if has_configuration {
+                connection
+                    .execute(
+                        "INSERT INTO account_connections
+                             (account_id, credential_key, auth_kind, login_name,
+                              imap_host, imap_port)
+                         VALUES (?1, ?2, 'app_password', 'owner@example.test',
+                                 'imap.example.test', 993)",
+                        params![id, format!("{id:032x}")],
+                    )
+                    .unwrap();
+            }
+        }
+        drop(connection);
+
+        let (client, replies, runtime, _info) =
+            spawn_target(Target::File(path.clone()), REQUEST_CAPACITY, REPLY_CAPACITY).unwrap();
+        let pending = receive_oneshot(client.try_load_pending_cache_removals().unwrap()).unwrap();
+
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].account_id.get(), 5);
+        assert_eq!(pending[0].configuration_generation.get(), 11);
+        assert_eq!(pending[1].account_id.get(), 9);
+        assert_eq!(pending[1].configuration_generation.get(), 21);
+        assert!(replies.is_empty());
+        runtime.shutdown().unwrap();
+        remove_database_files(&path);
     }
 
     #[test]

@@ -19,7 +19,7 @@ pub(crate) use account::{
     AccountDiagnosticKind, AccountGeneration, AccountLifecycle, AccountPurgeOutcome, AccountRecord,
     AccountRemovalTicket, AccountSetupTarget, AccountValidationError, AccountWrite,
     AccountWriteOutcome, DiagnosticCommit, DiagnosticEpoch, DiagnosticRecord, DiagnosticTicket,
-    RemovedAccount,
+    PendingCacheRemoval, PendingCredentialRemoval, RemovedAccount,
 };
 #[allow(unused_imports)]
 pub(crate) use actor::{

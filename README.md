@@ -76,7 +76,7 @@ The embedded icon subset is generated from Material Symbols Rounded and retains 
 - DTO text is converted into `SharedString` only for the current bounded Slint page or selected detail; the source DTO is then released.
 - Search uses a restartable 180ms debounce, a 256-byte input cap, generation rejection, external-content SQLite FTS, and exact-key interruption of obsolete mailbox work.
 - Dialogs, menus, and settings are conditionally instantiated, and no decorative animation or periodic synchronization timer runs while idle.
-- Account, mailbox, reader, and mutation work crosses bounded 64-command and 128-event channels without blocking the UI; snackbar feedback alone uses a restartable UI timer.
+- Ordinary mailbox, reader, and mutation work crosses bounded 64-command and 128-event channels without blocking the UI. Secret-bearing account operations use a separate capacity-four queue and return the exact redacted operation when busy; snackbar feedback alone uses a restartable UI timer.
 - Full mailbox and reader projections never accumulate in the 128-slot control queue: it carries lightweight notifications while independent latest-value slots retain at most one 50-row page and one 64KiB detail.
 - UI-visible mutations are single-flight and retain no history queue. A successful write fences obsolete reads and must commit one strict 50-row first-page snapshot before another ordinary action; Trash undo may replace an in-flight refresh without extending its absolute five-second deadline.
 - Stored previews are capped at 2,048 UTF-8 bytes and the reader excerpt at 64KiB. Full bodies and attachments stay in private files and are consumed through bounded streams rather than copied into SQLite or mailbox-wide UI state.

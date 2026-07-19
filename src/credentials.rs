@@ -433,6 +433,14 @@ pub(crate) fn spawn() -> (CredentialClient, CredentialRuntime) {
     spawn_with_factory(Arc::new(open_platform_store))
 }
 
+#[cfg(test)]
+pub(crate) fn spawn_with_test_factory<F>(factory: F) -> (CredentialClient, CredentialRuntime)
+where
+    F: Fn() -> Result<Arc<CredentialStore>, CredentialFailure> + Send + Sync + 'static,
+{
+    spawn_with_factory(Arc::new(factory))
+}
+
 fn spawn_with_factory(factory: StoreFactory) -> (CredentialClient, CredentialRuntime) {
     let (sender, receiver) = crossbeam_channel::bounded(REQUEST_CAPACITY);
     let control = Arc::new(Control {

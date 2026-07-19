@@ -13,6 +13,7 @@ const MAX_TIMESTAMP_MS: i64 = 253_402_300_799_999;
 const ACCOUNT_PURGE_MESSAGE_BATCH: usize = 16;
 const ACCOUNT_PURGE_ATTACHMENT_BATCH: usize = 16;
 const ACCOUNT_PURGE_STAGING_BATCH: usize = 16;
+const PENDING_REMOVAL_LIMIT: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AccountAuthKind {
@@ -272,6 +273,20 @@ pub(crate) struct AccountRemovalTicket {
     pub(crate) credential_key: Option<Box<str>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingCredentialRemoval {
+    pub(crate) account_id: AccountId,
+    pub(crate) configuration_generation: AccountGeneration,
+    pub(crate) credential_key: Box<str>,
+    pub(crate) auth_kind: AccountAuthKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PendingCacheRemoval {
+    pub(crate) account_id: AccountId,
+    pub(crate) configuration_generation: AccountGeneration,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DiagnosticTicket {
     pub(crate) account_id: AccountId,
@@ -481,6 +496,73 @@ pub(super) fn load_account(
     account_id: AccountId,
 ) -> Result<AccountRecord, DbFailure> {
     load_account_record_from(connection, account_id)
+}
+
+pub(super) fn load_pending_credential_removals(
+    connection: &Connection,
+) -> Result<Box<[PendingCredentialRemoval]>, DbFailure> {
+    type StoredRemoval = (i64, i64, String, String);
+
+    let mut statement = connection
+        .prepare(
+            "SELECT account.id, account.configuration_generation,
+                    connection.credential_key, connection.auth_kind
+             FROM accounts AS account
+             JOIN account_connections AS connection ON connection.account_id = account.id
+             WHERE account.state = 'removing_credentials'
+             ORDER BY account.id ASC
+             LIMIT ?1",
+        )
+        .map_err(DbFailure::database)?;
+    let rows = statement
+        .query_map([PENDING_REMOVAL_LIMIT as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .map_err(DbFailure::database)?;
+    let mut removals = Vec::with_capacity(PENDING_REMOVAL_LIMIT);
+    for row in rows {
+        let (account_id, generation, credential_key, auth_kind): StoredRemoval =
+            row.map_err(DbFailure::database)?;
+        let credential_key = validate_credential_key(&credential_key)
+            .map_err(|_| DbFailure::database("invalid pending credential key"))?;
+        removals.push(PendingCredentialRemoval {
+            account_id: AccountId::new(account_id)
+                .map_err(|error| DbFailure::database(error.to_string()))?,
+            configuration_generation: AccountGeneration::from_database(generation)?,
+            credential_key: credential_key.into(),
+            auth_kind: AccountAuthKind::from_database(&auth_kind)?,
+        });
+    }
+    Ok(removals.into_boxed_slice())
+}
+
+pub(super) fn load_pending_cache_removals(
+    connection: &Connection,
+) -> Result<Box<[PendingCacheRemoval]>, DbFailure> {
+    let mut statement = connection
+        .prepare(
+            "SELECT id, configuration_generation
+             FROM accounts
+             WHERE state = 'removing_cache'
+             ORDER BY id ASC
+             LIMIT ?1",
+        )
+        .map_err(DbFailure::database)?;
+    let rows = statement
+        .query_map([PENDING_REMOVAL_LIMIT as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(DbFailure::database)?;
+    let mut removals = Vec::with_capacity(PENDING_REMOVAL_LIMIT);
+    for row in rows {
+        let (account_id, generation) = row.map_err(DbFailure::database)?;
+        removals.push(PendingCacheRemoval {
+            account_id: AccountId::new(account_id)
+                .map_err(|error| DbFailure::database(error.to_string()))?,
+            configuration_generation: AccountGeneration::from_database(generation)?,
+        });
+    }
+    Ok(removals.into_boxed_slice())
 }
 
 pub(super) fn update_account(
@@ -1555,6 +1637,135 @@ mod tests {
                 .unwrap(),
             AccountPurgeOutcome::Complete(_)
         ));
+    }
+
+    #[test]
+    fn pending_credential_removals_are_bounded_filtered_and_stably_ordered() {
+        let connection = database();
+        connection
+            .execute("DROP TRIGGER reject_account_limit_insert", [])
+            .unwrap();
+
+        for id in (1_i64..=68).rev() {
+            let state = match id {
+                2 => "active",
+                3 => "removing_cache",
+                4 => "disabled",
+                _ => "removing_credentials",
+            };
+            let credential_key = format!("{id:032x}");
+            let auth_kind = if id % 2 == 0 {
+                "app_password"
+            } else {
+                "oauth2"
+            };
+            connection
+                .execute(
+                    "INSERT INTO accounts
+                         (id, provider, remote_key, name, address, state, accent_rgb,
+                          configuration_generation)
+                     VALUES (?1, 'imap', ?2, ?2, ?2, ?3, 0, ?4)",
+                    params![id, format!("account-{id}"), state, 1_000 + id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO account_connections
+                         (account_id, credential_key, auth_kind, login_name, imap_host, imap_port)
+                     VALUES (?1, ?2, ?3, 'owner@example.test', 'imap.example.test', 993)",
+                    params![id, credential_key, auth_kind],
+                )
+                .unwrap();
+        }
+
+        let pending = load_pending_credential_removals(&connection).unwrap();
+        assert_eq!(pending.len(), PENDING_REMOVAL_LIMIT);
+        let expected_ids: Vec<_> = (1_i64..=68)
+            .filter(|id| !matches!(id, 2..=4))
+            .take(PENDING_REMOVAL_LIMIT)
+            .collect();
+        assert_eq!(
+            pending
+                .iter()
+                .map(|removal| removal.account_id.get())
+                .collect::<Vec<_>>(),
+            expected_ids
+        );
+        assert_eq!(pending[0].configuration_generation.get(), 1_001);
+        assert_eq!(
+            pending[0].credential_key.as_ref(),
+            "00000000000000000000000000000001"
+        );
+        assert_eq!(pending[0].auth_kind, AccountAuthKind::OAuth2);
+        assert_eq!(pending[63].account_id.get(), 67);
+        assert!(!pending.iter().any(|removal| removal.account_id.get() == 68));
+    }
+
+    #[test]
+    fn pending_cache_removals_are_bounded_for_configured_and_legacy_accounts() {
+        let connection = database();
+        connection
+            .execute("DROP TRIGGER reject_account_limit_insert", [])
+            .unwrap();
+
+        for id in (1_i64..=68).rev() {
+            let state = match id {
+                2 => "active",
+                3 => "removing_credentials",
+                4 => "disabled",
+                _ => "removing_cache",
+            };
+            connection
+                .execute(
+                    "INSERT INTO accounts
+                         (id, provider, remote_key, name, address, state, accent_rgb,
+                          configuration_generation)
+                     VALUES (?1, 'imap', ?2, ?2, ?2, ?3, 0, ?4)",
+                    params![id, format!("cache-account-{id}"), state, 2_000 + id],
+                )
+                .unwrap();
+            if id % 2 == 0 || id == 3 {
+                connection
+                    .execute(
+                        "INSERT INTO account_connections
+                             (account_id, credential_key, auth_kind, login_name,
+                              imap_host, imap_port)
+                         VALUES (?1, ?2, 'app_password', 'owner@example.test',
+                                 'imap.example.test', 993)",
+                        params![id, format!("{id:032x}")],
+                    )
+                    .unwrap();
+            }
+        }
+
+        let pending = load_pending_cache_removals(&connection).unwrap();
+        assert_eq!(pending.len(), PENDING_REMOVAL_LIMIT);
+        assert_eq!(
+            pending
+                .iter()
+                .map(|removal| removal.account_id.get())
+                .collect::<Vec<_>>(),
+            (1_i64..=68)
+                .filter(|id| !matches!(id, 2..=4))
+                .take(PENDING_REMOVAL_LIMIT)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(pending[0].configuration_generation.get(), 2_001);
+        assert_eq!(pending[63].account_id.get(), 67);
+        assert!(!pending.iter().any(|removal| removal.account_id.get() == 68));
+
+        let AccountRecord::NeedsSetup(legacy) =
+            load_account(&connection, AccountId::new(1).unwrap()).unwrap()
+        else {
+            panic!("odd cache-removal account must remain a legacy setup target");
+        };
+        assert!(legacy.removal_pending);
+        let AccountRecord::Configured(configured) =
+            load_account(&connection, AccountId::new(6).unwrap()).unwrap()
+        else {
+            panic!("even cache-removal account must remain configured");
+        };
+        assert_eq!(configured.lifecycle, AccountLifecycle::RemovingCache);
     }
 
     #[test]

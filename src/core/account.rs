@@ -1,0 +1,2091 @@
+use std::{
+    collections::VecDeque,
+    fmt,
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
+
+use tokio::{
+    sync::oneshot,
+    time::{self, Sleep},
+};
+
+use crate::{
+    credentials::{
+        CredentialClient, CredentialDeleteOutcome, CredentialFailureKind, CredentialLocator,
+        CredentialOperation, CredentialOutcome, CredentialResponse, CredentialSubmitError, Secret,
+    },
+    store::sqlite::{
+        AccountAuthKind, AccountConfigInput, AccountConfiguration, AccountGeneration, AccountId,
+        AccountLifecycle, AccountPurgeOutcome, AccountRecord, AccountRemovalTicket,
+        AccountValidationError, AccountWrite, AccountWriteOutcome, AccountWriteReply,
+        DatabaseClient, DatabaseSubmitError, FailureKind, PendingCacheRemoval,
+        PendingCredentialRemoval, RequestId,
+    },
+};
+
+#[cfg_attr(not(test), allow(dead_code))]
+const PLACEHOLDER_CREDENTIAL_KEY: &str = "00000000000000000000000000000000";
+const RECOVERY_SUBMISSION_RETRY: Duration = Duration::from_millis(10);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AccountConfigDraft {
+    name: Box<str>,
+    address: Box<str>,
+    login_name: Box<str>,
+    imap_host: Box<str>,
+    imap_port: u16,
+    accent_rgb: u32,
+}
+
+impl AccountConfigDraft {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn new(
+        name: &str,
+        address: &str,
+        login_name: &str,
+        imap_host: &str,
+        imap_port: u16,
+        accent_rgb: u32,
+    ) -> Result<Self, AccountValidationError> {
+        let validated = AccountConfigInput::new(
+            PLACEHOLDER_CREDENTIAL_KEY,
+            name,
+            address,
+            AccountAuthKind::AppPassword,
+            login_name,
+            imap_host,
+            imap_port,
+            accent_rgb,
+        )?;
+        Ok(Self {
+            name: validated.name,
+            address: validated.address,
+            login_name: validated.login_name,
+            imap_host: validated.imap_host,
+            imap_port: validated.imap_port,
+            accent_rgb: validated.accent_rgb,
+        })
+    }
+
+    fn into_input(self, locator: &CredentialLocator) -> AccountConfigInput {
+        AccountConfigInput {
+            credential_key: locator.as_str().into(),
+            name: self.name,
+            address: self.address,
+            auth_kind: AccountAuthKind::AppPassword,
+            login_name: self.login_name,
+            imap_host: self.imap_host,
+            imap_port: self.imap_port,
+            accent_rgb: self.accent_rgb,
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AccountSetupMode {
+    Create,
+    #[allow(dead_code)]
+    ConfigureExisting {
+        account_id: AccountId,
+        expected_generation: AccountGeneration,
+    },
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum AccountOperation {
+    Setup {
+        request_id: RequestId,
+        mode: AccountSetupMode,
+        draft: AccountConfigDraft,
+        secret: Secret,
+    },
+    RetryCredential {
+        request_id: RequestId,
+        account_id: AccountId,
+        expected_generation: AccountGeneration,
+        secret: Secret,
+    },
+    Remove {
+        request_id: RequestId,
+        account_id: AccountId,
+        expected_generation: AccountGeneration,
+    },
+}
+
+impl AccountOperation {
+    pub(crate) fn request_id(&self) -> RequestId {
+        match self {
+            Self::Setup { request_id, .. }
+            | Self::RetryCredential { request_id, .. }
+            | Self::Remove { request_id, .. } => *request_id,
+        }
+    }
+}
+
+impl fmt::Debug for AccountOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Setup {
+                request_id,
+                mode,
+                draft,
+                ..
+            } => formatter
+                .debug_struct("Setup")
+                .field("request_id", request_id)
+                .field("mode", mode)
+                .field("draft", draft)
+                .field("secret", &"[REDACTED]")
+                .finish(),
+            Self::RetryCredential {
+                request_id,
+                account_id,
+                expected_generation,
+                ..
+            } => formatter
+                .debug_struct("RetryCredential")
+                .field("request_id", request_id)
+                .field("account_id", account_id)
+                .field("expected_generation", expected_generation)
+                .field("secret", &"[REDACTED]")
+                .finish(),
+            Self::Remove {
+                request_id,
+                account_id,
+                expected_generation,
+            } => formatter
+                .debug_struct("Remove")
+                .field("request_id", request_id)
+                .field("account_id", account_id)
+                .field("expected_generation", expected_generation)
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AccountOperationSuccess {
+    Configured {
+        account_id: AccountId,
+        generation: AccountGeneration,
+    },
+    Removed {
+        account_id: AccountId,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AccountOperationFailure {
+    pub(crate) account_id: Option<AccountId>,
+    pub(crate) generation: Option<AccountGeneration>,
+    pub(crate) stage: AccountWorkflowStage,
+    pub(crate) kind: AccountWorkflowFailureKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AccountOperationReply {
+    pub(crate) request_id: RequestId,
+    pub(crate) result: Result<AccountOperationSuccess, AccountOperationFailure>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AccountWorkflowStage {
+    LoadConfiguration,
+    PersistLocator,
+    StoreCredential,
+    BeginRemoval,
+    DeleteCredential,
+    ConfirmRemoval,
+    PurgeRemoval,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AccountWorkflowFailureKind {
+    Busy,
+    Database(FailureKind),
+    Credential(CredentialFailureKind),
+    CredentialReplyClosed,
+    InvalidLocator,
+    UnexpectedReply,
+}
+
+pub(crate) enum AccountWorkflowRequest {
+    PersistAndStore {
+        write: Box<AccountWrite>,
+        secret: Secret,
+    },
+    RetryStore {
+        configuration: AccountConfiguration,
+        secret: Secret,
+    },
+    BeginRemove {
+        account_id: AccountId,
+        expected_generation: AccountGeneration,
+    },
+    ResumeRemove(AccountRemovalTicket),
+    ResumePurge {
+        account_id: AccountId,
+        expected_generation: AccountGeneration,
+    },
+}
+
+impl fmt::Debug for AccountWorkflowRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PersistAndStore { write, .. } => formatter
+                .debug_struct("PersistAndStore")
+                .field("write", &account_write_kind(write))
+                .field("secret", &"[REDACTED]")
+                .finish(),
+            Self::RetryStore { configuration, .. } => formatter
+                .debug_struct("RetryStore")
+                .field("account_id", &configuration.account_id)
+                .field("generation", &configuration.generation)
+                .field("secret", &"[REDACTED]")
+                .finish(),
+            Self::BeginRemove {
+                account_id,
+                expected_generation,
+            } => formatter
+                .debug_struct("BeginRemove")
+                .field("account_id", account_id)
+                .field("expected_generation", expected_generation)
+                .finish(),
+            Self::ResumeRemove(ticket) => formatter
+                .debug_struct("ResumeRemove")
+                .field("account_id", &ticket.account_id)
+                .field("generation", &ticket.generation)
+                .field("has_credential", &ticket.credential_key.is_some())
+                .finish(),
+            Self::ResumePurge {
+                account_id,
+                expected_generation,
+            } => formatter
+                .debug_struct("ResumePurge")
+                .field("account_id", account_id)
+                .field("expected_generation", expected_generation)
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AccountWorkflowStartFailureKind {
+    Busy,
+    UnsupportedWrite,
+    InvalidLocator,
+}
+
+pub(crate) struct AccountWorkflowStartFailure {
+    kind: AccountWorkflowStartFailureKind,
+    request: Box<AccountWorkflowRequest>,
+}
+
+impl AccountWorkflowStartFailure {
+    #[cfg(test)]
+    pub(crate) fn kind(&self) -> AccountWorkflowStartFailureKind {
+        self.kind
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_request(self) -> AccountWorkflowRequest {
+        *self.request
+    }
+}
+
+impl fmt::Debug for AccountWorkflowStartFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AccountWorkflowStartFailure")
+            .field("kind", &self.kind)
+            .field("request", &self.request)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum AccountWorkflowOutcome {
+    CredentialStored(AccountConfiguration),
+    CredentialPending {
+        configuration: AccountConfiguration,
+        failure: AccountWorkflowFailureKind,
+    },
+    AccountRemoved {
+        account_id: AccountId,
+    },
+    RemovalPending {
+        account_id: AccountId,
+        generation: AccountGeneration,
+        stage: AccountWorkflowStage,
+        failure: AccountWorkflowFailureKind,
+    },
+    Failed {
+        stage: AccountWorkflowStage,
+        failure: AccountWorkflowFailureKind,
+    },
+}
+
+impl fmt::Debug for AccountWorkflowOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CredentialStored(configuration) => formatter
+                .debug_struct("CredentialStored")
+                .field("account_id", &configuration.account_id)
+                .field("generation", &configuration.generation)
+                .finish(),
+            Self::CredentialPending {
+                configuration,
+                failure,
+            } => formatter
+                .debug_struct("CredentialPending")
+                .field("account_id", &configuration.account_id)
+                .field("generation", &configuration.generation)
+                .field("failure", failure)
+                .finish(),
+            Self::AccountRemoved { account_id } => formatter
+                .debug_struct("AccountRemoved")
+                .field("account_id", account_id)
+                .finish(),
+            Self::RemovalPending {
+                account_id,
+                generation,
+                stage,
+                failure,
+            } => formatter
+                .debug_struct("RemovalPending")
+                .field("account_id", account_id)
+                .field("generation", generation)
+                .field("stage", stage)
+                .field("failure", failure)
+                .finish(),
+            Self::Failed { stage, failure } => formatter
+                .debug_struct("Failed")
+                .field("stage", stage)
+                .field("failure", failure)
+                .finish(),
+        }
+    }
+}
+
+pub(crate) enum AccountWorkflowAction {
+    Database {
+        stage: AccountWorkflowStage,
+        write: Box<AccountWrite>,
+    },
+    Credential {
+        stage: AccountWorkflowStage,
+        operation: CredentialOperation,
+    },
+    Finished(AccountWorkflowOutcome),
+}
+
+impl fmt::Debug for AccountWorkflowAction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Database { stage, write } => formatter
+                .debug_struct("Database")
+                .field("stage", stage)
+                .field("write", &account_write_kind(write))
+                .finish(),
+            Self::Credential { stage, operation } => formatter
+                .debug_struct("Credential")
+                .field("stage", stage)
+                .field("operation", operation)
+                .finish(),
+            Self::Finished(outcome) => formatter.debug_tuple("Finished").field(outcome).finish(),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum AccountDatabaseCompletion {
+    Saved(AccountConfiguration),
+    RemovalStarted(AccountRemovalTicket),
+    Purged(AccountPurgeOutcome),
+    Failed(FailureKind),
+    Unexpected,
+}
+
+impl fmt::Debug for AccountDatabaseCompletion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Saved(_) => formatter.write_str("Saved([ACCOUNT])"),
+            Self::RemovalStarted(_) => formatter.write_str("RemovalStarted([TICKET])"),
+            Self::Purged(AccountPurgeOutcome::Pending { .. }) => {
+                formatter.write_str("Purged(Pending)")
+            }
+            Self::Purged(AccountPurgeOutcome::Complete(_)) => {
+                formatter.write_str("Purged(Complete)")
+            }
+            Self::Failed(kind) => formatter.debug_tuple("Failed").field(kind).finish(),
+            Self::Unexpected => formatter.write_str("Unexpected"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AccountCredentialCompletion {
+    Stored,
+    Deleted(CredentialDeleteOutcome),
+    Failed(CredentialFailureKind),
+    ReplyClosed,
+    Unexpected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AccountTransitionError {
+    Idle,
+    ExpectedDatabase(AccountWorkflowStage),
+    ExpectedCredential(AccountWorkflowStage),
+}
+
+#[derive(Default)]
+pub(crate) struct AccountCoordinator {
+    active: Option<ActiveWorkflow>,
+}
+
+impl AccountCoordinator {
+    pub(crate) fn try_start(
+        &mut self,
+        request: AccountWorkflowRequest,
+    ) -> Result<AccountWorkflowAction, AccountWorkflowStartFailure> {
+        if self.active.is_some() {
+            return Err(AccountWorkflowStartFailure {
+                kind: AccountWorkflowStartFailureKind::Busy,
+                request: Box::new(request),
+            });
+        }
+
+        match request {
+            AccountWorkflowRequest::PersistAndStore { write, secret } => {
+                let Some(key) = persisted_credential_key(&write) else {
+                    return Err(AccountWorkflowStartFailure {
+                        kind: AccountWorkflowStartFailureKind::UnsupportedWrite,
+                        request: Box::new(AccountWorkflowRequest::PersistAndStore {
+                            write,
+                            secret,
+                        }),
+                    });
+                };
+                let locator = match CredentialLocator::parse(key) {
+                    Ok(locator) => locator,
+                    Err(_) => {
+                        return Err(AccountWorkflowStartFailure {
+                            kind: AccountWorkflowStartFailureKind::InvalidLocator,
+                            request: Box::new(AccountWorkflowRequest::PersistAndStore {
+                                write,
+                                secret,
+                            }),
+                        });
+                    }
+                };
+                self.active = Some(ActiveWorkflow::Persisting { locator, secret });
+                Ok(AccountWorkflowAction::Database {
+                    stage: AccountWorkflowStage::PersistLocator,
+                    write,
+                })
+            }
+            AccountWorkflowRequest::RetryStore {
+                configuration,
+                secret,
+            } => {
+                let locator = match CredentialLocator::parse(&configuration.credential_key) {
+                    Ok(locator) => locator,
+                    Err(_) => {
+                        return Err(AccountWorkflowStartFailure {
+                            kind: AccountWorkflowStartFailureKind::InvalidLocator,
+                            request: Box::new(AccountWorkflowRequest::RetryStore {
+                                configuration,
+                                secret,
+                            }),
+                        });
+                    }
+                };
+                self.active = Some(ActiveWorkflow::Storing { configuration });
+                Ok(AccountWorkflowAction::Credential {
+                    stage: AccountWorkflowStage::StoreCredential,
+                    operation: CredentialOperation::Store { locator, secret },
+                })
+            }
+            AccountWorkflowRequest::BeginRemove {
+                account_id,
+                expected_generation,
+            } => {
+                self.active = Some(ActiveWorkflow::BeginningRemoval { account_id });
+                Ok(AccountWorkflowAction::Database {
+                    stage: AccountWorkflowStage::BeginRemoval,
+                    write: Box::new(AccountWrite::BeginRemove {
+                        account_id,
+                        expected_generation,
+                    }),
+                })
+            }
+            AccountWorkflowRequest::ResumeRemove(ticket) => self.resume_removal(ticket),
+            AccountWorkflowRequest::ResumePurge {
+                account_id,
+                expected_generation,
+            } => Ok(self.purge(account_id, expected_generation)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stage(&self) -> Option<AccountWorkflowStage> {
+        self.active.as_ref().map(ActiveWorkflow::stage)
+    }
+
+    pub(crate) fn database_completed(
+        &mut self,
+        completion: AccountDatabaseCompletion,
+    ) -> Result<AccountWorkflowAction, AccountTransitionError> {
+        let Some(active) = self.active.as_ref() else {
+            return Err(AccountTransitionError::Idle);
+        };
+        if !active.expects_database() {
+            return Err(AccountTransitionError::ExpectedCredential(active.stage()));
+        }
+        let active = self.active.take().expect("active workflow was checked");
+        Ok(match active {
+            ActiveWorkflow::Persisting { locator, secret } => {
+                self.complete_locator_persist(locator, secret, completion)
+            }
+            ActiveWorkflow::BeginningRemoval { account_id } => {
+                self.complete_begin_removal(account_id, completion)
+            }
+            ActiveWorkflow::Confirming { ticket } => {
+                self.complete_removal_confirmation(ticket, completion)
+            }
+            ActiveWorkflow::Purging {
+                account_id,
+                generation,
+            } => self.complete_purge(account_id, generation, completion),
+            ActiveWorkflow::Storing { .. } | ActiveWorkflow::Deleting { .. } => {
+                unreachable!("credential stages were rejected before taking the workflow")
+            }
+        })
+    }
+
+    pub(crate) fn credential_completed(
+        &mut self,
+        completion: AccountCredentialCompletion,
+    ) -> Result<AccountWorkflowAction, AccountTransitionError> {
+        let Some(active) = self.active.as_ref() else {
+            return Err(AccountTransitionError::Idle);
+        };
+        if active.expects_database() {
+            return Err(AccountTransitionError::ExpectedDatabase(active.stage()));
+        }
+        let active = self.active.take().expect("active workflow was checked");
+        Ok(match active {
+            ActiveWorkflow::Storing { configuration } => complete_store(configuration, completion),
+            ActiveWorkflow::Deleting { ticket } => self.complete_delete(ticket, completion),
+            ActiveWorkflow::Persisting { .. }
+            | ActiveWorkflow::BeginningRemoval { .. }
+            | ActiveWorkflow::Confirming { .. }
+            | ActiveWorkflow::Purging { .. } => {
+                unreachable!("database stages were rejected before taking the workflow")
+            }
+        })
+    }
+
+    fn resume_removal(
+        &mut self,
+        ticket: AccountRemovalTicket,
+    ) -> Result<AccountWorkflowAction, AccountWorkflowStartFailure> {
+        let Some(key) = ticket.credential_key.as_deref() else {
+            return Ok(self.purge(ticket.account_id, ticket.generation));
+        };
+        let locator = match CredentialLocator::parse(key) {
+            Ok(locator) => locator,
+            Err(_) => {
+                return Err(AccountWorkflowStartFailure {
+                    kind: AccountWorkflowStartFailureKind::InvalidLocator,
+                    request: Box::new(AccountWorkflowRequest::ResumeRemove(ticket)),
+                });
+            }
+        };
+        self.active = Some(ActiveWorkflow::Deleting { ticket });
+        Ok(AccountWorkflowAction::Credential {
+            stage: AccountWorkflowStage::DeleteCredential,
+            operation: CredentialOperation::Delete { locator },
+        })
+    }
+
+    fn complete_locator_persist(
+        &mut self,
+        locator: CredentialLocator,
+        secret: Secret,
+        completion: AccountDatabaseCompletion,
+    ) -> AccountWorkflowAction {
+        match completion {
+            AccountDatabaseCompletion::Saved(configuration)
+                if configuration.credential_key.as_ref() == locator.as_str() =>
+            {
+                self.active = Some(ActiveWorkflow::Storing { configuration });
+                AccountWorkflowAction::Credential {
+                    stage: AccountWorkflowStage::StoreCredential,
+                    operation: CredentialOperation::Store { locator, secret },
+                }
+            }
+            AccountDatabaseCompletion::Failed(kind) => failed(
+                AccountWorkflowStage::PersistLocator,
+                AccountWorkflowFailureKind::Database(kind),
+            ),
+            AccountDatabaseCompletion::Saved(_)
+            | AccountDatabaseCompletion::RemovalStarted(_)
+            | AccountDatabaseCompletion::Purged(_)
+            | AccountDatabaseCompletion::Unexpected => failed(
+                AccountWorkflowStage::PersistLocator,
+                AccountWorkflowFailureKind::UnexpectedReply,
+            ),
+        }
+    }
+
+    fn complete_begin_removal(
+        &mut self,
+        account_id: AccountId,
+        completion: AccountDatabaseCompletion,
+    ) -> AccountWorkflowAction {
+        match completion {
+            AccountDatabaseCompletion::RemovalStarted(ticket)
+                if ticket.account_id == account_id && ticket.credential_key.is_none() =>
+            {
+                self.purge(ticket.account_id, ticket.generation)
+            }
+            AccountDatabaseCompletion::RemovalStarted(ticket)
+                if ticket.account_id == account_id =>
+            {
+                let Some(key) = ticket.credential_key.as_deref() else {
+                    unreachable!("credential-free removal was handled above")
+                };
+                let locator = match CredentialLocator::parse(key) {
+                    Ok(locator) => locator,
+                    Err(_) => {
+                        return removal_pending(
+                            ticket,
+                            AccountWorkflowStage::DeleteCredential,
+                            AccountWorkflowFailureKind::InvalidLocator,
+                        );
+                    }
+                };
+                self.active = Some(ActiveWorkflow::Deleting { ticket });
+                AccountWorkflowAction::Credential {
+                    stage: AccountWorkflowStage::DeleteCredential,
+                    operation: CredentialOperation::Delete { locator },
+                }
+            }
+            AccountDatabaseCompletion::Failed(kind) => failed(
+                AccountWorkflowStage::BeginRemoval,
+                AccountWorkflowFailureKind::Database(kind),
+            ),
+            AccountDatabaseCompletion::Saved(_)
+            | AccountDatabaseCompletion::RemovalStarted(_)
+            | AccountDatabaseCompletion::Purged(_)
+            | AccountDatabaseCompletion::Unexpected => failed(
+                AccountWorkflowStage::BeginRemoval,
+                AccountWorkflowFailureKind::UnexpectedReply,
+            ),
+        }
+    }
+
+    fn complete_delete(
+        &mut self,
+        ticket: AccountRemovalTicket,
+        completion: AccountCredentialCompletion,
+    ) -> AccountWorkflowAction {
+        match completion {
+            AccountCredentialCompletion::Deleted(
+                CredentialDeleteOutcome::Deleted | CredentialDeleteOutcome::AlreadyMissing,
+            ) => {
+                let account_id = ticket.account_id;
+                let expected_generation = ticket.generation;
+                self.active = Some(ActiveWorkflow::Confirming { ticket });
+                AccountWorkflowAction::Database {
+                    stage: AccountWorkflowStage::ConfirmRemoval,
+                    write: Box::new(AccountWrite::ConfirmCredentialsRemoved {
+                        account_id,
+                        expected_generation,
+                    }),
+                }
+            }
+            AccountCredentialCompletion::Failed(kind) => removal_pending(
+                ticket,
+                AccountWorkflowStage::DeleteCredential,
+                AccountWorkflowFailureKind::Credential(kind),
+            ),
+            AccountCredentialCompletion::ReplyClosed => removal_pending(
+                ticket,
+                AccountWorkflowStage::DeleteCredential,
+                AccountWorkflowFailureKind::CredentialReplyClosed,
+            ),
+            AccountCredentialCompletion::Stored | AccountCredentialCompletion::Unexpected => {
+                removal_pending(
+                    ticket,
+                    AccountWorkflowStage::DeleteCredential,
+                    AccountWorkflowFailureKind::UnexpectedReply,
+                )
+            }
+        }
+    }
+
+    fn complete_removal_confirmation(
+        &mut self,
+        ticket: AccountRemovalTicket,
+        completion: AccountDatabaseCompletion,
+    ) -> AccountWorkflowAction {
+        match completion {
+            AccountDatabaseCompletion::Saved(configuration)
+                if configuration.account_id == ticket.account_id
+                    && configuration.lifecycle == AccountLifecycle::RemovingCache =>
+            {
+                self.purge(configuration.account_id, configuration.generation)
+            }
+            AccountDatabaseCompletion::Failed(kind) => removal_pending(
+                ticket,
+                AccountWorkflowStage::ConfirmRemoval,
+                AccountWorkflowFailureKind::Database(kind),
+            ),
+            AccountDatabaseCompletion::Saved(_)
+            | AccountDatabaseCompletion::RemovalStarted(_)
+            | AccountDatabaseCompletion::Purged(_)
+            | AccountDatabaseCompletion::Unexpected => removal_pending(
+                ticket,
+                AccountWorkflowStage::ConfirmRemoval,
+                AccountWorkflowFailureKind::UnexpectedReply,
+            ),
+        }
+    }
+
+    fn purge(
+        &mut self,
+        account_id: AccountId,
+        generation: AccountGeneration,
+    ) -> AccountWorkflowAction {
+        self.active = Some(ActiveWorkflow::Purging {
+            account_id,
+            generation,
+        });
+        AccountWorkflowAction::Database {
+            stage: AccountWorkflowStage::PurgeRemoval,
+            write: Box::new(AccountWrite::PurgeRemovedAccount {
+                account_id,
+                expected_generation: generation,
+            }),
+        }
+    }
+
+    fn complete_purge(
+        &mut self,
+        account_id: AccountId,
+        generation: AccountGeneration,
+        completion: AccountDatabaseCompletion,
+    ) -> AccountWorkflowAction {
+        match completion {
+            AccountDatabaseCompletion::Purged(AccountPurgeOutcome::Pending { .. }) => {
+                self.purge(account_id, generation)
+            }
+            AccountDatabaseCompletion::Purged(AccountPurgeOutcome::Complete(removed))
+                if removed.account_id == account_id =>
+            {
+                AccountWorkflowAction::Finished(AccountWorkflowOutcome::AccountRemoved {
+                    account_id,
+                })
+            }
+            AccountDatabaseCompletion::Failed(kind) => removal_pending_at(
+                account_id,
+                generation,
+                AccountWorkflowStage::PurgeRemoval,
+                AccountWorkflowFailureKind::Database(kind),
+            ),
+            AccountDatabaseCompletion::Saved(_)
+            | AccountDatabaseCompletion::RemovalStarted(_)
+            | AccountDatabaseCompletion::Purged(_)
+            | AccountDatabaseCompletion::Unexpected => removal_pending_at(
+                account_id,
+                generation,
+                AccountWorkflowStage::PurgeRemoval,
+                AccountWorkflowFailureKind::UnexpectedReply,
+            ),
+        }
+    }
+}
+
+enum ActiveWorkflow {
+    Persisting {
+        locator: CredentialLocator,
+        secret: Secret,
+    },
+    Storing {
+        configuration: AccountConfiguration,
+    },
+    BeginningRemoval {
+        account_id: AccountId,
+    },
+    Deleting {
+        ticket: AccountRemovalTicket,
+    },
+    Confirming {
+        ticket: AccountRemovalTicket,
+    },
+    Purging {
+        account_id: AccountId,
+        generation: AccountGeneration,
+    },
+}
+
+impl ActiveWorkflow {
+    fn stage(&self) -> AccountWorkflowStage {
+        match self {
+            Self::Persisting { .. } => AccountWorkflowStage::PersistLocator,
+            Self::Storing { .. } => AccountWorkflowStage::StoreCredential,
+            Self::BeginningRemoval { .. } => AccountWorkflowStage::BeginRemoval,
+            Self::Deleting { .. } => AccountWorkflowStage::DeleteCredential,
+            Self::Confirming { .. } => AccountWorkflowStage::ConfirmRemoval,
+            Self::Purging { .. } => AccountWorkflowStage::PurgeRemoval,
+        }
+    }
+
+    fn expects_database(&self) -> bool {
+        matches!(
+            self,
+            Self::Persisting { .. }
+                | Self::BeginningRemoval { .. }
+                | Self::Confirming { .. }
+                | Self::Purging { .. }
+        )
+    }
+}
+
+fn persisted_credential_key(write: &AccountWrite) -> Option<&str> {
+    match write {
+        AccountWrite::Create(input) | AccountWrite::ConfigureExisting { input, .. } => {
+            Some(&input.credential_key)
+        }
+        AccountWrite::Update { .. }
+        | AccountWrite::SetEnabled { .. }
+        | AccountWrite::BeginDiagnostic { .. }
+        | AccountWrite::RecordDiagnostic { .. }
+        | AccountWrite::BeginRemove { .. }
+        | AccountWrite::ConfirmCredentialsRemoved { .. }
+        | AccountWrite::PurgeRemovedAccount { .. } => None,
+    }
+}
+
+fn account_write_kind(write: &AccountWrite) -> &'static str {
+    match write {
+        AccountWrite::Create(_) => "Create",
+        AccountWrite::ConfigureExisting { .. } => "ConfigureExisting",
+        AccountWrite::Update { .. } => "Update",
+        AccountWrite::SetEnabled { .. } => "SetEnabled",
+        AccountWrite::BeginDiagnostic { .. } => "BeginDiagnostic",
+        AccountWrite::RecordDiagnostic { .. } => "RecordDiagnostic",
+        AccountWrite::BeginRemove { .. } => "BeginRemove",
+        AccountWrite::ConfirmCredentialsRemoved { .. } => "ConfirmCredentialsRemoved",
+        AccountWrite::PurgeRemovedAccount { .. } => "PurgeRemovedAccount",
+    }
+}
+
+fn complete_store(
+    configuration: AccountConfiguration,
+    completion: AccountCredentialCompletion,
+) -> AccountWorkflowAction {
+    match completion {
+        AccountCredentialCompletion::Stored => {
+            AccountWorkflowAction::Finished(AccountWorkflowOutcome::CredentialStored(configuration))
+        }
+        AccountCredentialCompletion::Failed(kind) => {
+            AccountWorkflowAction::Finished(AccountWorkflowOutcome::CredentialPending {
+                configuration,
+                failure: AccountWorkflowFailureKind::Credential(kind),
+            })
+        }
+        AccountCredentialCompletion::ReplyClosed => {
+            AccountWorkflowAction::Finished(AccountWorkflowOutcome::CredentialPending {
+                configuration,
+                failure: AccountWorkflowFailureKind::CredentialReplyClosed,
+            })
+        }
+        AccountCredentialCompletion::Deleted(_) | AccountCredentialCompletion::Unexpected => {
+            AccountWorkflowAction::Finished(AccountWorkflowOutcome::CredentialPending {
+                configuration,
+                failure: AccountWorkflowFailureKind::UnexpectedReply,
+            })
+        }
+    }
+}
+
+fn removal_pending(
+    ticket: AccountRemovalTicket,
+    stage: AccountWorkflowStage,
+    failure: AccountWorkflowFailureKind,
+) -> AccountWorkflowAction {
+    removal_pending_at(ticket.account_id, ticket.generation, stage, failure)
+}
+
+fn removal_pending_at(
+    account_id: AccountId,
+    generation: AccountGeneration,
+    stage: AccountWorkflowStage,
+    failure: AccountWorkflowFailureKind,
+) -> AccountWorkflowAction {
+    AccountWorkflowAction::Finished(AccountWorkflowOutcome::RemovalPending {
+        account_id,
+        generation,
+        stage,
+        failure,
+    })
+}
+
+fn failed(
+    stage: AccountWorkflowStage,
+    failure: AccountWorkflowFailureKind,
+) -> AccountWorkflowAction {
+    AccountWorkflowAction::Finished(AccountWorkflowOutcome::Failed { stage, failure })
+}
+
+pub(super) struct AccountWorkflows {
+    database: DatabaseClient,
+    credentials: CredentialClient,
+    recovery: RecoveryState,
+    active: Option<ActiveTask>,
+}
+
+impl AccountWorkflows {
+    pub(super) fn new(database: DatabaseClient, credentials: CredentialClient) -> Self {
+        Self {
+            database,
+            credentials,
+            recovery: RecoveryState::SubmitCredentialScan,
+            active: None,
+        }
+    }
+
+    pub(super) fn can_start_user_operation(&self) -> bool {
+        matches!(self.recovery, RecoveryState::Complete) && self.active.is_none()
+    }
+
+    pub(super) fn start_user_operation(
+        &mut self,
+        operation: AccountOperation,
+        reply: oneshot::Sender<AccountOperationReply>,
+    ) -> Result<(), AccountDriverError> {
+        debug_assert!(self.can_start_user_operation());
+        let request_id = operation.request_id();
+        match operation {
+            AccountOperation::Setup {
+                mode,
+                draft,
+                secret,
+                ..
+            } => {
+                let locator = match CredentialLocator::generate() {
+                    Ok(locator) => locator,
+                    Err(failure) => {
+                        let identity = setup_identity(mode);
+                        let _ = reply.send(AccountOperationReply {
+                            request_id,
+                            result: Err(AccountOperationFailure {
+                                account_id: identity.map(|identity| identity.0),
+                                generation: identity.map(|identity| identity.1),
+                                stage: AccountWorkflowStage::PersistLocator,
+                                kind: AccountWorkflowFailureKind::Credential(failure.kind),
+                            }),
+                        });
+                        return Ok(());
+                    }
+                };
+                let input = draft.into_input(&locator);
+                let (write, identity) = match mode {
+                    AccountSetupMode::Create => (AccountWrite::Create(input), Identity::default()),
+                    AccountSetupMode::ConfigureExisting {
+                        account_id,
+                        expected_generation,
+                    } => (
+                        AccountWrite::ConfigureExisting {
+                            account_id,
+                            expected_generation,
+                            input,
+                        },
+                        Identity::new(account_id, expected_generation),
+                    ),
+                };
+                self.active = Some(ActiveTask::start_workflow(
+                    AccountWorkflowRequest::PersistAndStore {
+                        write: Box::new(write),
+                        secret,
+                    },
+                    identity,
+                    Some(UserReply { request_id, reply }),
+                    &self.database,
+                    &self.credentials,
+                )?);
+            }
+            AccountOperation::RetryCredential {
+                account_id,
+                expected_generation,
+                secret,
+                ..
+            } => {
+                let receiver = match self.database.try_load_account(account_id) {
+                    Ok(receiver) => receiver,
+                    Err(DatabaseSubmitError::Busy) => {
+                        let _ = reply.send(AccountOperationReply {
+                            request_id,
+                            result: Err(AccountOperationFailure {
+                                account_id: Some(account_id),
+                                generation: Some(expected_generation),
+                                stage: AccountWorkflowStage::LoadConfiguration,
+                                kind: AccountWorkflowFailureKind::Busy,
+                            }),
+                        });
+                        return Ok(());
+                    }
+                    Err(DatabaseSubmitError::Closed) => {
+                        return Err(AccountDriverError::DatabaseClosed);
+                    }
+                };
+                self.active = Some(ActiveTask {
+                    identity: Identity::new(account_id, expected_generation),
+                    reply: Some(UserReply { request_id, reply }),
+                    state: ActiveTaskState::LoadingRetry {
+                        account_id,
+                        expected_generation,
+                        secret: Some(secret),
+                        receiver,
+                    },
+                });
+            }
+            AccountOperation::Remove {
+                account_id,
+                expected_generation,
+                ..
+            } => {
+                let receiver = match self.database.try_load_account(account_id) {
+                    Ok(receiver) => receiver,
+                    Err(DatabaseSubmitError::Busy) => {
+                        let _ = reply.send(AccountOperationReply {
+                            request_id,
+                            result: Err(AccountOperationFailure {
+                                account_id: Some(account_id),
+                                generation: Some(expected_generation),
+                                stage: AccountWorkflowStage::LoadConfiguration,
+                                kind: AccountWorkflowFailureKind::Busy,
+                            }),
+                        });
+                        return Ok(());
+                    }
+                    Err(DatabaseSubmitError::Closed) => {
+                        return Err(AccountDriverError::DatabaseClosed);
+                    }
+                };
+                self.active = Some(ActiveTask {
+                    identity: Identity::new(account_id, expected_generation),
+                    reply: Some(UserReply { request_id, reply }),
+                    state: ActiveTaskState::LoadingRemoval {
+                        account_id,
+                        expected_generation,
+                        receiver,
+                    },
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn poll_progress(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), AccountDriverError>> {
+        if let Some(active) = self.active.as_mut() {
+            match active.poll_one(&self.database, &self.credentials, context) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(TaskProgress::Advanced)) => return Poll::Ready(Ok(())),
+                Poll::Ready(Ok(TaskProgress::Finished(outcome))) => {
+                    let mut active = self.active.take().expect("active account task was polled");
+                    if let Some(user) = active.reply.take() {
+                        let _ = user.reply.send(AccountOperationReply {
+                            request_id: user.request_id,
+                            result: project_outcome(outcome, active.identity),
+                        });
+                    }
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            }
+        }
+
+        match &mut self.recovery {
+            RecoveryState::SubmitCredentialScan => {
+                match self.database.try_load_pending_credential_removals() {
+                    Ok(receiver) => {
+                        self.recovery = RecoveryState::LoadingCredentialScan(receiver);
+                        context.waker().wake_by_ref();
+                        Poll::Ready(Ok(()))
+                    }
+                    Err(DatabaseSubmitError::Busy) => {
+                        self.recovery = RecoveryState::WaitingCredentialSubmit(Box::pin(
+                            time::sleep(RECOVERY_SUBMISSION_RETRY),
+                        ));
+                        Poll::Ready(Ok(()))
+                    }
+                    Err(DatabaseSubmitError::Closed) => {
+                        Poll::Ready(Err(AccountDriverError::DatabaseClosed))
+                    }
+                }
+            }
+            RecoveryState::WaitingCredentialSubmit(delay) => match delay.as_mut().poll(context) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(()) => {
+                    self.recovery = RecoveryState::SubmitCredentialScan;
+                    context.waker().wake_by_ref();
+                    Poll::Ready(Ok(()))
+                }
+            },
+            RecoveryState::SubmitCacheScan(requests) => {
+                match self.database.try_load_pending_cache_removals() {
+                    Ok(receiver) => {
+                        self.recovery = RecoveryState::LoadingCacheScan {
+                            requests: std::mem::take(requests),
+                            receiver,
+                        };
+                        context.waker().wake_by_ref();
+                        Poll::Ready(Ok(()))
+                    }
+                    Err(DatabaseSubmitError::Busy) => {
+                        self.recovery = RecoveryState::WaitingCacheSubmit {
+                            requests: std::mem::take(requests),
+                            delay: Box::pin(time::sleep(RECOVERY_SUBMISSION_RETRY)),
+                        };
+                        Poll::Ready(Ok(()))
+                    }
+                    Err(DatabaseSubmitError::Closed) => {
+                        Poll::Ready(Err(AccountDriverError::DatabaseClosed))
+                    }
+                }
+            }
+            RecoveryState::WaitingCacheSubmit { requests, delay } => {
+                match delay.as_mut().poll(context) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(()) => {
+                        self.recovery = RecoveryState::SubmitCacheScan(std::mem::take(requests));
+                        context.waker().wake_by_ref();
+                        Poll::Ready(Ok(()))
+                    }
+                }
+            }
+            RecoveryState::LoadingCredentialScan(receiver) => {
+                let removals = match Pin::new(receiver).poll(context) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(Ok(removals))) => removals,
+                    Poll::Ready(Ok(Err(failure))) => {
+                        return Poll::Ready(Err(AccountDriverError::Recovery(failure.kind)));
+                    }
+                    Poll::Ready(Err(_)) => {
+                        return Poll::Ready(Err(AccountDriverError::DatabaseClosed));
+                    }
+                };
+                let mut requests = VecDeque::with_capacity(removals.len());
+                for removal in removals {
+                    requests.push_back(AccountWorkflowRequest::ResumeRemove(
+                        AccountRemovalTicket {
+                            account_id: removal.account_id,
+                            generation: removal.configuration_generation,
+                            credential_key: Some(removal.credential_key),
+                        },
+                    ));
+                }
+                self.recovery = RecoveryState::SubmitCacheScan(requests);
+                context.waker().wake_by_ref();
+                Poll::Ready(Ok(()))
+            }
+            RecoveryState::LoadingCacheScan { requests, receiver } => {
+                let removals = match Pin::new(receiver).poll(context) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(Ok(removals))) => removals,
+                    Poll::Ready(Ok(Err(failure))) => {
+                        return Poll::Ready(Err(AccountDriverError::Recovery(failure.kind)));
+                    }
+                    Poll::Ready(Err(_)) => {
+                        return Poll::Ready(Err(AccountDriverError::DatabaseClosed));
+                    }
+                };
+                let mut queued = std::mem::take(requests);
+                for removal in removals {
+                    queued.push_back(AccountWorkflowRequest::ResumePurge {
+                        account_id: removal.account_id,
+                        expected_generation: removal.configuration_generation,
+                    });
+                }
+                self.recovery = RecoveryState::Queued(queued);
+                context.waker().wake_by_ref();
+                Poll::Ready(Ok(()))
+            }
+            RecoveryState::Queued(requests) => {
+                let Some(request) = requests.pop_front() else {
+                    self.recovery = RecoveryState::Complete;
+                    return Poll::Ready(Ok(()));
+                };
+                let identity = request_identity(&request);
+                match ActiveTask::start_workflow(
+                    request,
+                    identity,
+                    None,
+                    &self.database,
+                    &self.credentials,
+                ) {
+                    Ok(active) => self.active = Some(active),
+                    Err(AccountDriverError::WorkflowRejected) => {}
+                    Err(error) => return Poll::Ready(Err(error)),
+                }
+                context.waker().wake_by_ref();
+                Poll::Ready(Ok(()))
+            }
+            RecoveryState::Complete => Poll::Pending,
+        }
+    }
+}
+
+fn setup_identity(mode: AccountSetupMode) -> Option<(AccountId, AccountGeneration)> {
+    match mode {
+        AccountSetupMode::Create => None,
+        AccountSetupMode::ConfigureExisting {
+            account_id,
+            expected_generation,
+        } => Some((account_id, expected_generation)),
+    }
+}
+
+enum RecoveryState {
+    SubmitCredentialScan,
+    WaitingCredentialSubmit(Pin<Box<Sleep>>),
+    LoadingCredentialScan(
+        oneshot::Receiver<Result<Box<[PendingCredentialRemoval]>, crate::store::sqlite::DbFailure>>,
+    ),
+    SubmitCacheScan(VecDeque<AccountWorkflowRequest>),
+    WaitingCacheSubmit {
+        requests: VecDeque<AccountWorkflowRequest>,
+        delay: Pin<Box<Sleep>>,
+    },
+    LoadingCacheScan {
+        requests: VecDeque<AccountWorkflowRequest>,
+        receiver:
+            oneshot::Receiver<Result<Box<[PendingCacheRemoval]>, crate::store::sqlite::DbFailure>>,
+    },
+    Queued(VecDeque<AccountWorkflowRequest>),
+    Complete,
+}
+
+struct UserReply {
+    request_id: RequestId,
+    reply: oneshot::Sender<AccountOperationReply>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Identity {
+    account_id: Option<AccountId>,
+    generation: Option<AccountGeneration>,
+}
+
+impl Identity {
+    fn new(account_id: AccountId, generation: AccountGeneration) -> Self {
+        Self {
+            account_id: Some(account_id),
+            generation: Some(generation),
+        }
+    }
+}
+
+struct ActiveTask {
+    identity: Identity,
+    reply: Option<UserReply>,
+    state: ActiveTaskState,
+}
+
+enum ActiveTaskState {
+    LoadingRetry {
+        account_id: AccountId,
+        expected_generation: AccountGeneration,
+        secret: Option<Secret>,
+        receiver: oneshot::Receiver<Result<AccountRecord, crate::store::sqlite::DbFailure>>,
+    },
+    LoadingRemoval {
+        account_id: AccountId,
+        expected_generation: AccountGeneration,
+        receiver: oneshot::Receiver<Result<AccountRecord, crate::store::sqlite::DbFailure>>,
+    },
+    Workflow(Box<DrivenWorkflow>),
+}
+
+impl ActiveTask {
+    fn start_workflow(
+        request: AccountWorkflowRequest,
+        identity: Identity,
+        reply: Option<UserReply>,
+        database: &DatabaseClient,
+        credentials: &CredentialClient,
+    ) -> Result<Self, AccountDriverError> {
+        let workflow = DrivenWorkflow::start(request, database, credentials)?;
+        Ok(Self {
+            identity,
+            reply,
+            state: ActiveTaskState::Workflow(Box::new(workflow)),
+        })
+    }
+
+    fn poll_one(
+        &mut self,
+        database: &DatabaseClient,
+        credentials: &CredentialClient,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<TaskProgress, AccountDriverError>> {
+        match &mut self.state {
+            ActiveTaskState::LoadingRetry {
+                account_id,
+                expected_generation,
+                secret,
+                receiver,
+            } => {
+                let record = match Pin::new(receiver).poll(context) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(Ok(record))) => record,
+                    Poll::Ready(Ok(Err(failure))) => {
+                        return Poll::Ready(Ok(TaskProgress::Finished(
+                            AccountWorkflowOutcome::Failed {
+                                stage: AccountWorkflowStage::LoadConfiguration,
+                                failure: AccountWorkflowFailureKind::Database(failure.kind),
+                            },
+                        )));
+                    }
+                    Poll::Ready(Err(_)) => {
+                        return Poll::Ready(Err(AccountDriverError::DatabaseClosed));
+                    }
+                };
+                let AccountRecord::Configured(configuration) = record else {
+                    return Poll::Ready(Ok(TaskProgress::Finished(
+                        AccountWorkflowOutcome::Failed {
+                            stage: AccountWorkflowStage::LoadConfiguration,
+                            failure: AccountWorkflowFailureKind::Database(FailureKind::Conflict),
+                        },
+                    )));
+                };
+                if configuration.account_id != *account_id
+                    || configuration.generation != *expected_generation
+                    || configuration.auth_kind != AccountAuthKind::AppPassword
+                    || !matches!(
+                        configuration.lifecycle,
+                        AccountLifecycle::Active | AccountLifecycle::Disabled
+                    )
+                {
+                    return Poll::Ready(Ok(TaskProgress::Finished(
+                        AccountWorkflowOutcome::Failed {
+                            stage: AccountWorkflowStage::LoadConfiguration,
+                            failure: AccountWorkflowFailureKind::Database(FailureKind::Conflict),
+                        },
+                    )));
+                }
+                self.identity = Identity::new(configuration.account_id, configuration.generation);
+                let secret = secret.take().expect("retry secret is consumed once");
+                let workflow = DrivenWorkflow::start(
+                    AccountWorkflowRequest::RetryStore {
+                        configuration,
+                        secret,
+                    },
+                    database,
+                    credentials,
+                )?;
+                self.state = ActiveTaskState::Workflow(Box::new(workflow));
+                context.waker().wake_by_ref();
+                Poll::Ready(Ok(TaskProgress::Advanced))
+            }
+            ActiveTaskState::LoadingRemoval {
+                account_id,
+                expected_generation,
+                receiver,
+            } => {
+                let record = match Pin::new(receiver).poll(context) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(Ok(record))) => record,
+                    Poll::Ready(Ok(Err(failure))) => {
+                        return Poll::Ready(Ok(TaskProgress::Finished(
+                            AccountWorkflowOutcome::Failed {
+                                stage: AccountWorkflowStage::LoadConfiguration,
+                                failure: AccountWorkflowFailureKind::Database(failure.kind),
+                            },
+                        )));
+                    }
+                    Poll::Ready(Err(_)) => {
+                        return Poll::Ready(Err(AccountDriverError::DatabaseClosed));
+                    }
+                };
+                let request = match record {
+                    AccountRecord::Configured(configuration)
+                        if configuration.account_id == *account_id
+                            && configuration.generation == *expected_generation =>
+                    {
+                        match configuration.lifecycle {
+                            AccountLifecycle::Active | AccountLifecycle::Disabled => {
+                                AccountWorkflowRequest::BeginRemove {
+                                    account_id: *account_id,
+                                    expected_generation: *expected_generation,
+                                }
+                            }
+                            AccountLifecycle::RemovingCredentials => {
+                                AccountWorkflowRequest::ResumeRemove(AccountRemovalTicket {
+                                    account_id: configuration.account_id,
+                                    generation: configuration.generation,
+                                    credential_key: Some(configuration.credential_key),
+                                })
+                            }
+                            AccountLifecycle::RemovingCache => {
+                                AccountWorkflowRequest::ResumePurge {
+                                    account_id: configuration.account_id,
+                                    expected_generation: configuration.generation,
+                                }
+                            }
+                        }
+                    }
+                    AccountRecord::NeedsSetup(target)
+                        if target.account_id == *account_id
+                            && target.generation == *expected_generation =>
+                    {
+                        if target.removal_pending {
+                            AccountWorkflowRequest::ResumePurge {
+                                account_id: target.account_id,
+                                expected_generation: target.generation,
+                            }
+                        } else {
+                            AccountWorkflowRequest::BeginRemove {
+                                account_id: target.account_id,
+                                expected_generation: target.generation,
+                            }
+                        }
+                    }
+                    AccountRecord::Configured(_) | AccountRecord::NeedsSetup(_) => {
+                        return Poll::Ready(Ok(TaskProgress::Finished(
+                            AccountWorkflowOutcome::Failed {
+                                stage: AccountWorkflowStage::LoadConfiguration,
+                                failure: AccountWorkflowFailureKind::Database(
+                                    FailureKind::Conflict,
+                                ),
+                            },
+                        )));
+                    }
+                };
+                let workflow = DrivenWorkflow::start(request, database, credentials)?;
+                self.state = ActiveTaskState::Workflow(Box::new(workflow));
+                context.waker().wake_by_ref();
+                Poll::Ready(Ok(TaskProgress::Advanced))
+            }
+            ActiveTaskState::Workflow(workflow) => {
+                let progress = workflow.poll_one(database, credentials, context);
+                if let Poll::Ready(Ok(TaskProgress::Advanced)) = &progress
+                    && let Some(identity) = workflow.identity()
+                {
+                    self.identity = identity;
+                }
+                progress
+            }
+        }
+    }
+}
+
+enum TaskProgress {
+    Advanced,
+    Finished(AccountWorkflowOutcome),
+}
+
+struct DrivenWorkflow {
+    coordinator: AccountCoordinator,
+    pending: PendingAction,
+    identity: Identity,
+}
+
+enum PendingAction {
+    Database(oneshot::Receiver<AccountWriteReply>),
+    Credential(CredentialResponse),
+    Finished(Option<AccountWorkflowOutcome>),
+}
+
+impl DrivenWorkflow {
+    fn start(
+        request: AccountWorkflowRequest,
+        database: &DatabaseClient,
+        credentials: &CredentialClient,
+    ) -> Result<Self, AccountDriverError> {
+        let identity = request_identity(&request);
+        let mut coordinator = AccountCoordinator::default();
+        let action = coordinator
+            .try_start(request)
+            .map_err(|_| AccountDriverError::WorkflowRejected)?;
+        let pending = dispatch_action(action, database, credentials)?;
+        Ok(Self {
+            coordinator,
+            pending,
+            identity,
+        })
+    }
+
+    fn identity(&self) -> Option<Identity> {
+        self.identity.account_id.map(|_| self.identity)
+    }
+
+    fn poll_one(
+        &mut self,
+        database: &DatabaseClient,
+        credentials: &CredentialClient,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<TaskProgress, AccountDriverError>> {
+        let action = match &mut self.pending {
+            PendingAction::Database(receiver) => {
+                let completion = match Pin::new(receiver).poll(context) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(reply)) => map_database_reply(reply, &mut self.identity),
+                    Poll::Ready(Err(_)) => {
+                        return Poll::Ready(Err(AccountDriverError::DatabaseClosed));
+                    }
+                };
+                self.coordinator
+                    .database_completed(completion)
+                    .map_err(|_| AccountDriverError::WorkflowRejected)?
+            }
+            PendingAction::Credential(response) => {
+                let completion = match Pin::new(response).poll(context) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(reply)) => map_credential_reply(reply),
+                    Poll::Ready(Err(_)) => AccountCredentialCompletion::ReplyClosed,
+                };
+                self.coordinator
+                    .credential_completed(completion)
+                    .map_err(|_| AccountDriverError::WorkflowRejected)?
+            }
+            PendingAction::Finished(outcome) => {
+                return Poll::Ready(Ok(TaskProgress::Finished(
+                    outcome.take().expect("finished workflow is consumed once"),
+                )));
+            }
+        };
+
+        match action {
+            AccountWorkflowAction::Finished(outcome) => {
+                Poll::Ready(Ok(TaskProgress::Finished(outcome)))
+            }
+            action => {
+                self.pending = dispatch_action(action, database, credentials)?;
+                context.waker().wake_by_ref();
+                Poll::Ready(Ok(TaskProgress::Advanced))
+            }
+        }
+    }
+}
+
+fn dispatch_action(
+    action: AccountWorkflowAction,
+    database: &DatabaseClient,
+    credentials: &CredentialClient,
+) -> Result<PendingAction, AccountDriverError> {
+    match action {
+        AccountWorkflowAction::Database { stage, write } => {
+            match database.try_write_account(write) {
+                Ok(receiver) => Ok(PendingAction::Database(receiver)),
+                Err(failure) if failure.reason() == DatabaseSubmitError::Busy => Ok(
+                    PendingAction::Finished(Some(AccountWorkflowOutcome::Failed {
+                        stage,
+                        failure: AccountWorkflowFailureKind::Busy,
+                    })),
+                ),
+                Err(_) => Err(AccountDriverError::DatabaseClosed),
+            }
+        }
+        AccountWorkflowAction::Credential { stage, operation } => {
+            match credentials.try_submit(operation) {
+                Ok(response) => Ok(PendingAction::Credential(response)),
+                Err(failure) if failure.reason() == CredentialSubmitError::Busy => Ok(
+                    PendingAction::Finished(Some(AccountWorkflowOutcome::Failed {
+                        stage,
+                        failure: AccountWorkflowFailureKind::Busy,
+                    })),
+                ),
+                Err(_) => Ok(PendingAction::Finished(Some(
+                    AccountWorkflowOutcome::Failed {
+                        stage,
+                        failure: AccountWorkflowFailureKind::CredentialReplyClosed,
+                    },
+                ))),
+            }
+        }
+        AccountWorkflowAction::Finished(outcome) => Ok(PendingAction::Finished(Some(outcome))),
+    }
+}
+
+fn map_database_reply(
+    reply: AccountWriteReply,
+    identity: &mut Identity,
+) -> AccountDatabaseCompletion {
+    match reply {
+        Ok(AccountWriteOutcome::Saved(configuration)) => {
+            *identity = Identity::new(configuration.account_id, configuration.generation);
+            AccountDatabaseCompletion::Saved(configuration)
+        }
+        Ok(AccountWriteOutcome::RemovalStarted(ticket)) => {
+            *identity = Identity::new(ticket.account_id, ticket.generation);
+            AccountDatabaseCompletion::RemovalStarted(ticket)
+        }
+        Ok(AccountWriteOutcome::Purged(outcome)) => AccountDatabaseCompletion::Purged(outcome),
+        Ok(AccountWriteOutcome::DiagnosticStarted(_) | AccountWriteOutcome::Diagnostic(_)) => {
+            AccountDatabaseCompletion::Unexpected
+        }
+        Err(failure) => AccountDatabaseCompletion::Failed(failure.failure().kind),
+    }
+}
+
+fn map_credential_reply(
+    reply: Result<CredentialOutcome, crate::credentials::CredentialFailure>,
+) -> AccountCredentialCompletion {
+    match reply {
+        Ok(CredentialOutcome::Stored) => AccountCredentialCompletion::Stored,
+        Ok(CredentialOutcome::Deleted(outcome)) => AccountCredentialCompletion::Deleted(outcome),
+        Ok(CredentialOutcome::Loaded(_)) => AccountCredentialCompletion::Unexpected,
+        Err(failure) => AccountCredentialCompletion::Failed(failure.kind),
+    }
+}
+
+fn request_identity(request: &AccountWorkflowRequest) -> Identity {
+    match request {
+        AccountWorkflowRequest::PersistAndStore { .. } => Identity::default(),
+        AccountWorkflowRequest::RetryStore { configuration, .. } => {
+            Identity::new(configuration.account_id, configuration.generation)
+        }
+        AccountWorkflowRequest::BeginRemove {
+            account_id,
+            expected_generation,
+        }
+        | AccountWorkflowRequest::ResumePurge {
+            account_id,
+            expected_generation,
+        } => Identity::new(*account_id, *expected_generation),
+        AccountWorkflowRequest::ResumeRemove(ticket) => {
+            Identity::new(ticket.account_id, ticket.generation)
+        }
+    }
+}
+
+fn project_outcome(
+    outcome: AccountWorkflowOutcome,
+    identity: Identity,
+) -> Result<AccountOperationSuccess, AccountOperationFailure> {
+    match outcome {
+        AccountWorkflowOutcome::CredentialStored(configuration) => {
+            Ok(AccountOperationSuccess::Configured {
+                account_id: configuration.account_id,
+                generation: configuration.generation,
+            })
+        }
+        AccountWorkflowOutcome::CredentialPending {
+            configuration,
+            failure,
+        } => Err(AccountOperationFailure {
+            account_id: Some(configuration.account_id),
+            generation: Some(configuration.generation),
+            stage: AccountWorkflowStage::StoreCredential,
+            kind: failure,
+        }),
+        AccountWorkflowOutcome::AccountRemoved { account_id } => {
+            Ok(AccountOperationSuccess::Removed { account_id })
+        }
+        AccountWorkflowOutcome::RemovalPending {
+            account_id,
+            generation,
+            stage,
+            failure,
+        } => Err(AccountOperationFailure {
+            account_id: Some(account_id),
+            generation: Some(generation),
+            stage,
+            kind: failure,
+        }),
+        AccountWorkflowOutcome::Failed { stage, failure } => Err(AccountOperationFailure {
+            account_id: identity.account_id,
+            generation: identity.generation,
+            stage,
+            kind: failure,
+        }),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AccountDriverError {
+    DatabaseClosed,
+    Recovery(FailureKind),
+    WorkflowRejected,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::sqlite::{
+        AccountAuthKind, AccountConfigInput, AccountDiagnostic, RemovedAccount,
+    };
+
+    const KEY: &str = "0123456789abcdef0123456789abcdef";
+
+    fn account_id() -> AccountId {
+        AccountId::new(7).unwrap()
+    }
+
+    fn generation(value: i64) -> AccountGeneration {
+        AccountGeneration::new(value).unwrap()
+    }
+
+    fn input(key: &str) -> AccountConfigInput {
+        AccountConfigInput::new(
+            key,
+            "Personal",
+            "person@example.test",
+            AccountAuthKind::AppPassword,
+            "person@example.test",
+            "imap.example.test",
+            993,
+            0x336699,
+        )
+        .unwrap()
+    }
+
+    fn configuration(generation: i64, lifecycle: AccountLifecycle) -> AccountConfiguration {
+        AccountConfiguration {
+            account_id: account_id(),
+            generation: self::generation(generation),
+            credential_key: KEY.into(),
+            name: "Personal".into(),
+            address: "person@example.test".into(),
+            auth_kind: AccountAuthKind::AppPassword,
+            login_name: "person@example.test".into(),
+            imap_host: "imap.example.test".into(),
+            imap_port: 993,
+            accent_rgb: 0x336699,
+            lifecycle,
+            diagnostic: AccountDiagnostic::Never,
+        }
+    }
+
+    fn ticket() -> AccountRemovalTicket {
+        AccountRemovalTicket {
+            account_id: account_id(),
+            generation: generation(2),
+            credential_key: Some(KEY.into()),
+        }
+    }
+
+    fn secret() -> Secret {
+        Secret::new(b"not-a-real-password".to_vec()).unwrap()
+    }
+
+    #[test]
+    fn setup_persists_locator_before_storing_secret() {
+        let mut coordinator = AccountCoordinator::default();
+        let action = coordinator
+            .try_start(AccountWorkflowRequest::PersistAndStore {
+                write: Box::new(AccountWrite::Create(input(KEY))),
+                secret: secret(),
+            })
+            .unwrap();
+        assert!(matches!(
+            action,
+            AccountWorkflowAction::Database {
+                stage: AccountWorkflowStage::PersistLocator,
+                write
+            } if matches!(*write, AccountWrite::Create(_))
+        ));
+
+        let action = coordinator
+            .database_completed(AccountDatabaseCompletion::Saved(configuration(
+                1,
+                AccountLifecycle::Active,
+            )))
+            .unwrap();
+        assert!(matches!(
+            action,
+            AccountWorkflowAction::Credential {
+                stage: AccountWorkflowStage::StoreCredential,
+                operation: CredentialOperation::Store { locator, secret }
+            } if locator.as_str() == KEY && secret.expose() == b"not-a-real-password"
+        ));
+
+        let action = coordinator
+            .credential_completed(AccountCredentialCompletion::Stored)
+            .unwrap();
+        assert!(matches!(
+            action,
+            AccountWorkflowAction::Finished(AccountWorkflowOutcome::CredentialStored(_))
+        ));
+        assert_eq!(coordinator.stage(), None);
+    }
+
+    #[test]
+    fn failed_store_keeps_configuration_for_explicit_retry() {
+        let mut coordinator = AccountCoordinator::default();
+        let saved = configuration(1, AccountLifecycle::Active);
+        let _ = coordinator
+            .try_start(AccountWorkflowRequest::RetryStore {
+                configuration: saved.clone(),
+                secret: secret(),
+            })
+            .unwrap();
+        let action = coordinator
+            .credential_completed(AccountCredentialCompletion::Failed(
+                CredentialFailureKind::LockedOrDenied,
+            ))
+            .unwrap();
+        let AccountWorkflowAction::Finished(AccountWorkflowOutcome::CredentialPending {
+            configuration,
+            failure,
+        }) = action
+        else {
+            panic!("store failure must leave a retryable configuration")
+        };
+        assert_eq!(configuration, saved);
+        assert_eq!(
+            failure,
+            AccountWorkflowFailureKind::Credential(CredentialFailureKind::LockedOrDenied)
+        );
+
+        assert!(matches!(
+            coordinator
+                .try_start(AccountWorkflowRequest::RetryStore {
+                    configuration,
+                    secret: secret(),
+                })
+                .unwrap(),
+            AccountWorkflowAction::Credential {
+                stage: AccountWorkflowStage::StoreCredential,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn delete_success_and_missing_are_the_only_confirmation_gate() {
+        for delete_outcome in [
+            CredentialDeleteOutcome::Deleted,
+            CredentialDeleteOutcome::AlreadyMissing,
+        ] {
+            let mut coordinator = AccountCoordinator::default();
+            let _ = coordinator
+                .try_start(AccountWorkflowRequest::BeginRemove {
+                    account_id: account_id(),
+                    expected_generation: generation(1),
+                })
+                .unwrap();
+            let action = coordinator
+                .database_completed(AccountDatabaseCompletion::RemovalStarted(ticket()))
+                .unwrap();
+            assert!(matches!(
+                action,
+                AccountWorkflowAction::Credential {
+                    stage: AccountWorkflowStage::DeleteCredential,
+                    operation: CredentialOperation::Delete { .. }
+                }
+            ));
+
+            let action = coordinator
+                .credential_completed(AccountCredentialCompletion::Deleted(delete_outcome))
+                .unwrap();
+            assert!(matches!(
+                action,
+                AccountWorkflowAction::Database {
+                    stage: AccountWorkflowStage::ConfirmRemoval,
+                    write
+                } if matches!(
+                    *write,
+                    AccountWrite::ConfirmCredentialsRemoved {
+                        account_id: id,
+                        expected_generation
+                    } if id == account_id() && expected_generation == generation(2)
+                )
+            ));
+        }
+    }
+
+    #[test]
+    fn credential_failures_and_wrong_replies_never_confirm_removal() {
+        for completion in [
+            AccountCredentialCompletion::Failed(CredentialFailureKind::Unavailable),
+            AccountCredentialCompletion::ReplyClosed,
+            AccountCredentialCompletion::Stored,
+            AccountCredentialCompletion::Unexpected,
+        ] {
+            let mut coordinator = AccountCoordinator::default();
+            let _ = coordinator
+                .try_start(AccountWorkflowRequest::ResumeRemove(ticket()))
+                .unwrap();
+            let action = coordinator.credential_completed(completion).unwrap();
+            assert!(matches!(
+                action,
+                AccountWorkflowAction::Finished(AccountWorkflowOutcome::RemovalPending { .. })
+            ));
+            assert_eq!(coordinator.stage(), None);
+        }
+    }
+
+    #[test]
+    fn accepted_removal_ignores_outer_receiver_closure() {
+        let (reply, receiver) = tokio::sync::oneshot::channel::<()>();
+        drop(receiver);
+        assert!(reply.is_closed());
+
+        let mut coordinator = AccountCoordinator::default();
+        let _ = coordinator
+            .try_start(AccountWorkflowRequest::ResumeRemove(ticket()))
+            .unwrap();
+        let action = coordinator
+            .credential_completed(AccountCredentialCompletion::Deleted(
+                CredentialDeleteOutcome::Deleted,
+            ))
+            .unwrap();
+        assert!(matches!(
+            action,
+            AccountWorkflowAction::Database {
+                stage: AccountWorkflowStage::ConfirmRemoval,
+                ..
+            }
+        ));
+        assert_eq!(
+            coordinator.stage(),
+            Some(AccountWorkflowStage::ConfirmRemoval)
+        );
+    }
+
+    #[test]
+    fn global_active_slot_returns_the_untouched_request() {
+        let mut coordinator = AccountCoordinator::default();
+        let _ = coordinator
+            .try_start(AccountWorkflowRequest::BeginRemove {
+                account_id: account_id(),
+                expected_generation: generation(1),
+            })
+            .unwrap();
+
+        let failure = coordinator
+            .try_start(AccountWorkflowRequest::PersistAndStore {
+                write: Box::new(AccountWrite::Create(input(KEY))),
+                secret: secret(),
+            })
+            .unwrap_err();
+        assert_eq!(failure.kind(), AccountWorkflowStartFailureKind::Busy);
+        assert!(matches!(
+            failure.into_request(),
+            AccountWorkflowRequest::PersistAndStore { .. }
+        ));
+        assert_eq!(
+            coordinator.stage(),
+            Some(AccountWorkflowStage::BeginRemoval)
+        );
+    }
+
+    #[test]
+    fn confirmation_failure_remains_restart_retryable() {
+        let mut coordinator = AccountCoordinator::default();
+        let removal_ticket = ticket();
+        let _ = coordinator
+            .try_start(AccountWorkflowRequest::ResumeRemove(removal_ticket.clone()))
+            .unwrap();
+        let _ = coordinator
+            .credential_completed(AccountCredentialCompletion::Deleted(
+                CredentialDeleteOutcome::AlreadyMissing,
+            ))
+            .unwrap();
+        let action = coordinator
+            .database_completed(AccountDatabaseCompletion::Failed(FailureKind::Database))
+            .unwrap();
+        assert_eq!(
+            action_as_outcome(action),
+            AccountWorkflowOutcome::RemovalPending {
+                account_id: removal_ticket.account_id,
+                generation: removal_ticket.generation,
+                stage: AccountWorkflowStage::ConfirmRemoval,
+                failure: AccountWorkflowFailureKind::Database(FailureKind::Database),
+            }
+        );
+    }
+
+    #[test]
+    fn purge_reuses_fence_until_complete() {
+        let mut coordinator = AccountCoordinator::default();
+        let action = coordinator
+            .try_start(AccountWorkflowRequest::ResumePurge {
+                account_id: account_id(),
+                expected_generation: generation(3),
+            })
+            .unwrap();
+        assert_purge_action(&action, 3);
+
+        let action = coordinator
+            .database_completed(AccountDatabaseCompletion::Purged(
+                AccountPurgeOutcome::Pending {
+                    removed_messages: 1,
+                    removed_attachments: 2,
+                    removed_staging_files: 0,
+                    queued_files: 3,
+                },
+            ))
+            .unwrap();
+        assert_purge_action(&action, 3);
+
+        let action = coordinator
+            .database_completed(AccountDatabaseCompletion::Purged(
+                AccountPurgeOutcome::Complete(RemovedAccount {
+                    account_id: account_id(),
+                }),
+            ))
+            .unwrap();
+        assert_eq!(
+            action_as_outcome(action),
+            AccountWorkflowOutcome::AccountRemoved {
+                account_id: account_id(),
+            }
+        );
+        assert_eq!(coordinator.stage(), None);
+    }
+
+    #[test]
+    fn debug_output_never_contains_credential_locator() {
+        let request = AccountWorkflowRequest::RetryStore {
+            configuration: configuration(1, AccountLifecycle::Active),
+            secret: secret(),
+        };
+        assert!(!format!("{request:?}").contains(KEY));
+
+        let outcome = AccountWorkflowOutcome::RemovalPending {
+            account_id: account_id(),
+            generation: generation(2),
+            stage: AccountWorkflowStage::DeleteCredential,
+            failure: AccountWorkflowFailureKind::CredentialReplyClosed,
+        };
+        assert!(!format!("{outcome:?}").contains(KEY));
+    }
+
+    fn assert_purge_action(action: &AccountWorkflowAction, expected_generation: i64) {
+        assert!(matches!(
+            action,
+            AccountWorkflowAction::Database {
+                stage: AccountWorkflowStage::PurgeRemoval,
+                write,
+            } if matches!(
+                write.as_ref(),
+                AccountWrite::PurgeRemovedAccount {
+                    account_id: id,
+                    expected_generation: fence,
+                } if *id == account_id() && *fence == generation(expected_generation)
+            )
+        ));
+    }
+
+    fn action_as_outcome(action: AccountWorkflowAction) -> AccountWorkflowOutcome {
+        let AccountWorkflowAction::Finished(outcome) = action else {
+            panic!("expected a terminal workflow outcome")
+        };
+        outcome
+    }
+}
