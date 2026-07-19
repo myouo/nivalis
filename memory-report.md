@@ -16,10 +16,10 @@ These numbers are machine- and viewport-specific. Software framebuffer memory gr
 ## Configuration
 
 - Measurement date and host: 2026-07-19, Linux 7.1.2-zen3-1-zen x86_64, Rust 1.96.1.
-- Release-code revision: `d19cec5`, schema v8. The SQLite controller cutover landed at `754c7db`, real-row stress at `73d1fdb`, the bounded fixture at `70db7b8`, and complete fixture-bound/page validation at `d19cec5`. Production runtime bytes are unchanged from `a85a279`.
-- Production build: stripped `cargo build --release`, `opt-level = "s"`, 19,382,904 bytes (18.48MiB), SHA-256 `015e878868391f4134c9c210ab37dac8ccc05445eba39bc0f21d2c6ca403aa46`.
-- Interaction build: stripped `cargo build --release --features bench-harness`, 19,390,200 bytes, SHA-256 `27aab936cd3d4adb7100657999aca8e0b4c2341e4e8349a9c83ba10de04074b6`.
-- UI state: light theme, three-pane inbox, 64 accounts, one account warning, 51 inbox messages, a 50-row current page, and a present next-page cursor. The controller does not yet request that next page.
+- Release-code revision: `0d3453c5860e1efcdb90cd9e61819dba030e5695`, schema v8. Bidirectional controller pagination landed at `2d7f26d`; exact query-count and memory-gate coverage landed at `0d3453c`.
+- Production build: `cargo build --locked --release`, stripped, `opt-level = "s"`, 19,410,424 bytes (18.51MiB), SHA-256 `2f74e875620a6ca2f005c9521accf74652aa0a37b68729892180a254a434081c`.
+- Pagination build: `cargo build --locked --release --features bench-harness`, stripped, 19,425,528 bytes (18.53MiB), SHA-256 `4547ace84c4d4b2895cb2eb0cb0c86484c706608563e11c65d919f43d50a69f4`.
+- UI state: light theme, three-pane inbox, 64 accounts, one account warning, 51 inbox messages, and bounded 50-row plus one-row pages connected through First/Next/Previous keyset navigation.
 - Data bounds: all 51 stored previews are exactly 2,048 bytes and all 51 reader excerpts are exactly 65,536 bytes. The 3.7MiB private fixture passes SQLite integrity and foreign-key checks; the production query returns 50 rows plus a cursor, then the remaining row without another cursor.
 - Backend state: active bounded Tokio core and single-connection SQLite actor, WAL mode, 1MiB page cache limit, persistent statistics, and real account/mailbox/detail projections.
 - Default renderer: `winit` + `skia-software` (Skia CPU rasterization and partial rendering).
@@ -28,15 +28,10 @@ These numbers are machine- and viewport-specific. Software framebuffer memory gr
 - Native Wayland baseline: default 1200x800 logical window, forced scale factor 1 for repeatability.
 - Sampling: fresh process, `/proc/<pid>/smaps_rollup`, interval CPU from `/proc/<pid>/stat`; the harness verifies the requested X11 geometry and fails if interaction stress does not finish.
 
-The committed raw samples are:
+Committed samples use one CSV per measured code revision. The `test_case` column identifies each workload and repeat without multiplying evidence files:
 
-- [`docs/measurements/2026-07-19-d19cec5-idle.csv`](docs/measurements/2026-07-19-d19cec5-idle.csv), SHA-256 `fa1258b33ab14cc5fc8e14a062ad904768419b03bbf61b6262598293151a31b6`.
-- [`docs/measurements/2026-07-19-d19cec5-soak.csv`](docs/measurements/2026-07-19-d19cec5-soak.csv), SHA-256 `357be6047646ad8d7cb28f3db972354d5e04a5941f3de5f62301765665a42d13`.
-- [`docs/measurements/2026-07-19-d19cec5-stress.csv`](docs/measurements/2026-07-19-d19cec5-stress.csv), SHA-256 `9448e78a5223515efff5e387c151f13762375a334b3ad95174984a6450c49c39`.
-- [`docs/measurements/2026-07-19-d19cec5-stress.log`](docs/measurements/2026-07-19-d19cec5-stress.log), SHA-256 `e21b3abaf0f23dd31858eec45775e79de00a93cc95c514ddab65b89a8460e677`.
-- [`docs/measurements/2026-07-19-d19cec5-stress-extended.csv`](docs/measurements/2026-07-19-d19cec5-stress-extended.csv), SHA-256 `091354d232a8a402eda8640b65de11d5222f2223083f9b228301d1bb317de327`.
-- [`docs/measurements/2026-07-19-d19cec5-stress-extended.log`](docs/measurements/2026-07-19-d19cec5-stress-extended.log), SHA-256 `4ab02b819967a1232a4d8d10cf47af3a9e09a2ffee592b7315c0793389946158`.
-- [`docs/measurements/2026-07-19-d19cec5-resize.csv`](docs/measurements/2026-07-19-d19cec5-resize.csv), SHA-256 `b67bd886ead5a147a08cdbf3d42d0973503e5fe37fe7bda616f13ffad9c16533`.
+- [`docs/measurements/2026-07-19-0d3453c.csv`](docs/measurements/2026-07-19-0d3453c.csv), SHA-256 `8179f3a68222ee829b002779bbf901d378ce740d9a3fb1ee18c97c297e6e9684`; [completion log](docs/measurements/2026-07-19-0d3453c.log), SHA-256 `3c198c469c098d11ac20683c4bf4525b182809a663c01d95d3e5c5575bbe1dc9`.
+- [`docs/measurements/2026-07-19-d19cec5.csv`](docs/measurements/2026-07-19-d19cec5.csv), SHA-256 `e76adb4b34e5554165cde279294bcba37958db30c980ed082244a8999c6c97b2`; [completion log](docs/measurements/2026-07-19-d19cec5.log), SHA-256 `84a84b28096be3e9e89e8368006a6ab49ffeb4d641dee07421fb9725852bc385`.
 
 ## Idle Results
 
@@ -44,13 +39,14 @@ Values below are the worst stable samples across the stated fresh-process runs.
 
 | Renderer | Platform | Runs | RSS | PSS | USS | Result |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
-| Skia software, bounded fixture | X11 | 3 + 300s soak | 37.60MiB | 24.60MiB | 20.77MiB | Hard gate pass; repeated target |
+| Skia software, `0d3453c` bounded fixture | X11 | 3 | 37.51MiB | 24.63MiB | 21.23MiB | Hard gate pass; repeated target |
+| Skia software, `d19cec5` bounded fixture | X11 | 3 + 300s soak | 37.60MiB | 24.60MiB | 20.77MiB | Historical local-read gate |
 | Skia software, retained outlier | X11 | 1 historical | 68.62MiB | Not retained | Not retained | Hard gate pass; target fail |
 | Skia software | X11 | 3 historical | 37.80MiB | 24.02MiB | 20.78MiB | Pre-controller-cutover pass |
 | Skia software | Wayland | 3 historical | 41.5MiB | 22.4MiB | 17.5MiB | Pre-SQLite reference |
 | Skia OpenGL | X11 | 1 historical | 248.0MiB | 81.9MiB | 34.0MiB | Pre-SQLite reference; RSS stretch fail |
 
-The current matrix uses three fresh production processes sampled at 5, 10, 20, and 30 seconds. Their stable RSS values were 37.24, 37.60, and 37.34MiB; interval CPU was 0.00% from 10 seconds onward. A separate exact-revision process held RSS exactly at 38,316KiB (37.42MiB) from 30 through 300 seconds; PSS/USS ended at 25,142/21,256KiB, anonymous memory stayed at 8,172KiB, and interval CPU was 0.00% from 60 seconds onward. All repeated exact-binary runs therefore meet the preferred 50MiB target with the maximum account catalog, a full visible page, maximum previews, and available maximum excerpts. The hard 90MiB release gate is proved; the target is not an unconditional guarantee because of the retained outlier below.
+The `0d3453c` matrix uses three fresh production processes sampled at 5, 10, 20, and 30 seconds. Their RSS values were stable at 38,308KiB (37.41MiB), 38,408KiB (37.51MiB), and 38,156KiB (37.26MiB); the largest PSS/USS/VmHWM values were 25,220/21,740/38,408KiB. Interval CPU was 0.00% from 10 seconds onward in every run. All three exact-binary runs meet the preferred 50MiB target with the maximum account catalog, a full visible page, maximum previews, and available maximum excerpts. The hard 90MiB release gate is proved; the target is not an unconditional guarantee because of the retained outlier below. The separate five-minute `d19cec5` pure-idle soak remains historical evidence rather than being attributed to this newer binary.
 
 During investigation of the preceding `73d1fdb` artifact, one populated-cache soak reported 70,264KiB (68.62MiB) RSS through 120 seconds before dropping to 61,684KiB at 300 seconds. It stayed below the hard gate but exceeded the preferred target. The value did not reproduce in the next four scripted fresh-process runs, two manual fully visible runs, the repeated five-minute soak, or the exact-binary matrix above. It remains an unexplained RSS outlier rather than being discarded; PSS and USS were not retained, so its ownership cannot be inferred. The Wayland and OpenGL rows remain historical and require refresh before use as current backend gates.
 
@@ -58,16 +54,26 @@ During investigation of the preceding `73d1fdb` artifact, one populated-cache so
 
 | Scenario | Baseline RSS/PSS/USS | Settled RSS/PSS/USS | Growth RSS/PSS/USS | Result |
 | --- | --- | --- | --- | --- |
-| 10,000 bounded UI/SQLite actions, X11, 300s | 37.59/24.69/20.87MiB | 45.05/32.16/28.34MiB | 19.85%/30.22%/35.77% | Hard/growth pass |
+| 10,000 keyset transitions, repeat 1, X11, 300s | 37.21/24.50/21.13MiB | 37.46/24.81/21.46MiB | 0.68%/1.26%/1.57% | Hard/growth pass |
+| 10,000 keyset transitions, repeat 2, X11, 300s | 37.16/24.35/20.96MiB | 37.44/24.55/21.32MiB | 0.75%/0.84%/1.73% | Hard/growth pass |
+| 10,000 bounded UI/SQLite actions, `d19cec5`, X11, 300s | 37.59/24.69/20.87MiB | 45.05/32.16/28.34MiB | 19.85%/30.22%/35.77% | Historical local-read pass |
 | Resize 1200x900 to 3840x2400 and restore, populated X11 | 37.46/24.50/20.71MiB | 68.53/40.52/21.66MiB | 82.91%/65.36%/4.60% | Hard/growth pass |
 | 10,000 former demo-controller actions, X11, 300s | 37.61/23.90/20.67MiB | 42.10/28.39/25.16MiB | 11.93%/18.80%/21.75% | Historical pre-cutover pass |
 | Native Wayland maximize and restore | 38.5/20.0/15.5MiB | 64.2/33.0/15.9MiB | 66.7%/65.3%/2.6% | Historical pass |
 
-The current deterministic run cycles real folder queries, conditional overlays, and valid rows from the live Slint model; visible rows repeatedly load the bounded 64KiB SQLite reader detail. It also exercises search input and debounce-timer churn, but it does not count executed SQLite searches and therefore cannot prove coverage of a non-empty query. That path remains outside this gate until the M1 FTS workload adds explicit execution instrumentation.
+The current pagination workload waits for the exact seeded first-page signature, records a query-counter baseline, and alternates 5,000 `After` and 5,000 `Before` keyset queries. Every reply must match the expected 50-row or one-row page before the next transition begins. Each measured run reported exactly one completion marker with `transitions=10000 after=5000 before=5000 final_page=1`; extra First queries, stale results, timeouts, counter regressions, or mismatched pages fail closed. The state machine retains one request, two counter snapshots, and no page history.
 
-The first exact-binary run completed 10,000 steps in 111.063 seconds. RSS remained 45,768KiB from 120 through 150 seconds, and the explicit 120-130, 130-140, and 140-150 second intervals each measured 0.00% CPU. The 150-180 second interval later averaged 8.96% and RSS rose by 320KiB, so that short run alone is not treated as settled evidence.
+Repeat 1 completed the 10,000 transitions in 147.900 seconds after the configured 15-second delay. RSS rose from 38,104KiB at 5 seconds to a peak and final value of 38,364KiB; VmHWM was 38,364KiB. CPU was 0.00% in every measured interval from 210 through 300 seconds.
 
-The exact-binary extended repeat completed in 110.502 seconds. RSS was exactly 46,136KiB from 90 through 300 seconds. CPU was 0.00% for the 120-130, 130-140, 140-150, 150-180, 180-190, 190-200, 200-210, 210-240, 240-270, and 270-300 second intervals. Its final values and growth determine the table result; the earlier late-activity observation remains in the committed short-run samples rather than being discarded.
+Repeat 2 completed in 147.534 seconds after the same delay. RSS rose from 38,052KiB to 38,336KiB at 300 seconds; VmHWM was 38,336KiB. CPU returned to 0.00% in every measured interval from 210 through 290 seconds. The retained 290-300 second interval measured 5.69% and RSS added 16KiB, so this report does not claim continuously zero CPU through the endpoint; it does prove multiple post-stress zero-CPU intervals and remains far inside both memory gates.
+
+This two-page fixture proves bounded bidirectional controller navigation, exact SQLite query classes, and stable post-navigation residency. It does not prove deep-page behavior in a large mailbox, mutations, FTS, provider traffic, MIME, or attachments. Those paths require their own instrumented workloads when activated.
+
+The historical `d19cec5` deterministic run cycles real folder queries, conditional overlays, and valid rows from the live Slint model; visible rows repeatedly load the bounded 64KiB SQLite reader detail. It also exercises search input and debounce-timer churn, but it does not count executed SQLite searches and therefore cannot prove coverage of a non-empty query. That path remains outside this gate until the M1 FTS workload adds explicit execution instrumentation.
+
+The first historical `d19cec5` exact-binary run completed 10,000 steps in 111.063 seconds. RSS remained 45,768KiB from 120 through 150 seconds, and the explicit 120-130, 130-140, and 140-150 second intervals each measured 0.00% CPU. The 150-180 second interval later averaged 8.96% and RSS rose by 320KiB, so that short run alone is not treated as settled evidence.
+
+The historical `d19cec5` exact-binary extended repeat completed in 110.502 seconds. RSS was exactly 46,136KiB from 90 through 300 seconds. CPU was 0.00% for the 120-130, 130-140, 140-150, 150-180, 180-190, 190-200, 200-210, 210-240, 240-270, and 270-300 second intervals. Its final values and growth determine that historical table row; the earlier late-activity observation remains in the committed short-run samples rather than being discarded.
 
 The populated 3840x2400 production resize began at 5 seconds and restored to 1200x900 at 10 seconds. The measured high-resolution peak was 68.53/40.53/21.67MiB RSS/PSS/USS during the 6-12 second samples, or +82.91%/+65.41%/+4.66%. At 60 seconds the retained surface was 68.53/40.52/21.66MiB, so the table reports the settled values while separately exposing the almost identical transient peak. RSS stayed below the 90MiB hard gate and below 2x baseline but exceeded the 50MiB normal-idle target; the small USS change is consistent with retained surface mappings rather than equivalent private-heap growth.
 
@@ -88,7 +94,7 @@ The `performance` profile remains available when the extra 2.5% measured active 
 Build a production binary, initialize an isolated database, and seed the schema-checked bounded fixture. The workflow requires `sqlite3`; X11 measurement also requires `xdotool` for window discovery and geometry control. The seed script refuses to touch a database that already contains an account:
 
 ```bash
-cargo build --release
+cargo build --locked --release
 fixture_dir=$(mktemp -d /tmp/nivalis-memory.XXXXXX)
 NIVALIS_MEMORY_DATA_DIR="$fixture_dir" NIVALIS_MEMORY_SAMPLES="1" \
   scripts/measure-memory.sh target/release/nivalis-mail \
@@ -99,37 +105,55 @@ scripts/seed-memory-fixture.sh "$fixture_dir"
 Run three fresh X11 processes with the release-gate sample points:
 
 ```bash
-NIVALIS_MEMORY_DATA_DIR="$fixture_dir" NIVALIS_MEMORY_RUNS=3 \
-NIVALIS_MEMORY_SAMPLES="5 10 20 30" \
+NIVALIS_MEMORY_DATA_DIR="$fixture_dir" NIVALIS_MEMORY_TEST_CASE=idle \
+NIVALIS_MEMORY_RUNS=3 \
+NIVALIS_MEMORY_SAMPLES="5 10 20 30" NIVALIS_MEMORY_HARD_GATE=1 \
+NIVALIS_MEMORY_HARD_CAP_KIB=92160 NIVALIS_MEMORY_GROWTH_LIMIT_PERCENT=100 \
   scripts/measure-memory.sh target/release/nivalis-mail \
   > /tmp/nivalis-memory-idle.csv
 ```
 
-Run the five-minute pure-idle soak:
+Optionally run a fresh five-minute pure-idle soak. The committed `0d3453c` CSV does not attribute the historical `d19cec5` soak to the newer binary, so this optional output is not part of the merge below:
 
 ```bash
 NIVALIS_MEMORY_DATA_DIR="$fixture_dir" \
+NIVALIS_MEMORY_TEST_CASE=idle-soak \
 NIVALIS_MEMORY_SAMPLES="30 60 120 180 300" \
   scripts/measure-memory.sh target/release/nivalis-mail \
   > /tmp/nivalis-memory-soak.csv
 ```
 
-Run the 10,000-step interaction scenario and retain its completion log:
+Run the 10,000-transition pagination scenario twice in fresh processes and inspect each completion log before merging the CSV rows under distinct `test_case` values. The 5- and 10-second samples establish the pre-stress baseline before the explicit 15-second delay:
 
 ```bash
-cargo build --release --features bench-harness
-NIVALIS_MEMORY_DATA_DIR="$fixture_dir" NIVALIS_STRESS_STEPS=10000 \
-NIVALIS_MEMORY_LOG=/tmp/nivalis-memory-stress.log \
-NIVALIS_MEMORY_SAMPLES="3 6 15 30 60 90 120 130 140 150 180 190 200 210 240 270 300" \
+cargo build --locked --release --features bench-harness
+NIVALIS_MEMORY_DATA_DIR="$fixture_dir" \
+NIVALIS_MEMORY_TEST_CASE=pagination-1 \
+NIVALIS_STRESS_SCENARIO=pagination NIVALIS_STRESS_STEPS=10000 \
+NIVALIS_STRESS_DELAY_MS=15000 NIVALIS_STRESS_INTERVAL_MS=2 \
+NIVALIS_STRESS_TRANSITION_TIMEOUT_MS=5000 \
+NIVALIS_MEMORY_LOG=/tmp/nivalis-memory-pagination-run-1.log \
+NIVALIS_MEMORY_SAMPLES="5 10 20 30 60 90 120 150 180 210 240 270 280 290 300" \
+NIVALIS_MEMORY_HARD_GATE=1 NIVALIS_MEMORY_HARD_CAP_KIB=92160 \
+NIVALIS_MEMORY_GROWTH_LIMIT_PERCENT=100 \
   scripts/measure-memory.sh target/release/nivalis-mail \
-  > /tmp/nivalis-memory-stress.csv
+  > /tmp/nivalis-memory-pagination-run-1.csv
+
+# Repeat with NIVALIS_MEMORY_TEST_CASE=pagination-2 and run-2 output paths.
+
+awk 'FNR == 1 && NR != 1 { next } { print }' \
+  /tmp/nivalis-memory-idle.csv \
+  /tmp/nivalis-memory-pagination-run-1.csv \
+  /tmp/nivalis-memory-pagination-run-2.csv \
+  > /tmp/nivalis-memory-0d3453c.csv
 ```
 
 Run the production 3840x2400 resize and restore scenario:
 
 ```bash
-cargo build --release
+cargo build --locked --release
 NIVALIS_MEMORY_DATA_DIR="$fixture_dir" NIVALIS_RESIZE_STRESS_WIDTH=3840 \
+NIVALIS_MEMORY_TEST_CASE=resize-3840x2400 \
 NIVALIS_RESIZE_STRESS_HEIGHT=2400 \
 NIVALIS_RESIZE_STRESS_AT=5 \
 NIVALIS_RESIZE_STRESS_DURATION=5 \
@@ -151,5 +175,5 @@ The script creates and removes an isolated private data directory unless `NIVALI
 - SQLite mailbox replies retain one 50-row page plus persistent counters and at most 64 per-account unread values. Statistic rebuilds aggregate in SQLite and do not materialize mailbox-wide Rust collections.
 - The measured database directory was mode `0700`; SQLite, WAL, and shared-memory files were mode `0600`. Thread inspection showed `nivalis-core` and `nivalis-sqlite` without an additional reply-bridge thread.
 - A 2,048-byte stored preview and 64KiB reader-excerpt boundary prevent malformed content from multiplying text layout work. Full-body loading remains unavailable until the bounded file-content pipeline is connected.
-- The current local-read gate covers the SQLite-controller projection path at its account, page, preview, and reader-excerpt bounds. It does not exercise IMAP/JMAP sessions, MIME parsing, attachment transfers, multi-account synchronization, controller mutations, pagination, FTS, or provider payloads. Each newly activated path requires an appropriate fresh soak before release.
+- The current local-read and pagination gate covers the SQLite-controller projection path at its account, page, preview, reader-excerpt, bidirectional keyset, and exact query-count bounds. It does not exercise deep pages in a large mailbox, IMAP/JMAP sessions, MIME parsing, attachment transfers, multi-account synchronization, controller mutations, FTS, or provider payloads. Each newly activated path requires an appropriate fresh soak before release.
 - A production IMAP/JMAP adapter must keep the page boundary, store message bodies and attachments on disk, and bound rendered quoted history. Loading arbitrary multi-megabyte bodies into one text paragraph cannot satisfy a fixed process-memory ceiling.
