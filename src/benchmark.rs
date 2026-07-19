@@ -191,8 +191,8 @@ fn run_content_cycle(
     cycle_index: usize,
 ) -> Result<ContentCycle, &'static str> {
     let raw = content_fixture(cycle_index);
-    let prepared = prepare_content(&raw, staging, ContentLimits::default())
-        .map_err(|_| "mime_prepare_failed")?;
+    let limits = ContentLimits::default();
+    let prepared = prepare_content(&raw, staging, limits).map_err(|_| "mime_prepare_failed")?;
     drop(raw);
     let published = prepared.publish().map_err(|_| "content_publish_failed")?;
     let record = published.record();
@@ -204,7 +204,6 @@ fn run_content_cycle(
     }
     let attachment = &record.attachments[0];
     let attachment_key = attachment.file_key.clone();
-    let body_bytes = usize::try_from(record.body_byte_count).map_err(|_| "body_size_overflow")?;
     let attachment_bytes =
         usize::try_from(attachment.byte_count).map_err(|_| "attachment_size_overflow")?;
     if attachment_bytes != CONTENT_ATTACHMENT_BYTES {
@@ -226,11 +225,18 @@ fn run_content_cycle(
         .map_err(|_| "content_import_reply_closed")?
         .map_err(|_| "content_import_failed")?;
 
-    read_published_file(staging, &body_key, body_bytes, "body_read_failed")?;
+    read_published_file(
+        staging,
+        &body_key,
+        None,
+        limits.stored_body_bytes,
+        "body_read_failed",
+    )?;
     read_published_file(
         staging,
         &attachment_key,
-        attachment_bytes,
+        Some(attachment_bytes),
+        limits.decoded_part_bytes,
         "attachment_read_failed",
     )?;
 
@@ -284,10 +290,19 @@ fn content_fixture(cycle_index: usize) -> Vec<u8> {
 fn read_published_file(
     staging: &ContentStaging,
     key: &FileKey,
-    expected_bytes: usize,
+    expected_bytes: Option<usize>,
+    maximum_bytes: usize,
     failure: &'static str,
 ) -> Result<(), &'static str> {
     let mut file = staging.open_file(key).map_err(|_| failure)?;
+    let file_bytes =
+        usize::try_from(file.metadata().map_err(|_| failure)?.len()).map_err(|_| failure)?;
+    if file_bytes == 0
+        || file_bytes > maximum_bytes
+        || expected_bytes.is_some_and(|expected| expected != file_bytes)
+    {
+        return Err(failure);
+    }
     let mut buffer = [0_u8; 64 * 1024];
     let mut total = 0_usize;
     loop {
@@ -297,10 +312,10 @@ fn read_published_file(
         }
         total = total
             .checked_add(read)
-            .filter(|total| *total <= expected_bytes)
+            .filter(|total| *total <= file_bytes)
             .ok_or(failure)?;
     }
-    if total != expected_bytes {
+    if total != file_bytes {
         return Err(failure);
     }
     Ok(())
@@ -1083,8 +1098,12 @@ mod tests {
         ));
         let staging = ContentStaging::open(root.clone()).unwrap();
         let raw = content_fixture(7);
-        let prepared = prepare_content(&raw, &staging, ContentLimits::default()).unwrap();
-        let record = prepared.record();
+        let limits = ContentLimits::default();
+        let published = prepare_content(&raw, &staging, limits)
+            .unwrap()
+            .publish()
+            .unwrap();
+        let record = published.record();
 
         assert!(record.body_byte_count > 0);
         assert_eq!(record.attachments.len(), 1);
@@ -1092,8 +1111,24 @@ mod tests {
             usize::try_from(record.attachments[0].byte_count).unwrap(),
             CONTENT_ATTACHMENT_BYTES
         );
+        read_published_file(
+            &staging,
+            record.body_file_key.as_ref().unwrap(),
+            None,
+            limits.stored_body_bytes,
+            "body",
+        )
+        .unwrap();
+        read_published_file(
+            &staging,
+            &record.attachments[0].file_key,
+            Some(CONTENT_ATTACHMENT_BYTES),
+            limits.decoded_part_bytes,
+            "attachment",
+        )
+        .unwrap();
 
-        drop(prepared);
+        drop(published);
         std::fs::remove_dir_all(root).unwrap();
     }
 
