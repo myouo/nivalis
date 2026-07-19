@@ -13,6 +13,7 @@ const MAX_TIMESTAMP_MS: i64 = 253_402_300_799_999;
 const ACCOUNT_PURGE_MESSAGE_BATCH: usize = 16;
 const ACCOUNT_PURGE_ATTACHMENT_BATCH: usize = 16;
 const ACCOUNT_PURGE_STAGING_BATCH: usize = 16;
+const ACCOUNT_PURGE_PROVIDER_BATCH: usize = 16;
 const PENDING_REMOVAL_LIMIT: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -915,6 +916,10 @@ pub(super) fn purge_removed_account(
                 break;
             }
         }
+        purge_message_provider_rows(&transaction, *message_id)?;
+        if message_provider_rows_remain(&transaction, *message_id)? {
+            break;
+        }
         queued_files = queued_files
             .checked_add(queue_message_singleton_files(
                 &transaction,
@@ -969,7 +974,7 @@ pub(super) fn purge_removed_account(
             .map_err(map_account_write_error)?;
     }
 
-    let remaining: bool = transaction
+    let local_cache_remaining: bool = transaction
         .query_row(
             "SELECT EXISTS (
                  SELECT 1 FROM messages WHERE account_id = ?1
@@ -980,7 +985,24 @@ pub(super) fn purge_removed_account(
             |row| row.get(0),
         )
         .map_err(DbFailure::database)?;
-    if remaining {
+    let provider_cleanup = if local_cache_remaining {
+        None
+    } else {
+        Some(purge_account_provider_rows(&transaction, account_id)?)
+    };
+    if provider_cleanup
+        .as_ref()
+        .is_some_and(|cleanup| cleanup.remaining && cleanup.removed == 0)
+    {
+        return Err(DbFailure::conflict(
+            "account provider cache cleanup could not make progress",
+        ));
+    }
+    if local_cache_remaining
+        || provider_cleanup
+            .as_ref()
+            .is_some_and(|cleanup| cleanup.remaining)
+    {
         let outcome = AccountPurgeOutcome::Pending {
             removed_messages: u8::try_from(removed_messages)
                 .expect("account purge message batch fits u8"),
@@ -995,6 +1017,23 @@ pub(super) fn purge_removed_account(
         return Ok(outcome);
     }
 
+    transaction
+        .execute(
+            "DELETE FROM account_connections WHERE account_id = ?1",
+            [account_id.get()],
+        )
+        .map_err(map_account_write_error)?;
+    transaction
+        .execute(
+            "DELETE FROM account_mailbox_stats WHERE account_id = ?1",
+            [account_id.get()],
+        )
+        .map_err(map_account_write_error)?;
+    if account_direct_children_remain(&transaction, account_id)? {
+        return Err(DbFailure::conflict(
+            "account cache still has rows that require bounded cleanup",
+        ));
+    }
     let removed = transaction
         .execute("DELETE FROM accounts WHERE id = ?1", [account_id.get()])
         .map_err(map_account_write_error)?;
@@ -1003,6 +1042,252 @@ pub(super) fn purge_removed_account(
     }
     transaction.commit().map_err(DbFailure::database)?;
     Ok(AccountPurgeOutcome::Complete(RemovedAccount { account_id }))
+}
+
+fn purge_message_provider_rows(
+    connection: &Connection,
+    message_id: MessageId,
+) -> Result<(), DbFailure> {
+    let limit = ACCOUNT_PURGE_PROVIDER_BATCH as i64;
+    connection
+        .execute(
+            "DELETE FROM imap_message_locations
+             WHERE (message_id, folder_id) IN (
+                 SELECT message_id, folder_id
+                 FROM imap_message_locations
+                 WHERE message_id = ?1
+                 ORDER BY folder_id
+                 LIMIT ?2
+             )",
+            params![message_id.get(), limit],
+        )
+        .map_err(map_account_write_error)?;
+    connection
+        .execute(
+            "DELETE FROM message_folders
+             WHERE (message_id, folder_id) IN (
+                 SELECT membership.message_id, membership.folder_id
+                 FROM message_folders AS membership
+                 WHERE membership.message_id = ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM imap_message_locations AS location
+                       WHERE location.message_id = membership.message_id
+                         AND location.folder_id = membership.folder_id
+                   )
+                 ORDER BY membership.folder_id
+                 LIMIT ?2
+             )",
+            params![message_id.get(), limit],
+        )
+        .map_err(map_account_write_error)?;
+    Ok(())
+}
+
+fn message_provider_rows_remain(
+    connection: &Connection,
+    message_id: MessageId,
+) -> Result<bool, DbFailure> {
+    connection
+        .query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM imap_message_locations WHERE message_id = ?1
+             ) OR EXISTS (
+                 SELECT 1 FROM message_folders WHERE message_id = ?1
+             )",
+            [message_id.get()],
+            |row| row.get(0),
+        )
+        .map_err(DbFailure::database)
+}
+
+struct ProviderCleanup {
+    removed: usize,
+    remaining: bool,
+}
+
+fn purge_account_provider_rows(
+    connection: &Connection,
+    account_id: AccountId,
+) -> Result<ProviderCleanup, DbFailure> {
+    let limit = ACCOUNT_PURGE_PROVIDER_BATCH as i64;
+    let mut removed = 0_usize;
+    for sql in [
+        "DELETE FROM remote_change_intent_folders
+         WHERE (intent_id, side, folder_key) IN (
+             SELECT child.intent_id, child.side, child.folder_key
+             FROM remote_change_intent_folders AS child
+             JOIN remote_change_intents AS intent ON intent.id = child.intent_id
+             WHERE intent.account_id = ?1
+             ORDER BY child.intent_id, child.side, child.folder_key
+             LIMIT ?2
+         )",
+        "DELETE FROM remote_change_intent_imap_sources
+         WHERE (intent_id, folder_key, uid_validity, uid) IN (
+             SELECT child.intent_id, child.folder_key, child.uid_validity, child.uid
+             FROM remote_change_intent_imap_sources AS child
+             JOIN remote_change_intents AS intent ON intent.id = child.intent_id
+             WHERE intent.account_id = ?1
+             ORDER BY child.intent_id, child.folder_key, child.uid_validity, child.uid
+             LIMIT ?2
+         )",
+        "DELETE FROM remote_change_intents
+         WHERE id IN (
+             SELECT intent.id
+             FROM remote_change_intents AS intent
+             WHERE intent.account_id = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM remote_change_intent_folders AS child
+                   WHERE child.intent_id = intent.id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM remote_change_intent_imap_sources AS child
+                   WHERE child.intent_id = intent.id
+               )
+             ORDER BY intent.id
+             LIMIT ?2
+         )",
+        "DELETE FROM message_tombstone_imap_locations
+         WHERE (account_id, target_key, folder_key, uid_validity, uid) IN (
+             SELECT account_id, target_key, folder_key, uid_validity, uid
+             FROM message_tombstone_imap_locations
+             WHERE account_id = ?1
+             ORDER BY target_key, folder_key, uid_validity, uid
+             LIMIT ?2
+         )",
+        "DELETE FROM message_tombstones
+         WHERE (account_id, remote_key) IN (
+             SELECT tombstone.account_id, tombstone.remote_key
+             FROM message_tombstones AS tombstone
+             WHERE tombstone.account_id = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM message_tombstone_imap_locations AS child
+                   WHERE child.account_id = tombstone.account_id
+                     AND child.target_key = tombstone.remote_key
+               )
+             ORDER BY tombstone.remote_key
+             LIMIT ?2
+         )",
+        "DELETE FROM imap_message_locations
+         WHERE (message_id, folder_id) IN (
+             SELECT message_id, folder_id
+             FROM imap_message_locations
+             WHERE account_id = ?1
+             ORDER BY message_id, folder_id
+             LIMIT ?2
+         )",
+        "DELETE FROM sync_state
+         WHERE folder_id IN (
+             SELECT state.folder_id
+             FROM sync_state AS state
+             JOIN folders AS folder ON folder.id = state.folder_id
+             WHERE folder.account_id = ?1
+             ORDER BY state.folder_id
+             LIMIT ?2
+         )",
+        "DELETE FROM folders
+         WHERE id IN (
+             SELECT folder.id
+             FROM folders AS folder
+             WHERE folder.account_id = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM message_folders AS membership
+                   WHERE membership.folder_id = folder.id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM imap_message_locations AS location
+                   WHERE location.folder_id = folder.id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM sync_state AS state
+                   WHERE state.folder_id = folder.id
+               )
+             ORDER BY folder.id
+             LIMIT ?2
+         )",
+        "DELETE FROM account_object_states
+         WHERE (account_id, object_kind) IN (
+             SELECT account_id, object_kind
+             FROM account_object_states
+             WHERE account_id = ?1
+             ORDER BY object_kind
+             LIMIT ?2
+         )",
+        "DELETE FROM remote_account_reconciliations
+         WHERE account_id IN (
+             SELECT account_id
+             FROM remote_account_reconciliations
+             WHERE account_id = ?1
+             LIMIT ?2
+         )",
+    ] {
+        removed = removed
+            .checked_add(
+                connection
+                    .execute(sql, params![account_id.get(), limit])
+                    .map_err(map_account_write_error)?,
+            )
+            .ok_or_else(|| DbFailure::resource_limit("account provider cleanup count overflow"))?;
+    }
+    Ok(ProviderCleanup {
+        removed,
+        remaining: account_provider_rows_remain(connection, account_id)?,
+    })
+}
+
+fn account_provider_rows_remain(
+    connection: &Connection,
+    account_id: AccountId,
+) -> Result<bool, DbFailure> {
+    connection
+        .query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM folders WHERE account_id = ?1
+             ) OR EXISTS (
+                 SELECT 1 FROM imap_message_locations WHERE account_id = ?1
+             ) OR EXISTS (
+                 SELECT 1 FROM message_tombstones WHERE account_id = ?1
+             ) OR EXISTS (
+                 SELECT 1 FROM remote_change_intents WHERE account_id = ?1
+             ) OR EXISTS (
+                 SELECT 1 FROM account_object_states WHERE account_id = ?1
+             ) OR EXISTS (
+                 SELECT 1 FROM remote_account_reconciliations WHERE account_id = ?1
+             )",
+            [account_id.get()],
+            |row| row.get(0),
+        )
+        .map_err(DbFailure::database)
+}
+
+fn account_direct_children_remain(
+    connection: &Connection,
+    account_id: AccountId,
+) -> Result<bool, DbFailure> {
+    connection
+        .query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM account_connections WHERE account_id = ?1
+             ) OR EXISTS (
+                 SELECT 1 FROM account_mailbox_stats WHERE account_id = ?1
+             ) OR EXISTS (
+                 SELECT 1 FROM messages WHERE account_id = ?1
+             ) OR EXISTS (
+                 SELECT 1 FROM file_staging WHERE account_id = ?1
+             ) OR EXISTS (
+                 SELECT 1 FROM folders WHERE account_id = ?1
+             ) OR EXISTS (
+                 SELECT 1 FROM message_tombstones WHERE account_id = ?1
+             ) OR EXISTS (
+                 SELECT 1 FROM account_object_states WHERE account_id = ?1
+             ) OR EXISTS (
+                 SELECT 1 FROM remote_account_reconciliations WHERE account_id = ?1
+             ) OR EXISTS (
+                 SELECT 1 FROM remote_change_intents WHERE account_id = ?1
+             )",
+            [account_id.get()],
+            |row| row.get(0),
+        )
+        .map_err(DbFailure::database)
 }
 
 fn queue_message_singleton_files(
@@ -1415,6 +1700,12 @@ fn map_account_write_error(error: rusqlite::Error) -> DbFailure {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
     use rusqlite::Connection;
 
     use super::*;
@@ -1428,10 +1719,23 @@ mod tests {
 
     const KEY: &str = "0123456789abcdef0123456789abcdef";
 
+    static NEXT_DATABASE_PATH: AtomicU64 = AtomicU64::new(1);
+
     fn database() -> Connection {
         let mut connection = Connection::open_in_memory().expect("open database");
         migrate(&mut connection).expect("migrate database");
         connection
+    }
+
+    fn file_database(label: &str) -> (PathBuf, Connection) {
+        let sequence = NEXT_DATABASE_PATH.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "nivalis-account-{label}-{}-{sequence}.sqlite",
+            std::process::id()
+        ));
+        let mut connection = Connection::open(&path).expect("open file database");
+        migrate(&mut connection).expect("migrate file database");
+        (path, connection)
     }
 
     fn input() -> AccountConfigInput {
@@ -1999,6 +2303,240 @@ mod tests {
             .query_row("SELECT count(*) FROM file_gc", [], |row| row.get(0))
             .unwrap();
         assert_eq!(queued, ACCOUNT_PURGE_ATTACHMENT_BATCH as i64 + 1);
+    }
+
+    #[test]
+    fn removal_resumes_bounded_provider_cleanup_without_final_cascade() {
+        let (path, mut connection) = file_database("provider-purge");
+        let created = create_account(&mut connection, &input()).expect("create account");
+        let account_id = created.account_id.get();
+        let row_count = ACCOUNT_PURGE_PROVIDER_BATCH as i64 + 1;
+
+        connection
+            .execute(
+                "INSERT INTO messages
+                     (id, account_id, remote_key, received_at_ms)
+                 VALUES (1, ?1, 'live-message', 0)",
+                [account_id],
+            )
+            .unwrap();
+        for index in 1..=row_count {
+            let folder_key = format!("folder-{index:02}");
+            connection
+                .execute(
+                    "INSERT INTO folders (id, account_id, remote_key, name, role)
+                     VALUES (?1, ?2, ?3, ?3, 'custom')",
+                    params![index, account_id, folder_key],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO sync_state
+                         (folder_id, uid_validity, change_cursor, last_sync_at_ms)
+                     VALUES (?1, 7, ?2, 0)",
+                    params![index, index.to_string()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO message_folders (message_id, folder_id, account_id)
+                     VALUES (1, ?1, ?2)",
+                    params![index, account_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO imap_message_locations
+                         (message_id, folder_id, account_id, uid_validity, uid,
+                          remote_seen, remote_flagged)
+                     VALUES (1, ?1, ?2, 7, ?1, 0, 0)",
+                    params![index, account_id],
+                )
+                .unwrap();
+        }
+
+        connection
+            .execute(
+                "INSERT INTO remote_change_intents
+                     (account_id, target_key, local_revision, placement_active,
+                      not_before_ms, created_at_ms, updated_at_ms)
+                 VALUES (?1, 'pending-message', 0, 1, 0, 0, 0)",
+                [account_id],
+            )
+            .unwrap();
+        let intent_id = connection.last_insert_rowid();
+        for index in 1..=row_count {
+            let folder_key = format!("folder-{index:02}");
+            connection
+                .execute(
+                    "INSERT INTO remote_change_intent_folders
+                         (intent_id, side, folder_key)
+                     VALUES (?1, 'base', ?2)",
+                    params![intent_id, folder_key],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO remote_change_intent_imap_sources
+                         (intent_id, folder_key, uid_validity, uid,
+                          remote_seen, remote_flagged)
+                     VALUES (?1, ?2, 7, ?3, 0, 0)",
+                    params![intent_id, folder_key, index],
+                )
+                .unwrap();
+        }
+
+        connection
+            .execute(
+                "INSERT INTO message_tombstones (account_id, remote_key, deleted_at_ms)
+                 VALUES (?1, 'deleted-message', 0)",
+                [account_id],
+            )
+            .unwrap();
+        for index in 1..=row_count {
+            connection
+                .execute(
+                    "INSERT INTO message_tombstone_imap_locations
+                         (account_id, target_key, folder_key, uid_validity, uid)
+                     VALUES (?1, 'deleted-message', ?2, 7, ?3)",
+                    params![account_id, format!("folder-{index:02}"), index],
+                )
+                .unwrap();
+        }
+        for kind in ["email", "mailbox", "thread"] {
+            connection
+                .execute(
+                    "INSERT INTO account_object_states
+                         (account_id, object_kind, state_token, updated_at_ms)
+                     VALUES (?1, ?2, ?3, 0)",
+                    params![account_id, kind, format!("state-{kind}")],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO remote_account_reconciliations
+                     (account_id, reason, requested_at_ms)
+                 VALUES (?1, 'legacy_journal_bootstrap', 0)",
+                [account_id],
+            )
+            .unwrap();
+
+        let removal =
+            begin_account_removal(&mut connection, created.account_id, created.generation).unwrap();
+        let removing_cache = confirm_account_credentials_removed(
+            &mut connection,
+            created.account_id,
+            removal.generation,
+        )
+        .unwrap();
+
+        assert_eq!(
+            purge_removed_account(
+                &mut connection,
+                created.account_id,
+                removing_cache.generation,
+                10,
+            )
+            .unwrap(),
+            AccountPurgeOutcome::Pending {
+                removed_messages: 0,
+                removed_attachments: 0,
+                removed_staging_files: 0,
+                queued_files: 0,
+            }
+        );
+        let (locations, memberships, messages): (i64, i64, i64) = connection
+            .query_row(
+                "SELECT
+                     (SELECT count(*) FROM imap_message_locations),
+                     (SELECT count(*) FROM message_folders),
+                     (SELECT count(*) FROM messages)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((locations, memberships, messages), (1, 1, 1));
+
+        assert_eq!(
+            purge_removed_account(
+                &mut connection,
+                created.account_id,
+                removing_cache.generation,
+                11,
+            )
+            .unwrap(),
+            AccountPurgeOutcome::Pending {
+                removed_messages: 1,
+                removed_attachments: 0,
+                removed_staging_files: 0,
+                queued_files: 0,
+            }
+        );
+        let (folders, intent_children, tombstone_children, journal_children): (i64, i64, i64, i64) =
+            connection
+                .query_row(
+                    "SELECT
+                         (SELECT count(*) FROM folders),
+                         (SELECT count(*) FROM remote_change_intent_folders) +
+                             (SELECT count(*) FROM remote_change_intent_imap_sources),
+                         (SELECT count(*) FROM message_tombstone_imap_locations),
+                         (SELECT child_count FROM remote_journal_usage WHERE singleton = 1)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+        assert_eq!((folders, intent_children, tombstone_children), (1, 2, 1));
+        assert_eq!(journal_children, 3);
+
+        drop(connection);
+        let mut connection = Connection::open(&path).expect("reopen removal database");
+        migrate(&mut connection).expect("restore database invariants");
+        let stale_generation = AccountGeneration::new(removing_cache.generation.get() - 1).unwrap();
+        let stale =
+            purge_removed_account(&mut connection, created.account_id, stale_generation, 12)
+                .expect_err("restart must preserve the removal generation fence");
+        assert_eq!(stale.kind, FailureKind::Conflict);
+        assert!(matches!(
+            purge_removed_account(
+                &mut connection,
+                created.account_id,
+                removing_cache.generation,
+                13,
+            )
+            .unwrap(),
+            AccountPurgeOutcome::Complete(_)
+        ));
+        let remaining: i64 = connection
+            .query_row(
+                "SELECT
+                     (SELECT count(*) FROM accounts) +
+                     (SELECT count(*) FROM folders) +
+                     (SELECT count(*) FROM sync_state) +
+                     (SELECT count(*) FROM imap_message_locations) +
+                     (SELECT count(*) FROM remote_change_intents) +
+                     (SELECT count(*) FROM remote_change_intent_folders) +
+                     (SELECT count(*) FROM remote_change_intent_imap_sources) +
+                     (SELECT count(*) FROM message_tombstones) +
+                     (SELECT count(*) FROM message_tombstone_imap_locations) +
+                     (SELECT count(*) FROM account_object_states) +
+                     (SELECT count(*) FROM remote_account_reconciliations)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+        let journal_usage: (i64, i64) = connection
+            .query_row(
+                "SELECT child_count, reserved_count
+                 FROM remote_journal_usage WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(journal_usage, (0, 0));
+        drop(connection);
+        fs::remove_file(path).expect("remove file database");
     }
 
     #[test]
