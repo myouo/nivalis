@@ -398,7 +398,7 @@ fn classify_account_diagnostic(
     has_error: bool,
 ) -> Option<AccountDiagnosticExpectation> {
     match (status, has_error) {
-        ("Connected", false) => Some(AccountDiagnosticExpectation::Ready),
+        ("Connected" | "Ready", false) => Some(AccountDiagnosticExpectation::Ready),
         _ => None,
     }
 }
@@ -1474,6 +1474,10 @@ mod tests {
         assert_eq!(AccountDiagnosticExpectation::parse("offline"), None);
         assert_eq!(
             classify_account_diagnostic("Connected", false),
+            Some(AccountDiagnosticExpectation::Ready)
+        );
+        assert_eq!(
+            classify_account_diagnostic("Ready", false),
             Some(AccountDiagnosticExpectation::Ready)
         );
         assert_eq!(
