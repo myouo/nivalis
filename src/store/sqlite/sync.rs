@@ -204,6 +204,7 @@ impl InboxReceivePage {
 pub(crate) struct StagedInboxMessage {
     pub(crate) uid: u32,
     pub(crate) message_id: MessageId,
+    pub(crate) needs_content: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -443,9 +444,11 @@ fn stage_messages(
             page.uid_validity,
             message,
         )?;
+        let needs_content = !message_has_content(transaction, message_id)?;
         staged.push(StagedInboxMessage {
             uid: message.uid,
             message_id,
+            needs_content,
         });
     }
     enforce_pending_window_bound(
@@ -852,8 +855,24 @@ fn update_envelope(
     transaction
         .execute(
             "UPDATE messages
-             SET sender_name = ?3, sender_address = ?4, subject = ?5, preview = ?6,
-                 received_at_ms = ?7, has_attachment = ?8
+             SET sender_name = CASE WHEN EXISTS (
+                         SELECT 1 FROM message_content WHERE message_id = ?1
+                     ) THEN sender_name ELSE ?3 END,
+                 sender_address = CASE WHEN EXISTS (
+                         SELECT 1 FROM message_content WHERE message_id = ?1
+                     ) THEN sender_address ELSE ?4 END,
+                 subject = CASE WHEN EXISTS (
+                         SELECT 1 FROM message_content WHERE message_id = ?1
+                     ) THEN subject ELSE ?5 END,
+                 preview = CASE WHEN EXISTS (
+                         SELECT 1 FROM message_content WHERE message_id = ?1
+                     ) THEN preview ELSE ?6 END,
+                 received_at_ms = CASE WHEN EXISTS (
+                         SELECT 1 FROM message_content WHERE message_id = ?1
+                     ) THEN received_at_ms ELSE ?7 END,
+                 has_attachment = CASE WHEN EXISTS (
+                         SELECT 1 FROM message_content WHERE message_id = ?1
+                     ) THEN has_attachment ELSE ?8 END
              WHERE id = ?1 AND account_id = ?2",
             params![
                 message_id,
@@ -865,6 +884,21 @@ fn update_envelope(
                 message.received_at_ms,
                 message.has_attachment,
             ],
+        )
+        .map_err(DbFailure::database)
+}
+
+fn message_has_content(
+    transaction: &Transaction<'_>,
+    message_id: MessageId,
+) -> Result<bool, DbFailure> {
+    transaction
+        .query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM message_content WHERE message_id = ?1
+             )",
+            [message_id.get()],
+            |row| row.get(0),
         )
         .map_err(DbFailure::database)
 }
@@ -1433,6 +1467,80 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, (1, false, true, "Updated".to_owned(), false, false));
+    }
+
+    #[test]
+    fn restaging_complete_content_skips_reimport_and_preserves_mime_metadata() {
+        let mut connection = connection();
+        let (first, _) = stage_parts(
+            stage_inbox_page(
+                &mut connection,
+                &page(
+                    None,
+                    UID_VALIDITY,
+                    vec![envelope(
+                        8,
+                        "Envelope subject",
+                        InboxFlags::new(false, false),
+                    )],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(first[0].needs_content);
+        add_content(&connection, &first);
+        connection
+            .execute(
+                "UPDATE messages
+                 SET subject = 'MIME subject', preview = 'MIME preview', has_attachment = 1
+                 WHERE id = ?1",
+                [first[0].message_id.get()],
+            )
+            .unwrap();
+
+        let (second, _) = stage_parts(
+            stage_inbox_page(
+                &mut connection,
+                &page(
+                    None,
+                    UID_VALIDITY,
+                    vec![envelope(8, "Changed envelope", InboxFlags::new(true, true))],
+                ),
+            )
+            .unwrap(),
+        );
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].message_id, first[0].message_id);
+        assert!(!second[0].needs_content);
+        let stored: (String, String, bool, bool, bool) = connection
+            .query_row(
+                "SELECT message.subject, message.preview, message.has_attachment,
+                        location.remote_seen, location.remote_flagged
+                 FROM messages AS message
+                 JOIN imap_message_locations AS location ON location.message_id = message.id
+                 WHERE message.id = ?1",
+                [first[0].message_id.get()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            (
+                "MIME subject".to_owned(),
+                "MIME preview".to_owned(),
+                true,
+                true,
+                true,
+            )
+        );
     }
 
     #[test]
