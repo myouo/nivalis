@@ -52,6 +52,9 @@ rcgen = { version = "=0.14.8", default-features = false, features = ["crypto", "
 [build-dependencies]
 slint-build = "=1.17.1"
 
+[patch.crates-io]
+imap-proto = { path = "vendor/imap-proto" }
+
 [profile.release]
 opt-level = "s"
 lto = true
