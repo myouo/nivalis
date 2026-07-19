@@ -11,6 +11,10 @@ pub(crate) use actor::{
     DatabaseClient, DatabaseInfo, DatabaseReplies, DatabaseRuntime, StartError,
     SubmitError as DatabaseSubmitError,
 };
+#[allow(unused_imports)]
+pub(crate) use actor::{
+    RemoteReportExecutionFailure, RemoteReportReply, RemoteReportSubmitFailure,
+};
 pub(crate) use domain::{AccountScope, FolderScope};
 pub(crate) use domain::{
     AccountStatsDelta, DbReply, Generation, MailboxPage, MessageDetail, MessageId, MessageMutation,

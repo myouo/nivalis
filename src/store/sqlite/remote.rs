@@ -12,7 +12,6 @@ pub(crate) use report::{
     RemoteCheckpoint, RemoteErrorClass, RemotePendingState, RemoteProblem, RemoteReport,
     RemoteReportOutcome, RemoteReportSubmission,
 };
-#[allow(unused_imports)]
 pub(super) use report::{ReportTransition, report_remote};
 
 const MIN_TIMESTAMP_MS: i64 = -62_135_596_800_000;

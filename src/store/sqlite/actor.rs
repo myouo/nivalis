@@ -19,7 +19,10 @@ use super::{
     migrations::migrate,
     mutation::mutate_message,
     query::{open_message, query_mailbox},
-    remote::{RemoteClaimOutcome, claim_remote},
+    remote::{
+        RemoteClaimOutcome, RemoteReportOutcome, RemoteReportSubmission, ReportTransition,
+        claim_remote, report_remote,
+    },
 };
 
 const REQUEST_CAPACITY: usize = 16;
@@ -46,6 +49,10 @@ enum Request {
     ClaimRemote {
         account_id: i64,
         reply: oneshot::Sender<Result<RemoteClaimOutcome, DbFailure>>,
+    },
+    ReportRemote {
+        submission: Box<RemoteReportSubmission>,
+        reply: oneshot::Sender<RemoteReportReply>,
     },
     #[cfg(test)]
     RunLongQuery { started: Sender<()> },
@@ -136,6 +143,39 @@ impl DatabaseClient {
         Ok(receiver)
     }
 
+    pub(crate) fn try_report_remote(
+        &self,
+        submission: Box<RemoteReportSubmission>,
+    ) -> Result<oneshot::Receiver<RemoteReportReply>, RemoteReportSubmitFailure> {
+        let admission = lock_admission(&self.admission);
+        if !*admission {
+            return Err(RemoteReportSubmitFailure {
+                reason: SubmitError::Closed,
+                submission,
+            });
+        }
+        let (reply, receiver) = oneshot::channel();
+        match self
+            .requests
+            .try_send(Request::ReportRemote { submission, reply })
+        {
+            Ok(()) => Ok(receiver),
+            Err(TrySendError::Full(Request::ReportRemote { submission, .. })) => {
+                Err(RemoteReportSubmitFailure {
+                    reason: SubmitError::Busy,
+                    submission,
+                })
+            }
+            Err(TrySendError::Disconnected(Request::ReportRemote { submission, .. })) => {
+                Err(RemoteReportSubmitFailure {
+                    reason: SubmitError::Closed,
+                    submission,
+                })
+            }
+            Err(_) => unreachable!("try_report_remote only submits remote reports"),
+        }
+    }
+
     fn try_submit(&self, request: Request) -> Result<(), SubmitError> {
         let admission = lock_admission(&self.admission);
         if !*admission {
@@ -154,6 +194,48 @@ impl DatabaseClient {
 pub(crate) enum SubmitError {
     Busy,
     Closed,
+}
+
+pub(crate) type RemoteReportReply = Result<RemoteReportOutcome, RemoteReportExecutionFailure>;
+
+#[derive(Debug)]
+pub(crate) struct RemoteReportSubmitFailure {
+    reason: SubmitError,
+    submission: Box<RemoteReportSubmission>,
+}
+
+impl RemoteReportSubmitFailure {
+    pub(crate) fn reason(&self) -> SubmitError {
+        self.reason
+    }
+
+    pub(crate) fn submission(&self) -> &RemoteReportSubmission {
+        &self.submission
+    }
+
+    pub(crate) fn into_parts(self) -> (SubmitError, Box<RemoteReportSubmission>) {
+        (self.reason, self.submission)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RemoteReportExecutionFailure {
+    failure: DbFailure,
+    submission: Box<RemoteReportSubmission>,
+}
+
+impl RemoteReportExecutionFailure {
+    pub(crate) fn failure(&self) -> &DbFailure {
+        &self.failure
+    }
+
+    pub(crate) fn submission(&self) -> &RemoteReportSubmission {
+        &self.submission
+    }
+
+    pub(crate) fn into_parts(self) -> (DbFailure, Box<RemoteReportSubmission>) {
+        (self.failure, self.submission)
+    }
 }
 
 impl From<TrySendError<Request>> for SubmitError {
@@ -326,7 +408,7 @@ fn run_actor(
         let request = select_biased! {
             recv(shutdown) -> _ => {
                 close_admission(&admission);
-                return drain_accepted_mutations(
+                return drain_accepted_writes(
                     &mut connection,
                     &requests,
                     &write_gate,
@@ -373,6 +455,11 @@ fn run_actor(
                 }
                 continue;
             }
+            Request::ReportRemote { submission, reply } => {
+                let result = execute_remote_report(&mut connection, submission, &write_gate);
+                let _ = reply.send(result);
+                continue;
+            }
             #[cfg(test)]
             Request::RunLongQuery { started } => {
                 let _ = started.send(());
@@ -392,7 +479,7 @@ fn run_actor(
 
         if let Err(undelivered) = send_reply(&replies, &shutdown, reply) {
             close_admission(&admission);
-            return drain_accepted_mutations(
+            return drain_accepted_writes(
                 &mut connection,
                 &requests,
                 &write_gate,
@@ -420,7 +507,30 @@ fn execute_remote_claim(
     claim_remote(connection, account_id, current_time_ms()?)
 }
 
-fn drain_accepted_mutations(
+fn execute_remote_report(
+    connection: &mut Connection,
+    submission: Box<RemoteReportSubmission>,
+    write_gate: &Mutex<()>,
+) -> RemoteReportReply {
+    let _write_guard = lock_write_gate(write_gate);
+    let transition = current_time_ms().and_then(|now_ms| {
+        report_remote(connection, submission.claim(), submission.report(), now_ms)
+    });
+    match transition {
+        Ok(ReportTransition::Stale) => Ok(RemoteReportOutcome::Stale),
+        Ok(ReportTransition::Completed) => Ok(RemoteReportOutcome::Completed),
+        Ok(ReportTransition::Pending { state, wake_at_ms }) => {
+            Ok(RemoteReportOutcome::Pending { state, wake_at_ms })
+        }
+        Ok(ReportTransition::Continued(lease)) => Ok(submission.continue_claim(lease)),
+        Err(failure) => Err(RemoteReportExecutionFailure {
+            failure,
+            submission,
+        }),
+    }
+}
+
+fn drain_accepted_writes(
     connection: &mut Connection,
     requests: &Receiver<Request>,
     write_gate: &Mutex<()>,
@@ -428,11 +538,23 @@ fn drain_accepted_mutations(
 ) -> Result<(), DbFailure> {
     let mut first_failure = initial_failure;
     while let Ok(request) = requests.try_recv() {
-        if let Request::Mutate { mutation, .. } = request {
-            let result = execute_mutation(connection, mutation, write_gate);
-            if first_failure.is_none() {
-                first_failure = result.err();
+        match request {
+            Request::Mutate { mutation, .. } => {
+                let result = execute_mutation(connection, mutation, write_gate);
+                if first_failure.is_none() {
+                    first_failure = result.err();
+                }
             }
+            Request::ReportRemote { submission, reply } => {
+                let result = execute_remote_report(connection, submission, write_gate);
+                if first_failure.is_none()
+                    && let Err(failure) = &result
+                {
+                    first_failure = Some(failure.failure.clone());
+                }
+                let _ = reply.send(result);
+            }
+            _ => {}
         }
     }
     first_failure.map_or(Ok(()), Err)
@@ -732,6 +854,7 @@ mod tests {
     use crate::store::sqlite::{
         domain::{AccountScope, FailureKind, FolderScope, MessageMutation},
         migrations::LATEST_SCHEMA_VERSION,
+        remote::{RemoteCheckpoint, RemoteImapSource, RemoteReport, RemoteWorkMode},
     };
 
     fn empty_spec() -> PageSpec {
@@ -764,6 +887,27 @@ mod tests {
                     .unwrap()
                     .unwrap()
             })
+    }
+
+    fn receive_remote_report(receiver: oneshot::Receiver<RemoteReportReply>) -> RemoteReportReply {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(1), receiver)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            })
+    }
+
+    fn claimed_remote_intent(client: &DatabaseClient) -> Box<super::super::remote::RemoteClaim> {
+        let outcome = receive_remote_claim(client.try_claim_remote(1).unwrap()).unwrap();
+        let RemoteClaimOutcome::Claimed(claim) = outcome else {
+            panic!("expected a claimed remote intent");
+        };
+        claim
     }
 
     fn temporary_database_path() -> PathBuf {
@@ -805,6 +949,15 @@ mod tests {
             )
             .unwrap();
         let intent_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO messages
+                     (id, account_id, remote_key, received_at_ms, unread, revision)
+                 VALUES (1, 1, 'local-message', 0, 1, 0)",
+                [],
+            )
+            .unwrap();
+        super::super::stats::rebuild_account(&connection, 1).unwrap();
         connection
             .execute(
                 "INSERT INTO remote_change_intent_imap_sources
@@ -878,6 +1031,316 @@ mod tests {
         assert_eq!(claim.lease.intent_id, intent_id);
         assert_eq!(claim.mode, super::super::remote::RemoteWorkMode::Apply);
         assert!(replies.is_empty());
+        runtime.shutdown().unwrap();
+        remove_database_files(&path);
+    }
+
+    #[test]
+    fn remote_report_round_trip_bypasses_the_ui_reply_channel() {
+        let path = temporary_database_path();
+        seed_remote_intent(&path);
+        let (client, replies, runtime, _info) =
+            spawn_target(Target::File(path.clone()), REQUEST_CAPACITY, REPLY_CAPACITY).unwrap();
+        let claim = claimed_remote_intent(&client);
+        let submission = RemoteReportSubmission::new(claim, RemoteReport::confirmed(None));
+
+        let receiver = client.try_report_remote(submission).unwrap();
+        let outcome = receive_remote_report(receiver).unwrap();
+
+        assert_eq!(outcome, RemoteReportOutcome::Completed);
+        assert!(replies.is_empty());
+        runtime.shutdown().unwrap();
+        let connection = Connection::open(&path).unwrap();
+        let intent_count: i64 = connection
+            .query_row("SELECT count(*) FROM remote_change_intents", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(intent_count, 0);
+        drop(connection);
+        remove_database_files(&path);
+    }
+
+    #[test]
+    fn full_report_queue_returns_the_exact_submission() {
+        let path = temporary_database_path();
+        seed_remote_intent(&path);
+        let (client, mut replies, runtime, _info) =
+            spawn_target(Target::File(path.clone()), 1, REPLY_CAPACITY).unwrap();
+        let claim = claimed_remote_intent(&client);
+        let submission = RemoteReportSubmission::new(claim, RemoteReport::confirmed(None));
+        let submission_pointer: *const RemoteReportSubmission = submission.as_ref();
+        let (started_tx, started_rx) = bounded(1);
+        client.try_run_long_query(started_tx).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        client
+            .try_query_mailbox(RequestId::new(1).unwrap(), Generation::new(0), empty_spec())
+            .unwrap();
+
+        let failure = match client.try_report_remote(submission) {
+            Ok(_) => panic!("a full request queue accepted a remote report"),
+            Err(failure) => failure,
+        };
+
+        assert_eq!(failure.reason(), SubmitError::Busy);
+        assert!(std::ptr::eq(submission_pointer, failure.submission()));
+        client.interrupt_queries();
+        let DbReply::Mailbox(reply) = receive_reply(&mut replies) else {
+            panic!("expected the queued mailbox reply");
+        };
+        reply.result.unwrap();
+        runtime.shutdown().unwrap();
+        remove_database_files(&path);
+    }
+
+    #[test]
+    fn closed_actor_returns_the_exact_report_submission() {
+        let path = temporary_database_path();
+        seed_remote_intent(&path);
+        let (client, _replies, runtime, _info) =
+            spawn_target(Target::File(path.clone()), REQUEST_CAPACITY, REPLY_CAPACITY).unwrap();
+        let claim = claimed_remote_intent(&client);
+        let submission = RemoteReportSubmission::new(claim, RemoteReport::confirmed(None));
+        let submission_pointer: *const RemoteReportSubmission = submission.as_ref();
+        runtime.shutdown().unwrap();
+
+        let failure = match client.try_report_remote(submission) {
+            Ok(_) => panic!("a closed actor accepted a remote report"),
+            Err(failure) => failure,
+        };
+
+        assert_eq!(failure.reason(), SubmitError::Closed);
+        assert!(std::ptr::eq(submission_pointer, failure.submission()));
+        let (reason, recovered) = failure.into_parts();
+        assert_eq!(reason, SubmitError::Closed);
+        assert!(std::ptr::eq(submission_pointer, recovered.as_ref()));
+        remove_database_files(&path);
+    }
+
+    #[test]
+    fn cancelled_report_receiver_does_not_cancel_the_write() {
+        let path = temporary_database_path();
+        seed_remote_intent(&path);
+        let (client, mut replies, runtime, _info) =
+            spawn_target(Target::File(path.clone()), 2, REPLY_CAPACITY).unwrap();
+        let claim = claimed_remote_intent(&client);
+        let (started_tx, started_rx) = bounded(1);
+        client.try_run_long_query(started_tx).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let receiver = client
+            .try_report_remote(RemoteReportSubmission::new(
+                claim,
+                RemoteReport::confirmed(None),
+            ))
+            .unwrap();
+        drop(receiver);
+        client
+            .try_query_mailbox(RequestId::new(1).unwrap(), Generation::new(0), empty_spec())
+            .unwrap();
+
+        client.interrupt_queries();
+        let DbReply::Mailbox(reply) = receive_reply(&mut replies) else {
+            panic!("expected the FIFO barrier reply");
+        };
+        reply.result.unwrap();
+        runtime.shutdown().unwrap();
+
+        let connection = Connection::open(&path).unwrap();
+        let intent_count: i64 = connection
+            .query_row("SELECT count(*) FROM remote_change_intents", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(intent_count, 0);
+        drop(connection);
+        remove_database_files(&path);
+    }
+
+    #[test]
+    fn shutdown_drains_an_accepted_remote_report() {
+        let path = temporary_database_path();
+        seed_remote_intent(&path);
+        let (client, _replies, runtime, _info) =
+            spawn_target(Target::File(path.clone()), 1, REPLY_CAPACITY).unwrap();
+        let claim = claimed_remote_intent(&client);
+        let (started_tx, started_rx) = bounded(1);
+        client.try_run_long_query(started_tx).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let receiver = client
+            .try_report_remote(RemoteReportSubmission::new(
+                claim,
+                RemoteReport::confirmed(None),
+            ))
+            .unwrap();
+
+        runtime.shutdown().unwrap();
+
+        assert_eq!(
+            receive_remote_report(receiver).unwrap(),
+            RemoteReportOutcome::Completed
+        );
+        let connection = Connection::open(&path).unwrap();
+        let intent_count: i64 = connection
+            .query_row("SELECT count(*) FROM remote_change_intents", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(intent_count, 0);
+        drop(connection);
+        remove_database_files(&path);
+    }
+
+    #[test]
+    fn shutdown_continues_draining_after_a_report_failure() {
+        let path = temporary_database_path();
+        seed_remote_intent(&path);
+        let (client, _replies, runtime, _info) =
+            spawn_target(Target::File(path.clone()), 2, REPLY_CAPACITY).unwrap();
+        let mut claim = claimed_remote_intent(&client);
+        claim.mode = RemoteWorkMode::Reconcile;
+        let (started_tx, started_rx) = bounded(1);
+        client.try_run_long_query(started_tx).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let report_receiver = client
+            .try_report_remote(RemoteReportSubmission::new(
+                claim,
+                RemoteReport::confirmed(None),
+            ))
+            .unwrap();
+        client
+            .try_mutate(
+                RequestId::new(1).unwrap(),
+                Generation::new(0),
+                MessageMutation::set_unread(MessageId::new(1).unwrap(), false),
+            )
+            .unwrap();
+
+        let shutdown_error = runtime.shutdown().unwrap_err();
+
+        assert!(matches!(shutdown_error, ShutdownError::Worker(_)));
+        assert_eq!(
+            receive_remote_report(report_receiver)
+                .unwrap_err()
+                .failure()
+                .kind,
+            FailureKind::Conflict
+        );
+        let connection = Connection::open(&path).unwrap();
+        let unread: bool = connection
+            .query_row("SELECT unread FROM messages WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(!unread);
+        drop(connection);
+        remove_database_files(&path);
+    }
+
+    #[test]
+    fn closed_ui_reply_stream_still_drains_an_accepted_report() {
+        let path = temporary_database_path();
+        seed_remote_intent(&path);
+        let (client, replies, runtime, _info) =
+            spawn_target(Target::File(path.clone()), 2, REPLY_CAPACITY).unwrap();
+        let claim = claimed_remote_intent(&client);
+        let (started_tx, started_rx) = bounded(1);
+        client.try_run_long_query(started_tx).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        client
+            .try_query_mailbox(RequestId::new(1).unwrap(), Generation::new(0), empty_spec())
+            .unwrap();
+        let report_receiver = client
+            .try_report_remote(RemoteReportSubmission::new(
+                claim,
+                RemoteReport::confirmed(None),
+            ))
+            .unwrap();
+        drop(replies);
+
+        client.interrupt_queries();
+
+        assert_eq!(
+            receive_remote_report(report_receiver).unwrap(),
+            RemoteReportOutcome::Completed
+        );
+        runtime.shutdown().unwrap();
+        let connection = Connection::open(&path).unwrap();
+        let intent_count: i64 = connection
+            .query_row("SELECT count(*) FROM remote_change_intents", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(intent_count, 0);
+        drop(connection);
+        remove_database_files(&path);
+    }
+
+    #[test]
+    fn report_execution_failure_returns_the_exact_submission() {
+        let path = temporary_database_path();
+        seed_remote_intent(&path);
+        let (client, _replies, runtime, _info) =
+            spawn_target(Target::File(path.clone()), REQUEST_CAPACITY, REPLY_CAPACITY).unwrap();
+        let mut claim = claimed_remote_intent(&client);
+        claim.mode = RemoteWorkMode::Reconcile;
+        let submission = RemoteReportSubmission::new(claim, RemoteReport::confirmed(None));
+        let submission_pointer: *const RemoteReportSubmission = submission.as_ref();
+
+        let receiver = client.try_report_remote(submission).unwrap();
+        let failure = receive_remote_report(receiver).unwrap_err();
+
+        assert_eq!(failure.failure().kind, FailureKind::Conflict);
+        assert!(std::ptr::eq(submission_pointer, failure.submission()));
+        let (database_failure, recovered) = failure.into_parts();
+        assert_eq!(database_failure.kind, FailureKind::Conflict);
+        assert!(std::ptr::eq(submission_pointer, recovered.as_ref()));
+        runtime.shutdown().unwrap();
+        remove_database_files(&path);
+    }
+
+    #[test]
+    fn progress_report_returns_the_renewed_claim() {
+        let path = temporary_database_path();
+        seed_remote_intent(&path);
+        let (client, _replies, runtime, _info) =
+            spawn_target(Target::File(path.clone()), REQUEST_CAPACITY, REPLY_CAPACITY).unwrap();
+        let claim = claimed_remote_intent(&client);
+        let source = RemoteImapSource::new(
+            "inbox",
+            Some("mailbox-1"),
+            1,
+            1,
+            Some(2),
+            Some("email-1"),
+            false,
+            false,
+        )
+        .unwrap();
+        let checkpoint = RemoteCheckpoint::imap_sources(vec![source].into_boxed_slice()).unwrap();
+        let receiver = client
+            .try_report_remote(RemoteReportSubmission::new(
+                claim,
+                RemoteReport::progress(checkpoint),
+            ))
+            .unwrap();
+
+        let RemoteReportOutcome::Continued(claim) = receive_remote_report(receiver).unwrap() else {
+            panic!("expected a continued remote claim");
+        };
+        assert_eq!(claim.lease.claim_epoch, 2);
+        assert_eq!(claim.mode, RemoteWorkMode::Apply);
+        assert_eq!(claim.imap_sources[0].modseq, Some(2));
+
+        let receiver = client
+            .try_report_remote(RemoteReportSubmission::new(
+                claim,
+                RemoteReport::confirmed(None),
+            ))
+            .unwrap();
+        assert_eq!(
+            receive_remote_report(receiver).unwrap(),
+            RemoteReportOutcome::Completed
+        );
         runtime.shutdown().unwrap();
         remove_database_files(&path);
     }
