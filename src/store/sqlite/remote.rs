@@ -1,6 +1,9 @@
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-use super::{domain::DbFailure, journal::ensure_payload_budget};
+use super::{
+    domain::DbFailure,
+    journal::{ensure_payload_budget, map_journal_error},
+};
 
 const MIN_TIMESTAMP_MS: i64 = -62_135_596_800_000;
 const MAX_TIMESTAMP_MS: i64 = 253_402_300_799_999;
@@ -106,7 +109,16 @@ pub(super) fn claim_remote(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(DbFailure::database)?;
     let provider = require_supported_account(&transaction, account_id)?;
-    recover_one_expired_lease(&transaction, now_ms)?;
+    let (transaction, provider) = if recover_one_expired_lease(&transaction, now_ms)? {
+        transaction.commit().map_err(DbFailure::database)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(DbFailure::database)?;
+        let provider = require_supported_account(&transaction, account_id)?;
+        (transaction, provider)
+    } else {
+        (transaction, provider)
+    };
 
     if account_reconciliation_required(&transaction, account_id)? {
         transaction.commit().map_err(DbFailure::database)?;
@@ -131,6 +143,7 @@ pub(super) fn claim_remote(
     }
     ensure_payload_budget(&transaction, candidate.id)?;
     let work_mode = claim_work_mode(&transaction, &candidate, provider)?;
+    let folder_reserve = placement_folder_reserve(&transaction, candidate.id, work_mode)?;
 
     let active_mask: i64 = transaction
         .query_row(
@@ -159,6 +172,7 @@ pub(super) fn claim_remote(
                  lease_expires_at_ms = ?3,
                  attempt_count = attempt_count + 1,
                  dispatched_mask = dispatched_mask | ?4,
+                 leased_folder_reserve = ?8,
                  updated_at_ms = ?2
              WHERE id = ?1
                AND state = ?5
@@ -177,9 +191,10 @@ pub(super) fn claim_remote(
                 candidate.state,
                 MAX_ATTEMPTS,
                 candidate.claim_epoch,
+                folder_reserve,
             ],
         )
-        .map_err(DbFailure::database)?;
+        .map_err(map_journal_error)?;
     if updated != 1 {
         return Err(DbFailure::conflict(
             "remote intent changed while it was being claimed",
@@ -191,7 +206,10 @@ pub(super) fn claim_remote(
     Ok(RemoteClaimOutcome::Claimed(Box::new(claim)))
 }
 
-fn recover_one_expired_lease(transaction: &Transaction<'_>, now_ms: i64) -> Result<(), DbFailure> {
+fn recover_one_expired_lease(
+    transaction: &Transaction<'_>,
+    now_ms: i64,
+) -> Result<bool, DbFailure> {
     let expired: Option<(i64, String, i64, bool, i64)> = transaction
         .query_row(
             "SELECT i.id, a.provider, i.dispatched_mask,
@@ -215,7 +233,7 @@ fn recover_one_expired_lease(transaction: &Transaction<'_>, now_ms: i64) -> Resu
         .optional()
         .map_err(DbFailure::database)?;
     let Some((id, provider, dispatched_mask, reconcile_requested, attempts)) = expired else {
-        return Ok(());
+        return Ok(false);
     };
 
     let exhausted = attempts >= MAX_ATTEMPTS;
@@ -255,12 +273,13 @@ fn recover_one_expired_lease(transaction: &Transaction<'_>, now_ms: i64) -> Resu
     } else {
         "The previous idempotent remote attempt did not report completion and can be retried safely."
     };
-    transaction
+    let updated = transaction
         .execute(
             "UPDATE remote_change_intents
              SET state = ?2,
                  leased_version = NULL,
                  lease_expires_at_ms = NULL,
+                 leased_folder_reserve = 0,
                  reconcile_requested = CASE
                      WHEN ?3 AND delete_requested = 0 THEN 1
                      ELSE reconcile_requested
@@ -282,7 +301,7 @@ fn recover_one_expired_lease(transaction: &Transaction<'_>, now_ms: i64) -> Resu
             ],
         )
         .map_err(DbFailure::database)?;
-    Ok(())
+    Ok(updated == 1)
 }
 
 fn require_supported_account(
@@ -424,6 +443,33 @@ fn claim_work_mode(
     } else {
         RemoteWorkMode::Reconcile
     })
+}
+
+fn placement_folder_reserve(
+    transaction: &Transaction<'_>,
+    intent_id: i64,
+    mode: RemoteWorkMode,
+) -> Result<i64, DbFailure> {
+    transaction
+        .query_row(
+            "SELECT CASE WHEN placement_active THEN
+                 CASE WHEN ?2 THEN
+                     (SELECT count(*) FROM remote_change_intent_folders
+                      WHERE intent_id = ?1)
+                 ELSE max(
+                     0,
+                     (SELECT count(*) FROM remote_change_intent_folders
+                      WHERE intent_id = ?1 AND side = 'desired')
+                     -
+                     (SELECT count(*) FROM remote_change_intent_folders
+                      WHERE intent_id = ?1 AND side = 'base')
+                 ) END
+             ELSE 0 END
+             FROM remote_change_intents WHERE id = ?1",
+            params![intent_id, mode == RemoteWorkMode::Reconcile],
+            |row| row.get(0),
+        )
+        .map_err(DbFailure::database)
 }
 
 fn next_account_wake(
@@ -1002,6 +1048,176 @@ mod tests {
     }
 
     #[test]
+    fn placement_claim_reserves_rebase_capacity_until_recovery() {
+        let mut connection = database();
+        insert_account(&connection, 1, "imap");
+        connection
+            .execute(
+                "INSERT INTO remote_change_intents
+                     (account_id, target_key, local_revision, placement_active,
+                      not_before_ms, created_at_ms, updated_at_ms)
+                 VALUES (1, 'message-1', 3, 1, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        let intent_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO remote_change_intent_folders (intent_id, side, folder_key)
+                 VALUES (?1, 'desired', 'archive'), (?1, 'desired', 'label')",
+                [intent_id],
+            )
+            .unwrap();
+        insert_source(&connection, intent_id, 42);
+
+        let claim = claimed(claim_remote(&mut connection, 1, NOW_MS).unwrap());
+
+        assert_eq!(claim.mode, RemoteWorkMode::Apply);
+        let usage: (i64, i64) = connection
+            .query_row(
+                "SELECT child_count, reserved_count
+                 FROM remote_journal_usage WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(usage, (3, 2));
+        let reserve: i64 = connection
+            .query_row(
+                "SELECT leased_folder_reserve FROM remote_change_intents WHERE id = ?1",
+                [intent_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reserve, 2);
+
+        connection
+            .execute(
+                "INSERT INTO remote_account_reconciliations
+                     (account_id, reason, requested_at_ms)
+                 VALUES (1, 'legacy_journal_bootstrap', 0)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            claim_remote(&mut connection, 1, claim.lease.expires_at_ms).unwrap(),
+            RemoteClaimOutcome::AccountReconciliationRequired
+        );
+        let recovered: (String, Option<i64>, i64) = connection
+            .query_row(
+                "SELECT state, leased_version, leased_folder_reserve
+                 FROM remote_change_intents WHERE id = ?1",
+                [intent_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(recovered, ("reconcile".into(), None, 0));
+        let reserved_after_recovery: i64 = connection
+            .query_row(
+                "SELECT reserved_count FROM remote_journal_usage WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reserved_after_recovery, 0);
+    }
+
+    #[test]
+    fn reconciliation_claim_reserves_the_complete_placement_snapshot() {
+        let mut connection = database();
+        insert_account(&connection, 1, "imap");
+        connection
+            .execute(
+                "INSERT INTO remote_change_intents
+                     (account_id, target_key, local_revision, placement_active,
+                      not_before_ms, created_at_ms, updated_at_ms)
+                 VALUES (1, 'message-1', 3, 1, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        let intent_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO remote_change_intent_folders (intent_id, side, folder_key)
+                 VALUES (?1, 'base', 'inbox'), (?1, 'desired', 'archive')",
+                [intent_id],
+            )
+            .unwrap();
+
+        let claim = claimed(claim_remote(&mut connection, 1, NOW_MS).unwrap());
+
+        assert_eq!(claim.mode, RemoteWorkMode::Reconcile);
+        let usage: (i64, i64) = connection
+            .query_row(
+                "SELECT child_count, reserved_count
+                 FROM remote_journal_usage WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(usage, (2, 2));
+        let reserve: i64 = connection
+            .query_row(
+                "SELECT leased_folder_reserve FROM remote_change_intents WHERE id = ?1",
+                [intent_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reserve, 2);
+    }
+
+    #[test]
+    fn placement_claim_rolls_back_when_rebase_capacity_is_full() {
+        let mut connection = database();
+        insert_account(&connection, 1, "imap");
+        connection
+            .execute(
+                "INSERT INTO remote_change_intents
+                     (account_id, target_key, local_revision, placement_active,
+                      not_before_ms, created_at_ms, updated_at_ms)
+                 VALUES (1, 'message-1', 3, 1, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        let intent_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO remote_change_intent_folders (intent_id, side, folder_key)
+                 VALUES (?1, 'desired', 'archive'), (?1, 'desired', 'label')",
+                [intent_id],
+            )
+            .unwrap();
+        insert_source(&connection, intent_id, 42);
+        connection
+            .execute(
+                "UPDATE remote_journal_usage SET child_count = 65535 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+
+        let failure = claim_remote(&mut connection, 1, NOW_MS).unwrap_err();
+
+        assert_eq!(failure.kind, FailureKind::ResourceLimit);
+        let stored: (String, Option<i64>, i64, i64) = connection
+            .query_row(
+                "SELECT state, leased_version, attempt_count, leased_folder_reserve
+                 FROM remote_change_intents WHERE id = ?1",
+                [intent_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, ("ready".into(), None, 0, 0));
+        let reserved: i64 = connection
+            .query_row(
+                "SELECT reserved_count FROM remote_journal_usage WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reserved, 0);
+    }
+
+    #[test]
     fn expired_imap_flag_write_is_replayed_idempotently() {
         let mut connection = database();
         insert_account(&connection, 1, "imap");
@@ -1155,6 +1371,57 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, ("ready".into(), None, None, 0, 0));
+    }
+
+    #[test]
+    fn expired_lease_recovery_commits_before_a_reclaim_failure() {
+        let mut connection = database();
+        insert_account(&connection, 1, "imap");
+        let intent_id = insert_flag_intent(&connection, 1, "large-message", 0);
+        insert_max_sources(&mut connection, intent_id, 512, 512);
+        connection
+            .execute(
+                "UPDATE remote_change_intents
+                 SET state = 'in_flight', leased_version = 1, claim_epoch = 1,
+                     lease_expires_at_ms = 500, attempt_count = 1,
+                     dispatched_mask = ?2
+                 WHERE id = ?1",
+                params![intent_id, UNREAD_MASK],
+            )
+            .unwrap();
+
+        let failure = claim_remote(&mut connection, 1, NOW_MS).unwrap_err();
+
+        assert_eq!(failure.kind, FailureKind::ResourceLimit);
+        let recovered: (String, Option<i64>, Option<i64>, i64, String) = connection
+            .query_row(
+                "SELECT state, leased_version, lease_expires_at_ms,
+                        leased_folder_reserve, error_code
+                 FROM remote_change_intents WHERE id = ?1",
+                [intent_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            recovered,
+            ("ready".into(), None, None, 0, "lease_expired_replay".into(),)
+        );
+        let reserved: i64 = connection
+            .query_row(
+                "SELECT reserved_count FROM remote_journal_usage WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reserved, 0);
     }
 
     #[test]

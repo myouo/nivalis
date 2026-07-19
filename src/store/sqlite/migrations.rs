@@ -2,7 +2,7 @@ use std::{error::Error, fmt};
 
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(crate) const LATEST_SCHEMA_VERSION: u32 = 7;
+pub(crate) const LATEST_SCHEMA_VERSION: u32 = 8;
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -38,6 +38,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 7,
         sql: include_str!("../../../migrations/0007_remote_change_journal.sql"),
+    },
+    Migration {
+        version: 8,
+        sql: include_str!("../../../migrations/0008_remote_lease_reservations.sql"),
     },
 ];
 
@@ -709,7 +713,10 @@ mod tests {
             })
             .expect("count target intents after legacy migration");
         assert_eq!(intent_count, 0);
-        assert_eq!(schema_version(&connection), 7);
+        assert_eq!(
+            schema_version(&connection),
+            i64::from(LATEST_SCHEMA_VERSION)
+        );
     }
 
     #[test]
@@ -747,7 +754,7 @@ mod tests {
             transaction.commit().expect("commit legacy overflow data");
         }
 
-        migrate(&mut connection).expect("upgrade oversized legacy state to v7");
+        migrate(&mut connection).expect("upgrade oversized legacy state to the latest schema");
 
         let marker_count: i64 = connection
             .query_row(
@@ -772,7 +779,10 @@ mod tests {
             })
             .expect("count target intents after oversized migration");
         assert_eq!(intent_count, 0);
-        assert_eq!(schema_version(&connection), 7);
+        assert_eq!(
+            schema_version(&connection),
+            i64::from(LATEST_SCHEMA_VERSION)
+        );
     }
 
     #[test]
@@ -1212,6 +1222,201 @@ mod tests {
     }
 
     #[test]
+    fn remote_lease_reservations_share_and_release_the_child_budget() {
+        let mut connection = memory_connection();
+        migrate(&mut connection).expect("apply migrations");
+        insert_account(&connection, 1, "one@example.test");
+        let bypass = connection
+            .execute(
+                "INSERT INTO remote_change_intents
+                     (account_id, target_key, local_revision,
+                      unread_base, unread_desired, state, leased_version,
+                      claim_epoch, lease_expires_at_ms, attempt_count,
+                      leased_folder_reserve, not_before_ms,
+                      created_at_ms, updated_at_ms)
+                 VALUES (1, 'bypass', 0, 1, 0, 'in_flight', 1,
+                         1, 1, 1, 1, 0, 0, 0)",
+                [],
+            )
+            .expect_err("a reservation cannot bypass accounting through insert");
+        assert_eq!(
+            bypass.sqlite_error_code(),
+            Some(ErrorCode::ConstraintViolation)
+        );
+        connection
+            .execute(
+                "INSERT INTO remote_change_intents
+                     (account_id, target_key, local_revision, placement_active,
+                      not_before_ms, created_at_ms, updated_at_ms)
+                 VALUES (1, 'message-1', 0, 1, 0, 0, 0)",
+                [],
+            )
+            .expect("insert placement intent");
+        let intent_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO remote_change_intent_folders (intent_id, side, folder_key)
+                 VALUES (?1, 'desired', 'archive')",
+                [intent_id],
+            )
+            .expect("insert desired folder");
+        connection
+            .execute(
+                "UPDATE remote_journal_usage SET child_count = 65534 WHERE singleton = 1",
+                [],
+            )
+            .expect("move usage near the global limit");
+        connection
+            .execute(
+                "UPDATE remote_change_intents
+                 SET state = 'in_flight', leased_version = 1, claim_epoch = 1,
+                     lease_expires_at_ms = 1, attempt_count = 1,
+                     leased_folder_reserve = 2
+                 WHERE id = ?1",
+                [intent_id],
+            )
+            .expect("reserve the remaining child capacity");
+        let reserved: i64 = connection
+            .query_row(
+                "SELECT reserved_count FROM remote_journal_usage WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read reserved usage");
+        assert_eq!(reserved, 2);
+
+        let full = connection
+            .execute(
+                "INSERT INTO remote_change_intent_folders (intent_id, side, folder_key)
+                 VALUES (?1, 'desired', 'trash')",
+                [intent_id],
+            )
+            .expect_err("reserved capacity must exclude unrelated child inserts");
+        assert_eq!(
+            full.sqlite_error_code(),
+            Some(ErrorCode::ConstraintViolation)
+        );
+        let invalid_release = connection
+            .execute(
+                "UPDATE remote_change_intents SET state = 'ready' WHERE id = ?1",
+                [intent_id],
+            )
+            .expect_err("a non-zero reserve requires an active lease");
+        assert_eq!(
+            invalid_release.sqlite_error_code(),
+            Some(ErrorCode::ConstraintViolation)
+        );
+
+        connection
+            .execute(
+                "UPDATE remote_change_intents
+                 SET state = 'ready', leased_version = NULL,
+                     lease_expires_at_ms = NULL, leased_folder_reserve = 0
+                 WHERE id = ?1",
+                [intent_id],
+            )
+            .expect("release the lease and its reservation atomically");
+        connection
+            .execute(
+                "INSERT INTO remote_change_intent_folders (intent_id, side, folder_key)
+                 VALUES (?1, 'desired', 'trash')",
+                [intent_id],
+            )
+            .expect("released capacity is available to child rows");
+        connection
+            .execute(
+                "UPDATE remote_change_intents
+                 SET state = 'in_flight', leased_version = 1,
+                     lease_expires_at_ms = 2, leased_folder_reserve = 1
+                 WHERE id = ?1",
+                [intent_id],
+            )
+            .expect("reserve capacity again");
+        connection
+            .execute(
+                "DELETE FROM remote_change_intents WHERE id = ?1",
+                [intent_id],
+            )
+            .expect("delete the leased intent");
+        let reserved_after_delete: i64 = connection
+            .query_row(
+                "SELECT reserved_count FROM remote_journal_usage WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read usage after delete");
+        assert_eq!(reserved_after_delete, 0);
+    }
+
+    #[test]
+    fn v8_recovers_unreserved_v7_leases_before_report_processing() {
+        let mut connection = memory_connection();
+        enable_foreign_keys(&connection).expect("enable foreign keys");
+        migrate_with(&mut connection, &MIGRATIONS[..7], 7).expect("create v7 schema");
+        insert_account(&connection, 1, "one@example.test");
+        connection
+            .execute(
+                "INSERT INTO remote_change_intents
+                     (account_id, target_key, local_revision, placement_active,
+                      dispatched_mask, state, leased_version, claim_epoch,
+                      lease_expires_at_ms, attempt_count, not_before_ms,
+                      created_at_ms, updated_at_ms)
+                 VALUES (1, 'message-1', 0, 1, 4, 'in_flight', 1, 1,
+                         253402300799999, 1, 0, 0, 0)",
+                [],
+            )
+            .expect("insert a v7 lease without a reservation");
+        let intent_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO remote_change_intent_folders (intent_id, side, folder_key)
+                 VALUES (?1, 'base', 'inbox'), (?1, 'desired', 'archive')",
+                [intent_id],
+            )
+            .expect("insert v7 placement snapshots");
+
+        migrate(&mut connection).expect("upgrade the active v7 lease to v8");
+
+        let recovered: (String, Option<i64>, Option<i64>, bool, i64, String) = connection
+            .query_row(
+                "SELECT state, leased_version, lease_expires_at_ms,
+                        reconcile_requested, leased_folder_reserve, error_code
+                 FROM remote_change_intents WHERE id = ?1",
+                [intent_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("read the recovered v8 intent");
+        assert_eq!(
+            recovered,
+            (
+                "reconcile".into(),
+                None,
+                None,
+                true,
+                0,
+                "upgrade_lease_recovery".into(),
+            )
+        );
+        let reserved: i64 = connection
+            .query_row(
+                "SELECT reserved_count FROM remote_journal_usage WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read v8 reservation usage");
+        assert_eq!(reserved, 0);
+    }
+
+    #[test]
     fn account_stats_follow_account_lifecycle_and_enforce_count_bounds() {
         let mut connection = memory_connection();
         migrate(&mut connection).expect("apply migrations");
@@ -1310,9 +1515,9 @@ mod tests {
         assert!(matches!(
             error,
             MigrationError::FutureSchema {
-                found: 8,
+                found,
                 supported: LATEST_SCHEMA_VERSION,
-            }
+            } if found == LATEST_SCHEMA_VERSION + 1
         ));
     }
 

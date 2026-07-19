@@ -786,7 +786,8 @@ fn ensure_global_child_capacity(
 ) -> Result<(), DbFailure> {
     let used: i64 = transaction
         .query_row(
-            "SELECT child_count FROM remote_journal_usage WHERE singleton = 1",
+            "SELECT child_count + reserved_count
+             FROM remote_journal_usage WHERE singleton = 1",
             [],
             |row| row.get(0),
         )
@@ -968,7 +969,7 @@ fn resource_limit(message: impl Into<Box<str>>) -> DbFailure {
     DbFailure::resource_limit(message)
 }
 
-fn map_journal_error(error: SqliteError) -> DbFailure {
+pub(super) fn map_journal_error(error: SqliteError) -> DbFailure {
     let message = error.to_string();
     if [
         "remote intent limit exceeded",
@@ -976,6 +977,7 @@ fn map_journal_error(error: SqliteError) -> DbFailure {
         "remote intent source limit exceeded",
         "tombstone location limit exceeded",
         "remote journal child limit exceeded",
+        "remote lease reservation limit exceeded",
     ]
     .iter()
     .any(|needle| message.contains(needle))
