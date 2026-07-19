@@ -29,6 +29,8 @@ Status: complete.
 
 Status: in progress.
 
+Checkpoint: SQLite accounts, one bounded mailbox page, persistent counters, and selected details now drive the production UI. The `d19cec5` local-read release proves the 90MiB hard idle gate and less-than-2x interaction/surface growth; repeated normal runs meet the preferred 50MiB target, while a retained outlier prevents an unconditional target claim. Pagination, controller writes/undo, FTS/interruption, and controller integration tests remain before M1 can close, and the memory gate must be rerun after they activate.
+
 Acceptance criteria:
 
 - The production controller no longer constructs or mutates `MailStore::demo()`.
