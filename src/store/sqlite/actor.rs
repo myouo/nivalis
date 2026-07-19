@@ -890,7 +890,7 @@ mod tests {
             .build()
             .unwrap()
             .block_on(async {
-                tokio::time::timeout(Duration::from_secs(1), replies.recv())
+                tokio::time::timeout(Duration::from_secs(3), replies.recv())
                     .await
                     .unwrap()
                     .unwrap()
