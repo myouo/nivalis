@@ -2,6 +2,7 @@
 name = "nivalis-mail"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.92"
 description = "A focused desktop mail client built with Rust, Slint, and Skia"
 license = "GPL-3.0-only"
 build = "build.rs"
