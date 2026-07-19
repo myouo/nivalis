@@ -833,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_panic_closes_admission_and_is_reported_by_shutdown() {
+    fn worker_panic_closes_response_and_is_reported_by_shutdown() {
         let (client, runtime) =
             spawn_with_factory(Arc::new(|| panic!("controlled credential worker failure")));
         let response = client
@@ -852,16 +852,17 @@ mod tests {
             });
         assert!(outer.is_err());
 
+        assert_eq!(
+            runtime.shutdown().unwrap_err(),
+            CredentialRuntimeError::WorkerPanicked
+        );
+
         let rejected = client
             .try_submit(CredentialOperation::Delete {
                 locator: locator(LOCATOR),
             })
             .unwrap_err();
         assert_eq!(rejected.reason(), CredentialSubmitError::Closed);
-        assert_eq!(
-            runtime.shutdown().unwrap_err(),
-            CredentialRuntimeError::WorkerPanicked
-        );
     }
 
     #[test]
