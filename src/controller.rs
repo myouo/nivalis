@@ -5,21 +5,26 @@ use self::session::{
     MutationIntent, MutationScope, ReadSession, SessionError,
 };
 use crate::core::{
-    AccountDirectoryLoadError, CoreHandle, Event, EventReceiver, MailboxLoadError,
-    MessageLoadError, MutationSubmitError, SubmitError,
+    AccountConfigDraft, AccountDirectoryLoadError, AccountOperation, AccountOperationFailure,
+    AccountOperationResponseError, AccountOperationSubmitError, AccountOperationSuccess,
+    AccountSetupMode, AccountWorkflowFailureKind, CoreHandle, Event, EventReceiver,
+    MailboxLoadError, MessageLoadError, MutationSubmitError, RequestId, SubmitError,
 };
+use crate::credentials::Secret;
 use crate::presentation::sqlite::{
-    AccountCatalog, ProjectedMailbox, ProjectedMailboxStats, ProjectionError,
+    AccountCatalog, AccountOperationTarget, ProjectedMailbox, ProjectedMailboxStats,
+    ProjectionError,
 };
 use crate::presentation::{show_snackbar, show_snackbar_for};
 use crate::store::sqlite::{
-    AccountDirectory, DbFailure, FailureKind, MailboxPage, MessageDetail, Tagged,
+    AccountDiagnosticKind, AccountDirectory, AccountValidationError, DbFailure, FailureKind,
+    MailboxPage, MessageDetail, Tagged,
 };
 use crate::ui_identity::{AccountKey, EntityKey};
 use crate::{AccountItem, AppWindow, MailDetail, MailSummary};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     rc::Rc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -53,6 +58,10 @@ struct Controller {
     pending_mailbox: RefCell<Option<PendingMailboxProjection>>,
     mail_model: Rc<VecModel<MailSummary>>,
     account_model: Rc<VecModel<AccountItem>>,
+    account_task: RefCell<Option<slint::JoinHandle<()>>>,
+    account_request_id: Cell<u64>,
+    account_cancelable: Cell<bool>,
+    pending_account_selection: Cell<Option<i64>>,
     search_timer: Rc<Timer>,
     snackbar_timer: Rc<Timer>,
 }
@@ -84,6 +93,9 @@ impl Controller {
         ui.set_total_known(true);
         ui.set_data_source_label("SQLite cache".into());
         ui.set_status_text("Loading local cache".into());
+        ui.set_account_operation_loading(false);
+        ui.set_account_operation_stage(SharedString::default());
+        ui.set_account_operation_error(SharedString::default());
         ui.set_selected_id(SharedString::default());
         ui.set_selected_mail(MailDetail::default());
 
@@ -95,6 +107,10 @@ impl Controller {
             pending_mailbox: RefCell::new(None),
             mail_model,
             account_model,
+            account_task: RefCell::new(None),
+            account_request_id: Cell::new(1),
+            account_cancelable: Cell::new(false),
+            pending_account_selection: Cell::new(None),
             search_timer: Rc::new(Timer::default()),
             snackbar_timer: Rc::new(Timer::default()),
         }
@@ -124,6 +140,23 @@ impl Controller {
 
         let controller = self.clone();
         ui.on_switch_account(move |key| controller.change_account(key.as_str()));
+
+        let controller = self.clone();
+        ui.on_manage_account(move |key| controller.manage_account(key.as_str()));
+
+        let controller = self.clone();
+        ui.on_add_account(move |name, address, login, host, port, password| {
+            controller.add_account(name, address, login, host, port, password);
+        });
+
+        let controller = self.clone();
+        ui.on_diagnose_account(move |key| controller.diagnose_account(key.as_str()));
+
+        let controller = self.clone();
+        ui.on_remove_account(move |key| controller.remove_account(key.as_str()));
+
+        let controller = self.clone();
+        ui.on_cancel_account_operation(move || controller.cancel_account_operation());
 
         let controller = self.clone();
         ui.on_retry_mailbox(move || controller.retry_mailbox());
@@ -276,12 +309,29 @@ impl Controller {
             }
         };
 
+        let requested_account = self
+            .pending_account_selection
+            .take()
+            .and_then(EntityKey::new)
+            .map(AccountKey::Account)
+            .filter(|account| catalog.contains(*account));
+        let requested_change = if let Some(account) = requested_account {
+            match self.state.borrow_mut().set_account(account) {
+                Ok(changed) => changed,
+                Err(error) => {
+                    self.fail_accounts(session_error(error));
+                    return;
+                }
+            }
+        } else {
+            false
+        };
         let active_account = self.state.borrow().account();
         let scope_reset = if catalog.contains(active_account) {
-            false
+            requested_change
         } else {
             match self.state.borrow_mut().set_account(AccountKey::All) {
-                Ok(changed) => changed,
+                Ok(changed) => requested_change || changed,
                 Err(error) => {
                     self.fail_accounts(session_error(error));
                     return;
@@ -296,6 +346,7 @@ impl Controller {
             ui.set_initial_loading(false);
         }
         self.refresh_active_account();
+        self.refresh_managed_account();
 
         let pending_page = self.pending_mailbox.borrow_mut().take();
         if scope_reset {
@@ -898,6 +949,437 @@ impl Controller {
         self.reload_mailbox();
     }
 
+    fn manage_account(&self, key: &str) {
+        let Some(account_key) = AccountKey::parse(key) else {
+            self.notify_error(UserError::selection());
+            return;
+        };
+        let catalog = self.catalog.borrow();
+        let Some(target) = catalog
+            .as_ref()
+            .and_then(|catalog| catalog.operation_target(account_key))
+        else {
+            self.notify_error(UserError::selection());
+            return;
+        };
+        let Some(item) = catalog
+            .as_ref()
+            .and_then(|catalog| catalog.active_item(account_key))
+        else {
+            self.notify_error(UserError::selection());
+            return;
+        };
+        drop(catalog);
+
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_managed_account_id(target.account_id.get().to_string().into());
+            ui.set_managed_account_name(item.name);
+            ui.set_managed_account_address(item.address);
+            ui.set_managed_account_status(item.status);
+            ui.set_managed_account_has_error(item.has_error);
+            ui.set_account_operation_error(SharedString::default());
+            ui.set_account_menu_open(false);
+            ui.set_account_status_open(true);
+        }
+    }
+
+    fn add_account(
+        self: &Rc<Self>,
+        name: SharedString,
+        address: SharedString,
+        login: SharedString,
+        host: SharedString,
+        port: SharedString,
+        password: SharedString,
+    ) {
+        let Some(port) = parse_imap_port(port.as_str()) else {
+            self.show_account_error(UserError::account_port());
+            return;
+        };
+        let draft = match AccountConfigDraft::new(
+            name.as_str(),
+            address.as_str(),
+            login.as_str(),
+            host.as_str(),
+            port,
+            account_accent(address.as_str()),
+        ) {
+            Ok(draft) => draft,
+            Err(error) => {
+                self.show_account_error(account_validation_error(error));
+                return;
+            }
+        };
+        let secret = match Secret::new(password.as_bytes().to_vec()) {
+            Ok(secret) => secret,
+            Err(_) => {
+                self.show_account_error(UserError::account_password());
+                return;
+            }
+        };
+        let Some(request_id) = self.next_account_request_id() else {
+            self.show_account_error(UserError::account_session_limit());
+            return;
+        };
+        if !self.begin_account_task("Saving account securely", false) {
+            return;
+        }
+        let response = match self.core.try_account_operation(AccountOperation::Setup {
+            request_id,
+            mode: AccountSetupMode::Create,
+            draft,
+            secret,
+        }) {
+            Ok(response) => response,
+            Err(failure) => {
+                self.finish_account_task_with_error(account_submit_error(failure.reason()));
+                return;
+            }
+        };
+
+        let weak = Rc::downgrade(self);
+        let task = slint::spawn_local(async move {
+            let setup_reply = response.await;
+            let Some(controller) = weak.upgrade() else {
+                return;
+            };
+            let target = match setup_reply {
+                Ok(reply) if reply.request_id == request_id => match reply.result {
+                    Ok(AccountOperationSuccess::Configured {
+                        account_id,
+                        generation,
+                    }) => AccountOperationTarget {
+                        account_id,
+                        expected_generation: generation,
+                    },
+                    Ok(_) => {
+                        controller.finish_account_task_with_error(UserError::account_result());
+                        return;
+                    }
+                    Err(failure) => {
+                        controller.finish_setup_failure(failure, &name, &address);
+                        return;
+                    }
+                },
+                Ok(_) => {
+                    controller.finish_account_task_with_error(UserError::account_result());
+                    return;
+                }
+                Err(error) => {
+                    controller.finish_account_task_with_error(account_response_error(error));
+                    return;
+                }
+            };
+
+            controller
+                .pending_account_selection
+                .set(Some(target.account_id.get()));
+            controller.show_managed_account(target, name, address, "Checking connection", false);
+            controller.issue_accounts();
+            controller.account_cancelable.set(true);
+            if let Some(ui) = controller.ui.upgrade() {
+                ui.set_account_setup_open(false);
+                ui.set_account_status_open(true);
+                ui.set_account_operation_stage("Checking connection".into());
+            }
+            let Some(diagnostic_request_id) = controller.next_account_request_id() else {
+                controller.finish_account_task_with_error(UserError::account_session_limit());
+                return;
+            };
+            let diagnostic =
+                match controller
+                    .core
+                    .try_account_operation(AccountOperation::Diagnose {
+                        request_id: diagnostic_request_id,
+                        account_id: target.account_id,
+                        expected_generation: target.expected_generation,
+                    }) {
+                    Ok(response) => response,
+                    Err(failure) => {
+                        controller
+                            .finish_account_task_with_error(account_submit_error(failure.reason()));
+                        return;
+                    }
+                };
+            drop(controller);
+
+            let result = diagnostic.await;
+            if let Some(controller) = weak.upgrade() {
+                controller.finish_diagnostic(result, diagnostic_request_id, target);
+            }
+        });
+        self.store_account_task(task);
+    }
+
+    fn diagnose_account(self: &Rc<Self>, key: &str) {
+        let Some(target) = self.account_operation_target(key) else {
+            self.show_account_error(UserError::selection());
+            return;
+        };
+        let Some(request_id) = self.next_account_request_id() else {
+            self.show_account_error(UserError::account_session_limit());
+            return;
+        };
+        if !self.begin_account_task("Checking connection", true) {
+            return;
+        }
+        let response = match self.core.try_account_operation(AccountOperation::Diagnose {
+            request_id,
+            account_id: target.account_id,
+            expected_generation: target.expected_generation,
+        }) {
+            Ok(response) => response,
+            Err(failure) => {
+                self.finish_account_task_with_error(account_submit_error(failure.reason()));
+                return;
+            }
+        };
+        let weak = Rc::downgrade(self);
+        let task = slint::spawn_local(async move {
+            let result = response.await;
+            if let Some(controller) = weak.upgrade() {
+                controller.finish_diagnostic(result, request_id, target);
+            }
+        });
+        self.store_account_task(task);
+    }
+
+    fn remove_account(self: &Rc<Self>, key: &str) {
+        let Some(target) = self.account_operation_target(key) else {
+            self.show_account_error(UserError::selection());
+            return;
+        };
+        let Some(request_id) = self.next_account_request_id() else {
+            self.show_account_error(UserError::account_session_limit());
+            return;
+        };
+        if !self.begin_account_task("Removing account", false) {
+            return;
+        }
+        let response = match self.core.try_account_operation(AccountOperation::Remove {
+            request_id,
+            account_id: target.account_id,
+            expected_generation: target.expected_generation,
+        }) {
+            Ok(response) => response,
+            Err(failure) => {
+                self.finish_account_task_with_error(account_submit_error(failure.reason()));
+                return;
+            }
+        };
+        let weak = Rc::downgrade(self);
+        let task = slint::spawn_local(async move {
+            let result = response.await;
+            let Some(controller) = weak.upgrade() else {
+                return;
+            };
+            match result {
+                Ok(reply)
+                    if reply.request_id == request_id
+                        && matches!(
+                            reply.result,
+                            Ok(AccountOperationSuccess::Removed { account_id })
+                                if account_id == target.account_id
+                        ) =>
+                {
+                    controller.finish_account_task();
+                    if let Some(ui) = controller.ui.upgrade() {
+                        ui.set_account_remove_open(false);
+                        ui.set_account_status_open(false);
+                        ui.set_status_text("Account removed".into());
+                        show_snackbar(
+                            &ui,
+                            "Account and its local cache were removed",
+                            false,
+                            &controller.snackbar_timer,
+                        );
+                    }
+                    controller.issue_accounts();
+                }
+                Ok(reply) if reply.request_id == request_id => match reply.result {
+                    Err(failure) => {
+                        controller.finish_account_task_with_error(account_operation_error(failure))
+                    }
+                    Ok(_) => controller.finish_account_task_with_error(UserError::account_result()),
+                },
+                Ok(_) => {
+                    controller.finish_account_task_with_error(UserError::account_result());
+                }
+                Err(error) => {
+                    controller.finish_account_task_with_error(account_response_error(error));
+                }
+            }
+        });
+        self.store_account_task(task);
+    }
+
+    fn account_operation_target(&self, key: &str) -> Option<AccountOperationTarget> {
+        let key = AccountKey::parse(key)?;
+        self.catalog.borrow().as_ref()?.operation_target(key)
+    }
+
+    fn next_account_request_id(&self) -> Option<RequestId> {
+        let current = self.account_request_id.get();
+        let next = current.checked_add(1)?;
+        let request_id = RequestId::new(current).ok()?;
+        self.account_request_id.set(next);
+        Some(request_id)
+    }
+
+    fn begin_account_task(&self, stage: &'static str, cancelable: bool) -> bool {
+        let mut task = self.account_task.borrow_mut();
+        if task.as_ref().is_some_and(|task| !task.is_finished()) {
+            drop(task);
+            self.show_account_error(UserError::account_busy());
+            return false;
+        }
+        task.take();
+        self.account_cancelable.set(cancelable);
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_account_operation_loading(true);
+            ui.set_account_operation_stage(stage.into());
+            ui.set_account_operation_error(SharedString::default());
+        }
+        true
+    }
+
+    fn store_account_task(&self, task: Result<slint::JoinHandle<()>, slint::EventLoopError>) {
+        match task {
+            Ok(task) => *self.account_task.borrow_mut() = Some(task),
+            Err(_) => self.finish_account_task_with_error(UserError::account_runtime()),
+        }
+    }
+
+    fn cancel_account_operation(&self) {
+        if !self.account_cancelable.replace(false) {
+            return;
+        }
+        if let Some(task) = self.account_task.borrow_mut().take() {
+            task.abort();
+        }
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_account_operation_loading(false);
+            ui.set_account_operation_stage(SharedString::default());
+            ui.set_account_operation_error(
+                "Connection check cancelled. Run it again when you are ready.".into(),
+            );
+            ui.set_status_text("Connection check cancelled".into());
+        }
+        self.issue_accounts();
+    }
+
+    fn finish_setup_failure(
+        &self,
+        failure: AccountOperationFailure,
+        name: &SharedString,
+        address: &SharedString,
+    ) {
+        if let (Some(account_id), Some(expected_generation)) =
+            (failure.account_id, failure.generation)
+        {
+            self.show_managed_account(
+                AccountOperationTarget {
+                    account_id,
+                    expected_generation,
+                },
+                name.clone(),
+                address.clone(),
+                "Setup needs attention",
+                true,
+            );
+            if let Some(ui) = self.ui.upgrade() {
+                ui.set_account_setup_open(false);
+                ui.set_account_status_open(true);
+            }
+            self.issue_accounts();
+        }
+        self.finish_account_task_with_error(account_operation_error(failure));
+    }
+
+    fn finish_diagnostic(
+        &self,
+        result: Result<crate::core::AccountOperationReply, AccountOperationResponseError>,
+        request_id: RequestId,
+        target: AccountOperationTarget,
+    ) {
+        match result {
+            Ok(reply)
+                if reply.request_id == request_id
+                    && matches!(
+                        reply.result,
+                        Ok(AccountOperationSuccess::Diagnosed {
+                            account_id,
+                            generation,
+                        }) if account_id == target.account_id
+                            && generation == target.expected_generation
+                    ) =>
+            {
+                self.finish_account_task();
+                if let Some(ui) = self.ui.upgrade() {
+                    ui.set_managed_account_status("Connected".into());
+                    ui.set_managed_account_has_error(false);
+                    ui.set_account_status_open(false);
+                    ui.set_status_text("Account connected".into());
+                    show_snackbar(&ui, "Account connected", false, &self.snackbar_timer);
+                }
+                self.issue_accounts();
+            }
+            Ok(reply) if reply.request_id == request_id => match reply.result {
+                Err(failure) => {
+                    let error = account_operation_error(failure);
+                    if let Some(ui) = self.ui.upgrade() {
+                        ui.set_managed_account_status(error.title.into());
+                        ui.set_managed_account_has_error(true);
+                        ui.set_account_status_open(true);
+                    }
+                    self.finish_account_task_with_error(error);
+                    self.issue_accounts();
+                }
+                Ok(_) => self.finish_account_task_with_error(UserError::account_result()),
+            },
+            Ok(_) => self.finish_account_task_with_error(UserError::account_result()),
+            Err(error) => self.finish_account_task_with_error(account_response_error(error)),
+        }
+    }
+
+    fn show_managed_account(
+        &self,
+        target: AccountOperationTarget,
+        name: SharedString,
+        address: SharedString,
+        status: &'static str,
+        has_error: bool,
+    ) {
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_managed_account_id(target.account_id.get().to_string().into());
+            ui.set_managed_account_name(name);
+            ui.set_managed_account_address(address);
+            ui.set_managed_account_status(status.into());
+            ui.set_managed_account_has_error(has_error);
+        }
+    }
+
+    fn finish_account_task(&self) {
+        self.account_task.borrow_mut().take();
+        self.account_cancelable.set(false);
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_account_operation_loading(false);
+            ui.set_account_operation_stage(SharedString::default());
+        }
+    }
+
+    fn finish_account_task_with_error(&self, error: UserError) {
+        self.finish_account_task();
+        self.show_account_error(error);
+    }
+
+    fn show_account_error(&self, error: UserError) {
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_account_operation_error(error.detail.into());
+            ui.set_status_text(error.title.into());
+        }
+    }
+
     fn refresh_active_account(&self) {
         let account_key = self.state.borrow().account();
         let item = self
@@ -917,6 +1399,36 @@ impl Controller {
             ui.set_active_account_color(item.avatar_color);
             ui.set_active_account_error(item.has_error);
         }
+    }
+
+    fn refresh_managed_account(&self) {
+        let Some(ui) = self.ui.upgrade() else {
+            return;
+        };
+        let key = ui.get_managed_account_id();
+        if key.is_empty() || ui.get_account_operation_loading() {
+            return;
+        }
+        let Some(account_key) = AccountKey::parse(key.as_str()) else {
+            ui.set_account_status_open(false);
+            ui.set_account_remove_open(false);
+            return;
+        };
+        let item = self
+            .catalog
+            .borrow()
+            .as_ref()
+            .and_then(|catalog| catalog.active_item(account_key));
+        let Some(item) = item else {
+            ui.set_account_status_open(false);
+            ui.set_account_remove_open(false);
+            ui.set_managed_account_id(SharedString::default());
+            return;
+        };
+        ui.set_managed_account_name(item.name);
+        ui.set_managed_account_address(item.address);
+        ui.set_managed_account_status(item.status);
+        ui.set_managed_account_has_error(item.has_error);
     }
 
     fn retry_mailbox(&self) {
@@ -1009,6 +1521,10 @@ impl Controller {
     fn core_closed(&self) {
         self.state.borrow_mut().cancel_pending();
         self.pending_mailbox.borrow_mut().take();
+        if let Some(task) = self.account_task.borrow_mut().take() {
+            task.abort();
+        }
+        self.account_cancelable.set(false);
         self.snackbar_timer.stop();
         let show_detail_error = self.ui.upgrade().is_some_and(|ui| {
             ui.set_initial_loading(false);
@@ -1018,6 +1534,11 @@ impl Controller {
             ui.set_delete_dialog_open(false);
             ui.set_snackbar_can_undo(false);
             ui.set_snackbar_visible(false);
+            ui.set_account_operation_loading(false);
+            ui.set_account_operation_stage(SharedString::default());
+            ui.set_account_operation_error(
+                "The account service stopped. Restart Nivalis and try again.".into(),
+            );
             ui.get_detail_loading() || !ui.get_selected_id().is_empty()
         });
         let error = submit_error(SubmitError::Closed);
@@ -1194,6 +1715,171 @@ impl UserError {
             title: "Undo is unavailable",
             detail: "Nivalis could not read a valid system time. Check the clock and try again.",
         }
+    }
+
+    const fn account_port() -> Self {
+        Self {
+            title: "Check the IMAP port",
+            detail: "Enter a port from 1 to 65535. Secure IMAP normally uses 993.",
+        }
+    }
+
+    const fn account_password() -> Self {
+        Self {
+            title: "Enter an app password",
+            detail: "Use a non-empty app password from your mail provider, then try again.",
+        }
+    }
+
+    const fn account_session_limit() -> Self {
+        Self {
+            title: "Account session reached a safety limit",
+            detail: "Restart Nivalis before changing another account.",
+        }
+    }
+
+    const fn account_busy() -> Self {
+        Self {
+            title: "An account action is already running",
+            detail: "Wait for the current account action to finish, or cancel the connection check.",
+        }
+    }
+
+    const fn account_result() -> Self {
+        Self {
+            title: "Account result could not be verified",
+            detail: "Refresh the account list and try the action again.",
+        }
+    }
+
+    const fn account_runtime() -> Self {
+        Self {
+            title: "Account action could not start",
+            detail: "The interface event loop is unavailable. Restart Nivalis and try again.",
+        }
+    }
+}
+
+fn parse_imap_port(value: &str) -> Option<u16> {
+    if value.is_empty() || value.trim() != value || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    value.parse().ok().filter(|port| *port != 0)
+}
+
+fn account_accent(address: &str) -> u32 {
+    const PALETTE: [u32; 6] = [0x315f4e, 0x3f5f78, 0x6a5741, 0x76546a, 0x516541, 0x73534a];
+    let index = address
+        .bytes()
+        .fold(0_usize, |value, byte| value.wrapping_add(byte as usize))
+        % PALETTE.len();
+    PALETTE[index]
+}
+
+fn account_validation_error(error: AccountValidationError) -> UserError {
+    match error {
+        AccountValidationError::Name => UserError {
+            title: "Check the account name",
+            detail: "Enter a short name that identifies this account.",
+        },
+        AccountValidationError::Address => UserError {
+            title: "Check the email address",
+            detail: "Enter a complete email address, such as name@example.com.",
+        },
+        AccountValidationError::Login => UserError {
+            title: "Check the login name",
+            detail: "Enter the login name required by your mail provider. It is usually your email address.",
+        },
+        AccountValidationError::Host => UserError {
+            title: "Check the IMAP server",
+            detail: "Enter a valid server name, such as imap.example.com. Nivalis always verifies its certificate.",
+        },
+        AccountValidationError::Port => UserError::account_port(),
+        AccountValidationError::CredentialKey
+        | AccountValidationError::Accent
+        | AccountValidationError::Generation
+        | AccountValidationError::Timestamp => UserError::account_result(),
+    }
+}
+
+fn account_submit_error(error: AccountOperationSubmitError) -> UserError {
+    match error {
+        AccountOperationSubmitError::Busy => UserError::account_busy(),
+        AccountOperationSubmitError::Closed => UserError {
+            title: "Account service stopped",
+            detail: "Restart Nivalis before changing this account.",
+        },
+    }
+}
+
+fn account_response_error(_error: AccountOperationResponseError) -> UserError {
+    UserError {
+        title: "Account action stopped",
+        detail: "The account service closed before the action finished. Restart Nivalis and try again.",
+    }
+}
+
+fn account_operation_error(failure: AccountOperationFailure) -> UserError {
+    match failure.kind {
+        AccountWorkflowFailureKind::Diagnostic(kind) => account_diagnostic_error(kind),
+        AccountWorkflowFailureKind::Credential(_) => UserError {
+            title: "App password is unavailable",
+            detail: "Unlock the system credential service, then run the account action again.",
+        },
+        AccountWorkflowFailureKind::CredentialReplyClosed => UserError {
+            title: "Credential service stopped",
+            detail: "Restart Nivalis, unlock the system credential service, and try again.",
+        },
+        AccountWorkflowFailureKind::Database(FailureKind::Conflict) => UserError {
+            title: "Account changed",
+            detail: "Reopen account status to use its latest settings, then try again.",
+        },
+        AccountWorkflowFailureKind::Database(FailureKind::NotFound) => UserError {
+            title: "Account is no longer available",
+            detail: "Refresh the account list and choose another account.",
+        },
+        AccountWorkflowFailureKind::Database(FailureKind::ResourceLimit) => UserError {
+            title: "Account limit reached",
+            detail: "Remove an unused account or reduce its local data before trying again.",
+        },
+        AccountWorkflowFailureKind::Database(FailureKind::Database)
+        | AccountWorkflowFailureKind::Database(FailureKind::Migration) => UserError {
+            title: "Local account data is unavailable",
+            detail: "Check local storage permissions and restart Nivalis before trying again.",
+        },
+        AccountWorkflowFailureKind::Busy => UserError::account_busy(),
+        AccountWorkflowFailureKind::InvalidLocator
+        | AccountWorkflowFailureKind::UnexpectedReply => UserError::account_result(),
+    }
+}
+
+fn account_diagnostic_error(kind: AccountDiagnosticKind) -> UserError {
+    match kind {
+        AccountDiagnosticKind::Authentication => UserError {
+            title: "Sign-in was rejected",
+            detail: "Check that the login and app password are current. Remove and add the account again to replace them.",
+        },
+        AccountDiagnosticKind::Permission => UserError {
+            title: "Inbox access was denied",
+            detail: "Enable IMAP access with your provider, then check the connection again.",
+        },
+        AccountDiagnosticKind::Certificate => UserError {
+            title: "Server identity could not be verified",
+            detail: "Check the IMAP server name and system trust settings. Certificate verification cannot be bypassed.",
+        },
+        AccountDiagnosticKind::Timeout => UserError {
+            title: "Connection check timed out",
+            detail: "Check the network and server address, then run the connection check again.",
+        },
+        AccountDiagnosticKind::Offline => UserError {
+            title: "IMAP server is unreachable",
+            detail: "Reconnect to the network or correct the server address, then try again.",
+        },
+        AccountDiagnosticKind::Protocol => UserError {
+            title: "Server response was not supported",
+            detail: "Confirm that this is an IMAP-over-TLS server on the selected port, then try again.",
+        },
     }
 }
 
@@ -1641,6 +2327,58 @@ mod tests {
     }
 
     #[test]
+    fn account_inputs_and_diagnostic_guidance_are_bounded_and_stable() {
+        assert_eq!(parse_imap_port("993"), Some(993));
+        for invalid in ["", "0", " 993", "993 ", "-1", "65536", "imap"] {
+            assert_eq!(parse_imap_port(invalid), None, "accepted {invalid:?}");
+        }
+        assert_eq!(
+            account_accent("user@example.test"),
+            account_accent("user@example.test")
+        );
+        assert!(account_accent("user@example.test") <= 0x00ff_ffff);
+
+        let cases = [
+            (
+                AccountDiagnosticKind::Authentication,
+                "Sign-in was rejected",
+                "app password",
+            ),
+            (
+                AccountDiagnosticKind::Permission,
+                "Inbox access was denied",
+                "Enable IMAP",
+            ),
+            (
+                AccountDiagnosticKind::Certificate,
+                "Server identity could not be verified",
+                "cannot be bypassed",
+            ),
+            (
+                AccountDiagnosticKind::Timeout,
+                "Connection check timed out",
+                "network",
+            ),
+            (
+                AccountDiagnosticKind::Offline,
+                "IMAP server is unreachable",
+                "Reconnect",
+            ),
+            (
+                AccountDiagnosticKind::Protocol,
+                "Server response was not supported",
+                "IMAP-over-TLS",
+            ),
+        ];
+        for (kind, title, next_step) in cases {
+            let error = account_diagnostic_error(kind);
+            assert_eq!(error.title, title);
+            assert!(error.detail.contains(next_step));
+            assert!(!error.detail.contains("secret server response"));
+        }
+    }
+
+    #[test]
     fn production_controller_drives_sqlite_success_empty_and_error_states() {
         i_slint_backend_testing::init_no_event_loop();
 
@@ -1652,6 +2390,30 @@ mod tests {
         assert!(harness.ui.get_has_accounts());
         assert!(harness.ui.get_mail_actions_enabled());
         assert_eq!(harness.ui.get_accounts().row_count(), 65);
+
+        harness.ui.invoke_manage_account("1".into());
+        assert!(harness.ui.get_account_status_open());
+        assert_eq!(harness.ui.get_managed_account_id().as_str(), "1");
+        assert_eq!(
+            harness.ui.get_managed_account_address().as_str(),
+            "account-1@example.test"
+        );
+        harness.ui.set_account_status_open(false);
+
+        harness.ui.invoke_add_account(
+            "Personal".into(),
+            "user@example.test".into(),
+            "user@example.test".into(),
+            "imap.example.test".into(),
+            "0".into(),
+            "not-retained".into(),
+        );
+        assert_eq!(
+            harness.ui.get_account_operation_error().as_str(),
+            "Enter a port from 1 to 65535. Secure IMAP normally uses 993."
+        );
+        assert!(!harness.ui.get_account_operation_loading());
+
         assert_eq!(harness.ui.get_message_total(), 51);
         assert!(harness.ui.get_has_next_mailbox_page());
         assert!(model_contains(&harness.ui, "51"));
