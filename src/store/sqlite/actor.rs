@@ -837,7 +837,11 @@ fn run_actor(
             }
             #[cfg(test)]
             Request::RunLongQuery { started } => {
-                let _ = started.send(());
+                // Arm the existing progress hook so tests interrupt an active VM, not a gap
+                // between request admission and sqlite3_step().
+                let previous =
+                    lock_progress_started(&control.mailbox.progress_started).replace(started);
+                assert!(previous.is_none(), "a progress probe is already armed");
                 let _ = connection.query_row(
                     "WITH RECURSIVE counter(value) AS (
                          VALUES(0)
