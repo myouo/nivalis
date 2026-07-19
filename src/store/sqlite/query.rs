@@ -26,9 +26,9 @@ const MAILBOX_SELECT: &str = "
      WHERE ";
 
 const OPEN_MESSAGE_SQL: &str = "
-    SELECT m.id, m.sender_name, m.sender_address, m.subject, m.received_at_ms,
-           coalesce(c.reader_excerpt, ''), coalesce(c.truncated, 0),
-           coalesce(c.body_byte_count, 0), c.body_file_key
+    SELECT m.id, m.account_id, m.sender_name, m.sender_address, m.subject, m.received_at_ms,
+           m.unread, m.starred, m.has_attachment, coalesce(c.reader_excerpt, ''),
+           coalesce(c.truncated, 0), coalesce(c.body_byte_count, 0), c.body_file_key
       FROM messages AS m
       LEFT JOIN message_content AS c ON c.message_id = m.id
      WHERE m.id = ?1";
@@ -266,19 +266,25 @@ pub(super) fn open_message(
 ) -> Result<Option<MessageDetail>, DbFailure> {
     connection
         .query_row(OPEN_MESSAGE_SQL, [id.get()], |row| {
-            let byte_count: i64 = row.get(7)?;
+            let byte_count: i64 = row.get(11)?;
             Ok(MessageDetail {
                 id: MessageId::from_database(row.get(0)?),
-                sender_name: row.get::<_, String>(1)?.into_boxed_str(),
-                sender_address: row.get::<_, String>(2)?.into_boxed_str(),
-                subject: row.get::<_, String>(3)?.into_boxed_str(),
-                received_at_ms: row.get(4)?,
-                reader_excerpt: row.get::<_, String>(5)?.into_boxed_str(),
-                body_truncated: row.get(6)?,
+                account_id: row.get(1)?,
+                sender_name: row.get::<_, String>(2)?.into_boxed_str(),
+                sender_address: row.get::<_, String>(3)?.into_boxed_str(),
+                subject: row.get::<_, String>(4)?.into_boxed_str(),
+                received_at_ms: row.get(5)?,
+                unread: row.get(6)?,
+                starred: row.get(7)?,
+                has_attachment: row.get(8)?,
+                reader_excerpt: row.get::<_, String>(9)?.into_boxed_str(),
+                body_truncated: row.get(10)?,
                 body_byte_count: u64::try_from(byte_count).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(7, Type::Integer, Box::new(error))
+                    rusqlite::Error::FromSqlConversionFailure(11, Type::Integer, Box::new(error))
                 })?,
-                body_file_key: row.get::<_, Option<String>>(8)?.map(String::into_boxed_str),
+                body_file_key: row
+                    .get::<_, Option<String>>(12)?
+                    .map(String::into_boxed_str),
             })
         })
         .optional()
@@ -557,8 +563,35 @@ mod tests {
             .unwrap();
 
         assert_eq!(&*detail.reader_excerpt, "Bounded body");
+        assert_eq!(detail.account_id, 1);
+        assert!(detail.unread);
+        assert!(!detail.starred);
+        assert!(!detail.has_attachment);
         assert!(detail.body_truncated);
         assert_eq!(detail.body_byte_count, 70_000);
+    }
+
+    #[test]
+    fn message_detail_carries_current_reader_actions_without_page_state() {
+        let connection = seeded_connection(1);
+        connection
+            .execute(
+                "UPDATE messages
+                 SET unread = 0, starred = 1, has_attachment = 1
+                 WHERE id = 1",
+                [],
+            )
+            .unwrap();
+
+        let detail = open_message(&connection, MessageId::new(1).unwrap())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(detail.id, MessageId::new(1).unwrap());
+        assert_eq!(detail.account_id, 1);
+        assert!(!detail.unread);
+        assert!(detail.starred);
+        assert!(detail.has_attachment);
     }
 
     #[test]

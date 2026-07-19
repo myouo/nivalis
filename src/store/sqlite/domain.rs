@@ -229,10 +229,14 @@ pub(crate) struct MailboxPage {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct MessageDetail {
     pub(crate) id: MessageId,
+    pub(crate) account_id: i64,
     pub(crate) sender_name: Box<str>,
     pub(crate) sender_address: Box<str>,
     pub(crate) subject: Box<str>,
     pub(crate) received_at_ms: i64,
+    pub(crate) unread: bool,
+    pub(crate) starred: bool,
+    pub(crate) has_attachment: bool,
     pub(crate) reader_excerpt: Box<str>,
     pub(crate) body_truncated: bool,
     pub(crate) body_byte_count: u64,
