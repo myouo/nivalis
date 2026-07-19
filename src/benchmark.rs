@@ -57,14 +57,12 @@ const ACCOUNT_DIAGNOSTIC_DEFAULT_TIMEOUT_MS: u64 = 45_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AccountDiagnosticExpectation {
     Ready,
-    Authentication,
 }
 
 impl AccountDiagnosticExpectation {
     fn parse(value: &str) -> Option<Self> {
         match value {
             "ready" => Some(Self::Ready),
-            "authentication" => Some(Self::Authentication),
             _ => None,
         }
     }
@@ -72,7 +70,6 @@ impl AccountDiagnosticExpectation {
     const fn label(self) -> &'static str {
         match self {
             Self::Ready => "ready",
-            Self::Authentication => "authentication",
         }
     }
 }
@@ -90,12 +87,18 @@ struct AccountDiagnosticConfig {
 impl AccountDiagnosticConfig {
     fn load() -> Result<Self, &'static str> {
         let secret_path = required_account_diagnostic_env("NIVALIS_STRESS_ACCOUNT_SECRET_FILE")?;
+        let host = required_account_diagnostic_env("NIVALIS_STRESS_ACCOUNT_IMAP_HOST")?;
+        // The harness copies through Slint to exercise production UI, so it only accepts fake
+        // credentials for a loopback fixture rather than a real provider secret.
+        if !is_loopback_imap_host(&host) {
+            return Err("nonlocal_host_rejected");
+        }
         Ok(Self {
             name: std::env::var("NIVALIS_STRESS_ACCOUNT_NAME")
                 .unwrap_or_else(|_| "Memory diagnostic".into()),
             address: required_account_diagnostic_env("NIVALIS_STRESS_ACCOUNT_ADDRESS")?,
             login: required_account_diagnostic_env("NIVALIS_STRESS_ACCOUNT_LOGIN")?,
-            host: required_account_diagnostic_env("NIVALIS_STRESS_ACCOUNT_IMAP_HOST")?,
+            host,
             port: std::env::var("NIVALIS_STRESS_ACCOUNT_IMAP_PORT")
                 .unwrap_or_else(|_| "993".into()),
             secret: read_account_diagnostic_secret(&PathBuf::from(secret_path))?,
@@ -106,6 +109,10 @@ impl AccountDiagnosticConfig {
                 .ok_or("invalid_expected_result")?,
         })
     }
+}
+
+fn is_loopback_imap_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
 fn required_account_diagnostic_env(name: &str) -> Result<String, &'static str> {
@@ -179,6 +186,7 @@ struct AccountDiagnosticStress {
     phase: AccountDiagnosticPhase,
     started: Instant,
     deadline: Instant,
+    cleanup_required: bool,
 }
 
 fn install_account_diagnostic_stress(
@@ -211,6 +219,7 @@ fn install_account_diagnostic_stress(
             phase: AccountDiagnosticPhase::WaitingForInitialState,
             started,
             deadline: started + Duration::from_millis(timeout),
+            cleanup_required: false,
         }));
         let state_for_timer = state.clone();
         let timer_for_callback = Rc::downgrade(&timer);
@@ -226,7 +235,12 @@ fn install_account_diagnostic_stress(
                 };
                 let mut state = state_for_timer.borrow_mut();
                 if Instant::now() >= state.deadline {
-                    fail_account_diagnostic_stress(&ui, &timer, "operation_timeout");
+                    fail_account_diagnostic_stress(
+                        &ui,
+                        &timer,
+                        "operation_timeout",
+                        state.cleanup_required,
+                    );
                     state.phase = AccountDiagnosticPhase::Complete;
                     return;
                 }
@@ -237,14 +251,19 @@ fn install_account_diagnostic_stress(
                             return;
                         }
                         if ui.get_has_accounts() {
-                            fail_account_diagnostic_stress(&ui, &timer, "fixture_not_empty");
+                            fail_account_diagnostic_stress(
+                                &ui,
+                                &timer,
+                                "fixture_not_empty",
+                                false,
+                            );
                             state.phase = AccountDiagnosticPhase::Complete;
                             return;
                         }
                         let config = match AccountDiagnosticConfig::load() {
                             Ok(config) => config,
                             Err(reason) => {
-                                fail_account_diagnostic_stress(&ui, &timer, reason);
+                                fail_account_diagnostic_stress(&ui, &timer, reason, false);
                                 state.phase = AccountDiagnosticPhase::Complete;
                                 return;
                             }
@@ -256,6 +275,7 @@ fn install_account_diagnostic_stress(
                                     &ui,
                                     &timer,
                                     "secret_file_invalid",
+                                    false,
                                 );
                                 state.phase = AccountDiagnosticPhase::Complete;
                                 return;
@@ -270,6 +290,7 @@ fn install_account_diagnostic_stress(
                             config.port.into(),
                             secret,
                         );
+                        state.cleanup_required = true;
                         state.phase = AccountDiagnosticPhase::Diagnosing { expected };
                     }
                     AccountDiagnosticPhase::Diagnosing { expected } => {
@@ -282,6 +303,7 @@ fn install_account_diagnostic_stress(
                                 &ui,
                                 &timer,
                                 "account_identity_missing",
+                                true,
                             );
                             state.phase = AccountDiagnosticPhase::Complete;
                             return;
@@ -323,7 +345,12 @@ fn install_account_diagnostic_stress(
                             return;
                         }
                         if !ui.get_account_operation_error().is_empty() {
-                            fail_account_diagnostic_stress(&ui, &timer, "removal_failed");
+                            fail_account_diagnostic_stress(
+                                &ui,
+                                &timer,
+                                "removal_failed",
+                                true,
+                            );
                             state.phase = AccountDiagnosticPhase::Complete;
                             return;
                         }
@@ -339,6 +366,8 @@ fn install_account_diagnostic_stress(
                         if account_model_contains(&ui, account_id.as_str()) {
                             return;
                         }
+                        let outcome = *outcome;
+                        state.cleanup_required = false;
                         match outcome {
                             Ok(outcome) => {
                                 ui.set_status_text("Account diagnostic memory stress complete".into());
@@ -349,7 +378,9 @@ fn install_account_diagnostic_stress(
                                 );
                                 stop_stress(&ui, &timer);
                             }
-                            Err(reason) => fail_account_diagnostic_stress(&ui, &timer, reason),
+                            Err(reason) => {
+                                fail_account_diagnostic_stress(&ui, &timer, reason, false)
+                            }
                         }
                         state.phase = AccountDiagnosticPhase::Complete;
                     }
@@ -368,7 +399,6 @@ fn classify_account_diagnostic(
 ) -> Option<AccountDiagnosticExpectation> {
     match (status, has_error) {
         ("Connected", false) => Some(AccountDiagnosticExpectation::Ready),
-        ("Sign-in was rejected", true) => Some(AccountDiagnosticExpectation::Authentication),
         _ => None,
     }
 }
@@ -382,9 +412,17 @@ fn account_model_contains(ui: &AppWindow, account_id: &str) -> bool {
     })
 }
 
-fn fail_account_diagnostic_stress(ui: &AppWindow, timer: &Timer, reason: &str) {
+fn fail_account_diagnostic_stress(
+    ui: &AppWindow,
+    timer: &Timer,
+    reason: &str,
+    cleanup_required: bool,
+) {
     ui.set_status_text("Account diagnostic memory stress failed".into());
-    eprintln!("NIVALIS_STRESS_ERROR scenario=account-diagnostic reason={reason}");
+    eprintln!(
+        "NIVALIS_STRESS_ERROR scenario=account-diagnostic reason={reason} cleanup_required={}",
+        u8::from(cleanup_required)
+    );
     stop_stress(ui, timer);
 }
 
@@ -1432,10 +1470,7 @@ mod tests {
             AccountDiagnosticExpectation::parse("ready"),
             Some(AccountDiagnosticExpectation::Ready)
         );
-        assert_eq!(
-            AccountDiagnosticExpectation::parse("authentication"),
-            Some(AccountDiagnosticExpectation::Authentication)
-        );
+        assert_eq!(AccountDiagnosticExpectation::parse("authentication"), None);
         assert_eq!(AccountDiagnosticExpectation::parse("offline"), None);
         assert_eq!(
             classify_account_diagnostic("Connected", false),
@@ -1443,9 +1478,13 @@ mod tests {
         );
         assert_eq!(
             classify_account_diagnostic("Sign-in was rejected", true),
-            Some(AccountDiagnosticExpectation::Authentication)
+            None
         );
         assert_eq!(classify_account_diagnostic("Connected", true), None);
+        assert!(is_loopback_imap_host("localhost"));
+        assert!(is_loopback_imap_host("127.0.0.1"));
+        assert!(is_loopback_imap_host("::1"));
+        assert!(!is_loopback_imap_host("imap.example.test"));
     }
 
     #[cfg(unix)]

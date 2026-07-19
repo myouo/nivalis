@@ -26,6 +26,7 @@ cpu_settle_seconds=${NIVALIS_MEMORY_CPU_SETTLE_SECONDS:-10}
 cpu_settle_max_percent=${NIVALIS_MEMORY_CPU_SETTLE_MAX_PERCENT:-0.00}
 stress_steps=${NIVALIS_STRESS_STEPS:-}
 test_case=${NIVALIS_MEMORY_TEST_CASE:-}
+account_diagnostic_delay_ms=${NIVALIS_STRESS_DELAY_MS:-5000}
 
 is_bounded_positive_decimal() {
     local value=$1
@@ -93,6 +94,19 @@ if [[ "$stress_scenario" == "account-diagnostic" && "$stress_steps" != "1" ]]; t
     printf 'account-diagnostic stress requires NIVALIS_STRESS_STEPS=1\n' >&2
     exit 1
 fi
+if [[ "$stress_scenario" == "account-diagnostic" && -z "$data_dir" ]]; then
+    printf 'account-diagnostic stress requires an explicit persistent NIVALIS_MEMORY_DATA_DIR or NIVALIS_DATA_DIR\n' >&2
+    exit 1
+fi
+if [[ "$stress_scenario" == "account-diagnostic" && "$cpu_settle_gate" != "1" ]]; then
+    printf 'account-diagnostic stress requires NIVALIS_MEMORY_CPU_SETTLE_GATE=1\n' >&2
+    exit 1
+fi
+if [[ "$stress_scenario" == "account-diagnostic" ]] &&
+    ! is_bounded_positive_decimal "$account_diagnostic_delay_ms" 2147483647; then
+    printf 'account-diagnostic stress requires a positive bounded NIVALIS_STRESS_DELAY_MS\n' >&2
+    exit 1
+fi
 if [[ -n "$stress_steps" &&
     ("$stress_scenario" == "pagination" || "$stress_scenario" == "write-search") ]] &&
     ((stress_steps % 2 != 0)); then
@@ -128,6 +142,11 @@ for sample in "${sample_points[@]}"; do
     fi
     previous_sample=$sample
 done
+if [[ "$stress_scenario" == "account-diagnostic" ]] &&
+    ((account_diagnostic_delay_ms <= sample_points[0] * 1000)); then
+    printf 'account-diagnostic stress must start after the first memory baseline sample\n' >&2
+    exit 1
+fi
 if ((hard_gate)) && ((${#sample_points[@]} < 2)); then
     printf 'NIVALIS_MEMORY_HARD_GATE requires at least two samples for the growth check\n' >&2
     exit 1
@@ -398,6 +417,10 @@ for ((run = 1; run <= runs; run++)); do
         if ((${#stress_errors[@]} > 0)); then
             printf 'Stress harness reported an error: %s\n' \
                 "${stress_errors[${#stress_errors[@]} - 1]}" >&2
+            if [[ "$stress_scenario" == "account-diagnostic" &&
+                "${stress_errors[${#stress_errors[@]} - 1]}" == *' cleanup_required=1' ]]; then
+                printf 'Account diagnostic recovery data retained at %s\n' "$data_dir" >&2
+            fi
             exit 1
         fi
         mapfile -t stress_results < <(grep -E '^NIVALIS_STRESS_RESULT ' "$run_log_file" || true)
@@ -409,7 +432,7 @@ for ((run = 1; run <= runs; run++)); do
         fi
         stress_result=${stress_results[0]}
         if [[ "$stress_scenario" == "account-diagnostic" ]]; then
-            account_diagnostic_pattern='^NIVALIS_STRESS_RESULT scenario=account-diagnostic cycles=1 outcome=(ready|authentication) removed=1 elapsed_ms=(0|[1-9][0-9]*)$'
+            account_diagnostic_pattern='^NIVALIS_STRESS_RESULT scenario=account-diagnostic cycles=1 outcome=ready removed=1 elapsed_ms=(0|[1-9][0-9]*)$'
             if [[ ! "$stress_result" =~ $account_diagnostic_pattern ]]; then
                 printf 'Account-diagnostic stress completion marker has an invalid format: %s\n' \
                     "$stress_result" >&2
