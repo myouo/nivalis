@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll},
     thread,
@@ -15,10 +15,17 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select_biased};
 use rusqlite::{Connection, InterruptHandle, OpenFlags, limits::Limit};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::content::{ContentStaging, PublishedContent};
+
 use super::{
+    content::{
+        ContentBatchToken, ContentManifest, ReserveContentRequest,
+        finalize_content_with_commit_hook, reserve_content,
+    },
     domain::{
         DbFailure, DbReply, Generation, MessageId, MessageMutation, PageSpec, RequestId, Tagged,
     },
+    file_gc::{FileGcOutcome, run_file_gc},
     migrations::migrate,
     mutation::mutate_message,
     query::{open_message, query_account_directory, query_mailbox},
@@ -33,6 +40,7 @@ const REPLY_CAPACITY: usize = 8;
 const SQLITE_CACHE_KIB: i64 = 1024;
 const SQLITE_MAX_VALUE_BYTES: i32 = 2 * 1024 * 1024;
 const MAILBOX_PROGRESS_OPS: i32 = 4096;
+const CONTENT_IMPORT_TTL_MS: i64 = 60 * 1_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MailboxDbKey {
@@ -168,6 +176,15 @@ enum Request {
     ReportRemote {
         submission: Box<RemoteReportSubmission>,
         reply: oneshot::Sender<RemoteReportReply>,
+    },
+    ImportContent {
+        submission: Box<ContentImportSubmission>,
+        reply: oneshot::Sender<ContentImportReply>,
+    },
+    RunFileGc {
+        staging: Arc<ContentStaging>,
+        limit: usize,
+        reply: oneshot::Sender<Result<FileGcOutcome, DbFailure>>,
     },
     #[cfg(test)]
     RunLongQuery { started: Sender<()> },
@@ -338,6 +355,53 @@ impl DatabaseClient {
         }
     }
 
+    pub(crate) fn try_import_content(
+        &self,
+        submission: Box<ContentImportSubmission>,
+    ) -> Result<oneshot::Receiver<ContentImportReply>, ContentImportSubmitFailure> {
+        let admission = lock_admission(&self.admission);
+        if !*admission {
+            return Err(ContentImportSubmitFailure {
+                reason: SubmitError::Closed,
+                submission,
+            });
+        }
+        let (reply, receiver) = oneshot::channel();
+        match self
+            .requests
+            .try_send(Request::ImportContent { submission, reply })
+        {
+            Ok(()) => Ok(receiver),
+            Err(TrySendError::Full(Request::ImportContent { submission, .. })) => {
+                Err(ContentImportSubmitFailure {
+                    reason: SubmitError::Busy,
+                    submission,
+                })
+            }
+            Err(TrySendError::Disconnected(Request::ImportContent { submission, .. })) => {
+                Err(ContentImportSubmitFailure {
+                    reason: SubmitError::Closed,
+                    submission,
+                })
+            }
+            Err(_) => unreachable!("try_import_content only submits content imports"),
+        }
+    }
+
+    pub(crate) fn try_run_file_gc(
+        &self,
+        staging: &Arc<ContentStaging>,
+        limit: usize,
+    ) -> Result<oneshot::Receiver<Result<FileGcOutcome, DbFailure>>, SubmitError> {
+        let (reply, receiver) = oneshot::channel();
+        self.try_submit(Request::RunFileGc {
+            staging: Arc::clone(staging),
+            limit,
+            reply,
+        })?;
+        Ok(receiver)
+    }
+
     fn try_submit(&self, request: Request) -> Result<(), SubmitError> {
         let admission = lock_admission(&self.admission);
         if !*admission {
@@ -380,6 +444,70 @@ pub(crate) enum SubmitError {
 }
 
 pub(crate) type RemoteReportReply = Result<RemoteReportOutcome, RemoteReportExecutionFailure>;
+
+#[derive(Debug)]
+pub(crate) struct ContentImportSubmission {
+    message_id: MessageId,
+    account_id: i64,
+    content: PublishedContent,
+}
+
+impl ContentImportSubmission {
+    pub(crate) fn new(message_id: MessageId, account_id: i64, content: PublishedContent) -> Self {
+        Self {
+            message_id,
+            account_id,
+            content,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ContentImportOutcome {
+    pub(crate) generation: i64,
+}
+
+pub(crate) type ContentImportReply = Result<ContentImportOutcome, ContentImportExecutionFailure>;
+
+#[derive(Debug)]
+pub(crate) struct ContentImportSubmitFailure {
+    reason: SubmitError,
+    submission: Box<ContentImportSubmission>,
+}
+
+impl ContentImportSubmitFailure {
+    pub(crate) fn reason(&self) -> SubmitError {
+        self.reason
+    }
+
+    pub(crate) fn submission(&self) -> &ContentImportSubmission {
+        &self.submission
+    }
+
+    pub(crate) fn into_parts(self) -> (SubmitError, Box<ContentImportSubmission>) {
+        (self.reason, self.submission)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ContentImportExecutionFailure {
+    failure: DbFailure,
+    submission: Box<ContentImportSubmission>,
+}
+
+impl ContentImportExecutionFailure {
+    pub(crate) fn failure(&self) -> &DbFailure {
+        &self.failure
+    }
+
+    pub(crate) fn submission(&self) -> &ContentImportSubmission {
+        &self.submission
+    }
+
+    pub(crate) fn into_parts(self) -> (DbFailure, Box<ContentImportSubmission>) {
+        (self.failure, self.submission)
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct RemoteReportSubmitFailure {
@@ -689,6 +817,24 @@ fn run_actor(
                 let _ = reply.send(result);
                 continue;
             }
+            Request::ImportContent { submission, reply } => {
+                let result =
+                    execute_content_import(&mut connection, submission, &control.write_gate);
+                let _ = reply.send(result);
+                continue;
+            }
+            Request::RunFileGc {
+                staging,
+                limit,
+                reply,
+            } => {
+                if !reply.is_closed() {
+                    let result =
+                        execute_file_gc(&mut connection, &staging, limit, &control.write_gate);
+                    let _ = reply.send(result);
+                }
+                continue;
+            }
             #[cfg(test)]
             Request::RunLongQuery { started } => {
                 let _ = started.send(());
@@ -814,6 +960,53 @@ fn execute_remote_report(
     }
 }
 
+fn execute_content_import(
+    connection: &mut Connection,
+    mut submission: Box<ContentImportSubmission>,
+    write_gate: &Mutex<()>,
+) -> ContentImportReply {
+    let _write_guard = lock_write_gate(write_gate);
+    let result = (|| {
+        let now_ms = current_time_ms()?;
+        let expires_at_ms = now_ms
+            .checked_add(CONTENT_IMPORT_TTL_MS)
+            .ok_or_else(|| DbFailure::resource_limit("content import lease overflow"))?;
+        let record = submission.content.record();
+        let request = ReserveContentRequest::new(
+            submission.message_id,
+            submission.account_id,
+            next_content_batch_token(),
+            ContentManifest::from_record(&record)?,
+            now_ms,
+            expires_at_ms,
+        )?;
+        let reservation = reserve_content(connection, request)?;
+        finalize_content_with_commit_hook(connection, &reservation, &record, now_ms, || {
+            submission.content.retain_files();
+        })
+    })();
+
+    match result {
+        Ok(outcome) => Ok(ContentImportOutcome {
+            generation: outcome.generation,
+        }),
+        Err(failure) => Err(ContentImportExecutionFailure {
+            failure,
+            submission,
+        }),
+    }
+}
+
+fn execute_file_gc(
+    connection: &mut Connection,
+    staging: &ContentStaging,
+    limit: usize,
+    write_gate: &Mutex<()>,
+) -> Result<FileGcOutcome, DbFailure> {
+    let _write_guard = lock_write_gate(write_gate);
+    run_file_gc(connection, staging, limit)
+}
+
 fn drain_accepted_writes(
     connection: &mut Connection,
     requests: &Receiver<Request>,
@@ -831,6 +1024,15 @@ fn drain_accepted_writes(
             }
             Request::ReportRemote { submission, reply } => {
                 let result = execute_remote_report(connection, submission, write_gate);
+                if first_failure.is_none()
+                    && let Err(failure) = &result
+                {
+                    first_failure = Some(failure.failure.clone());
+                }
+                let _ = reply.send(result);
+            }
+            Request::ImportContent { submission, reply } => {
+                let result = execute_content_import(connection, submission, write_gate);
                 if first_failure.is_none()
                     && let Err(failure) = &result
                 {
@@ -894,6 +1096,18 @@ fn current_time_ms() -> Result<i64, DbFailure> {
         .map_err(|error| DbFailure::resource_limit(error.to_string()))?;
     i64::try_from(elapsed.as_millis())
         .map_err(|_| DbFailure::resource_limit("system time exceeds millisecond range"))
+}
+
+fn next_content_batch_token() -> ContentBatchToken {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(1);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let process = u128::from(std::process::id());
+    ContentBatchToken::new(
+        (timestamp ^ process.rotate_left(47) ^ u128::from(sequence)).to_be_bytes(),
+    )
 }
 
 fn send_reply(
@@ -1148,15 +1362,19 @@ fn panic_message(panic: Box<dyn Any + Send>) -> Arc<str> {
 #[cfg(test)]
 mod tests {
     use std::{
+        io::Read,
         sync::atomic::{AtomicU64, Ordering},
         time::Instant,
     };
 
     use super::*;
-    use crate::store::sqlite::{
-        domain::{AccountScope, FailureKind, FolderScope, MessageMutation, PageBoundary},
-        migrations::LATEST_SCHEMA_VERSION,
-        remote::{RemoteCheckpoint, RemoteImapSource, RemoteReport, RemoteWorkMode},
+    use crate::{
+        content::{ContentLimits, prepare_content},
+        store::sqlite::{
+            domain::{AccountScope, FailureKind, FolderScope, MessageMutation, PageBoundary},
+            migrations::LATEST_SCHEMA_VERSION,
+            remote::{RemoteCheckpoint, RemoteImapSource, RemoteReport, RemoteWorkMode},
+        },
     };
 
     fn empty_spec() -> PageSpec {
@@ -1211,6 +1429,19 @@ mod tests {
             })
     }
 
+    fn receive_oneshot<T>(receiver: oneshot::Receiver<T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(3), receiver)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            })
+    }
+
     fn claimed_remote_intent(client: &DatabaseClient) -> Box<super::super::remote::RemoteClaim> {
         let outcome = receive_remote_claim(client.try_claim_remote(1).unwrap()).unwrap();
         let RemoteClaimOutcome::Claimed(claim) = outcome else {
@@ -1232,6 +1463,55 @@ mod tests {
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(format!("{}-wal", path.display()));
         let _ = fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    fn temporary_content_staging(label: &str) -> (PathBuf, Arc<ContentStaging>) {
+        static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
+        let root = std::env::temp_dir().join(format!(
+            "nivalis-actor-content-{label}-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let staging = ContentStaging::open(root.clone()).unwrap();
+        (root, Arc::new(staging))
+    }
+
+    fn publish_test_content(
+        staging: &ContentStaging,
+        subject: &str,
+        body: &str,
+    ) -> PublishedContent {
+        let raw = format!(
+            "From: Ada <ada@example.test>\r\n\
+             Subject: {subject}\r\n\
+             Date: Thu, 01 Jan 1970 00:00:01 +0000\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             \r\n\
+             {body}"
+        );
+        prepare_content(raw.as_bytes(), staging, ContentLimits::default())
+            .unwrap()
+            .publish()
+            .unwrap()
+    }
+
+    fn seed_content_message(path: &std::path::Path) {
+        remove_database_files(path);
+        let mut connection = Connection::open(path).unwrap();
+        configure(&mut connection).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO accounts
+                     (id, provider, remote_key, name, address, state, accent_rgb)
+                 VALUES
+                     (1, 'imap', 'account', 'Personal',
+                      'user@example.test', 'active', 0);
+                 INSERT INTO messages
+                     (id, account_id, remote_key, received_at_ms)
+                 VALUES (1, 1, 'message', 0);",
+            )
+            .unwrap();
     }
 
     fn seed_remote_intent(path: &std::path::Path) -> i64 {
@@ -1296,6 +1576,200 @@ mod tests {
                      inbox_unread = CASE account_id WHEN 1 THEN 3 ELSE 5 END;",
             )
             .unwrap();
+    }
+
+    #[test]
+    fn content_import_open_replace_and_gc_form_a_bounded_slice() {
+        let path = temporary_database_path();
+        seed_content_message(&path);
+        let (root, staging) = temporary_content_staging("slice");
+        let first = publish_test_content(&staging, "First subject", "first body");
+        let first_record = first.record();
+        let first_key = first_record.body_file_key.clone().unwrap();
+        let (client, mut replies, runtime, _info) =
+            spawn_target(Target::File(path.clone()), REQUEST_CAPACITY, REPLY_CAPACITY).unwrap();
+
+        let outcome = receive_oneshot(
+            client
+                .try_import_content(Box::new(ContentImportSubmission::new(
+                    MessageId::new(1).unwrap(),
+                    1,
+                    first,
+                )))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(outcome.generation > 0);
+
+        client
+            .try_open_message(
+                RequestId::new(1).unwrap(),
+                Generation::new(0),
+                MessageId::new(1).unwrap(),
+            )
+            .unwrap();
+        let DbReply::Message(reply) = receive_reply(&mut replies) else {
+            panic!("expected imported message detail");
+        };
+        let detail = reply.result.unwrap().unwrap();
+        assert_eq!(&*detail.subject, "First subject");
+        assert_eq!(detail.body_file_key.as_deref(), Some(first_key.as_str()));
+        let mut body = String::new();
+        staging
+            .open_file(&first_key)
+            .unwrap()
+            .read_to_string(&mut body)
+            .unwrap();
+        assert!(body.contains("first body"));
+        drop(body);
+
+        let second = publish_test_content(&staging, "Second subject", "second body");
+        let second_key = second.record().body_file_key.unwrap();
+        receive_oneshot(
+            client
+                .try_import_content(Box::new(ContentImportSubmission::new(
+                    MessageId::new(1).unwrap(),
+                    1,
+                    second,
+                )))
+                .unwrap(),
+        )
+        .unwrap();
+        let gc = receive_oneshot(client.try_run_file_gc(&staging, 1).unwrap()).unwrap();
+        assert_eq!(
+            gc,
+            FileGcOutcome {
+                examined: 1,
+                removed: 1,
+                ..FileGcOutcome::default()
+            }
+        );
+        assert_eq!(
+            staging.open_file(&first_key).unwrap_err().kind,
+            std::io::ErrorKind::NotFound
+        );
+        assert!(staging.open_file(&second_key).is_ok());
+
+        client
+            .try_open_message(
+                RequestId::new(2).unwrap(),
+                Generation::new(0),
+                MessageId::new(1).unwrap(),
+            )
+            .unwrap();
+        let DbReply::Message(reply) = receive_reply(&mut replies) else {
+            panic!("expected replaced message detail");
+        };
+        let detail = reply.result.unwrap().unwrap();
+        assert_eq!(&*detail.subject, "Second subject");
+        assert_eq!(detail.body_file_key.as_deref(), Some(second_key.as_str()));
+
+        runtime.shutdown().unwrap();
+        remove_database_files(&path);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn content_import_returns_ownership_when_not_committed() {
+        let (root, staging) = temporary_content_staging("recover");
+        let (sender, _receiver) = bounded(1);
+        let connection = Connection::open_in_memory().unwrap();
+        let client = DatabaseClient {
+            requests: sender,
+            admission: Arc::new(Mutex::new(true)),
+            interrupt: Arc::new(connection.get_interrupt_handle()),
+            mailbox_control: Arc::new(MailboxQueryControl::default()),
+            next_mailbox_gate: Arc::new(Mutex::new(None)),
+            next_mailbox_long: Arc::new(AtomicBool::new(false)),
+            write_gate: Arc::new(Mutex::new(())),
+        };
+        client
+            .try_query_mailbox(RequestId::new(1).unwrap(), Generation::new(0), empty_spec())
+            .unwrap();
+
+        let busy = Box::new(ContentImportSubmission::new(
+            MessageId::new(1).unwrap(),
+            1,
+            publish_test_content(&staging, "Busy", "body"),
+        ));
+        let busy_pointer: *const ContentImportSubmission = busy.as_ref();
+        let failure = client.try_import_content(busy).unwrap_err();
+        assert_eq!(failure.reason(), SubmitError::Busy);
+        assert!(std::ptr::eq(busy_pointer, failure.submission()));
+        drop(failure.into_parts().1);
+
+        close_admission(&client.admission);
+        let closed = Box::new(ContentImportSubmission::new(
+            MessageId::new(1).unwrap(),
+            1,
+            publish_test_content(&staging, "Closed", "body"),
+        ));
+        let closed_pointer: *const ContentImportSubmission = closed.as_ref();
+        let failure = client.try_import_content(closed).unwrap_err();
+        assert_eq!(failure.reason(), SubmitError::Closed);
+        assert!(std::ptr::eq(closed_pointer, failure.submission()));
+        drop(failure.into_parts().1);
+
+        let (actor, _replies, runtime, _info) =
+            spawn_target(Target::Memory, REQUEST_CAPACITY, REPLY_CAPACITY).unwrap();
+        let rejected = Box::new(ContentImportSubmission::new(
+            MessageId::new(99).unwrap(),
+            1,
+            publish_test_content(&staging, "Missing", "body"),
+        ));
+        let rejected_pointer: *const ContentImportSubmission = rejected.as_ref();
+        let failure = receive_oneshot(actor.try_import_content(rejected).unwrap()).unwrap_err();
+        assert_eq!(failure.failure().kind, FailureKind::NotFound);
+        assert!(std::ptr::eq(rejected_pointer, failure.submission()));
+        let (database_failure, recovered) = failure.into_parts();
+        assert_eq!(database_failure.kind, FailureKind::NotFound);
+        assert!(std::ptr::eq(rejected_pointer, recovered.as_ref()));
+        drop(recovered);
+
+        runtime.shutdown().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shutdown_drains_an_accepted_content_import_after_receiver_cancellation() {
+        let path = temporary_database_path();
+        seed_content_message(&path);
+        let (root, staging) = temporary_content_staging("drain");
+        let published = publish_test_content(&staging, "Drained", "durable body");
+        let body_key = published.record().body_file_key.unwrap();
+        let (client, _replies, runtime, _info) =
+            spawn_target(Target::File(path.clone()), 2, REPLY_CAPACITY).unwrap();
+        let (started_tx, started_rx) = bounded(1);
+        client.try_run_long_query(started_tx).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let receiver = client
+            .try_import_content(Box::new(ContentImportSubmission::new(
+                MessageId::new(1).unwrap(),
+                1,
+                published,
+            )))
+            .unwrap();
+        drop(receiver);
+
+        runtime.shutdown().unwrap();
+
+        let connection = Connection::open(&path).unwrap();
+        let stored: (String, Option<String>) = connection
+            .query_row(
+                "SELECT m.subject, c.body_file_key
+                 FROM messages AS m
+                 JOIN message_content AS c ON c.message_id = m.id
+                 WHERE m.id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, ("Drained".into(), Some(body_key.as_str().into())));
+        assert!(staging.open_file(&body_key).is_ok());
+
+        drop(connection);
+        remove_database_files(&path);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

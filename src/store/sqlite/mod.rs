@@ -12,13 +12,15 @@ mod stats;
 #[cfg(feature = "bench-harness")]
 pub(crate) use query::{MailboxQueryCounts, mailbox_query_counts};
 
+#[allow(unused_imports)]
+pub(crate) use actor::{
+    ContentImportExecutionFailure, ContentImportOutcome, ContentImportReply,
+    ContentImportSubmission, ContentImportSubmitFailure, RemoteReportExecutionFailure,
+    RemoteReportReply, RemoteReportSubmitFailure,
+};
 pub(crate) use actor::{
     DatabaseClient, DatabaseInfo, DatabaseReplies, DatabaseRuntime, StartError,
     SubmitError as DatabaseSubmitError,
-};
-#[allow(unused_imports)]
-pub(crate) use actor::{
-    RemoteReportExecutionFailure, RemoteReportReply, RemoteReportSubmitFailure,
 };
 #[allow(unused_imports)]
 pub(crate) use domain::{
@@ -30,6 +32,8 @@ pub(crate) use domain::{
     AccountStatsDelta, DbFailure, DbReply, FailureKind, Generation, MailboxPage, MessageDetail,
     MessageId, MessageMutation, MutationOutcome, PageSpec, RequestId, Tagged, UndoToken,
 };
+#[allow(unused_imports)]
+pub(crate) use file_gc::FileGcOutcome;
 
 #[cfg(test)]
 pub(crate) use domain::{MessageState, UndoReceipt};

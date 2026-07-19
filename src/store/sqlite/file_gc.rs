@@ -7,13 +7,13 @@ use super::domain::{DbFailure, MessageId};
 const MAX_FILES_PER_RUN: usize = 16;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct FileGcOutcome {
-    pub(super) examined: u8,
-    pub(super) referenced: u8,
-    pub(super) removed: u8,
-    pub(super) missing: u8,
-    pub(super) invalid_keys: u8,
-    pub(super) io_errors: u8,
+pub(crate) struct FileGcOutcome {
+    pub(crate) examined: u8,
+    pub(crate) referenced: u8,
+    pub(crate) removed: u8,
+    pub(crate) missing: u8,
+    pub(crate) invalid_keys: u8,
+    pub(crate) io_errors: u8,
 }
 
 pub(super) fn run_file_gc(
