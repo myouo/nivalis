@@ -1,5 +1,7 @@
 #[cfg(feature = "bench-harness")]
 mod benchmark;
+#[allow(dead_code)]
+mod content;
 mod controller;
 mod core;
 mod platform;

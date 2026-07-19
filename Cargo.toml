@@ -13,6 +13,7 @@ bench-harness = []
 
 [dependencies]
 crossbeam-channel = { version = "=0.5.16", default-features = false, features = ["std"] }
+mail-parser = { version = "=0.11.5", default-features = false, features = ["full_encoding"] }
 rusqlite = { version = "=0.40.1", default-features = false, features = [
     "bundled",
     "hooks",
