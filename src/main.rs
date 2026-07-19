@@ -6,6 +6,8 @@ mod controller;
 mod core;
 #[allow(dead_code)]
 mod credentials;
+#[allow(dead_code)]
+mod network;
 mod platform;
 mod presentation;
 mod store;

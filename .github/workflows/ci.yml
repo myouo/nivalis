@@ -46,6 +46,17 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Enforce the release dependency policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          forbidden='^(async-std|native-tls|openssl|openssl-sys|aws-lc-rs|aws-lc-sys|async-compression) v'
+          if cargo tree --locked -e normal --prefix none | grep -E "$forbidden"; then
+            printf 'A forbidden runtime, TLS, crypto, or compression dependency entered the release graph.\n' >&2
+            exit 1
+          fi
+          cargo tree --locked -e features -i async-imap | grep -F 'async-imap feature "runtime-tokio"'
+
       - name: Validate memory evidence layout
         shell: bash
         run: |

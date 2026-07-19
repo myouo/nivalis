@@ -12,6 +12,7 @@ default = []
 bench-harness = []
 
 [dependencies]
+async-imap = { version = "=0.11.3", default-features = false, features = ["runtime-tokio"] }
 crossbeam-channel = { version = "=0.5.16", default-features = false, features = ["std"] }
 getrandom = { version = "=0.4.3", default-features = false }
 keyring-core = { version = "=1.0.0", default-features = false }
@@ -21,6 +22,8 @@ rusqlite = { version = "=0.40.1", default-features = false, features = [
     "hooks",
     "limits",
 ] }
+rustls = { version = "=0.23.42", default-features = false, features = ["std", "ring", "tls12"] }
+rustls-platform-verifier = { version = "=0.7.0", default-features = false }
 slint = { version = "=1.17.1", default-features = false, features = [
     "std",
     "backend-winit",
@@ -31,9 +34,12 @@ slint = { version = "=1.17.1", default-features = false, features = [
 ] }
 tokio = { version = "=1.52.3", default-features = false, features = [
     "rt",
+    "io-util",
+    "net",
     "sync",
     "time",
 ] }
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
 zeroize = { version = "=1.9.0", default-features = false, features = ["alloc"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -41,6 +47,7 @@ zbus-secret-service-keyring-store = { version = "=1.0.0", default-features = fal
 
 [dev-dependencies]
 i-slint-backend-testing = { version = "=1.17.1", default-features = false }
+rcgen = { version = "=0.14.8", default-features = false, features = ["crypto", "ring"] }
 
 [build-dependencies]
 slint-build = "=1.17.1"
