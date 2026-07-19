@@ -6,6 +6,8 @@ This document fixes the production architecture for Nivalis Mail. Components des
 
 The primary constraints are predictable UI latency, safe processing of untrusted mail, reliable offline behavior, and a release idle resident set below 90 MiB, preferably below 50 MiB. Resident and swap-inclusive memory after representative work must stabilize below twice the warm-idle baseline. A smaller feature graph and bounded live data take priority over speculative concurrency.
 
+This document defines the final ownership and resource boundaries, not a requirement to finish every provider or hardening path before shipping the next usable slice. Milestone work takes the shortest path to a real end-to-end mail workflow and records non-blocking gaps in the roadmap instead of creating implementation-version ladders. M3 therefore starts with manually configured app-password IMAP over platform-verified Rustls; broader OAuth and network/provider coverage follow without weakening the same secret, TLS, cancellation, and memory boundaries. Persistent file reservations, directory-relative race hardening, cross-platform ACL behavior, and deep fuzzing belong to M7; strict commit recovery for irreplaceable outbound data belongs to the M5 outbox.
+
 ### Implementation status
 
 - The UI-to-core boundary uses a bounded 64-command channel plus an independent four-operation account channel feeding one Tokio `current_thread` runtime. Account queue saturation returns the exact redacted operation for retry rather than retaining secrets in a general UI queue. A bounded 128-slot control queue returns lightweight events through Slint's local executor; full mailbox and reader projections live in independent latest-value slots instead of accumulating in that queue.
