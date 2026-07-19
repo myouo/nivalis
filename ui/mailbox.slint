@@ -149,6 +149,7 @@ export component MailboxPane inherits Rectangle {
     in property <bool> total-known: true;
     in property <bool> mail-actions-enabled: true;
     in property <bool> mutation-loading: false;
+    in property <bool> sync-loading: false;
     in property <[MailSummary]> mails;
     in property <string> selected-id: "";
     in property <int> message-total: 0;
@@ -161,6 +162,7 @@ export component MailboxPane inherits Rectangle {
     callback select-mail(string);
     callback query-mail(string);
     callback toggle-star(string);
+    callback sync-account(string);
     callback retry;
     callback previous-mailbox-page;
     callback next-mailbox-page;
@@ -193,7 +195,19 @@ export component MailboxPane inherits Rectangle {
                         font-family: Theme.body-font;
                         font-size: 10px;
                         overflow: elide;
+                        accessible-role: region;
+                        accessible-live-region: polite;
+                        accessible-label: self.text;
                     }
+                }
+                MIconButton {
+                    icon: root.sync-loading ? "progress_activity" : "refresh";
+                    label: root.active-account-id == ""
+                        ? "Select an account to sync its inbox"
+                        : root.sync-loading ? "Syncing inbox" : "Sync inbox";
+                    enabled: root.active-account-id != "";
+                    busy: root.sync-loading;
+                    clicked => { root.sync-account(root.active-account-id); }
                 }
                 MIconButton { icon: "more_horiz"; label: "More inbox actions"; selected: root.more-menu-open; clicked => { root.more-menu-open = true; } }
             }

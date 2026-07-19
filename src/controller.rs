@@ -8,7 +8,8 @@ use crate::core::{
     AccountConfigDraft, AccountDirectoryLoadError, AccountOperation, AccountOperationFailure,
     AccountOperationResponseError, AccountOperationSubmitError, AccountOperationSuccess,
     AccountSetupMode, AccountWorkflowFailureKind, CoreHandle, Event, EventReceiver,
-    MailboxLoadError, MessageLoadError, MutationSubmitError, RequestId, SubmitError,
+    InboxSyncFailureKind, MailboxLoadError, MessageLoadError, MutationSubmitError, RequestId,
+    SubmitError,
 };
 use crate::credentials::Secret;
 use crate::presentation::sqlite::{
@@ -94,6 +95,7 @@ impl Controller {
         ui.set_data_source_label("SQLite cache".into());
         ui.set_status_text("Loading local cache".into());
         ui.set_account_operation_loading(false);
+        ui.set_sync_loading(false);
         ui.set_account_operation_stage(SharedString::default());
         ui.set_account_operation_error(SharedString::default());
         ui.set_selected_id(SharedString::default());
@@ -151,6 +153,9 @@ impl Controller {
 
         let controller = self.clone();
         ui.on_diagnose_account(move |key| controller.diagnose_account(key.as_str()));
+
+        let controller = self.clone();
+        ui.on_sync_account(move |key| controller.sync_account(key.as_str()));
 
         let controller = self.clone();
         ui.on_remove_account(move |key| controller.remove_account(key.as_str()));
@@ -1144,6 +1149,74 @@ impl Controller {
         self.store_account_task(task);
     }
 
+    fn sync_account(self: &Rc<Self>, key: &str) {
+        let Some(target) = self.account_operation_target(key) else {
+            self.show_sync_error(UserError::selection());
+            return;
+        };
+        let Some(request_id) = self.next_account_request_id() else {
+            self.show_sync_error(UserError::account_session_limit());
+            return;
+        };
+        if !self.begin_account_task("Syncing inbox", false) {
+            return;
+        }
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_sync_loading(true);
+            ui.set_status_text("Syncing inbox".into());
+        }
+        let response = match self
+            .core
+            .try_account_operation(AccountOperation::SyncInbox {
+                request_id,
+                account_id: target.account_id,
+                expected_generation: target.expected_generation,
+            }) {
+            Ok(response) => response,
+            Err(failure) => {
+                self.finish_sync_with_error(account_submit_error(failure.reason()));
+                return;
+            }
+        };
+        let weak = Rc::downgrade(self);
+        let task = slint::spawn_local(async move {
+            let result = response.await;
+            let Some(controller) = weak.upgrade() else {
+                return;
+            };
+            match result {
+                Ok(reply) if reply.request_id == request_id => match reply.result {
+                    Ok(AccountOperationSuccess::Synced {
+                        account_id,
+                        generation,
+                        imported,
+                        has_more,
+                    }) if account_id == target.account_id
+                        && generation == target.expected_generation =>
+                    {
+                        let feedback = sync_success_feedback(imported, has_more);
+                        controller.finish_account_task();
+                        if let Some(ui) = controller.ui.upgrade() {
+                            ui.set_status_text(feedback.clone().into());
+                            show_snackbar(&ui, &feedback, false, &controller.snackbar_timer);
+                        }
+                        controller.issue_accounts();
+                        controller.reload_mailbox();
+                    }
+                    Err(failure) => {
+                        controller.finish_sync_with_error(account_operation_error(failure))
+                    }
+                    Ok(_) => controller.finish_sync_with_error(UserError::account_result()),
+                },
+                Ok(_) => controller.finish_sync_with_error(UserError::account_result()),
+                Err(error) => {
+                    controller.finish_sync_with_error(account_response_error(error));
+                }
+            }
+        });
+        self.store_account_task(task);
+    }
+
     fn remove_account(self: &Rc<Self>, key: &str) {
         let Some(target) = self.account_operation_target(key) else {
             self.show_account_error(UserError::selection());
@@ -1364,6 +1437,7 @@ impl Controller {
         self.account_cancelable.set(false);
         if let Some(ui) = self.ui.upgrade() {
             ui.set_account_operation_loading(false);
+            ui.set_sync_loading(false);
             ui.set_account_operation_stage(SharedString::default());
         }
     }
@@ -1371,6 +1445,19 @@ impl Controller {
     fn finish_account_task_with_error(&self, error: UserError) {
         self.finish_account_task();
         self.show_account_error(error);
+    }
+
+    fn finish_sync_with_error(&self, error: UserError) {
+        self.finish_account_task();
+        self.show_sync_error(error);
+    }
+
+    fn show_sync_error(&self, error: UserError) {
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_account_operation_error(error.detail.into());
+            ui.set_status_text(error.title.into());
+            show_snackbar(&ui, error.detail, false, &self.snackbar_timer);
+        }
     }
 
     fn show_account_error(&self, error: UserError) {
@@ -1535,6 +1622,7 @@ impl Controller {
             ui.set_snackbar_can_undo(false);
             ui.set_snackbar_visible(false);
             ui.set_account_operation_loading(false);
+            ui.set_sync_loading(false);
             ui.set_account_operation_stage(SharedString::default());
             ui.set_account_operation_error(
                 "The account service stopped. Restart Nivalis and try again.".into(),
@@ -1608,6 +1696,17 @@ struct MutationSuccessFeedback {
     snackbar: &'static str,
     close_reader: bool,
     close_delete_dialog: bool,
+}
+
+fn sync_success_feedback(imported: u8, has_more: bool) -> String {
+    match (imported, has_more) {
+        (0, false) => "Inbox is up to date".to_owned(),
+        (0, true) => "Checked one bounded range; sync again for more".to_owned(),
+        (1, false) => "Imported 1 new message".to_owned(),
+        (1, true) => "Imported 1 new message; sync again for more".to_owned(),
+        (count, false) => format!("Imported {count} new messages"),
+        (count, true) => format!("Imported {count} new messages; sync again for more"),
+    }
 }
 
 fn mutation_success_feedback(intent: MutationIntent) -> MutationSuccessFeedback {
@@ -1822,6 +1921,7 @@ fn account_response_error(_error: AccountOperationResponseError) -> UserError {
 
 fn account_operation_error(failure: AccountOperationFailure) -> UserError {
     match failure.kind {
+        AccountWorkflowFailureKind::InboxSync(kind) => inbox_sync_error(kind),
         AccountWorkflowFailureKind::Diagnostic(kind) => account_diagnostic_error(kind),
         AccountWorkflowFailureKind::Credential(_) => UserError {
             title: "App password is unavailable",
@@ -1851,6 +1951,55 @@ fn account_operation_error(failure: AccountOperationFailure) -> UserError {
         AccountWorkflowFailureKind::Busy => UserError::account_busy(),
         AccountWorkflowFailureKind::InvalidLocator
         | AccountWorkflowFailureKind::UnexpectedReply => UserError::account_result(),
+    }
+}
+
+fn inbox_sync_error(kind: InboxSyncFailureKind) -> UserError {
+    match kind {
+        InboxSyncFailureKind::Authentication => UserError {
+            title: "Inbox sign-in was rejected",
+            detail: "Check that the login and app password are current. Remove and add the account again to replace them, then sync Inbox.",
+        },
+        InboxSyncFailureKind::Permission => UserError {
+            title: "Inbox access was denied",
+            detail: "Enable IMAP access with your provider, then sync Inbox again.",
+        },
+        InboxSyncFailureKind::Certificate => UserError {
+            title: "Server identity could not be verified",
+            detail: "Check the IMAP server name and system trust settings, then sync again. Certificate verification cannot be bypassed.",
+        },
+        InboxSyncFailureKind::Timeout => UserError {
+            title: "Inbox sync timed out",
+            detail: "Check the network and server address, then sync Inbox again.",
+        },
+        InboxSyncFailureKind::Offline => UserError {
+            title: "IMAP server is unreachable",
+            detail: "Reconnect to the network or correct the server address, then sync Inbox again.",
+        },
+        InboxSyncFailureKind::Protocol => UserError {
+            title: "Server response was not supported",
+            detail: "Confirm that this is an IMAP-over-TLS server on the selected port, then sync again.",
+        },
+        InboxSyncFailureKind::ResourceLimit => UserError {
+            title: "Inbox response exceeds a safety limit",
+            detail: "Move the oversized message out of Inbox with your provider's web app, then sync again.",
+        },
+        InboxSyncFailureKind::Cancelled => UserError {
+            title: "Inbox sync was cancelled",
+            detail: "Run Sync inbox again when you are ready.",
+        },
+        InboxSyncFailureKind::UidValidityChanged => UserError {
+            title: "Inbox identity changed",
+            detail: "Open Accounts, remove and add this account again to rebuild its local Inbox cache.",
+        },
+        InboxSyncFailureKind::MalformedContent => UserError {
+            title: "A message could not be imported",
+            detail: "Move the malformed message out of Inbox with your provider's web app, then sync again.",
+        },
+        InboxSyncFailureKind::Storage => UserError {
+            title: "Inbox could not be saved",
+            detail: "Check available disk space and local storage permissions, then sync Inbox again.",
+        },
     }
 }
 
@@ -2307,6 +2456,20 @@ mod tests {
     }
 
     #[test]
+    fn inbox_sync_feedback_distinguishes_current_and_imported_mail() {
+        assert_eq!(sync_success_feedback(0, false), "Inbox is up to date");
+        assert_eq!(
+            sync_success_feedback(0, true),
+            "Checked one bounded range; sync again for more"
+        );
+        assert_eq!(sync_success_feedback(1, false), "Imported 1 new message");
+        assert_eq!(
+            sync_success_feedback(16, true),
+            "Imported 16 new messages; sync again for more"
+        );
+    }
+
+    #[test]
     fn mutation_errors_do_not_disclose_database_messages() {
         let failure = DbFailure {
             kind: FailureKind::Conflict,
@@ -2375,6 +2538,33 @@ mod tests {
             assert_eq!(error.title, title);
             assert!(error.detail.contains(next_step));
             assert!(!error.detail.contains("secret server response"));
+        }
+    }
+
+    #[test]
+    fn inbox_sync_failures_explain_the_next_action() {
+        let cases = [
+            (InboxSyncFailureKind::Authentication, "app password"),
+            (InboxSyncFailureKind::Permission, "Enable IMAP"),
+            (InboxSyncFailureKind::Certificate, "trust settings"),
+            (InboxSyncFailureKind::Timeout, "sync Inbox again"),
+            (InboxSyncFailureKind::Offline, "Reconnect"),
+            (InboxSyncFailureKind::Protocol, "IMAP-over-TLS"),
+            (InboxSyncFailureKind::ResourceLimit, "provider's web app"),
+            (InboxSyncFailureKind::Cancelled, "Sync inbox again"),
+            (InboxSyncFailureKind::UidValidityChanged, "Open Accounts"),
+            (InboxSyncFailureKind::MalformedContent, "provider's web app"),
+            (InboxSyncFailureKind::Storage, "disk space"),
+        ];
+
+        for (kind, next_step) in cases {
+            let error = inbox_sync_error(kind);
+            assert!(!error.title.is_empty());
+            assert!(
+                error.detail.contains(next_step),
+                "{kind:?}: {}",
+                error.detail
+            );
         }
     }
 

@@ -9,6 +9,7 @@ use super::{
         MessageLoadError, MessageQuery, MessageRequestKey, MutationRequest, MutationSubmitError,
         event_channel,
     },
+    sync::{ImapInboxFetchProbe, production_imap_inbox_fetch},
 };
 use crate::{
     credentials::{self, CredentialClient, CredentialRuntime},
@@ -46,17 +47,33 @@ type CredentialParts = (CredentialClient, CredentialRuntime);
 pub(crate) fn spawn(
     database_path: PathBuf,
 ) -> Result<(CoreHandle, EventReceiver, CoreRuntime), StartError> {
+    let content_root = database_path.with_file_name("content");
     let database = sqlite::spawn(database_path).map_err(StartError::Database)?;
-    spawn_with_options(EVENT_CAPACITY, database)
+    spawn_with_sync_components(
+        EVENT_CAPACITY,
+        database,
+        credentials::spawn(),
+        production_imap_diagnostic,
+        production_imap_inbox_fetch,
+        Some(content_root),
+    )
 }
 
 #[cfg(feature = "bench-harness")]
 pub(crate) fn spawn_with_database(
     database_path: PathBuf,
 ) -> Result<(CoreHandle, EventReceiver, CoreRuntime, DatabaseClient), StartError> {
+    let content_root = database_path.with_file_name("content");
     let database = sqlite::spawn(database_path).map_err(StartError::Database)?;
     let benchmark_database = database.0.clone();
-    let (core, events, runtime) = spawn_with_options(EVENT_CAPACITY, database)?;
+    let (core, events, runtime) = spawn_with_sync_components(
+        EVENT_CAPACITY,
+        database,
+        credentials::spawn(),
+        production_imap_diagnostic,
+        production_imap_inbox_fetch,
+        Some(content_root),
+    )?;
     Ok((core, events, runtime, benchmark_database))
 }
 
@@ -66,6 +83,7 @@ fn spawn_for_test() -> Result<(CoreHandle, EventReceiver, CoreRuntime), StartErr
     spawn_with_options(EVENT_CAPACITY, database)
 }
 
+#[cfg(test)]
 fn spawn_with_options(
     event_capacity: usize,
     database: DatabaseParts,
@@ -73,6 +91,7 @@ fn spawn_with_options(
     spawn_with_components(event_capacity, database, credentials::spawn())
 }
 
+#[cfg(test)]
 fn spawn_with_components(
     event_capacity: usize,
     database: DatabaseParts,
@@ -86,11 +105,30 @@ fn spawn_with_components(
     )
 }
 
+#[cfg(test)]
 fn spawn_with_components_and_probe(
     event_capacity: usize,
     database: DatabaseParts,
     credentials: CredentialParts,
     diagnostic_probe: ImapDiagnosticProbe,
+) -> Result<(CoreHandle, EventReceiver, CoreRuntime), StartError> {
+    spawn_with_sync_components(
+        event_capacity,
+        database,
+        credentials,
+        diagnostic_probe,
+        production_imap_inbox_fetch,
+        None,
+    )
+}
+
+fn spawn_with_sync_components(
+    event_capacity: usize,
+    database: DatabaseParts,
+    credentials: CredentialParts,
+    diagnostic_probe: ImapDiagnosticProbe,
+    inbox_fetch_probe: ImapInboxFetchProbe,
+    content_root: Option<PathBuf>,
 ) -> Result<(CoreHandle, EventReceiver, CoreRuntime), StartError> {
     let (database, database_replies, database_runtime, _database_info) = database;
     let (credentials, credential_runtime) = credentials;
@@ -107,8 +145,13 @@ fn spawn_with_components_and_probe(
     let worker = thread::Builder::new()
         .name("nivalis-core".into())
         .spawn(move || {
-            let account_workflows =
-                AccountWorkflows::new(database.clone(), credentials, diagnostic_probe);
+            let account_workflows = AccountWorkflows::with_sync(
+                database.clone(),
+                credentials,
+                diagnostic_probe,
+                inbox_fetch_probe,
+                content_root,
+            );
             let core_result = runtime.block_on(run_core(
                 command_rx,
                 event_tx,

@@ -1,11 +1,13 @@
 mod account;
 mod message;
 mod runtime;
+mod sync;
 
 #[allow(unused_imports)]
 pub(crate) use account::{
     AccountConfigDraft, AccountOperation, AccountOperationFailure, AccountOperationReply,
     AccountOperationSuccess, AccountSetupMode, AccountWorkflowFailureKind, AccountWorkflowStage,
+    InboxSyncFailureKind,
 };
 pub(crate) use message::{CoreHandle, Event, EventReceiver};
 pub(crate) use runtime::{CoreRuntime, StartError};

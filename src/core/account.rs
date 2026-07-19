@@ -3,6 +3,7 @@ use std::{
     fmt,
     future::Future,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -13,6 +14,7 @@ use tokio::{
 };
 
 use crate::{
+    content::ContentStaging,
     credentials::{
         CredentialClient, CredentialDeleteOutcome, CredentialFailureKind, CredentialLocator,
         CredentialOperation, CredentialOutcome, CredentialResponse, CredentialSubmitError, Secret,
@@ -26,13 +28,19 @@ use crate::{
         AccountGeneration, AccountId, AccountLifecycle, AccountPurgeOutcome, AccountRecord,
         AccountRemovalTicket, AccountValidationError, AccountWrite, AccountWriteOutcome,
         AccountWriteReply, DatabaseClient, DatabaseSubmitError, DiagnosticCommit, DiagnosticRecord,
-        DiagnosticTicket, FailureKind, PendingCacheRemoval, PendingCredentialRemoval, RequestId,
+        DiagnosticTicket, FailureKind, FileGcOutcome, PendingCacheRemoval,
+        PendingCredentialRemoval, RequestId,
     },
 };
+
+#[cfg(test)]
+use super::sync::production_imap_inbox_fetch;
+use super::sync::{ImapInboxFetchProbe, SyncInboxFuture, SyncInboxOutcome, start_inbox_sync};
 
 #[cfg_attr(not(test), allow(dead_code))]
 const PLACEHOLDER_CREDENTIAL_KEY: &str = "00000000000000000000000000000000";
 const RECOVERY_SUBMISSION_RETRY: Duration = Duration::from_millis(10);
+const STARTUP_FILE_GC_LIMIT: usize = 16;
 
 pub(super) type ImapDiagnosticFuture =
     Pin<Box<dyn Future<Output = Result<(), ImapDiagnosticFailure>> + 'static>>;
@@ -126,6 +134,11 @@ pub(crate) enum AccountOperation {
         account_id: AccountId,
         expected_generation: AccountGeneration,
     },
+    SyncInbox {
+        request_id: RequestId,
+        account_id: AccountId,
+        expected_generation: AccountGeneration,
+    },
     Remove {
         request_id: RequestId,
         account_id: AccountId,
@@ -139,6 +152,7 @@ impl AccountOperation {
             Self::Setup { request_id, .. }
             | Self::RetryCredential { request_id, .. }
             | Self::Diagnose { request_id, .. }
+            | Self::SyncInbox { request_id, .. }
             | Self::Remove { request_id, .. } => *request_id,
         }
     }
@@ -181,6 +195,16 @@ impl fmt::Debug for AccountOperation {
                 .field("account_id", account_id)
                 .field("expected_generation", expected_generation)
                 .finish(),
+            Self::SyncInbox {
+                request_id,
+                account_id,
+                expected_generation,
+            } => formatter
+                .debug_struct("SyncInbox")
+                .field("request_id", request_id)
+                .field("account_id", account_id)
+                .field("expected_generation", expected_generation)
+                .finish(),
             Self::Remove {
                 request_id,
                 account_id,
@@ -204,6 +228,12 @@ pub(crate) enum AccountOperationSuccess {
     Diagnosed {
         account_id: AccountId,
         generation: AccountGeneration,
+    },
+    Synced {
+        account_id: AccountId,
+        generation: AccountGeneration,
+        imported: u8,
+        has_more: bool,
     },
     Removed {
         account_id: AccountId,
@@ -232,6 +262,12 @@ pub(crate) enum AccountWorkflowStage {
     BeginDiagnostic,
     LoadCredential,
     ConnectImap,
+    LoadInboxCheckpoint,
+    FetchInbox,
+    StageInbox,
+    ParseContent,
+    ImportContent,
+    CommitInbox,
     RecordDiagnostic,
     BeginRemoval,
     DeleteCredential,
@@ -246,8 +282,24 @@ pub(crate) enum AccountWorkflowFailureKind {
     Credential(CredentialFailureKind),
     CredentialReplyClosed,
     Diagnostic(AccountDiagnosticKind),
+    InboxSync(InboxSyncFailureKind),
     InvalidLocator,
     UnexpectedReply,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InboxSyncFailureKind {
+    Authentication,
+    Permission,
+    Certificate,
+    Timeout,
+    Offline,
+    Protocol,
+    ResourceLimit,
+    Cancelled,
+    UidValidityChanged,
+    MalformedContent,
+    Storage,
 }
 
 pub(crate) enum AccountWorkflowRequest {
@@ -359,6 +411,12 @@ pub(crate) enum AccountWorkflowOutcome {
         generation: AccountGeneration,
         result: Result<(), AccountDiagnosticKind>,
     },
+    InboxSynced {
+        account_id: AccountId,
+        generation: AccountGeneration,
+        imported: u8,
+        has_more: bool,
+    },
     RemovalPending {
         account_id: AccountId,
         generation: AccountGeneration,
@@ -401,6 +459,18 @@ impl fmt::Debug for AccountWorkflowOutcome {
                 .field("account_id", account_id)
                 .field("generation", generation)
                 .field("result", result)
+                .finish(),
+            Self::InboxSynced {
+                account_id,
+                generation,
+                imported,
+                has_more,
+            } => formatter
+                .debug_struct("InboxSynced")
+                .field("account_id", account_id)
+                .field("generation", generation)
+                .field("imported", imported)
+                .field("has_more", has_more)
                 .finish(),
             Self::RemovalPending {
                 account_id,
@@ -1002,20 +1072,41 @@ pub(super) struct AccountWorkflows {
     database: DatabaseClient,
     credentials: CredentialClient,
     diagnostic_probe: ImapDiagnosticProbe,
+    inbox_fetch_probe: ImapInboxFetchProbe,
+    content_root: Option<std::path::PathBuf>,
     recovery: RecoveryState,
     active: Option<ActiveTask>,
 }
 
 impl AccountWorkflows {
+    #[cfg(test)]
     pub(super) fn new(
         database: DatabaseClient,
         credentials: CredentialClient,
         diagnostic_probe: ImapDiagnosticProbe,
     ) -> Self {
+        Self::with_sync(
+            database,
+            credentials,
+            diagnostic_probe,
+            production_imap_inbox_fetch,
+            None,
+        )
+    }
+
+    pub(super) fn with_sync(
+        database: DatabaseClient,
+        credentials: CredentialClient,
+        diagnostic_probe: ImapDiagnosticProbe,
+        inbox_fetch_probe: ImapInboxFetchProbe,
+        content_root: Option<std::path::PathBuf>,
+    ) -> Self {
         Self {
             database,
             credentials,
             diagnostic_probe,
+            inbox_fetch_probe,
+            content_root,
             recovery: RecoveryState::SubmitCredentialScan,
             active: None,
         }
@@ -1147,6 +1238,38 @@ impl AccountWorkflows {
                         expected_generation,
                         receiver,
                     },
+                });
+            }
+            AccountOperation::SyncInbox {
+                account_id,
+                expected_generation,
+                ..
+            } => {
+                let Some(content_root) = self.content_root.clone() else {
+                    let _ = reply.send(AccountOperationReply {
+                        request_id,
+                        result: Err(AccountOperationFailure {
+                            account_id: Some(account_id),
+                            generation: Some(expected_generation),
+                            stage: AccountWorkflowStage::ParseContent,
+                            kind: AccountWorkflowFailureKind::InboxSync(
+                                InboxSyncFailureKind::Storage,
+                            ),
+                        }),
+                    });
+                    return Ok(());
+                };
+                self.active = Some(ActiveTask {
+                    identity: Identity::new(account_id, expected_generation),
+                    reply: Some(UserReply { request_id, reply }),
+                    state: ActiveTaskState::Syncing(start_inbox_sync(
+                        self.database.clone(),
+                        self.credentials.clone(),
+                        self.inbox_fetch_probe,
+                        content_root,
+                        account_id,
+                        expected_generation,
+                    )),
                 });
             }
             AccountOperation::Remove {
@@ -1325,7 +1448,16 @@ impl AccountWorkflows {
             }
             RecoveryState::Queued(requests) => {
                 let Some(request) = requests.pop_front() else {
-                    self.recovery = RecoveryState::Complete;
+                    let Some(content_root) = self.content_root.clone() else {
+                        self.recovery = RecoveryState::Complete;
+                        return Poll::Ready(Ok(()));
+                    };
+                    let Ok(staging) = ContentStaging::open(content_root) else {
+                        self.recovery = RecoveryState::Complete;
+                        return Poll::Ready(Ok(()));
+                    };
+                    self.recovery = RecoveryState::SubmitFileGc(Arc::new(staging));
+                    context.waker().wake_by_ref();
                     return Poll::Ready(Ok(()));
                 };
                 let identity = request_identity(&request);
@@ -1343,6 +1475,47 @@ impl AccountWorkflows {
                 context.waker().wake_by_ref();
                 Poll::Ready(Ok(()))
             }
+            RecoveryState::SubmitFileGc(staging) => {
+                match self
+                    .database
+                    .try_run_file_gc(staging, STARTUP_FILE_GC_LIMIT)
+                {
+                    Ok(receiver) => {
+                        self.recovery = RecoveryState::LoadingFileGc(receiver);
+                        context.waker().wake_by_ref();
+                        Poll::Ready(Ok(()))
+                    }
+                    Err(DatabaseSubmitError::Busy) => {
+                        self.recovery = RecoveryState::WaitingFileGcSubmit {
+                            staging: Arc::clone(staging),
+                            delay: Box::pin(time::sleep(RECOVERY_SUBMISSION_RETRY)),
+                        };
+                        Poll::Ready(Ok(()))
+                    }
+                    Err(DatabaseSubmitError::Closed) => {
+                        Poll::Ready(Err(AccountDriverError::DatabaseClosed))
+                    }
+                }
+            }
+            RecoveryState::WaitingFileGcSubmit { staging, delay } => {
+                match delay.as_mut().poll(context) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(()) => {
+                        self.recovery = RecoveryState::SubmitFileGc(Arc::clone(staging));
+                        context.waker().wake_by_ref();
+                        Poll::Ready(Ok(()))
+                    }
+                }
+            }
+            RecoveryState::LoadingFileGc(receiver) => match Pin::new(receiver).poll(context) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(_)) => {
+                    self.recovery = RecoveryState::Complete;
+                    context.waker().wake_by_ref();
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Err(_)) => Poll::Ready(Err(AccountDriverError::DatabaseClosed)),
+            },
             RecoveryState::Complete => Poll::Pending,
         }
     }
@@ -1375,6 +1548,12 @@ enum RecoveryState {
             oneshot::Receiver<Result<Box<[PendingCacheRemoval]>, crate::store::sqlite::DbFailure>>,
     },
     Queued(VecDeque<AccountWorkflowRequest>),
+    SubmitFileGc(Arc<ContentStaging>),
+    WaitingFileGcSubmit {
+        staging: Arc<ContentStaging>,
+        delay: Pin<Box<Sleep>>,
+    },
+    LoadingFileGc(oneshot::Receiver<Result<FileGcOutcome, crate::store::sqlite::DbFailure>>),
     Complete,
 }
 
@@ -1405,6 +1584,7 @@ struct ActiveTask {
 }
 
 enum ActiveTaskState {
+    Syncing(SyncInboxFuture),
     LoadingRetry {
         account_id: AccountId,
         expected_generation: AccountGeneration,
@@ -1465,14 +1645,41 @@ impl ActiveTask {
         diagnostic_probe: ImapDiagnosticProbe,
         context: &mut Context<'_>,
     ) -> Poll<Result<TaskProgress, AccountDriverError>> {
-        if matches!(self.state, ActiveTaskState::ProbingDiagnostic { .. })
-            && let Some(user) = self.reply.as_mut()
+        if matches!(
+            self.state,
+            ActiveTaskState::ProbingDiagnostic { .. } | ActiveTaskState::Syncing(_)
+        ) && let Some(user) = self.reply.as_mut()
             && user.reply.poll_closed(context).is_ready()
         {
             return Poll::Ready(Ok(TaskProgress::Cancelled));
         }
 
         match &mut self.state {
+            ActiveTaskState::Syncing(sync) => match sync.as_mut().poll(context) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(SyncInboxOutcome::Synced {
+                    account_id,
+                    generation,
+                    imported,
+                    has_more,
+                }) => Poll::Ready(Ok(TaskProgress::Finished(
+                    AccountWorkflowOutcome::InboxSynced {
+                        account_id,
+                        generation,
+                        imported,
+                        has_more,
+                    },
+                ))),
+                Poll::Ready(SyncInboxOutcome::Failed { stage, failure }) => {
+                    Poll::Ready(Ok(TaskProgress::Finished(AccountWorkflowOutcome::Failed {
+                        stage,
+                        failure,
+                    })))
+                }
+                Poll::Ready(SyncInboxOutcome::DatabaseClosed) => {
+                    Poll::Ready(Err(AccountDriverError::DatabaseClosed))
+                }
+            },
             ActiveTaskState::LoadingRetry {
                 account_id,
                 expected_generation,
@@ -2176,6 +2383,17 @@ fn project_outcome(
             generation: Some(generation),
             stage: AccountWorkflowStage::ConnectImap,
             kind: AccountWorkflowFailureKind::Diagnostic(kind),
+        }),
+        AccountWorkflowOutcome::InboxSynced {
+            account_id,
+            generation,
+            imported,
+            has_more,
+        } => Ok(AccountOperationSuccess::Synced {
+            account_id,
+            generation,
+            imported,
+            has_more,
         }),
         AccountWorkflowOutcome::RemovalPending {
             account_id,

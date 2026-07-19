@@ -72,6 +72,7 @@ export component AppWindow inherits Window {
     in-out property <bool> account-status-open: false;
     in-out property <bool> account-remove-open: false;
     in property <bool> account-operation-loading: false;
+    in property <bool> sync-loading: false;
     in property <string> account-operation-stage: "";
     in-out property <string> account-operation-error: "";
     in property <string> managed-account-id: "";
@@ -124,6 +125,7 @@ export component AppWindow inherits Window {
     callback add-account(string, string, string, string, string, string);
     callback manage-account(string);
     callback diagnose-account(string);
+    callback sync-account(string);
     callback remove-account(string);
     callback cancel-account-operation;
     callback undo-delete;
@@ -266,6 +268,7 @@ export component AppWindow inherits Window {
                                 total-known: root.total-known;
                                 mail-actions-enabled: root.mail-actions-enabled;
                                 mutation-loading: root.mutation-loading;
+                                sync-loading: root.sync-loading;
                                 mails: root.mails;
                                 selected-id: root.selected-id;
                                 message-total: root.message-total;
@@ -278,6 +281,7 @@ export component AppWindow inherits Window {
                                 select-mail(id) => { root.select-mail(id); }
                                 query-mail(query) => { root.query-mail(query); }
                                 toggle-star(id) => { root.toggle-star(id); }
+                                sync-account(id) => { root.sync-account(id); }
                                 retry => { root.retry-mailbox(); }
                                 previous-mailbox-page => { root.previous-mailbox-page(); }
                                 next-mailbox-page => { root.next-mailbox-page(); }
