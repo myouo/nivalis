@@ -119,72 +119,77 @@ jobs:
           install -m 755 target/release/nivalis-mail target/release/nivalis-mail-production
           cargo build --locked --release --features bench-harness
 
-      - name: Exercise schema, writes, search, and pagination
+      - name: Exercise schema, writes, search, pagination, and content
         shell: bash
         run: |
           set -euo pipefail
           work=$(mktemp -d)
           trap 'rm -rf "$work"' EXIT
           mkdir -p "$work/data"
+          export NIVALIS_CI_WORK="$work"
 
-          xvfb-run -a -s '-screen 0 1280x1024x24' env \
-            NIVALIS_MEMORY_DATA_DIR="$work/data" \
-            NIVALIS_MEMORY_TEST_CASE=ci-init \
-            NIVALIS_MEMORY_SAMPLES=1 \
-            scripts/measure-memory.sh target/release/nivalis-mail-production \
-            > "$work/init.csv"
-          scripts/seed-memory-fixture.sh "$work/data"
+          # Keep each measurement's stdout redirection inside xvfb-run's child shell;
+          # Debian xvfb-run merges the child stderr into its own stdout.
+          xvfb-run -a -s '-screen 0 1280x1024x24' bash -euo pipefail -c '
+            work=$NIVALIS_CI_WORK
+            env \
+              NIVALIS_MEMORY_DATA_DIR="$work/data" \
+              NIVALIS_MEMORY_TEST_CASE=ci-init \
+              NIVALIS_MEMORY_SAMPLES=1 \
+              scripts/measure-memory.sh target/release/nivalis-mail-production \
+              > "$work/init.csv"
+            scripts/seed-memory-fixture.sh "$work/data"
 
-          xvfb-run -a -s '-screen 0 1280x1024x24' env \
-            NIVALIS_MEMORY_DATA_DIR="$work/data" \
-            NIVALIS_MEMORY_TEST_CASE=write-search-smoke \
-            NIVALIS_STRESS_SCENARIO=write-search \
-            NIVALIS_STRESS_STEPS=2 \
-            NIVALIS_STRESS_DELAY_MS=250 \
-            NIVALIS_STRESS_INTERVAL_MS=2 \
-            NIVALIS_STRESS_TRANSITION_TIMEOUT_MS=5000 \
-            NIVALIS_MEMORY_LOG="$work/write-search.log" \
-            NIVALIS_MEMORY_SAMPLES='1 40' \
-            NIVALIS_MEMORY_CPU_SETTLE_GATE=1 \
-            NIVALIS_MEMORY_CPU_SETTLE_GRACE_SECONDS=5 \
-            NIVALIS_MEMORY_CPU_SETTLE_SECONDS=10 \
-            NIVALIS_MEMORY_CPU_SETTLE_MAX_PERCENT=1.00 \
-            scripts/measure-memory.sh target/release/nivalis-mail \
-            > "$work/write-search.csv"
+            env \
+              NIVALIS_MEMORY_DATA_DIR="$work/data" \
+              NIVALIS_MEMORY_TEST_CASE=write-search-smoke \
+              NIVALIS_STRESS_SCENARIO=write-search \
+              NIVALIS_STRESS_STEPS=2 \
+              NIVALIS_STRESS_DELAY_MS=250 \
+              NIVALIS_STRESS_INTERVAL_MS=2 \
+              NIVALIS_STRESS_TRANSITION_TIMEOUT_MS=5000 \
+              NIVALIS_MEMORY_LOG="$work/write-search.log" \
+              NIVALIS_MEMORY_SAMPLES="1 40" \
+              NIVALIS_MEMORY_CPU_SETTLE_GATE=1 \
+              NIVALIS_MEMORY_CPU_SETTLE_GRACE_SECONDS=5 \
+              NIVALIS_MEMORY_CPU_SETTLE_SECONDS=10 \
+              NIVALIS_MEMORY_CPU_SETTLE_MAX_PERCENT=1.00 \
+              scripts/measure-memory.sh target/release/nivalis-mail \
+              > "$work/write-search.csv"
 
-          xvfb-run -a -s '-screen 0 1280x1024x24' env \
-            NIVALIS_MEMORY_DATA_DIR="$work/data" \
-            NIVALIS_MEMORY_TEST_CASE=pagination-smoke \
-            NIVALIS_STRESS_SCENARIO=pagination \
-            NIVALIS_STRESS_STEPS=2 \
-            NIVALIS_STRESS_DELAY_MS=250 \
-            NIVALIS_STRESS_INTERVAL_MS=2 \
-            NIVALIS_STRESS_TRANSITION_TIMEOUT_MS=5000 \
-            NIVALIS_MEMORY_LOG="$work/pagination.log" \
-            NIVALIS_MEMORY_SAMPLES='1 40' \
-            NIVALIS_MEMORY_CPU_SETTLE_GATE=1 \
-            NIVALIS_MEMORY_CPU_SETTLE_GRACE_SECONDS=5 \
-            NIVALIS_MEMORY_CPU_SETTLE_SECONDS=10 \
-            NIVALIS_MEMORY_CPU_SETTLE_MAX_PERCENT=1.00 \
-            scripts/measure-memory.sh target/release/nivalis-mail \
-            > "$work/pagination.csv"
+            env \
+              NIVALIS_MEMORY_DATA_DIR="$work/data" \
+              NIVALIS_MEMORY_TEST_CASE=pagination-smoke \
+              NIVALIS_STRESS_SCENARIO=pagination \
+              NIVALIS_STRESS_STEPS=2 \
+              NIVALIS_STRESS_DELAY_MS=250 \
+              NIVALIS_STRESS_INTERVAL_MS=2 \
+              NIVALIS_STRESS_TRANSITION_TIMEOUT_MS=5000 \
+              NIVALIS_MEMORY_LOG="$work/pagination.log" \
+              NIVALIS_MEMORY_SAMPLES="1 40" \
+              NIVALIS_MEMORY_CPU_SETTLE_GATE=1 \
+              NIVALIS_MEMORY_CPU_SETTLE_GRACE_SECONDS=5 \
+              NIVALIS_MEMORY_CPU_SETTLE_SECONDS=10 \
+              NIVALIS_MEMORY_CPU_SETTLE_MAX_PERCENT=1.00 \
+              scripts/measure-memory.sh target/release/nivalis-mail \
+              > "$work/pagination.csv"
 
-          xvfb-run -a -s '-screen 0 1280x1024x24' env \
-            NIVALIS_MEMORY_DATA_DIR="$work/data" \
-            NIVALIS_MEMORY_TEST_CASE=content-smoke \
-            NIVALIS_STRESS_SCENARIO=content \
-            NIVALIS_STRESS_STEPS=2 \
-            NIVALIS_STRESS_DELAY_MS=2000 \
-            NIVALIS_STRESS_INTERVAL_MS=2 \
-            NIVALIS_MEMORY_LOG="$work/content.log" \
-            NIVALIS_MEMORY_SAMPLES='1 5' \
-            NIVALIS_MEMORY_CPU_SETTLE_GATE=1 \
-            NIVALIS_MEMORY_CPU_SETTLE_GRACE_SECONDS=1 \
-            NIVALIS_MEMORY_CPU_SETTLE_SECONDS=5 \
-            NIVALIS_MEMORY_CPU_SETTLE_MAX_PERCENT=1.00 \
-            scripts/measure-memory.sh target/release/nivalis-mail \
-            > "$work/content.csv"
+            env \
+              NIVALIS_MEMORY_DATA_DIR="$work/data" \
+              NIVALIS_MEMORY_TEST_CASE=content-smoke \
+              NIVALIS_STRESS_SCENARIO=content \
+              NIVALIS_STRESS_STEPS=2 \
+              NIVALIS_STRESS_DELAY_MS=2000 \
+              NIVALIS_MEMORY_LOG="$work/content.log" \
+              NIVALIS_MEMORY_SAMPLES="1 5" \
+              NIVALIS_MEMORY_CPU_SETTLE_GATE=1 \
+              NIVALIS_MEMORY_CPU_SETTLE_GRACE_SECONDS=1 \
+              NIVALIS_MEMORY_CPU_SETTLE_SECONDS=5 \
+              NIVALIS_MEMORY_CPU_SETTLE_MAX_PERCENT=1.00 \
+              scripts/measure-memory.sh target/release/nivalis-mail \
+              > "$work/content.csv"
 
-          awk -F, 'NF != 14 { exit 1 }' \
-            "$work/init.csv" "$work/write-search.csv" "$work/pagination.csv" \
-            "$work/content.csv"
+            awk -F, "NF != 14 { exit 1 }" \
+              "$work/init.csv" "$work/write-search.csv" "$work/pagination.csv" \
+              "$work/content.csv"
+          '
