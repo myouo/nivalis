@@ -176,13 +176,42 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+read_process_stat() {
+    local stat_line stat_tail
+    local -a stat_fields
+
+    if ! IFS= read -r stat_line <"/proc/$pid/stat"; then
+        printf 'Could not read process statistics for PID %s\n' "$pid" >&2
+        exit 1
+    fi
+    stat_tail=${stat_line##*) }
+    read -r -a stat_fields <<<"$stat_tail"
+    if [[ "$stat_tail" == "$stat_line" || ${#stat_fields[@]} -lt 20 ]]; then
+        printf 'Malformed process statistics for PID %s\n' "$pid" >&2
+        exit 1
+    fi
+    if [[ ! "${stat_fields[11]}" =~ ^[0-9]+$ ||
+        ! "${stat_fields[12]}" =~ ^[0-9]+$ ||
+        ! "${stat_fields[19]}" =~ ^[0-9]+$ ]]; then
+        printf 'Malformed process statistics for PID %s\n' "$pid" >&2
+        exit 1
+    fi
+
+    current_cpu_ticks=$((${stat_fields[11]} + ${stat_fields[12]}))
+    current_start_ticks=${stat_fields[19]}
+}
+
 sample_process_metrics() {
     if ! kill -0 "$pid" 2>/dev/null; then
         cat "$run_log_file" >&2
         exit 1
     fi
 
-    current_cpu_ticks=$(awk '{ print $14 + $15 }' "/proc/$pid/stat")
+    read_process_stat
+    if [[ "$current_start_ticks" != "$process_start_ticks" ]]; then
+        printf 'Process identity changed while measuring PID %s\n' "$pid" >&2
+        exit 1
+    fi
     current_wall_ns=$(date +%s%N)
     cpu_percent=$(awk \
         -v cpu_ticks="$((current_cpu_ticks - previous_cpu_ticks))" \
@@ -203,43 +232,58 @@ sample_process_metrics() {
         /^Private_Clean:/ { private_clean = $2 }
         /^Private_Dirty:/ { private_dirty = $2 }
         /^Anonymous:/ { anonymous = $2 }
+        /^Swap:/ { swap = $2 }
+        /^SwapPss:/ { swap_pss = $2 }
         END {
-            printf "%d %d %d %d", rss, pss, private_clean + private_dirty,
-                anonymous
+            printf "%d %d %d %d %d %d", rss, pss,
+                private_clean + private_dirty, anonymous, swap, swap_pss
         }
     ' "/proc/$pid/smaps_rollup")
-    read -r rss_kib pss_kib uss_kib anonymous_kib <<<"$metrics"
+    read -r rss_kib pss_kib uss_kib anonymous_kib swap_kib swap_pss_kib <<<"$metrics"
     if ! is_bounded_positive_decimal "$rss_kib" 2147483647 ||
         ! is_bounded_positive_decimal "$pss_kib" 2147483647 ||
         ! is_bounded_nonnegative_decimal "$uss_kib" 2147483647 ||
-        ! is_bounded_nonnegative_decimal "$anonymous_kib" 2147483647; then
+        ! is_bounded_nonnegative_decimal "$anonymous_kib" 2147483647 ||
+        ! is_bounded_nonnegative_decimal "$swap_kib" 2147483647 ||
+        ! is_bounded_nonnegative_decimal "$swap_pss_kib" 2147483647; then
         printf 'Could not read bounded smaps metrics for process %s: %s\n' \
             "$pid" "$metrics" >&2
         exit 1
+    fi
+    if ((rss_kib > peak_rss_kib)); then
+        peak_rss_kib=$rss_kib
+    fi
+    if ((vm_hwm_kib > peak_rss_kib)); then
+        peak_rss_kib=$vm_hwm_kib
     fi
 }
 
 record_sample() {
     local seconds=$1
-    printf '%s,%s,%s,%d,%d,%d,%d,%d,%d,%s,%d\n' \
+    printf '%s,%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%s,%d,%d\n' \
         "$test_case" "$renderer" "$platform" "$run" "$seconds" "$rss_kib" \
-        "$pss_kib" "$uss_kib" "$anonymous_kib" "$cpu_percent" "$vm_hwm_kib"
+        "$pss_kib" "$uss_kib" "$anonymous_kib" "$swap_kib" "$swap_pss_kib" \
+        "$cpu_percent" "$vm_hwm_kib" "$peak_rss_kib"
 
     if ((baseline_rss_kib == 0)); then
         baseline_rss_kib=$rss_kib
         baseline_pss_kib=$pss_kib
+        baseline_total_rss_kib=$((rss_kib + swap_kib))
+        baseline_total_pss_kib=$((pss_kib + swap_pss_kib))
     fi
     settled_rss_kib=$rss_kib
     settled_pss_kib=$pss_kib
+    settled_total_rss_kib=$((rss_kib + swap_kib))
+    settled_total_pss_kib=$((pss_kib + swap_pss_kib))
 
-    if ((hard_gate)) && ((rss_kib >= hard_cap_kib || vm_hwm_kib >= hard_cap_kib)); then
-        printf 'Memory hard cap failed on run %d at %ss: RSS=%dKiB VmHWM=%dKiB; both must be below %dKiB\n' \
-            "$run" "$seconds" "$rss_kib" "$vm_hwm_kib" "$hard_cap_kib" >&2
+    if ((hard_gate)) && ((rss_kib >= hard_cap_kib || peak_rss_kib >= hard_cap_kib)); then
+        printf 'Memory hard cap failed on run %d at %ss: RSS=%dKiB peak=%dKiB; both must be below %dKiB\n' \
+            "$run" "$seconds" "$rss_kib" "$peak_rss_kib" "$hard_cap_kib" >&2
         exit 1
     fi
 }
 
-printf 'test_case,renderer,platform,run,seconds,rss_kib,pss_kib,uss_kib,anonymous_kib,cpu_percent,vm_hwm_kib\n'
+printf 'test_case,renderer,platform,run,seconds,rss_kib,pss_kib,uss_kib,anonymous_kib,swap_kib,swap_pss_kib,cpu_percent,vm_hwm_kib,peak_rss_kib\n'
 
 for ((run = 1; run <= runs; run++)); do
     run_log_file=$log_file
@@ -319,13 +363,20 @@ for ((run = 1; run <= runs; run++)); do
     fi
 
     clock_ticks=$(getconf CLK_TCK)
-    previous_cpu_ticks=$(awk '{ print $14 + $15 }' "/proc/$pid/stat")
+    read_process_stat
+    previous_cpu_ticks=$current_cpu_ticks
+    process_start_ticks=$current_start_ticks
     previous_wall_ns=$(date +%s%N)
     previous=0
+    peak_rss_kib=0
     baseline_rss_kib=0
     baseline_pss_kib=0
+    baseline_total_rss_kib=0
+    baseline_total_pss_kib=0
     settled_rss_kib=0
     settled_pss_kib=0
+    settled_total_rss_kib=0
+    settled_total_pss_kib=0
     for seconds in "${sample_points[@]}"; do
         delay=$((seconds - previous))
         if ((delay > 0)); then
@@ -399,7 +450,12 @@ for ((run = 1; run <= runs; run++)); do
         if ((cpu_settle_grace_seconds > 0)); then
             sleep "$cpu_settle_grace_seconds"
         fi
-        previous_cpu_ticks=$(awk '{ print $14 + $15 }' "/proc/$pid/stat")
+        read_process_stat
+        if [[ "$current_start_ticks" != "$process_start_ticks" ]]; then
+            printf 'Process identity changed while measuring PID %s\n' "$pid" >&2
+            exit 1
+        fi
+        previous_cpu_ticks=$current_cpu_ticks
         previous_wall_ns=$(date +%s%N)
         sleep "$cpu_settle_seconds"
         settled_seconds=$((previous + cpu_settle_grace_seconds + cpu_settle_seconds))
@@ -417,10 +473,14 @@ for ((run = 1; run <= runs; run++)); do
     if ((hard_gate)); then
         growth_factor=$((100 + growth_limit_percent))
         if ((settled_rss_kib * 100 >= baseline_rss_kib * growth_factor ||
-            settled_pss_kib * 100 >= baseline_pss_kib * growth_factor)); then
-            printf 'Memory growth gate failed on run %d: baseline RSS/PSS=%d/%dKiB, settled=%d/%dKiB; growth must be below %d%%\n' \
+            settled_pss_kib * 100 >= baseline_pss_kib * growth_factor ||
+            settled_total_rss_kib * 100 >= baseline_total_rss_kib * growth_factor ||
+            settled_total_pss_kib * 100 >= baseline_total_pss_kib * growth_factor)); then
+            printf 'Memory growth gate failed on run %d: baseline RSS/PSS/total-RSS/total-PSS=%d/%d/%d/%dKiB, settled=%d/%d/%d/%dKiB; growth must be below %d%%\n' \
                 "$run" "$baseline_rss_kib" "$baseline_pss_kib" \
-                "$settled_rss_kib" "$settled_pss_kib" "$growth_limit_percent" >&2
+                "$baseline_total_rss_kib" "$baseline_total_pss_kib" \
+                "$settled_rss_kib" "$settled_pss_kib" "$settled_total_rss_kib" \
+                "$settled_total_pss_kib" "$growth_limit_percent" >&2
             exit 1
         fi
     fi

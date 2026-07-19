@@ -169,5 +169,5 @@ jobs:
             scripts/measure-memory.sh target/release/nivalis-mail \
             > "$work/pagination.csv"
 
-          awk -F, 'NF != 11 { exit 1 }' \
+          awk -F, 'NF != 14 { exit 1 }' \
             "$work/init.csv" "$work/write-search.csv" "$work/pagination.csv"
