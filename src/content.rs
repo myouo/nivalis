@@ -317,7 +317,17 @@ struct AttachmentMetadata {
 }
 
 impl PreparedContent {
-    fn publish(self) -> Result<PublishedContent, StorageError> {
+    pub(crate) fn record(&self) -> ContentRecord {
+        make_record(
+            &self.metadata,
+            self.body.as_ref().map(|file| &file.key),
+            self.attachments
+                .iter()
+                .map(|attachment| (&attachment.metadata, &attachment.file.key)),
+        )
+    }
+
+    pub(crate) fn publish(self) -> Result<PublishedContent, StorageError> {
         let body = self.body.map(StagedFile::publish).transpose()?;
         let mut attachments = Vec::with_capacity(self.attachments.len());
         for attachment in self.attachments.into_vec() {
@@ -335,7 +345,7 @@ impl PreparedContent {
 }
 
 #[derive(Debug)]
-struct PublishedContent {
+pub(crate) struct PublishedContent {
     metadata: ContentMetadata,
     body: Option<PublishedFile>,
     attachments: Box<[PublishedAttachment]>,
@@ -348,7 +358,7 @@ struct PublishedAttachment {
 }
 
 impl PublishedContent {
-    fn record(&self) -> ContentRecord {
+    pub(crate) fn record(&self) -> ContentRecord {
         make_record(
             &self.metadata,
             self.body.as_ref().map(|file| &file.key),
@@ -358,7 +368,7 @@ impl PublishedContent {
         )
     }
 
-    fn retain_files(&mut self) {
+    pub(crate) fn retain_files(&mut self) {
         if let Some(body) = &mut self.body {
             body.retained = true;
         }
@@ -695,11 +705,9 @@ pub(crate) fn prepare_content(
     let (body, body_byte_count, body_truncated) = extract_bounded_body(&message, limits);
     let preview = bounded_prefix(&body, limits.preview_bytes).trim().into();
     let reader_excerpt = bounded_prefix(&body, limits.reader_excerpt_bytes).into();
-    let staged_body = if body.is_empty() {
-        None
-    } else {
-        Some(staging.stage_reader(FileKind::Body, body.as_bytes(), limits.stored_body_bytes)?)
-    };
+    // A zero-byte body still gives every durable reservation one physical row.
+    let staged_body =
+        Some(staging.stage_reader(FileKind::Body, body.as_bytes(), limits.stored_body_bytes)?);
 
     let mut attachments = Vec::with_capacity(message.attachments.len());
     for (ordinal, part_id) in message.attachments.iter().copied().enumerate() {
@@ -1633,6 +1641,32 @@ AQIDBA==\r\n\
         drop(published);
         assert!(!body_path.exists());
         assert!(!attachment_path.exists());
+        remove_root(&root);
+    }
+
+    #[test]
+    fn empty_body_keeps_a_durable_zero_byte_reservation_manifest() {
+        let root = temporary_root("empty-body");
+        let staging = ContentStaging::open(root.clone()).unwrap();
+        let prepared = prepare_content(
+            b"Subject: headers only\r\n\r\n",
+            &staging,
+            ContentLimits::default(),
+        )
+        .unwrap();
+        let staged_record = prepared.record();
+        assert_eq!(staged_record.body_byte_count, 0);
+        assert!(staged_record.body_file_key.is_some());
+
+        let published = prepared.publish().unwrap();
+        let published_record = published.record();
+        assert_eq!(published_record, staged_record);
+        let body_path = staging
+            .resolve(published_record.body_file_key.as_ref().unwrap())
+            .unwrap();
+        assert_eq!(fs::metadata(&body_path).unwrap().len(), 0);
+        drop(published);
+        assert!(!body_path.exists());
         remove_root(&root);
     }
 

@@ -1,5 +1,7 @@
 mod actor;
+mod content;
 mod domain;
+mod file_gc;
 mod journal;
 mod migrations;
 mod mutation;
