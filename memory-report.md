@@ -16,12 +16,12 @@ These numbers are machine- and viewport-specific. Software framebuffer memory gr
 ## Configuration
 
 - Measurement date and host: 2026-07-20, Linux 7.1.2-zen3-1-zen x86_64, Rust 1.96.1.
-- Release-code revision: `9f0fd179d32d3a360a723a7cbadfa85862934cff`, schema v11.
-- Production build: `cargo build --locked --release`, stripped, `opt-level = "s"`, 19,926,744 bytes (19.00MiB), SHA-256 `e75056d1904b63e72c632df987297ff903cffc7e8a35222c588098226e4eabfa`.
-- Benchmark build: `cargo build --locked --release --features bench-harness`, stripped, 20,396,120 bytes (19.45MiB), SHA-256 `247c9bc2536abc4722071681ef374d0d592544ea611a92ef01176aa95790f95c`.
-- UI state: light theme, three-pane inbox, 64 configured accounts, one account warning, 51 inbox messages, and bounded 50-row plus one-row pages connected through First/Next/Previous keyset navigation.
-- Data bounds: all 51 stored previews are exactly 2,048 bytes and all 51 reader excerpts are exactly 65,536 bytes. The private v11 fixture has 64 non-secret account connections and passes SQLite, foreign-key, and FTS integrity checks; the production query returns 50 rows plus a cursor, then one row without another cursor, while `message 51` has exactly one FTS hit at row 51.
-- Backend state: active bounded Tokio core and single-connection SQLite actor, WAL mode, 1MiB page cache limit, persistent statistics, real account/mailbox/detail projections, bounded local MIME/file lifecycle, and the connected account coordinator. The warm case starts the production credential worker, opens the real Linux Secret Service, deletes one deliberately absent opaque locator, confirms removal, and completes the bounded account purge.
+- Release-code revision: `528c2b440db1c731110b12e88bc9b532d1a52d16`, schema v11.
+- Production build: `cargo build --locked --release`, stripped, `opt-level = "s"`, 21,439,064 bytes (20.45MiB), SHA-256 `10e5d0c41055a68b9b03d2ff5f25f2c704cab34e6fa2ddaec0771b1631212105`.
+- Benchmark build: `cargo build --locked --release --features bench-harness`, stripped, 21,913,560 bytes (20.90MiB), SHA-256 `99362b362d4807435a81d604a19f2e8900014d2f3c3be27d12ea6e2b77661429`.
+- UI state: light theme at 1200x900. Production idle uses the empty-account onboarding state. The protocol case transiently drives the production add, connection-status, and remove surfaces, then returns to the same empty state.
+- Data state: both current fixtures start empty. The protocol case atomically creates one generation-fenced app-password account, stores and loads one fake loopback-only secret through the real Linux Secret Service, records one successful diagnostic, deletes the keyring item, purges the account, and ends with zero account, connection, staging, and GC rows. SQLite integrity and foreign-key checks pass.
+- Backend state: active bounded Tokio core, single-connection SQLite actor, lazy credential actor, platform-verifying Rustls, and `async-imap`. The local TLS fixture completes greeting, LOGIN, CAPABILITY, and EXAMINE INBOX through the production diagnostic function, followed by its bounded best-effort LOGOUT attempt; no mock connector or second runtime is used.
 - Default renderer: `winit` + `skia-software` (Skia CPU rasterization and partial rendering).
 - GPU override: `NIVALIS_RENDERER=skia`.
 - X11 viewport: 1200x900 physical pixels, scale factor 1.
@@ -30,7 +30,8 @@ These numbers are machine- and viewport-specific. Software framebuffer memory gr
 
 Committed samples use one CSV per measured code revision. The `test_case` column identifies each workload and repeat without multiplying evidence files:
 
-- [`docs/measurements/2026-07-20-9f0fd17.csv`](docs/measurements/2026-07-20-9f0fd17.csv), SHA-256 `6fed4cd86ed589188df2f6fcc4c522d7f41bafd9c9e6ad164ffe7bb4325998c5`. Its 31 data rows contain the complete cold-idle, credential-recovery, and content-soak matrix; no per-hash log or second evidence file is committed.
+- [`docs/measurements/2026-07-20-528c2b4.csv`](docs/measurements/2026-07-20-528c2b4.csv), SHA-256 `0a0cbf69faf493ca829d0d630c42713e8a4c8e69acdb799fd1db2701f4cec756`. Its 21 data rows contain three production idle runs and one complete loopback account-diagnostic lifecycle; no per-hash log or second evidence file is committed.
+- [`docs/measurements/2026-07-20-9f0fd17.csv`](docs/measurements/2026-07-20-9f0fd17.csv), SHA-256 `6fed4cd86ed589188df2f6fcc4c522d7f41bafd9c9e6ad164ffe7bb4325998c5`. Its 31 data rows contain the preceding cold-idle, credential-recovery, and content-soak matrix; no per-hash log or second evidence file is committed.
 - [`docs/measurements/2026-07-19-456ad2f.csv`](docs/measurements/2026-07-19-456ad2f.csv), SHA-256 `1ec859a8d0689d588074b3e882d36cd243500fb55dd62ede4f76471e9b51e8df`. Its `test_case` rows contain the complete idle and 600-second content-soak matrix; no second per-hash evidence file is committed.
 - [`docs/measurements/2026-07-19-8c005c8.csv`](docs/measurements/2026-07-19-8c005c8.csv), SHA-256 `5642ab4d752d1ade19b2abde8b11a633965006de90271a09954c50ae77ef5c9f`; [completion log](docs/measurements/2026-07-19-8c005c8.log), SHA-256 `213b452f45c3a8c96fc214284d086efba5d60c151511ae97438e83a71e9d4427`.
 - [`docs/measurements/2026-07-19-a74b8bb.csv`](docs/measurements/2026-07-19-a74b8bb.csv), SHA-256 `58dd1f44a27f9a186e25a82c9fbd6bda0d63d80b12a1ef916f216f3728e8cdb9`; [completion log](docs/measurements/2026-07-19-a74b8bb.log), SHA-256 `115a6f1b129385713602b6d0b101d9c94c40cabda2b8f06b293c00f8588d0554`.
@@ -42,7 +43,8 @@ Values below are the worst stable samples across the stated fresh-process runs.
 
 | Renderer | Platform | Runs | RSS | PSS | USS | Result |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
-| Skia software, `9f0fd17` schema-v11 fixture | X11 | 3 | 38.07MiB | 28.67MiB | 26.11MiB | Current hard gate and tested target pass |
+| Skia software, `528c2b4` empty-account state | X11 | 3 | 35.93MiB | 26.54MiB | 23.96MiB | Current M3 hard gate and tested target pass |
+| Skia software, `9f0fd17` schema-v11 fixture | X11 | 3 | 38.07MiB | 28.67MiB | 26.11MiB | Pre-M3 populated-fixture pass |
 | Skia software, `456ad2f` schema-v11 fixture | X11 | 3 | 37.79MiB | 28.14MiB | 25.52MiB | Pre-coordinator gate pass |
 | Skia software, `8c005c8` schema-v10 fixture | X11 | 3 | 37.59MiB | 27.62MiB | 24.84MiB | M2 hard gate and tested target pass |
 | Skia software, `a74b8bb` schema-v9 fixture | X11 | 3 | 37.75MiB | 24.34MiB | 20.75MiB | Hard gate and tested target pass |
@@ -53,7 +55,9 @@ Values below are the worst stable samples across the stated fresh-process runs.
 | Skia software | Wayland | 3 historical | 41.5MiB | 22.4MiB | 17.5MiB | Pre-SQLite reference |
 | Skia OpenGL | X11 | 1 historical | 248.0MiB | 81.9MiB | 34.0MiB | Pre-SQLite reference; RSS stretch fail |
 
-The `9f0fd17` matrix uses three fresh production processes sampled at 5, 10, 20, and 30 seconds, followed by the quiet grace and dedicated 10-second CPU sample at 45 seconds. Their largest RSS values were 38,980, 38,704, and 38,744KiB; the matrix maxima were 29,356KiB PSS and 26,736KiB USS, with zero Swap. All three final CPU intervals were 0.00%. The current revision meets both the 90MiB hard gate and preferred 50MiB target at the tested viewport.
+The `528c2b4` matrix uses three fresh production processes sampled at 5, 10, 20, and 30 seconds, followed by the quiet grace and dedicated 10-second CPU sample at 45 seconds. Their largest RSS values were 36,792, 36,428, and 36,612KiB; the matrix maxima were 27,176KiB PSS and 24,532KiB USS, with zero Swap. All three final CPU intervals were 0.00%. The current revision meets both the 90MiB hard gate and preferred 50MiB target at the tested viewport.
+
+The preceding `9f0fd17` populated-fixture matrix peaked at 38,980KiB RSS, 29,356KiB PSS, and 26,736KiB USS across three fresh processes.
 
 The preceding `456ad2f` matrix peaked at 38,700KiB RSS before the account coordinator became reachable from the core.
 
@@ -69,8 +73,9 @@ The baseline and settled columns show `RSS/PSS + Swap/SwapPss` in KiB. Growth sh
 
 | Scenario | Baseline | Settled | Growth | Peak RSS | Result |
 | --- | --- | --- | --- | ---: | --- |
-| Secret Service recovery plus 600s warm idle, `9f0fd17` | 39,448/29,778 + 0/0 | 39,448/29,776 + 0/0 | 0.00%/-0.01%; 0.00%/-0.01% | 39,448 | Current warm pass |
-| 10,000 content lifecycle cycles plus 600s soak, `9f0fd17` | 39,032/29,381 + 0/0 | 40,032/30,388 + 0/0 | +2.56%/+3.43%; +2.56%/+3.43% | 40,084 | Current content pass |
+| One complete account diagnostic plus 120s warm hold, `528c2b4` | 36,880/27,293 + 0/0 | 38,988/28,754 + 0/0 | +5.72%/+5.35%; +5.72%/+5.35% | 38,988 | Current M3 path pass |
+| Secret Service recovery plus 600s warm idle, `9f0fd17` | 39,448/29,778 + 0/0 | 39,448/29,776 + 0/0 | 0.00%/-0.01%; 0.00%/-0.01% | 39,448 | Pre-M3 warm pass |
+| 10,000 content lifecycle cycles plus 600s soak, `9f0fd17` | 39,032/29,381 + 0/0 | 40,032/30,388 + 0/0 | +2.56%/+3.43%; +2.56%/+3.43% | 40,084 | M2 content pass |
 | 10,000 content lifecycle cycles plus 600s soak, `456ad2f` | 38,856/28,882 + 0/0 | 39,792/29,780 + 0/0 | +2.41%/+3.11%; +2.41%/+3.11% | 39,844 | Pre-coordinator pass |
 | 10,000 content lifecycle cycles | 38,640/28,281 + 0/0 | 39,632/29,273 + 0/0 | +2.57%/+3.51%; +2.57%/+3.51% | 39,684 | M2 pass |
 | 1,000 write/search cycles, repeat 1 | 38,200/24,528 + 0/0 | 35,780/22,002 + 11,024/2,904 | -6.34%/-10.30%; +22.52%/+1.54% | 39,100 | Pass |
@@ -78,7 +83,9 @@ The baseline and settled columns show `RSS/PSS + Swap/SwapPss` in KiB. Growth sh
 | 10,000 keyset transitions, repeat 1 | 33,948/21,579 + 11,992/0 | 17,784/7,452 + 22,968/6,112 | -47.61%/-65.47%; -11.29%/-37.14% | 33,948 | Pass |
 | 10,000 keyset transitions, repeat 2 | 34,088/23,138 + 11,968/0 | 23,552/10,276 + 20,632/4,948 | -30.91%/-55.59%; -4.06%/-34.20% | 34,088 | Pass |
 
-The `9f0fd17` warm case started from one generation-fenced `removing_credentials` account. Production opened the real Secret Service, converged the deliberately absent locator through `AlreadyMissing`, removed the account and connection, and left one file reference for the delayed janitor. RSS remained exactly 39,448KiB from 5 through 615 seconds; PSS changed from 29,778 to 29,776KiB, Swap remained zero, and the final CPU interval was 0.00%.
+The `528c2b4` account case started from an empty persistent data directory. After the 5- and 10-second baselines, one 128ms lifecycle drove the production UI add/status/remove callbacks, stored and loaded one fake secret through the real Secret Service, completed platform-verified loopback TLS, LOGIN, CAPABILITY, and EXAMINE followed by best-effort LOGOUT, fenced the diagnostic report, then deleted the secret and account. RSS rose from 36,880KiB to 38,988KiB and stayed there at 20, 60, 120, and the 135-second CPU-settle sample; PSS settled at 28,754KiB, Swap remained zero, and final CPU was 0.00%. SQLite ended with no account, connection, staging, or GC rows and passed integrity and foreign-key checks.
+
+The preceding `9f0fd17` warm case started from one generation-fenced `removing_credentials` account. Production opened the real Secret Service, converged the deliberately absent locator through `AlreadyMissing`, removed the account and connection, and left one file reference for the delayed janitor. RSS remained exactly 39,448KiB from 5 through 615 seconds; PSS changed from 29,778 to 29,776KiB, Swap remained zero, and the final CPU interval was 0.00%.
 
 The `9f0fd17` content workload completed exactly 10,000 bounded MIME imports, 10,000 body streams, 10,000 attachment streams, and 10,000 bounded GC runs in 34.566 seconds. It examined 19,999 old file references, removed 19,998 files, converged one intentionally missing fixture file, and ended with generation 10,000, empty staging and GC tables, and only the current body and attachment on disk. RSS settled at 40,032KiB from 60 through 615 seconds, peak RSS was 40,084KiB (39.14MiB), final growth was 2.56% RSS and 3.43% PSS, Swap remained zero, and the final CPU interval was 0.00%.
 
@@ -88,9 +95,9 @@ The preceding `8c005c8` M2 workload completed the same exact-count lifecycle in 
 
 Each historical M1 write/search run completed exactly 1,000 star transactions, 1,000 deterministic one-hit FTS queries, 1,000 clears, and 3,000 authoritative First queries. Each pagination run completed exactly 5,000 `After` and 5,000 `Before` transitions and returned to page one. All four logs contain one completion marker and no error marker; every dedicated post-workload CPU interval is 0.00%.
 
-Across the retained matrices, the largest current resident peak was 40,084KiB and the largest sampled `RSS+Swap` was 47,244KiB. The worst settled ratios remain below 1.026x RSS, 1.036x PSS, 1.226x `RSS+Swap`, and 1.036x `PSS+SwapPss`, all below the 2x gate. Significant host swapping occurred during M1, so its lower settled resident values are not claimed as deallocation or an optimization gain; the swap-inclusive totals determine that conclusion.
+Across the retained current and historical matrices, the largest non-outlier resident peak was 40,084KiB and the largest sampled `RSS+Swap` was 47,244KiB. The current M3 diagnostic settles at 1.0572x RSS and 1.0535x PSS; the worst retained ratios remain below 1.226x for all resident and swap-inclusive measures, below the 2x gate. Significant host swapping occurred during M1, so its lower settled resident values are not claimed as deallocation or an optimization gain; the swap-inclusive totals determine that conclusion.
 
-The current checkpoint proves the schema-v11 UI/SQLite/content baseline and one real Secret Service account-removal recovery with the coordinator connected. The warm case exercises store opening and idempotent deletion, but not storing or loading a real secret, desktop unlock prompts, repeated credential operations, OAuth, or concurrent multi-account work. Those paths, IMAP/JMAP synchronization, SMTP/outbox delivery, large FTS rebuilds, deep large-mailbox paging, and representative multi-account protocol activity require fresh measurements when their owning milestones activate them.
+The current checkpoint proves production empty idle and one complete loopback add/keyring-store/keyring-load/fenced-diagnostic/IMAP/remove/keyring-delete path. It does not prove warm idle with a retained configured account, public DNS or provider behavior, desktop unlock prompts, repeated diagnostics, multiple accounts, OAuth, receive synchronization, SMTP/outbox delivery, large FTS rebuilds, deep large-mailbox paging, or representative long-duration protocol activity. Each newly activated milestone requires its own release measurement rather than inheriting this result.
 
 ## Historical Release Profile A/B
 
@@ -106,74 +113,120 @@ The `performance` profile remains available when the extra 2.5% measured active 
 
 ## Reproduce
 
-Check out `9f0fd179d32d3a360a723a7cbadfa85862934cff`. The workflow requires `sqlite3`; X11 measurement also requires `xdotool`. A usable Secret Service session is required for the warm credential case. Build and preserve the production binary before the benchmark build replaces Cargo's release output:
+Check out `528c2b440db1c731110b12e88bc9b532d1a52d16`. The workflow requires `sqlite3`, `openssl`, and `xdotool`, plus a usable Linux Secret Service session. Build and preserve the production binary before the benchmark build replaces Cargo's release output:
 
 ```bash
-work=$(mktemp -d /tmp/nivalis-memory-9f0fd17.XXXXXX)
+set -euo pipefail
+work=$(mktemp -d /tmp/nivalis-memory-528c2b4.XXXXXX)
 cargo build --locked --release
 install -m 755 target/release/nivalis-mail "$work/nivalis-mail-production"
+[[ $(stat -c %s "$work/nivalis-mail-production") == 21439064 ]]
+[[ $(sha256sum "$work/nivalis-mail-production" | cut -d' ' -f1) == \
+  10e5d0c41055a68b9b03d2ff5f25f2c704cab34e6fa2ddaec0771b1631212105 ]]
 cargo build --locked --release --features bench-harness
 install -m 755 target/release/nivalis-mail "$work/nivalis-mail-bench"
+[[ $(stat -c %s "$work/nivalis-mail-bench") == 21913560 ]]
+[[ $(sha256sum "$work/nivalis-mail-bench" | cut -d' ' -f1) == \
+  99362b362d4807435a81d604a19f2e8900014d2f3c3be27d12ea6e2b77661429 ]]
 ```
 
-Initialize and seed one checked fixture, then copy it so cold idle, credential recovery, and content measurements cannot contaminate each other:
+Create independent empty data directories and a fake loopback-only secret file. The harness rejects non-loopback hosts, non-absolute secret paths, files accessible to group or other users, non-UTF-8 data, empty data, and files over 16KiB:
 
 ```bash
-mkdir -p "$work/fixture-base"
-NIVALIS_MEMORY_DATA_DIR="$work/fixture-base" NIVALIS_MEMORY_SAMPLES=1 \
-  scripts/measure-memory.sh "$work/nivalis-mail-production" > "$work/init.csv"
-sqlite3 "$work/fixture-base/mail.sqlite3" < scripts/fixtures/memory.sql
-sqlite3 "$work/fixture-base/mail.sqlite3" \
-  "INSERT INTO account_connections
-     (account_id, credential_key, auth_kind, login_name, imap_host, imap_port)
-   SELECT id, printf('%032x', id), 'app_password', address,
-          'imap.example.test', 993
-     FROM accounts;
-   PRAGMA wal_checkpoint(TRUNCATE);"
-[[ $(sqlite3 "$work/fixture-base/mail.sqlite3" 'PRAGMA user_version;') == 11 ]]
-[[ $(sqlite3 "$work/fixture-base/mail.sqlite3" 'PRAGMA integrity_check;') == ok ]]
-[[ -z $(sqlite3 "$work/fixture-base/mail.sqlite3" 'PRAGMA foreign_key_check;') ]]
-cp -a "$work/fixture-base" "$work/idle"
-cp -a "$work/fixture-base" "$work/warm-recovery"
-cp -a "$work/fixture-base" "$work/content"
-sqlite3 "$work/warm-recovery/mail.sqlite3" \
-  "BEGIN IMMEDIATE;
-   UPDATE account_connections
-      SET credential_key = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
-    WHERE account_id = 1;
-   UPDATE accounts SET state = 'removing_credentials' WHERE id = 1;
-   COMMIT;
-   PRAGMA wal_checkpoint(TRUNCATE);"
+mkdir -p "$work/idle" "$work/account-diagnostic"
+printf '%s' 'not-a-real-password' > "$work/loopback.secret"
+chmod 600 "$work/loopback.secret"
 ```
 
-Run the production idle matrix, real Secret Service recovery soak, and exact-count content lifecycle gate:
+Run the production idle matrix:
 
 ```bash
-NIVALIS_MEMORY_DATA_DIR="$work/idle" NIVALIS_MEMORY_TEST_CASE=idle \
+NIVALIS_MEMORY_DATA_DIR="$work/idle" NIVALIS_MEMORY_TEST_CASE=m3-idle \
 NIVALIS_MEMORY_RUNS=3 NIVALIS_MEMORY_SAMPLES="5 10 20 30" \
 NIVALIS_MEMORY_HARD_GATE=1 NIVALIS_MEMORY_HARD_CAP_KIB=92160 \
 NIVALIS_MEMORY_GROWTH_LIMIT_PERCENT=100 NIVALIS_MEMORY_LOG="$work/idle.log" \
   scripts/measure-memory.sh "$work/nivalis-mail-production" > "$work/idle.csv"
-
-NIVALIS_MEMORY_DATA_DIR="$work/warm-recovery" \
-NIVALIS_MEMORY_TEST_CASE=credential-recovery-soak \
-NIVALIS_MEMORY_SAMPLES="5 10 20 60 120 300 600" \
-NIVALIS_MEMORY_HARD_GATE=1 NIVALIS_MEMORY_HARD_CAP_KIB=92160 \
-NIVALIS_MEMORY_GROWTH_LIMIT_PERCENT=100 \
-NIVALIS_MEMORY_LOG="$work/warm-recovery.log" \
-  scripts/measure-memory.sh "$work/nivalis-mail-production" \
-  > "$work/warm-recovery.csv"
-
-NIVALIS_MEMORY_DATA_DIR="$work/content" \
-NIVALIS_MEMORY_TEST_CASE=content-lifecycle-soak \
-NIVALIS_STRESS_SCENARIO=content NIVALIS_STRESS_STEPS=10000 \
-NIVALIS_STRESS_DELAY_MS=10000 NIVALIS_MEMORY_SAMPLES="5 10 20 60 120 300 600" \
-NIVALIS_MEMORY_HARD_GATE=1 NIVALIS_MEMORY_HARD_CAP_KIB=92160 \
-NIVALIS_MEMORY_GROWTH_LIMIT_PERCENT=100 NIVALIS_MEMORY_LOG="$work/content.log" \
-  scripts/measure-memory.sh "$work/nivalis-mail-bench" > "$work/content.csv"
 ```
 
-The committed CSV contains the idle header followed by credential and content rows without repeated headers. The temporary content log must contain exactly one `NIVALIS_STRESS_RESULT` and no error marker. Verify the warm fixture has no removal-state account, then verify content generation 10,000, empty staging and GC tables, and one current body and attachment. Discard the temporary logs; the per-hash evidence directory retains only the combined CSV.
+Create a one-day local CA and a `localhost` server certificate, then start a single-connection scripted TLS endpoint. The CA is trusted only by this benchmark process through `SSL_CERT_FILE`:
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+  -subj '/CN=Nivalis memory CA' \
+  -addext 'basicConstraints=critical,CA:TRUE' \
+  -addext 'keyUsage=critical,keyCertSign,cRLSign' \
+  -keyout "$work/ca.key" -out "$work/ca.crt"
+openssl req -newkey rsa:2048 -nodes -subj '/CN=localhost' \
+  -addext 'subjectAltName=DNS:localhost' \
+  -addext 'extendedKeyUsage=serverAuth' \
+  -keyout "$work/server.key" -out "$work/server.csr"
+openssl x509 -req -days 1 -in "$work/server.csr" \
+  -CA "$work/ca.crt" -CAkey "$work/ca.key" -CAcreateserial \
+  -copy_extensions copy -out "$work/server.crt"
+openssl verify -CAfile "$work/ca.crt" -verify_hostname localhost "$work/server.crt"
+
+printf '%b' \
+  '* OK Nivalis memory IMAP ready\r\nA0001 OK authenticated\r\n* CAPABILITY IMAP4rev1 IDLE\r\nA0002 OK capabilities complete\r\n* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n* 0 EXISTS\r\n* 0 RECENT\r\nA0003 OK [READ-ONLY] mailbox examined\r\n* BYE logging out\r\nA0004 OK logout complete\r\n' | \
+  openssl s_server -quiet -naccept 1 -accept 19993 \
+    -cert "$work/server.crt" -key "$work/server.key" \
+    > "$work/server.log" 2>&1 &
+server_pid=$!
+```
+
+Run exactly one production account lifecycle after two baseline samples. The script accepts only a `ready` completion that removes the account, then holds the process through 120 seconds and records the dedicated settled CPU sample at 135 seconds:
+
+```bash
+SSL_CERT_FILE="$work/ca.crt" \
+NIVALIS_MEMORY_DATA_DIR="$work/account-diagnostic" \
+NIVALIS_MEMORY_TEST_CASE=m3-account-diagnostic-ready \
+NIVALIS_STRESS_SCENARIO=account-diagnostic NIVALIS_STRESS_STEPS=1 \
+NIVALIS_STRESS_DELAY_MS=15000 NIVALIS_STRESS_INTERVAL_MS=25 \
+NIVALIS_STRESS_TRANSITION_TIMEOUT_MS=45000 \
+NIVALIS_STRESS_ACCOUNT_NAME='Memory diagnostic' \
+NIVALIS_STRESS_ACCOUNT_ADDRESS='memory@localhost' \
+NIVALIS_STRESS_ACCOUNT_LOGIN='memory@localhost' \
+NIVALIS_STRESS_ACCOUNT_IMAP_HOST=localhost \
+NIVALIS_STRESS_ACCOUNT_IMAP_PORT=19993 \
+NIVALIS_STRESS_ACCOUNT_SECRET_FILE="$work/loopback.secret" \
+NIVALIS_STRESS_ACCOUNT_EXPECTED_RESULT=ready \
+NIVALIS_MEMORY_SAMPLES="5 10 20 60 120" \
+NIVALIS_MEMORY_HARD_GATE=1 NIVALIS_MEMORY_HARD_CAP_KIB=92160 \
+NIVALIS_MEMORY_GROWTH_LIMIT_PERCENT=100 \
+NIVALIS_MEMORY_CPU_SETTLE_GATE=1 \
+NIVALIS_MEMORY_CPU_SETTLE_GRACE_SECONDS=5 \
+NIVALIS_MEMORY_CPU_SETTLE_SECONDS=10 \
+NIVALIS_MEMORY_LOG="$work/account-diagnostic.log" \
+  scripts/measure-memory.sh "$work/nivalis-mail-bench" \
+  > "$work/account-diagnostic.csv"
+wait "$server_pid"
+```
+
+The temporary diagnostic log must contain exactly one `outcome=ready removed=1` completion marker and no error marker. Verify that SQLite has no retained account, connection, staging, or GC rows and passes both consistency checks. Combine the idle header and all data rows into one per-revision CSV; do not commit the fake secret, CA, server key, or logs. If a failed run reports `cleanup_required=1`, preserve the printed data directory until the same profile can resume account removal.
+
+```bash
+[[ $(grep -c '^NIVALIS_STRESS_RESULT scenario=account-diagnostic cycles=1 outcome=ready removed=1 ' \
+  "$work/account-diagnostic.log") == 1 ]]
+! grep -q '^NIVALIS_STRESS_ERROR ' "$work/account-diagnostic.log"
+[[ $(sqlite3 "$work/account-diagnostic/mail.sqlite3" \
+  'SELECT count(*) FROM accounts;') == 0 ]]
+[[ $(sqlite3 "$work/account-diagnostic/mail.sqlite3" \
+  'SELECT count(*) FROM account_connections;') == 0 ]]
+[[ $(sqlite3 "$work/account-diagnostic/mail.sqlite3" \
+  'SELECT count(*) FROM file_staging;') == 0 ]]
+[[ $(sqlite3 "$work/account-diagnostic/mail.sqlite3" \
+  'SELECT count(*) FROM file_gc;') == 0 ]]
+[[ $(sqlite3 "$work/account-diagnostic/mail.sqlite3" \
+  'PRAGMA integrity_check;') == ok ]]
+[[ -z $(sqlite3 "$work/account-diagnostic/mail.sqlite3" \
+  'PRAGMA foreign_key_check;') ]]
+{ head -n 1 "$work/idle.csv"; tail -n +2 "$work/idle.csv"; \
+  tail -n +2 "$work/account-diagnostic.csv"; } \
+  > "$work/2026-07-20-528c2b4.csv"
+```
+
+### Historical `9f0fd17` procedure
+
+The preceding schema-v11 credential-recovery and content-soak matrix used revision `9f0fd179d32d3a360a723a7cbadfa85862934cff`. Its full commands remain reproducible from that revision's copy of this report and are retained as historical evidence rather than the current M3 gate.
 
 ### Historical M1 procedure
 
