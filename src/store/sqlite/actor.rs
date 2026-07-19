@@ -18,6 +18,12 @@ use tokio::sync::{mpsc, oneshot};
 use crate::content::{ContentStaging, PublishedContent};
 
 use super::{
+    account::{
+        AccountRecord, AccountWrite, AccountWriteOutcome, begin_account_removal, begin_diagnostic,
+        configure_existing_account, confirm_account_credentials_removed, create_account,
+        load_account, purge_removed_account, record_diagnostic, set_account_enabled,
+        update_account,
+    },
     content::{
         ContentBatchToken, ContentManifest, ReserveContentRequest,
         finalize_content_with_commit_hook, reserve_content,
@@ -169,6 +175,14 @@ enum Request {
         generation: Generation,
         mutation: MessageMutation,
     },
+    LoadAccount {
+        account_id: super::domain::AccountId,
+        reply: oneshot::Sender<Result<AccountRecord, DbFailure>>,
+    },
+    WriteAccount {
+        write: Box<AccountWrite>,
+        reply: oneshot::Sender<AccountWriteReply>,
+    },
     ClaimRemote {
         account_id: i64,
         reply: oneshot::Sender<Result<RemoteClaimOutcome, DbFailure>>,
@@ -313,6 +327,48 @@ impl DatabaseClient {
         self.interrupt.interrupt();
     }
 
+    pub(crate) fn try_load_account(
+        &self,
+        account_id: super::domain::AccountId,
+    ) -> Result<oneshot::Receiver<Result<AccountRecord, DbFailure>>, SubmitError> {
+        let (reply, receiver) = oneshot::channel();
+        self.try_submit(Request::LoadAccount { account_id, reply })?;
+        Ok(receiver)
+    }
+
+    pub(crate) fn try_write_account(
+        &self,
+        write: Box<AccountWrite>,
+    ) -> Result<oneshot::Receiver<AccountWriteReply>, AccountWriteSubmitFailure> {
+        let admission = lock_admission(&self.admission);
+        if !*admission {
+            return Err(AccountWriteSubmitFailure {
+                reason: SubmitError::Closed,
+                write,
+            });
+        }
+        let (reply, receiver) = oneshot::channel();
+        match self
+            .requests
+            .try_send(Request::WriteAccount { write, reply })
+        {
+            Ok(()) => Ok(receiver),
+            Err(TrySendError::Full(Request::WriteAccount { write, .. })) => {
+                Err(AccountWriteSubmitFailure {
+                    reason: SubmitError::Busy,
+                    write,
+                })
+            }
+            Err(TrySendError::Disconnected(Request::WriteAccount { write, .. })) => {
+                Err(AccountWriteSubmitFailure {
+                    reason: SubmitError::Closed,
+                    write,
+                })
+            }
+            Err(_) => unreachable!("try_write_account only submits account writes"),
+        }
+    }
+
     pub(crate) fn try_claim_remote(
         &self,
         account_id: i64,
@@ -444,6 +500,40 @@ pub(crate) enum SubmitError {
 }
 
 pub(crate) type RemoteReportReply = Result<RemoteReportOutcome, RemoteReportExecutionFailure>;
+
+pub(crate) type AccountWriteReply = Result<AccountWriteOutcome, AccountWriteExecutionFailure>;
+
+#[derive(Debug)]
+pub(crate) struct AccountWriteSubmitFailure {
+    reason: SubmitError,
+    write: Box<AccountWrite>,
+}
+
+impl AccountWriteSubmitFailure {
+    pub(crate) fn reason(&self) -> SubmitError {
+        self.reason
+    }
+
+    pub(crate) fn into_parts(self) -> (SubmitError, Box<AccountWrite>) {
+        (self.reason, self.write)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct AccountWriteExecutionFailure {
+    failure: DbFailure,
+    write: Box<AccountWrite>,
+}
+
+impl AccountWriteExecutionFailure {
+    pub(crate) fn failure(&self) -> &DbFailure {
+        &self.failure
+    }
+
+    pub(crate) fn into_parts(self) -> (DbFailure, Box<AccountWrite>) {
+        (self.failure, self.write)
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct ContentImportSubmission {
@@ -803,6 +893,17 @@ fn run_actor(
                 generation,
                 result: execute_mutation(&mut connection, mutation, &control.write_gate),
             }),
+            Request::LoadAccount { account_id, reply } => {
+                if !reply.is_closed() {
+                    let _ = reply.send(load_account(&connection, account_id));
+                }
+                continue;
+            }
+            Request::WriteAccount { write, reply } => {
+                let result = execute_account_write(&mut connection, write, &control.write_gate);
+                let _ = reply.send(result);
+                continue;
+            }
             Request::ClaimRemote { account_id, reply } => {
                 if !reply.is_closed() {
                     let result =
@@ -932,6 +1033,74 @@ fn execute_mutation(
     mutate_message(connection, mutation, current_time_ms()?)
 }
 
+fn execute_account_write(
+    connection: &mut Connection,
+    write: Box<AccountWrite>,
+    write_gate: &Mutex<()>,
+) -> AccountWriteReply {
+    let _write_guard = lock_write_gate(write_gate);
+    let result = match write.as_ref() {
+        AccountWrite::Create(input) => {
+            create_account(connection, input).map(AccountWriteOutcome::Saved)
+        }
+        AccountWrite::ConfigureExisting {
+            account_id,
+            expected_generation,
+            input,
+        } => configure_existing_account(connection, *account_id, *expected_generation, input)
+            .map(AccountWriteOutcome::Saved),
+        AccountWrite::Update {
+            account_id,
+            expected_generation,
+            input,
+        } => update_account(connection, *account_id, *expected_generation, input)
+            .map(AccountWriteOutcome::Saved),
+        AccountWrite::SetEnabled {
+            account_id,
+            expected_generation,
+            enabled,
+        } => set_account_enabled(connection, *account_id, *expected_generation, *enabled)
+            .map(AccountWriteOutcome::Saved),
+        AccountWrite::BeginDiagnostic {
+            account_id,
+            expected_generation,
+        } => begin_diagnostic(connection, *account_id, *expected_generation)
+            .map(AccountWriteOutcome::DiagnosticStarted),
+        AccountWrite::RecordDiagnostic {
+            account_id,
+            expected_generation,
+            epoch,
+            record,
+        } => record_diagnostic(
+            connection,
+            *account_id,
+            *expected_generation,
+            *epoch,
+            record,
+        )
+        .map(AccountWriteOutcome::Diagnostic),
+        AccountWrite::BeginRemove {
+            account_id,
+            expected_generation,
+        } => begin_account_removal(connection, *account_id, *expected_generation)
+            .map(AccountWriteOutcome::RemovalStarted),
+        AccountWrite::ConfirmCredentialsRemoved {
+            account_id,
+            expected_generation,
+        } => confirm_account_credentials_removed(connection, *account_id, *expected_generation)
+            .map(AccountWriteOutcome::Saved),
+        AccountWrite::PurgeRemovedAccount {
+            account_id,
+            expected_generation,
+        } => current_time_ms()
+            .and_then(|now_ms| {
+                purge_removed_account(connection, *account_id, *expected_generation, now_ms)
+            })
+            .map(AccountWriteOutcome::Purged),
+    };
+    result.map_err(|failure| AccountWriteExecutionFailure { failure, write })
+}
+
 fn execute_remote_claim(
     connection: &mut Connection,
     account_id: i64,
@@ -1037,6 +1206,15 @@ fn drain_accepted_writes(
             }
             Request::ImportContent { submission, reply } => {
                 let result = execute_content_import(connection, submission, write_gate);
+                if first_failure.is_none()
+                    && let Err(failure) = &result
+                {
+                    first_failure = Some(failure.failure.clone());
+                }
+                let _ = reply.send(result);
+            }
+            Request::WriteAccount { write, reply } => {
+                let result = execute_account_write(connection, write, write_gate);
                 if first_failure.is_none()
                     && let Err(failure) = &result
                 {
@@ -1375,6 +1553,7 @@ mod tests {
     use crate::{
         content::{ContentLimits, prepare_content},
         store::sqlite::{
+            account::{AccountLifecycle, AccountPurgeOutcome},
             domain::{AccountScope, FailureKind, FolderScope, MessageMutation, PageBoundary},
             migrations::LATEST_SCHEMA_VERSION,
             remote::{RemoteCheckpoint, RemoteImapSource, RemoteReport, RemoteWorkMode},
@@ -1939,6 +2118,173 @@ mod tests {
         assert_eq!(directory.rows[1].inbox_unread, 5);
         runtime.shutdown().unwrap();
         remove_database_files(&path);
+    }
+
+    #[test]
+    fn account_write_round_trip_uses_oneshot_and_generation_fencing() {
+        let (client, replies, runtime, _info) =
+            spawn_target(Target::Memory, REQUEST_CAPACITY, REPLY_CAPACITY).unwrap();
+        let input = super::super::account::AccountConfigInput::new(
+            "0123456789abcdef0123456789abcdef",
+            "Personal",
+            "owner@example.test",
+            super::super::account::AccountAuthKind::AppPassword,
+            "owner@example.test",
+            "imap.example.test",
+            993,
+            0x335244,
+        )
+        .unwrap();
+        let created = receive_oneshot(
+            client
+                .try_write_account(Box::new(AccountWrite::Create(input)))
+                .unwrap(),
+        )
+        .unwrap();
+        let AccountWriteOutcome::Saved(created) = created else {
+            panic!("expected saved account");
+        };
+        let loaded = receive_oneshot(client.try_load_account(created.account_id).unwrap()).unwrap();
+        assert_eq!(loaded, AccountRecord::Configured(created.clone()));
+
+        let disabled = receive_oneshot(
+            client
+                .try_write_account(Box::new(AccountWrite::SetEnabled {
+                    account_id: created.account_id,
+                    expected_generation: created.generation,
+                    enabled: false,
+                }))
+                .unwrap(),
+        )
+        .unwrap();
+        let AccountWriteOutcome::Saved(disabled) = disabled else {
+            panic!("expected disabled account");
+        };
+        assert!(!disabled.lifecycle.enabled());
+        assert_eq!(disabled.generation.get(), 2);
+
+        let stale = receive_oneshot(
+            client
+                .try_write_account(Box::new(AccountWrite::SetEnabled {
+                    account_id: created.account_id,
+                    expected_generation: created.generation,
+                    enabled: true,
+                }))
+                .unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(stale.failure().kind, FailureKind::Conflict);
+
+        let enabled = receive_oneshot(
+            client
+                .try_write_account(Box::new(AccountWrite::SetEnabled {
+                    account_id: disabled.account_id,
+                    expected_generation: disabled.generation,
+                    enabled: true,
+                }))
+                .unwrap(),
+        )
+        .unwrap();
+        let AccountWriteOutcome::Saved(enabled) = enabled else {
+            panic!("expected enabled account");
+        };
+        let diagnostic = receive_oneshot(
+            client
+                .try_write_account(Box::new(AccountWrite::BeginDiagnostic {
+                    account_id: enabled.account_id,
+                    expected_generation: enabled.generation,
+                }))
+                .unwrap(),
+        )
+        .unwrap();
+        let AccountWriteOutcome::DiagnosticStarted(ticket) = diagnostic else {
+            panic!("expected diagnostic ticket");
+        };
+        let recorded = receive_oneshot(
+            client
+                .try_write_account(Box::new(AccountWrite::RecordDiagnostic {
+                    account_id: ticket.account_id,
+                    expected_generation: ticket.configuration_generation,
+                    epoch: ticket.epoch,
+                    record: super::super::account::DiagnosticRecord::ready(10).unwrap(),
+                }))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            recorded,
+            AccountWriteOutcome::Diagnostic(super::super::account::DiagnosticCommit::Recorded)
+        );
+
+        let removal = receive_oneshot(
+            client
+                .try_write_account(Box::new(AccountWrite::BeginRemove {
+                    account_id: enabled.account_id,
+                    expected_generation: enabled.generation,
+                }))
+                .unwrap(),
+        )
+        .unwrap();
+        let AccountWriteOutcome::RemovalStarted(removal) = removal else {
+            panic!("expected removal ticket");
+        };
+        assert!(removal.credential_key.is_some());
+        let cache_removal = receive_oneshot(
+            client
+                .try_write_account(Box::new(AccountWrite::ConfirmCredentialsRemoved {
+                    account_id: removal.account_id,
+                    expected_generation: removal.generation,
+                }))
+                .unwrap(),
+        )
+        .unwrap();
+        let AccountWriteOutcome::Saved(cache_removal) = cache_removal else {
+            panic!("expected cache-removal configuration");
+        };
+        assert_eq!(cache_removal.lifecycle, AccountLifecycle::RemovingCache);
+        let purged = receive_oneshot(
+            client
+                .try_write_account(Box::new(AccountWrite::PurgeRemovedAccount {
+                    account_id: cache_removal.account_id,
+                    expected_generation: cache_removal.generation,
+                }))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            purged,
+            AccountWriteOutcome::Purged(AccountPurgeOutcome::Complete(_))
+        ));
+        let missing = receive_oneshot(client.try_load_account(cache_removal.account_id).unwrap())
+            .unwrap_err();
+        assert_eq!(missing.kind, FailureKind::NotFound);
+        assert!(replies.is_empty());
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn accepted_account_write_drains_during_shutdown() {
+        let (client, _replies, runtime, _info) =
+            spawn_target(Target::Memory, REQUEST_CAPACITY, REPLY_CAPACITY).unwrap();
+        let input = super::super::account::AccountConfigInput::new(
+            "fedcba9876543210fedcba9876543210",
+            "Work",
+            "owner@example.test",
+            super::super::account::AccountAuthKind::AppPassword,
+            "owner@example.test",
+            "imap.example.test",
+            993,
+            0,
+        )
+        .unwrap();
+        let receiver = client
+            .try_write_account(Box::new(AccountWrite::Create(input)))
+            .unwrap();
+
+        runtime.shutdown().unwrap();
+
+        let outcome = receive_oneshot(receiver).unwrap();
+        assert!(matches!(outcome, AccountWriteOutcome::Saved(_)));
     }
 
     #[test]

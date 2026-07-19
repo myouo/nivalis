@@ -70,7 +70,7 @@ impl UndoToken {
 pub(crate) struct AccountId(NonZeroI64);
 
 impl AccountId {
-    fn new(value: i64) -> Result<Self, ValidationError> {
+    pub(crate) fn new(value: i64) -> Result<Self, ValidationError> {
         if value > 0 {
             Ok(Self(
                 NonZeroI64::new(value).expect("positive account id is non-zero"),
@@ -80,7 +80,7 @@ impl AccountId {
         }
     }
 
-    fn get(self) -> i64 {
+    pub(crate) fn get(self) -> i64 {
         self.0.get()
     }
 }

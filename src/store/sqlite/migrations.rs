@@ -2,7 +2,7 @@ use std::{error::Error, fmt};
 
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(crate) const LATEST_SCHEMA_VERSION: u32 = 10;
+pub(crate) const LATEST_SCHEMA_VERSION: u32 = 11;
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -50,6 +50,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 10,
         sql: include_str!("../../../migrations/0010_content_file_lifecycle.sql"),
+    },
+    Migration {
+        version: 11,
+        sql: include_str!("../../../migrations/0011_account_configuration.sql"),
     },
 ];
 
@@ -176,7 +180,7 @@ mod tests {
 
     use crate::store::sqlite::{
         domain::{AccountScope, FolderScope, PageBoundary, PageSpec},
-        query::query_mailbox,
+        query::{query_account_directory, query_mailbox},
     };
 
     use super::{
@@ -188,6 +192,7 @@ mod tests {
 
     const TABLES: &[&str] = &[
         "account_mailbox_stats",
+        "account_connections",
         "account_object_states",
         "accounts",
         "attachments",
@@ -666,7 +671,7 @@ mod tests {
         insert_account(&connection, 1, "user@example.test");
         insert_message(&connection, 100, 1, "message-1");
 
-        migrate(&mut connection).expect("upgrade v9 schema to v10");
+        migrate_with(&mut connection, &MIGRATIONS[..10], 10).expect("upgrade v9 schema to v10");
 
         let generation: i64 = connection
             .query_row(
@@ -686,7 +691,7 @@ mod tests {
         assert_eq!(usage, 0);
         assert_eq!(schema_version(&connection), 10);
 
-        migrate(&mut connection).expect("run v10 migration again");
+        migrate_with(&mut connection, &MIGRATIONS[..10], 10).expect("run v10 migration again");
         assert_eq!(schema_version(&connection), 10);
         let usage_rows: i64 = connection
             .query_row("SELECT count(*) FROM file_staging_usage", [], |row| {
@@ -705,6 +710,43 @@ mod tests {
             error.sqlite_error_code(),
             Some(ErrorCode::ConstraintViolation)
         );
+    }
+
+    #[test]
+    fn v11_upgrade_preserves_legacy_accounts_without_inventing_credentials() {
+        let mut connection = memory_connection();
+        enable_foreign_keys(&connection).expect("enable foreign keys");
+        enable_recursive_triggers(&connection).expect("enable recursive triggers");
+        migrate_with(&mut connection, &MIGRATIONS[..10], 10).expect("create v10 schema");
+        insert_account(&connection, 1, "owner@example.test");
+
+        migrate(&mut connection).expect("upgrade v10 schema to v11");
+
+        assert_eq!(schema_version(&connection), 11);
+        let accounts: i64 = connection
+            .query_row("SELECT count(*) FROM accounts", [], |row| row.get(0))
+            .expect("count preserved accounts");
+        let connections: i64 = connection
+            .query_row("SELECT count(*) FROM account_connections", [], |row| {
+                row.get(0)
+            })
+            .expect("count connection configurations");
+        let generation: i64 = connection
+            .query_row(
+                "SELECT configuration_generation FROM accounts WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read the legacy account fence");
+        assert_eq!(accounts, 1);
+        assert_eq!(connections, 0);
+        assert_eq!(generation, 1);
+        let directory = query_account_directory(&connection).expect("project legacy account");
+        assert_eq!(directory.rows.len(), 1);
+        assert_eq!(directory.rows[0].state.as_ref(), "needs_setup");
+
+        migrate(&mut connection).expect("run v11 migration again");
+        assert_eq!(schema_version(&connection), 11);
     }
 
     #[test]

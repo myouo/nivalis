@@ -262,7 +262,7 @@ fn project_account(row: AccountSummaryDto) -> Result<ProjectedAccount, Projectio
     })?;
     let name = boxed_string(row.name);
     let address = boxed_string(row.address);
-    let active = row.state.as_ref() == "active";
+    let (status, has_error) = account_status(&row.state);
     let unread_count = project_count("account.inbox_unread", row.inbox_unread)?;
 
     Ok(ProjectedAccount {
@@ -274,15 +274,27 @@ fn project_account(row: AccountSummaryDto) -> Result<ProjectedAccount, Projectio
             address,
             initials: initials(name.as_str()),
             unread_count,
-            status: if active {
-                "Ready".into()
-            } else {
-                "Needs attention".into()
-            },
+            status: status.into(),
             avatar_color: accent_color(row.accent_rgb),
-            has_error: !active,
+            has_error,
         },
     })
+}
+
+fn account_status(state: &str) -> (&'static str, bool) {
+    match state {
+        "active" => ("Ready", false),
+        "disabled" => ("Disabled", false),
+        "removing" => ("Removing account", false),
+        "needs_setup" => ("Setup required", true),
+        "authentication" => ("Sign-in required", true),
+        "permission" => ("Permission required", true),
+        "certificate" => ("Certificate problem", true),
+        "timeout" => ("Connection timed out", true),
+        "offline" => ("Offline", true),
+        "protocol" => ("Server problem", true),
+        _ => ("Needs attention", true),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -488,6 +500,25 @@ mod tests {
                 .into_boxed_slice(),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn configured_account_states_have_stable_non_secret_guidance() {
+        let mut disabled = account(1, 0);
+        disabled.state = "disabled".into();
+        let mut authentication = account(2, 0);
+        authentication.state = "authentication".into();
+        let catalog = AccountCatalog::try_from_directory(AccountDirectory {
+            rows: vec![disabled, authentication].into_boxed_slice(),
+        })
+        .unwrap();
+        let items = catalog.account_items();
+
+        assert_eq!(items[1].status, "Disabled");
+        assert!(!items[1].has_error);
+        assert_eq!(items[2].status, "Sign-in required");
+        assert!(items[2].has_error);
+        assert!(items[0].has_error);
     }
 
     fn summary(id: i64, account_id: i64) -> MailSummaryDto {

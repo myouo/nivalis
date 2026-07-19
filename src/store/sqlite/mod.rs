@@ -1,3 +1,4 @@
+mod account;
 mod actor;
 mod content;
 mod domain;
@@ -13,7 +14,16 @@ mod stats;
 pub(crate) use query::{MailboxQueryCounts, mailbox_query_counts};
 
 #[allow(unused_imports)]
+pub(crate) use account::{
+    AccountAuthKind, AccountConfigInput, AccountConfiguration, AccountDiagnostic,
+    AccountDiagnosticKind, AccountGeneration, AccountLifecycle, AccountPurgeOutcome, AccountRecord,
+    AccountRemovalTicket, AccountSetupTarget, AccountValidationError, AccountWrite,
+    AccountWriteOutcome, DiagnosticCommit, DiagnosticEpoch, DiagnosticRecord, DiagnosticTicket,
+    RemovedAccount,
+};
+#[allow(unused_imports)]
 pub(crate) use actor::{
+    AccountWriteExecutionFailure, AccountWriteReply, AccountWriteSubmitFailure,
     ContentImportExecutionFailure, ContentImportOutcome, ContentImportReply,
     ContentImportSubmission, ContentImportSubmitFailure, RemoteReportExecutionFailure,
     RemoteReportReply, RemoteReportSubmitFailure,
@@ -27,7 +37,8 @@ pub(crate) use domain::{
     AccountDirectory, AccountSummaryDto, AccountUnreadDto, MailSummaryDto, MailboxStatsDto,
     PageBoundary, PageCursor,
 };
-pub(crate) use domain::{AccountScope, FolderScope};
+#[allow(unused_imports)]
+pub(crate) use domain::{AccountId, AccountScope, FolderScope};
 pub(crate) use domain::{
     AccountStatsDelta, DbFailure, DbReply, FailureKind, Generation, MailboxPage, MessageDetail,
     MessageId, MessageMutation, MutationOutcome, PageSpec, RequestId, Tagged, UndoToken,

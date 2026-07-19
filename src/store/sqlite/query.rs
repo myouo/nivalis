@@ -14,10 +14,20 @@ use super::domain::{
 use super::stats::query_mailbox_stats;
 
 const ACCOUNT_DIRECTORY_SQL: &str = "
-    SELECT a.id, a.name, a.address, a.state, a.accent_rgb,
+    SELECT a.id, a.name, a.address,
+           CASE
+               WHEN a.state IN ('removing_credentials', 'removing_cache') THEN 'removing'
+               WHEN connection.account_id IS NULL THEN 'needs_setup'
+               WHEN a.state = 'disabled' THEN 'disabled'
+               WHEN connection.diagnostic_state = 'ready' THEN 'active'
+               WHEN connection.diagnostic_state = 'never' THEN 'needs_setup'
+               ELSE connection.diagnostic_state
+           END,
+           a.accent_rgb,
            s.account_id, s.inbox_unread, s.dirty
       FROM accounts AS a
       LEFT JOIN account_mailbox_stats AS s ON s.account_id = a.id
+      LEFT JOIN account_connections AS connection ON connection.account_id = a.id
      ORDER BY a.sort_order, a.id
      LIMIT ?1";
 
@@ -112,11 +122,12 @@ pub(super) fn query_account_directory(
                 "mail account statistics identity does not match",
             ));
         }
-        if dirty {
+        if dirty && state != "removing" {
             return Err(DbFailure::conflict(
                 "mailbox statistics are stale and must be rebuilt",
             ));
         }
+        let removing = state == "removing";
         rows.push(AccountSummaryDto {
             id,
             name: name.into_boxed_str(),
@@ -124,8 +135,12 @@ pub(super) fn query_account_directory(
             state: state.into_boxed_str(),
             accent_rgb: u32::try_from(accent_rgb)
                 .map_err(|_| DbFailure::resource_limit("invalid account accent color"))?,
-            inbox_unread: u64::try_from(inbox_unread)
-                .map_err(|_| DbFailure::resource_limit("invalid negative inbox statistic"))?,
+            inbox_unread: if removing {
+                0
+            } else {
+                u64::try_from(inbox_unread)
+                    .map_err(|_| DbFailure::resource_limit("invalid negative inbox statistic"))?
+            },
         });
     }
     if rows.len() > MAX_ACCOUNT_STATS {
@@ -259,6 +274,13 @@ fn mailbox_query(spec: &PageSpec) -> (String, Vec<Value>) {
             )"
         }
     });
+    sql.push_str(
+        " AND EXISTS (
+            SELECT 1 FROM accounts AS visible_account
+            WHERE visible_account.id = m.account_id
+              AND visible_account.state NOT IN ('removing_credentials', 'removing_cache')
+        )",
+    );
 
     if spec.folder != FolderScope::Trash {
         sql.push_str(
@@ -499,7 +521,7 @@ mod tests {
                     id: 3,
                     name: "Three".into(),
                     address: "three@example.test".into(),
-                    state: "offline".into(),
+                    state: "needs_setup".into(),
                     accent_rgb: 515,
                     inbox_unread: 2,
                 },
@@ -507,7 +529,7 @@ mod tests {
                     id: 1,
                     name: "One".into(),
                     address: "one@example.test".into(),
-                    state: "auth_required".into(),
+                    state: "needs_setup".into(),
                     accent_rgb: 1,
                     inbox_unread: 4,
                 },
@@ -515,7 +537,7 @@ mod tests {
                     id: 2,
                     name: "Two".into(),
                     address: "two@example.test".into(),
-                    state: "active".into(),
+                    state: "needs_setup".into(),
                     accent_rgb: 258,
                     inbox_unread: 6,
                 },

@@ -65,12 +65,16 @@ Recorded deferrals that do not block M2: persistent reservation restart recovery
 
 Status: pending.
 
+Implementation checkpoint: schema v11 now stores bounded non-secret IMAP account configuration behind generation-fenced actor writes. It distinguishes disabled accounts from actionable connection failures, lets legacy cache-only accounts be configured or removed without inventing credentials, and drains accepted writes on shutdown. Removal persists `removing_credentials` before external secret deletion, advances to `removing_cache` only after confirmation, and processes at most 16 messages, 16 attachment rows, and 16 staging rows per transaction while queuing file references for the delayed janitor. The operating-system credential actor, Rustls diagnostic, OAuth flows, UI lifecycle, integration test, and new release-memory matrix remain required before M3 can close.
+
 Acceptance criteria:
 
 - Users can add, diagnose, update, disable, and remove accounts without exposing secrets to SQLite or UI models.
 - OAuth2 PKCE/device flows and application passwords use the operating-system keyring; access tokens remain short lived.
 - Rustls and platform trust verification are mandatory. Authentication, permission, certificate, timeout, and offline failures have distinct recovery guidance.
 - Account setup and connection diagnostics are cancellable, bounded, and covered by integration tests.
+
+Recorded mainline boundary: M3 bounds message, attachment, and staging cleanup, but the final account cascade still covers folder, tombstone, and provider-state rows. Before M4 enables real synchronization, those newly active child sets must join the restart-safe bounded cleanup protocol. Rebinding a legacy cache to new credentials must also verify the same remote identity or clear/reconcile the old cache and pending intents first. Provider auto-discovery, proxy configuration, custom certificate authorities, certificate pinning, client certificates, and provider preset breadth do not block the first real account slice. Cross-platform packaging and prompt integration beyond the reference Linux credential service remain M7 release work; no platform may silently fall back to SQLite or plaintext files.
 
 ## M4: IMAP receive and synchronization
 
@@ -82,6 +86,7 @@ Acceptance criteria:
 - Incoming state, locators, cursors, persistent statistics, legacy reconciliation, tombstones, and pending local desired dimensions merge atomically.
 - Provider execution consumes one fenced claim at a time and reports every durable checkpoint through the existing actor contract.
 - Connection loss and ambiguous MOVE/COPY outcomes reconcile before replay. Offline changes survive restart and converge after reconnection.
+- Real provider state cannot activate until account removal covers every provider-owned child set with bounded restart recovery and legacy cache reuse verifies remote identity.
 - Representative large-mailbox and multi-hour synchronization soaks remain within the memory contract.
 
 ## M5: drafts, outbox, and SMTP

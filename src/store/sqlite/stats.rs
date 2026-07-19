@@ -194,6 +194,7 @@ pub(super) fn query_mailbox_stats(
                     s.archive_total, s.trash_total, s.dirty
              FROM accounts AS a
              LEFT JOIN account_mailbox_stats AS s ON s.account_id = a.id
+             WHERE a.state NOT IN ('removing_credentials', 'removing_cache')
              ORDER BY a.sort_order, a.id
              LIMIT ?1",
         )
