@@ -4,7 +4,7 @@ use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use tokio::{
@@ -17,18 +17,30 @@ use crate::{
         CredentialClient, CredentialDeleteOutcome, CredentialFailureKind, CredentialLocator,
         CredentialOperation, CredentialOutcome, CredentialResponse, CredentialSubmitError, Secret,
     },
+    network::imap::{
+        ImapDiagnosticFailure, ImapDiagnosticFailureKind, ImapDiagnosticRequest,
+        diagnose_app_password,
+    },
     store::sqlite::{
-        AccountAuthKind, AccountConfigInput, AccountConfiguration, AccountGeneration, AccountId,
-        AccountLifecycle, AccountPurgeOutcome, AccountRecord, AccountRemovalTicket,
-        AccountValidationError, AccountWrite, AccountWriteOutcome, AccountWriteReply,
-        DatabaseClient, DatabaseSubmitError, FailureKind, PendingCacheRemoval,
-        PendingCredentialRemoval, RequestId,
+        AccountAuthKind, AccountConfigInput, AccountConfiguration, AccountDiagnosticKind,
+        AccountGeneration, AccountId, AccountLifecycle, AccountPurgeOutcome, AccountRecord,
+        AccountRemovalTicket, AccountValidationError, AccountWrite, AccountWriteOutcome,
+        AccountWriteReply, DatabaseClient, DatabaseSubmitError, DiagnosticCommit, DiagnosticRecord,
+        DiagnosticTicket, FailureKind, PendingCacheRemoval, PendingCredentialRemoval, RequestId,
     },
 };
 
 #[cfg_attr(not(test), allow(dead_code))]
 const PLACEHOLDER_CREDENTIAL_KEY: &str = "00000000000000000000000000000000";
 const RECOVERY_SUBMISSION_RETRY: Duration = Duration::from_millis(10);
+
+pub(super) type ImapDiagnosticFuture =
+    Pin<Box<dyn Future<Output = Result<(), ImapDiagnosticFailure>> + 'static>>;
+pub(super) type ImapDiagnosticProbe = fn(ImapDiagnosticRequest) -> ImapDiagnosticFuture;
+
+pub(super) fn production_imap_diagnostic(request: ImapDiagnosticRequest) -> ImapDiagnosticFuture {
+    Box::pin(diagnose_app_password(request))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AccountConfigDraft {
@@ -109,6 +121,11 @@ pub(crate) enum AccountOperation {
         expected_generation: AccountGeneration,
         secret: Secret,
     },
+    Diagnose {
+        request_id: RequestId,
+        account_id: AccountId,
+        expected_generation: AccountGeneration,
+    },
     Remove {
         request_id: RequestId,
         account_id: AccountId,
@@ -121,6 +138,7 @@ impl AccountOperation {
         match self {
             Self::Setup { request_id, .. }
             | Self::RetryCredential { request_id, .. }
+            | Self::Diagnose { request_id, .. }
             | Self::Remove { request_id, .. } => *request_id,
         }
     }
@@ -153,6 +171,16 @@ impl fmt::Debug for AccountOperation {
                 .field("expected_generation", expected_generation)
                 .field("secret", &"[REDACTED]")
                 .finish(),
+            Self::Diagnose {
+                request_id,
+                account_id,
+                expected_generation,
+            } => formatter
+                .debug_struct("Diagnose")
+                .field("request_id", request_id)
+                .field("account_id", account_id)
+                .field("expected_generation", expected_generation)
+                .finish(),
             Self::Remove {
                 request_id,
                 account_id,
@@ -170,6 +198,10 @@ impl fmt::Debug for AccountOperation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AccountOperationSuccess {
     Configured {
+        account_id: AccountId,
+        generation: AccountGeneration,
+    },
+    Diagnosed {
         account_id: AccountId,
         generation: AccountGeneration,
     },
@@ -197,6 +229,10 @@ pub(crate) enum AccountWorkflowStage {
     LoadConfiguration,
     PersistLocator,
     StoreCredential,
+    BeginDiagnostic,
+    LoadCredential,
+    ConnectImap,
+    RecordDiagnostic,
     BeginRemoval,
     DeleteCredential,
     ConfirmRemoval,
@@ -209,6 +245,7 @@ pub(crate) enum AccountWorkflowFailureKind {
     Database(FailureKind),
     Credential(CredentialFailureKind),
     CredentialReplyClosed,
+    Diagnostic(AccountDiagnosticKind),
     InvalidLocator,
     UnexpectedReply,
 }
@@ -317,6 +354,11 @@ pub(crate) enum AccountWorkflowOutcome {
     AccountRemoved {
         account_id: AccountId,
     },
+    Diagnostic {
+        account_id: AccountId,
+        generation: AccountGeneration,
+        result: Result<(), AccountDiagnosticKind>,
+    },
     RemovalPending {
         account_id: AccountId,
         generation: AccountGeneration,
@@ -349,6 +391,16 @@ impl fmt::Debug for AccountWorkflowOutcome {
             Self::AccountRemoved { account_id } => formatter
                 .debug_struct("AccountRemoved")
                 .field("account_id", account_id)
+                .finish(),
+            Self::Diagnostic {
+                account_id,
+                generation,
+                result,
+            } => formatter
+                .debug_struct("Diagnostic")
+                .field("account_id", account_id)
+                .field("generation", generation)
+                .field("result", result)
                 .finish(),
             Self::RemovalPending {
                 account_id,
@@ -949,15 +1001,21 @@ fn failed(
 pub(super) struct AccountWorkflows {
     database: DatabaseClient,
     credentials: CredentialClient,
+    diagnostic_probe: ImapDiagnosticProbe,
     recovery: RecoveryState,
     active: Option<ActiveTask>,
 }
 
 impl AccountWorkflows {
-    pub(super) fn new(database: DatabaseClient, credentials: CredentialClient) -> Self {
+    pub(super) fn new(
+        database: DatabaseClient,
+        credentials: CredentialClient,
+        diagnostic_probe: ImapDiagnosticProbe,
+    ) -> Self {
         Self {
             database,
             credentials,
+            diagnostic_probe,
             recovery: RecoveryState::SubmitCredentialScan,
             active: None,
         }
@@ -1058,6 +1116,39 @@ impl AccountWorkflows {
                     },
                 });
             }
+            AccountOperation::Diagnose {
+                account_id,
+                expected_generation,
+                ..
+            } => {
+                let receiver = match self.database.try_load_account(account_id) {
+                    Ok(receiver) => receiver,
+                    Err(DatabaseSubmitError::Busy) => {
+                        let _ = reply.send(AccountOperationReply {
+                            request_id,
+                            result: Err(AccountOperationFailure {
+                                account_id: Some(account_id),
+                                generation: Some(expected_generation),
+                                stage: AccountWorkflowStage::LoadConfiguration,
+                                kind: AccountWorkflowFailureKind::Busy,
+                            }),
+                        });
+                        return Ok(());
+                    }
+                    Err(DatabaseSubmitError::Closed) => {
+                        return Err(AccountDriverError::DatabaseClosed);
+                    }
+                };
+                self.active = Some(ActiveTask {
+                    identity: Identity::new(account_id, expected_generation),
+                    reply: Some(UserReply { request_id, reply }),
+                    state: ActiveTaskState::LoadingDiagnostic {
+                        account_id,
+                        expected_generation,
+                        receiver,
+                    },
+                });
+            }
             AccountOperation::Remove {
                 account_id,
                 expected_generation,
@@ -1100,9 +1191,18 @@ impl AccountWorkflows {
         context: &mut Context<'_>,
     ) -> Poll<Result<(), AccountDriverError>> {
         if let Some(active) = self.active.as_mut() {
-            match active.poll_one(&self.database, &self.credentials, context) {
+            match active.poll_one(
+                &self.database,
+                &self.credentials,
+                self.diagnostic_probe,
+                context,
+            ) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(TaskProgress::Advanced)) => return Poll::Ready(Ok(())),
+                Poll::Ready(Ok(TaskProgress::Cancelled)) => {
+                    self.active.take();
+                    return Poll::Ready(Ok(()));
+                }
                 Poll::Ready(Ok(TaskProgress::Finished(outcome))) => {
                     let mut active = self.active.take().expect("active account task was polled");
                     if let Some(user) = active.reply.take() {
@@ -1316,6 +1416,29 @@ enum ActiveTaskState {
         expected_generation: AccountGeneration,
         receiver: oneshot::Receiver<Result<AccountRecord, crate::store::sqlite::DbFailure>>,
     },
+    LoadingDiagnostic {
+        account_id: AccountId,
+        expected_generation: AccountGeneration,
+        receiver: oneshot::Receiver<Result<AccountRecord, crate::store::sqlite::DbFailure>>,
+    },
+    BeginningDiagnostic {
+        configuration: Option<AccountConfiguration>,
+        receiver: oneshot::Receiver<AccountWriteReply>,
+    },
+    LoadingDiagnosticCredential {
+        configuration: Option<AccountConfiguration>,
+        ticket: DiagnosticTicket,
+        response: CredentialResponse,
+    },
+    ProbingDiagnostic {
+        ticket: DiagnosticTicket,
+        probe: ImapDiagnosticFuture,
+    },
+    RecordingDiagnostic {
+        ticket: DiagnosticTicket,
+        probe_result: Result<(), AccountDiagnosticKind>,
+        receiver: oneshot::Receiver<AccountWriteReply>,
+    },
     Workflow(Box<DrivenWorkflow>),
 }
 
@@ -1339,8 +1462,16 @@ impl ActiveTask {
         &mut self,
         database: &DatabaseClient,
         credentials: &CredentialClient,
+        diagnostic_probe: ImapDiagnosticProbe,
         context: &mut Context<'_>,
     ) -> Poll<Result<TaskProgress, AccountDriverError>> {
+        if matches!(self.state, ActiveTaskState::ProbingDiagnostic { .. })
+            && let Some(user) = self.reply.as_mut()
+            && user.reply.poll_closed(context).is_ready()
+        {
+            return Poll::Ready(Ok(TaskProgress::Cancelled));
+        }
+
         match &mut self.state {
             ActiveTaskState::LoadingRetry {
                 account_id,
@@ -1479,6 +1610,297 @@ impl ActiveTask {
                 context.waker().wake_by_ref();
                 Poll::Ready(Ok(TaskProgress::Advanced))
             }
+            ActiveTaskState::LoadingDiagnostic {
+                account_id,
+                expected_generation,
+                receiver,
+            } => {
+                let record = match Pin::new(receiver).poll(context) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(Ok(record))) => record,
+                    Poll::Ready(Ok(Err(failure))) => {
+                        return Poll::Ready(Ok(TaskProgress::Finished(
+                            AccountWorkflowOutcome::Failed {
+                                stage: AccountWorkflowStage::LoadConfiguration,
+                                failure: AccountWorkflowFailureKind::Database(failure.kind),
+                            },
+                        )));
+                    }
+                    Poll::Ready(Err(_)) => {
+                        return Poll::Ready(Err(AccountDriverError::DatabaseClosed));
+                    }
+                };
+                let AccountRecord::Configured(configuration) = record else {
+                    return Poll::Ready(Ok(TaskProgress::Finished(
+                        AccountWorkflowOutcome::Failed {
+                            stage: AccountWorkflowStage::LoadConfiguration,
+                            failure: AccountWorkflowFailureKind::Database(FailureKind::Conflict),
+                        },
+                    )));
+                };
+                if configuration.account_id != *account_id
+                    || configuration.generation != *expected_generation
+                    || configuration.auth_kind != AccountAuthKind::AppPassword
+                    || configuration.lifecycle != AccountLifecycle::Active
+                {
+                    return Poll::Ready(Ok(TaskProgress::Finished(
+                        AccountWorkflowOutcome::Failed {
+                            stage: AccountWorkflowStage::LoadConfiguration,
+                            failure: AccountWorkflowFailureKind::Database(FailureKind::Conflict),
+                        },
+                    )));
+                }
+                let receiver =
+                    match database.try_write_account(Box::new(AccountWrite::BeginDiagnostic {
+                        account_id: *account_id,
+                        expected_generation: *expected_generation,
+                    })) {
+                        Ok(receiver) => receiver,
+                        Err(failure) if failure.reason() == DatabaseSubmitError::Busy => {
+                            return Poll::Ready(Ok(TaskProgress::Finished(
+                                AccountWorkflowOutcome::Failed {
+                                    stage: AccountWorkflowStage::BeginDiagnostic,
+                                    failure: AccountWorkflowFailureKind::Busy,
+                                },
+                            )));
+                        }
+                        Err(_) => return Poll::Ready(Err(AccountDriverError::DatabaseClosed)),
+                    };
+                self.state = ActiveTaskState::BeginningDiagnostic {
+                    configuration: Some(configuration),
+                    receiver,
+                };
+                context.waker().wake_by_ref();
+                Poll::Ready(Ok(TaskProgress::Advanced))
+            }
+            ActiveTaskState::BeginningDiagnostic {
+                configuration,
+                receiver,
+            } => {
+                let ticket = match Pin::new(receiver).poll(context) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(Ok(AccountWriteOutcome::DiagnosticStarted(ticket)))) => ticket,
+                    Poll::Ready(Ok(Ok(_))) => {
+                        return Poll::Ready(Ok(TaskProgress::Finished(
+                            AccountWorkflowOutcome::Failed {
+                                stage: AccountWorkflowStage::BeginDiagnostic,
+                                failure: AccountWorkflowFailureKind::UnexpectedReply,
+                            },
+                        )));
+                    }
+                    Poll::Ready(Ok(Err(failure))) => {
+                        return Poll::Ready(Ok(TaskProgress::Finished(
+                            AccountWorkflowOutcome::Failed {
+                                stage: AccountWorkflowStage::BeginDiagnostic,
+                                failure: AccountWorkflowFailureKind::Database(
+                                    failure.failure().kind,
+                                ),
+                            },
+                        )));
+                    }
+                    Poll::Ready(Err(_)) => {
+                        return Poll::Ready(Err(AccountDriverError::DatabaseClosed));
+                    }
+                };
+                let configuration = configuration
+                    .take()
+                    .expect("diagnostic configuration is consumed once");
+                if ticket.account_id != configuration.account_id
+                    || ticket.configuration_generation != configuration.generation
+                {
+                    return Poll::Ready(Ok(TaskProgress::Finished(
+                        AccountWorkflowOutcome::Failed {
+                            stage: AccountWorkflowStage::BeginDiagnostic,
+                            failure: AccountWorkflowFailureKind::UnexpectedReply,
+                        },
+                    )));
+                }
+                let locator = match CredentialLocator::parse(&configuration.credential_key) {
+                    Ok(locator) => locator,
+                    Err(_) => {
+                        return Poll::Ready(Ok(TaskProgress::Finished(
+                            AccountWorkflowOutcome::Failed {
+                                stage: AccountWorkflowStage::LoadCredential,
+                                failure: AccountWorkflowFailureKind::InvalidLocator,
+                            },
+                        )));
+                    }
+                };
+                let response = match credentials.try_submit(CredentialOperation::Load { locator }) {
+                    Ok(response) => response,
+                    Err(failure) if failure.reason() == CredentialSubmitError::Busy => {
+                        return Poll::Ready(Ok(TaskProgress::Finished(
+                            AccountWorkflowOutcome::Failed {
+                                stage: AccountWorkflowStage::LoadCredential,
+                                failure: AccountWorkflowFailureKind::Busy,
+                            },
+                        )));
+                    }
+                    Err(_) => {
+                        return Poll::Ready(Ok(TaskProgress::Finished(
+                            AccountWorkflowOutcome::Failed {
+                                stage: AccountWorkflowStage::LoadCredential,
+                                failure: AccountWorkflowFailureKind::CredentialReplyClosed,
+                            },
+                        )));
+                    }
+                };
+                self.state = ActiveTaskState::LoadingDiagnosticCredential {
+                    configuration: Some(configuration),
+                    ticket,
+                    response,
+                };
+                context.waker().wake_by_ref();
+                Poll::Ready(Ok(TaskProgress::Advanced))
+            }
+            ActiveTaskState::LoadingDiagnosticCredential {
+                configuration,
+                ticket,
+                response,
+            } => {
+                let secret = match Pin::new(response).poll(context) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(Ok(CredentialOutcome::Loaded(secret)))) => secret,
+                    Poll::Ready(Ok(Ok(_))) => {
+                        return Poll::Ready(Ok(TaskProgress::Finished(
+                            AccountWorkflowOutcome::Failed {
+                                stage: AccountWorkflowStage::LoadCredential,
+                                failure: AccountWorkflowFailureKind::UnexpectedReply,
+                            },
+                        )));
+                    }
+                    Poll::Ready(Ok(Err(failure))) => {
+                        return Poll::Ready(Ok(TaskProgress::Finished(
+                            AccountWorkflowOutcome::Failed {
+                                stage: AccountWorkflowStage::LoadCredential,
+                                failure: AccountWorkflowFailureKind::Credential(failure.kind),
+                            },
+                        )));
+                    }
+                    Poll::Ready(Err(_)) => {
+                        return Poll::Ready(Ok(TaskProgress::Finished(
+                            AccountWorkflowOutcome::Failed {
+                                stage: AccountWorkflowStage::LoadCredential,
+                                failure: AccountWorkflowFailureKind::CredentialReplyClosed,
+                            },
+                        )));
+                    }
+                };
+                let configuration = configuration
+                    .take()
+                    .expect("diagnostic configuration is consumed once");
+                let request = match ImapDiagnosticRequest::new(
+                    &configuration.imap_host,
+                    configuration.imap_port,
+                    &configuration.login_name,
+                    secret,
+                ) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        let result = Err(AccountDiagnosticKind::Protocol);
+                        let next = match start_diagnostic_record(database, *ticket, result) {
+                            Ok(next) => next,
+                            Err(DatabaseSubmitError::Busy) => {
+                                return Poll::Ready(Ok(TaskProgress::Finished(
+                                    AccountWorkflowOutcome::Failed {
+                                        stage: AccountWorkflowStage::RecordDiagnostic,
+                                        failure: AccountWorkflowFailureKind::Busy,
+                                    },
+                                )));
+                            }
+                            Err(DatabaseSubmitError::Closed) => {
+                                return Poll::Ready(Err(AccountDriverError::DatabaseClosed));
+                            }
+                        };
+                        self.state = next;
+                        context.waker().wake_by_ref();
+                        return Poll::Ready(Ok(TaskProgress::Advanced));
+                    }
+                };
+                self.state = ActiveTaskState::ProbingDiagnostic {
+                    ticket: *ticket,
+                    probe: diagnostic_probe(request),
+                };
+                context.waker().wake_by_ref();
+                Poll::Ready(Ok(TaskProgress::Advanced))
+            }
+            ActiveTaskState::ProbingDiagnostic { ticket, probe } => {
+                let result = match probe.as_mut().poll(context) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(())) => Ok(()),
+                    Poll::Ready(Err(failure)) => Err(map_imap_failure(failure)),
+                };
+                if self
+                    .reply
+                    .as_ref()
+                    .is_some_and(|user| user.reply.is_closed())
+                {
+                    return Poll::Ready(Ok(TaskProgress::Cancelled));
+                }
+                let next = match start_diagnostic_record(database, *ticket, result) {
+                    Ok(next) => next,
+                    Err(DatabaseSubmitError::Busy) => {
+                        return Poll::Ready(Ok(TaskProgress::Finished(
+                            AccountWorkflowOutcome::Failed {
+                                stage: AccountWorkflowStage::RecordDiagnostic,
+                                failure: AccountWorkflowFailureKind::Busy,
+                            },
+                        )));
+                    }
+                    Err(DatabaseSubmitError::Closed) => {
+                        return Poll::Ready(Err(AccountDriverError::DatabaseClosed));
+                    }
+                };
+                self.state = next;
+                context.waker().wake_by_ref();
+                Poll::Ready(Ok(TaskProgress::Advanced))
+            }
+            ActiveTaskState::RecordingDiagnostic {
+                ticket,
+                probe_result,
+                receiver,
+            } => {
+                let commit = match Pin::new(receiver).poll(context) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(Ok(AccountWriteOutcome::Diagnostic(commit)))) => commit,
+                    Poll::Ready(Ok(Ok(_))) => {
+                        return Poll::Ready(Ok(TaskProgress::Finished(
+                            AccountWorkflowOutcome::Failed {
+                                stage: AccountWorkflowStage::RecordDiagnostic,
+                                failure: AccountWorkflowFailureKind::UnexpectedReply,
+                            },
+                        )));
+                    }
+                    Poll::Ready(Ok(Err(failure))) => {
+                        return Poll::Ready(Ok(TaskProgress::Finished(
+                            AccountWorkflowOutcome::Failed {
+                                stage: AccountWorkflowStage::RecordDiagnostic,
+                                failure: AccountWorkflowFailureKind::Database(
+                                    failure.failure().kind,
+                                ),
+                            },
+                        )));
+                    }
+                    Poll::Ready(Err(_)) => {
+                        return Poll::Ready(Err(AccountDriverError::DatabaseClosed));
+                    }
+                };
+                match commit {
+                    DiagnosticCommit::Recorded => Poll::Ready(Ok(TaskProgress::Finished(
+                        AccountWorkflowOutcome::Diagnostic {
+                            account_id: ticket.account_id,
+                            generation: ticket.configuration_generation,
+                            result: *probe_result,
+                        },
+                    ))),
+                    DiagnosticCommit::Stale => {
+                        Poll::Ready(Ok(TaskProgress::Finished(AccountWorkflowOutcome::Failed {
+                            stage: AccountWorkflowStage::RecordDiagnostic,
+                            failure: AccountWorkflowFailureKind::Database(FailureKind::Conflict),
+                        })))
+                    }
+                }
+            }
             ActiveTaskState::Workflow(workflow) => {
                 let progress = workflow.poll_one(database, credentials, context);
                 if let Poll::Ready(Ok(TaskProgress::Advanced)) = &progress
@@ -1492,8 +1914,50 @@ impl ActiveTask {
     }
 }
 
+fn start_diagnostic_record(
+    database: &DatabaseClient,
+    ticket: DiagnosticTicket,
+    probe_result: Result<(), AccountDiagnosticKind>,
+) -> Result<ActiveTaskState, DatabaseSubmitError> {
+    let checked_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0);
+    let record = match probe_result {
+        Ok(()) => DiagnosticRecord::ready(checked_at_ms),
+        Err(kind) => DiagnosticRecord::failed(kind, checked_at_ms),
+    }
+    .expect("the bounded current timestamp is valid");
+    let receiver = database
+        .try_write_account(Box::new(AccountWrite::RecordDiagnostic {
+            account_id: ticket.account_id,
+            expected_generation: ticket.configuration_generation,
+            epoch: ticket.epoch,
+            record,
+        }))
+        .map_err(|failure| failure.reason())?;
+    Ok(ActiveTaskState::RecordingDiagnostic {
+        ticket,
+        probe_result,
+        receiver,
+    })
+}
+
+fn map_imap_failure(failure: ImapDiagnosticFailure) -> AccountDiagnosticKind {
+    match failure.kind {
+        ImapDiagnosticFailureKind::Authentication => AccountDiagnosticKind::Authentication,
+        ImapDiagnosticFailureKind::Permission => AccountDiagnosticKind::Permission,
+        ImapDiagnosticFailureKind::Certificate => AccountDiagnosticKind::Certificate,
+        ImapDiagnosticFailureKind::Timeout => AccountDiagnosticKind::Timeout,
+        ImapDiagnosticFailureKind::Offline => AccountDiagnosticKind::Offline,
+        ImapDiagnosticFailureKind::Protocol => AccountDiagnosticKind::Protocol,
+    }
+}
+
 enum TaskProgress {
     Advanced,
+    Cancelled,
     Finished(AccountWorkflowOutcome),
 }
 
@@ -1695,6 +2159,24 @@ fn project_outcome(
         AccountWorkflowOutcome::AccountRemoved { account_id } => {
             Ok(AccountOperationSuccess::Removed { account_id })
         }
+        AccountWorkflowOutcome::Diagnostic {
+            account_id,
+            generation,
+            result: Ok(()),
+        } => Ok(AccountOperationSuccess::Diagnosed {
+            account_id,
+            generation,
+        }),
+        AccountWorkflowOutcome::Diagnostic {
+            account_id,
+            generation,
+            result: Err(kind),
+        } => Err(AccountOperationFailure {
+            account_id: Some(account_id),
+            generation: Some(generation),
+            stage: AccountWorkflowStage::ConnectImap,
+            kind: AccountWorkflowFailureKind::Diagnostic(kind),
+        }),
         AccountWorkflowOutcome::RemovalPending {
             account_id,
             generation,

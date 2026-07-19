@@ -1,5 +1,7 @@
 use super::{
-    account::{AccountDriverError, AccountWorkflows},
+    account::{
+        AccountDriverError, AccountWorkflows, ImapDiagnosticProbe, production_imap_diagnostic,
+    },
     message::{
         ACCOUNT_COMMAND_CAPACITY, AccountCommand, AccountDirectoryLoadError, AccountDirectoryQuery,
         AccountDirectoryRequestKey, COMMAND_CAPACITY, Command, CoreHandle, EVENT_CAPACITY, Event,
@@ -76,6 +78,20 @@ fn spawn_with_components(
     database: DatabaseParts,
     credentials: CredentialParts,
 ) -> Result<(CoreHandle, EventReceiver, CoreRuntime), StartError> {
+    spawn_with_components_and_probe(
+        event_capacity,
+        database,
+        credentials,
+        production_imap_diagnostic,
+    )
+}
+
+fn spawn_with_components_and_probe(
+    event_capacity: usize,
+    database: DatabaseParts,
+    credentials: CredentialParts,
+    diagnostic_probe: ImapDiagnosticProbe,
+) -> Result<(CoreHandle, EventReceiver, CoreRuntime), StartError> {
     let (database, database_replies, database_runtime, _database_info) = database;
     let (credentials, credential_runtime) = credentials;
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CAPACITY);
@@ -83,6 +99,7 @@ fn spawn_with_components(
     let (event_tx, event_rx) = event_channel(event_capacity);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let runtime = Builder::new_current_thread()
+        .enable_io()
         .enable_time()
         .max_blocking_threads(2)
         .build()
@@ -90,6 +107,8 @@ fn spawn_with_components(
     let worker = thread::Builder::new()
         .name("nivalis-core".into())
         .spawn(move || {
+            let account_workflows =
+                AccountWorkflows::new(database.clone(), credentials, diagnostic_probe);
             let core_result = runtime.block_on(run_core(
                 command_rx,
                 event_tx,
@@ -97,7 +116,7 @@ fn spawn_with_components(
                 database,
                 database_replies,
                 account_command_rx,
-                credentials,
+                account_workflows,
             ));
             let credential_result =
                 credential_runtime
@@ -135,7 +154,7 @@ async fn run_core(
     database: DatabaseClient,
     mut database_replies: DatabaseReplies,
     account_commands: mpsc::Receiver<AccountCommand>,
-    credentials: CredentialClient,
+    mut account_workflows: AccountWorkflows,
 ) -> Result<(), RuntimeError> {
     let mut shutdown = Box::pin(shutdown);
     let mut accounts = AccountDirectorySchedule::default();
@@ -144,7 +163,6 @@ async fn run_core(
     let mut active_mutations = 0_usize;
     let mut command_streak = 0_u8;
     let mut account_commands = Some(account_commands);
-    let mut account_workflows = AccountWorkflows::new(database.clone(), credentials);
 
     loop {
         let input = next_input(
@@ -938,15 +956,16 @@ mod tests {
         core::{
             AccountConfigDraft, AccountDirectoryQuery, AccountOperation, AccountOperationSuccess,
             AccountScope, AccountSetupMode, FolderScope, Generation, MailboxQuery, MessageId,
-            MessageQuery, PageBoundary, PageSpec, RequestId,
+            MessageQuery, PageBoundary, PageSpec, RequestId, account::ImapDiagnosticFuture,
         },
         credentials::{
             CredentialDeleteOutcome, CredentialFailure, CredentialFailureKind, CredentialLocator,
             CredentialOperation, CredentialOutcome, Secret,
         },
+        network::imap::{ImapDiagnosticFailure, ImapDiagnosticRequest},
         store::sqlite::{
-            AccountAuthKind, AccountConfigInput, AccountLifecycle, AccountWrite,
-            AccountWriteOutcome, FailureKind,
+            AccountAuthKind, AccountConfigInput, AccountConfiguration, AccountDiagnostic,
+            AccountLifecycle, AccountWrite, AccountWriteOutcome, DatabaseClient, FailureKind,
         },
     };
     use keyring_core::CredentialStore;
@@ -955,7 +974,7 @@ mod tests {
         fs,
         sync::{
             Arc,
-            atomic::{AtomicBool, AtomicU64, Ordering},
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         },
         time::Instant,
     };
@@ -1029,6 +1048,92 @@ mod tests {
             })
     }
 
+    fn successful_diagnostic(_: ImapDiagnosticRequest) -> ImapDiagnosticFuture {
+        Box::pin(async { Ok(()) })
+    }
+
+    static PENDING_DIAGNOSTIC_POLLS: AtomicUsize = AtomicUsize::new(0);
+    static PENDING_DIAGNOSTIC_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+    struct PendingDiagnostic;
+
+    impl Future for PendingDiagnostic {
+        type Output = Result<(), ImapDiagnosticFailure>;
+
+        fn poll(self: Pin<&mut Self>, _context: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+            PENDING_DIAGNOSTIC_POLLS.fetch_add(1, Ordering::AcqRel);
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingDiagnostic {
+        fn drop(&mut self) {
+            PENDING_DIAGNOSTIC_DROPS.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn pending_diagnostic(_: ImapDiagnosticRequest) -> ImapDiagnosticFuture {
+        Box::pin(PendingDiagnostic)
+    }
+
+    fn diagnostic_fixture(
+        diagnostic_probe: ImapDiagnosticProbe,
+    ) -> (
+        CoreHandle,
+        CoreRuntime,
+        DatabaseClient,
+        AccountConfiguration,
+    ) {
+        const KEY: &str = "0123456789abcdef0123456789abcdef";
+        let database = test_database();
+        let observer = database.0.clone();
+        let created = wait_for(
+            observer
+                .try_write_account(Box::new(AccountWrite::Create(
+                    AccountConfigInput::new(
+                        KEY,
+                        "Diagnostic",
+                        "diagnostic@example.test",
+                        AccountAuthKind::AppPassword,
+                        "diagnostic@example.test",
+                        "imap.example.test",
+                        993,
+                        0x335577,
+                    )
+                    .unwrap(),
+                )))
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let AccountWriteOutcome::Saved(configuration) = created else {
+            panic!("account creation must return configuration")
+        };
+        let store: Arc<CredentialStore> =
+            keyring_core::mock::Store::new().expect("create shared credential store");
+        let credential_parts = credentials::spawn_with_test_factory(move || Ok(store.clone()));
+        let credential_client = credential_parts.0.clone();
+        let stored = wait_for(
+            credential_client
+                .try_submit(CredentialOperation::Store {
+                    locator: CredentialLocator::parse(KEY).unwrap(),
+                    secret: Secret::new(b"diagnostic-secret".to_vec()).unwrap(),
+                })
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(stored, CredentialOutcome::Stored));
+        let (core, _events, runtime) = spawn_with_components_and_probe(
+            EVENT_CAPACITY,
+            database,
+            credential_parts,
+            diagnostic_probe,
+        )
+        .unwrap();
+        (core, runtime, observer, configuration)
+    }
+
     fn seed_file_database(path: &std::path::Path) {
         let (client, replies, database_runtime, _info) = sqlite::spawn(path.to_owned()).unwrap();
         drop(client);
@@ -1051,6 +1156,87 @@ mod tests {
             )
             .unwrap();
         sqlite::rebuild_account_stats_for_test(&connection, 1).unwrap();
+    }
+
+    #[test]
+    fn account_diagnostic_records_a_fenced_ready_result() {
+        let (core, runtime, observer, configuration) = diagnostic_fixture(successful_diagnostic);
+        let reply = wait_for(
+            core.try_account_operation(AccountOperation::Diagnose {
+                request_id: RequestId::new(46).unwrap(),
+                account_id: configuration.account_id,
+                expected_generation: configuration.generation,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            reply.result,
+            Ok(AccountOperationSuccess::Diagnosed {
+                account_id: configuration.account_id,
+                generation: configuration.generation,
+            })
+        );
+
+        let loaded = wait_for(observer.try_load_account(configuration.account_id).unwrap())
+            .unwrap()
+            .unwrap();
+        let crate::store::sqlite::AccountRecord::Configured(loaded) = loaded else {
+            panic!("diagnostic account must remain configured")
+        };
+        assert!(matches!(
+            loaded.diagnostic,
+            AccountDiagnostic::Ready { checked_at_ms } if checked_at_ms > 0
+        ));
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn cancelled_account_diagnostic_drops_probe_without_recording() {
+        PENDING_DIAGNOSTIC_POLLS.store(0, Ordering::Release);
+        PENDING_DIAGNOSTIC_DROPS.store(0, Ordering::Release);
+        let (core, runtime, observer, configuration) = diagnostic_fixture(pending_diagnostic);
+        let response = core
+            .try_account_operation(AccountOperation::Diagnose {
+                request_id: RequestId::new(47).unwrap(),
+                account_id: configuration.account_id,
+                expected_generation: configuration.generation,
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while PENDING_DIAGNOSTIC_POLLS.load(Ordering::Acquire) == 0 {
+            assert!(Instant::now() < deadline, "diagnostic probe did not start");
+            thread::sleep(Duration::from_millis(1));
+        }
+        drop(response);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while PENDING_DIAGNOSTIC_DROPS.load(Ordering::Acquire) == 0 {
+            assert!(Instant::now() < deadline, "cancelled probe was not dropped");
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let retry = wait_for(
+            core.try_account_operation(AccountOperation::RetryCredential {
+                request_id: RequestId::new(48).unwrap(),
+                account_id: configuration.account_id,
+                expected_generation: configuration.generation,
+                secret: Secret::new(b"replacement-secret".to_vec()).unwrap(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            retry.result,
+            Ok(AccountOperationSuccess::Configured { .. })
+        ));
+        let loaded = wait_for(observer.try_load_account(configuration.account_id).unwrap())
+            .unwrap()
+            .unwrap();
+        let crate::store::sqlite::AccountRecord::Configured(loaded) = loaded else {
+            panic!("cancelled diagnostic account must remain configured")
+        };
+        assert_eq!(loaded.diagnostic, AccountDiagnostic::Never);
+        runtime.shutdown().unwrap();
     }
 
     #[test]
@@ -1832,7 +2018,11 @@ mod tests {
         let (_account_tx, account_rx) = mpsc::channel(1);
         let mut account_commands = Some(account_rx);
         let (credential_client, credential_runtime) = credentials::spawn();
-        let mut account_workflows = AccountWorkflows::new(database.clone(), credential_client);
+        let mut account_workflows = AccountWorkflows::new(
+            database.clone(),
+            credential_client,
+            production_imap_diagnostic,
+        );
         let input = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
