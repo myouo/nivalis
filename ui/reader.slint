@@ -9,6 +9,11 @@ import { AccountAvatar } from "shared.slint";
 export component ReaderPane inherits Rectangle {
     in property <bool> compact-layout: false;
     in property <length> window-width: 1200px;
+    in property <bool> mail-actions-enabled: true;
+    in property <bool> detail-loading: false;
+    in property <bool> detail-error: false;
+    in property <string> detail-error-title: "";
+    in property <string> detail-error-detail: "";
     in property <string> selected-id: "";
     in property <MailDetail> selected-mail;
     in-out property <bool> detail-open: false;
@@ -18,6 +23,7 @@ export component ReaderPane inherits Rectangle {
     callback toggle-star(string);
     callback archive(string);
     callback mark-unread(string);
+    callback retry-detail;
 
     horizontal-stretch: 1;
     background: Theme.surface;
@@ -26,7 +32,26 @@ export component ReaderPane inherits Rectangle {
 
     if !root.compact-layout: Rectangle { x: 0; width: 1px; height: parent.height; background: Theme.outline-variant; }
 
-    if root.selected-id == "": EmptyState {
+    if root.detail-loading: Rectangle {
+        accessible-role: progress-indicator;
+        accessible-label: "Loading message";
+        VerticalLayout {
+            alignment: center;
+            spacing: 8px;
+            MaterialIcon { name: "progress_activity"; height: 38px; size: 26px; icon-color: Theme.primary; }
+            Text { text: "Loading message..."; color: Theme.on-surface-variant; font-family: Theme.body-font; font-size: 11px; horizontal-alignment: center; }
+        }
+    }
+
+    if !root.detail-loading && root.detail-error: EmptyState {
+        title: root.detail-error-title;
+        detail: root.detail-error-detail;
+        icon: "warning";
+        action-label: "Try again";
+        action => { root.retry-detail(); }
+    }
+
+    if !root.detail-loading && !root.detail-error && root.selected-id == "": EmptyState {
         title: "Select a message";
         detail: "Choose a conversation from the inbox to read it here.";
         icon: "mail";
@@ -34,7 +59,7 @@ export component ReaderPane inherits Rectangle {
         action => { root.filter-folder("Inbox"); root.detail-open = false; }
     }
 
-    if root.selected-id != "": VerticalLayout {
+    if !root.detail-loading && !root.detail-error && root.selected-id != "": VerticalLayout {
         spacing: 0px;
 
         Rectangle {
@@ -53,10 +78,31 @@ export component ReaderPane inherits Rectangle {
                 spacing: 0px;
                 if root.compact-layout: MIconButton { icon: "arrow_back"; label: "Back to message list"; clicked => { root.detail-open = false; } }
                 Rectangle { horizontal-stretch: 1; }
-                ReaderAction { label: "Archive"; icon: "archive"; clicked => { root.archive(root.selected-id); root.detail-open = false; } }
-                if root.window-width >= 1000px: ReaderAction { width: 76px; label: "Mark unread"; icon: "mark_email_unread"; clicked => { root.mark-unread(root.selected-id); } }
+                ReaderAction {
+                    label: "Archive";
+                    icon: "archive";
+                    enabled: root.mail-actions-enabled;
+                    disabled-reason: "Archive is unavailable while mail is read-only";
+                    clicked => { root.archive(root.selected-id); root.detail-open = false; }
+                }
+                if root.window-width >= 1000px: ReaderAction {
+                    width: 76px;
+                    label: "Mark unread";
+                    icon: "mark_email_unread";
+                    enabled: root.mail-actions-enabled;
+                    disabled-reason: "Mark unread is unavailable while mail is read-only";
+                    clicked => { root.mark-unread(root.selected-id); }
+                }
                 Rectangle { width: 1px; height: 32px; background: Theme.outline-variant; }
-                ReaderAction { width: 64px; icon: "delete"; label: "Delete sample"; danger: true; clicked => { root.delete-dialog-open = true; } }
+                ReaderAction {
+                    width: 64px;
+                    icon: "delete";
+                    label: "Delete";
+                    danger: true;
+                    enabled: root.mail-actions-enabled;
+                    disabled-reason: "Delete is unavailable while mail is read-only";
+                    clicked => { root.delete-dialog-open = true; }
+                }
                 ReaderAction { width: 58px; icon: "more_horiz"; label: "More"; clicked => { root.message-menu-open = true; } }
             }
         }
@@ -90,7 +136,13 @@ export component ReaderPane inherits Rectangle {
                         background: Theme.surface-container-low;
                         Text { text: root.selected-mail.folder; color: Theme.on-surface-variant; font-family: Theme.body-font; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; overflow: elide; }
                     }
-                    MIconButton { icon: root.selected-mail.starred ? "star" : "star_outline"; label: root.selected-mail.starred ? "Remove star" : "Add star"; selected: root.selected-mail.starred; clicked => { root.toggle-star(root.selected-id); } }
+                    MIconButton {
+                        icon: root.selected-mail.starred ? "star" : "star_outline";
+                        label: !root.mail-actions-enabled ? "Star changes are unavailable while mail is read-only" : root.selected-mail.starred ? "Remove star" : "Add star";
+                        selected: root.selected-mail.starred;
+                        enabled: root.mail-actions-enabled;
+                        clicked => { root.toggle-star(root.selected-id); }
+                    }
                     MIconButton { icon: "more_horiz"; label: "More message actions"; clicked => { root.message-menu-open = true; } }
                 }
 

@@ -10,6 +10,8 @@ import {
     AccountMenuOverlay, DeleteDialog, FilterMenuOverlay, InboxMoreMenuOverlay,
     MessageMenuOverlay, SettingsOverlay, Snackbar
 } from "overlays.slint";
+import { MaterialIcon } from "components.slint";
+import { EmptyState } from "states.slint";
 import { AccountItem, MailDetail, MailSummary } from "models.slint";
 
 export { AccountItem, MailDetail, MailSummary } from "models.slint";
@@ -30,6 +32,8 @@ export component AppWindow inherits Window {
     in property <[MailSummary]> mails;
     in property <[AccountItem]> accounts;
     in property <MailDetail> selected-mail;
+    in property <bool> has-accounts: true;
+    in property <bool> mail-actions-enabled: true;
     in property <string> selected-id: "";
     in property <int> message-total: 0;
     in property <int> inbox-count: 0;
@@ -46,6 +50,15 @@ export component AppWindow inherits Window {
     in-out property <string> search-query: "";
     in-out property <bool> detail-open: false;
     in-out property <bool> initial-loading: false;
+    in property <bool> mailbox-loading: false;
+    in property <bool> mailbox-error: false;
+    in property <string> mailbox-error-title: "";
+    in property <string> mailbox-error-detail: "";
+    in property <bool> total-known: true;
+    in property <bool> detail-loading: false;
+    in property <bool> detail-error: false;
+    in property <string> detail-error-title: "";
+    in property <string> detail-error-detail: "";
     in-out property <string> status-text: "Local preview";
     in-out property <bool> account-menu-open: false;
     in-out property <bool> settings-open: false;
@@ -85,6 +98,8 @@ export component AppWindow inherits Window {
     callback archive(string);
     callback delete-mail(string);
     callback mark-unread(string);
+    callback retry-mailbox;
+    callback retry-detail;
     callback switch-account(string);
     callback undo-delete;
     callback window-minimize;
@@ -161,7 +176,33 @@ export component AppWindow inherits Window {
                         accessible-role: main;
                         accessible-label: "Mail workspace";
 
-                        HorizontalLayout {
+                        if !root.has-accounts && (root.initial-loading || root.mailbox-loading): Rectangle {
+                            accessible-role: progress-indicator;
+                            accessible-label: "Loading local mail accounts";
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 8px;
+                                MaterialIcon { name: "progress_activity"; height: 38px; size: 26px; icon-color: Theme.primary; }
+                                Text { text: "Loading local mail..."; color: Theme.on-surface-variant; font-family: Theme.body-font; font-size: 11px; horizontal-alignment: center; }
+                            }
+                        }
+
+                        if !root.has-accounts && !root.initial-loading && !root.mailbox-loading && root.mailbox-error: EmptyState {
+                            title: root.mailbox-error-title;
+                            detail: root.mailbox-error-detail;
+                            icon: "warning";
+                            action-label: "Try again";
+                            action => { root.retry-mailbox(); }
+                        }
+
+                        if !root.has-accounts && !root.initial-loading && !root.mailbox-loading && !root.mailbox-error: EmptyState {
+                            title: "No mail accounts";
+                            detail: "No accounts have been added. Account setup is not available yet.";
+                            icon: "account_circle";
+                            action-label: "";
+                        }
+
+                        if root.has-accounts: HorizontalLayout {
                             spacing: 0px;
 
                             if !root.compact-layout || !root.detail-open: MailboxPane {
@@ -175,6 +216,12 @@ export component AppWindow inherits Window {
                                 inbox-count: root.inbox-count;
                                 status-text: root.status-text;
                                 initial-loading: root.initial-loading;
+                                mailbox-loading: root.mailbox-loading;
+                                mailbox-error: root.mailbox-error;
+                                mailbox-error-title: root.mailbox-error-title;
+                                mailbox-error-detail: root.mailbox-error-detail;
+                                total-known: root.total-known;
+                                mail-actions-enabled: root.mail-actions-enabled;
                                 mails: root.mails;
                                 selected-id: root.selected-id;
                                 message-total: root.message-total;
@@ -187,11 +234,17 @@ export component AppWindow inherits Window {
                                 select-mail(id) => { root.select-mail(id); }
                                 query-mail(query) => { root.query-mail(query); }
                                 toggle-star(id) => { root.toggle-star(id); }
+                                retry => { root.retry-mailbox(); }
                             }
 
                             if !root.compact-layout || root.detail-open: ReaderPane {
                                 compact-layout: root.compact-layout;
                                 window-width: root.width;
+                                mail-actions-enabled: root.mail-actions-enabled;
+                                detail-loading: root.detail-loading;
+                                detail-error: root.detail-error;
+                                detail-error-title: root.detail-error-title;
+                                detail-error-detail: root.detail-error-detail;
                                 selected-id: root.selected-id;
                                 selected-mail: root.selected-mail;
                                 detail-open <=> root.detail-open;
@@ -201,6 +254,7 @@ export component AppWindow inherits Window {
                                 toggle-star(id) => { root.toggle-star(id); }
                                 archive(id) => { root.archive(id); }
                                 mark-unread(id) => { root.mark-unread(id); }
+                                retry-detail => { root.retry-detail(); }
                             }
                         }
                     }
@@ -256,6 +310,7 @@ export component AppWindow inherits Window {
         width: parent.width;
         height: parent.height;
         compact-layout: root.compact-layout;
+        mail-actions-enabled: root.mail-actions-enabled;
         selected-mail: root.selected-mail;
         selected-id: root.selected-id;
         active-folder: root.active-folder;
@@ -270,6 +325,7 @@ export component AppWindow inherits Window {
         height: parent.height;
         active-folder: root.active-folder;
         selected-id: root.selected-id;
+        mail-actions-enabled: root.mail-actions-enabled;
         delete-dialog-open <=> root.delete-dialog-open;
         detail-open <=> root.detail-open;
         delete-mail(id) => { root.delete-mail(id); }
@@ -280,6 +336,7 @@ export component AppWindow inherits Window {
         window-height: root.height;
         snackbar-text: root.snackbar-text;
         snackbar-can-undo: root.snackbar-can-undo;
+        mail-actions-enabled: root.mail-actions-enabled;
         snackbar-visible <=> root.snackbar-visible;
         undo-delete => { root.undo-delete(); }
     }

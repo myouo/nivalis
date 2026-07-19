@@ -9,6 +9,7 @@ export component MailRow inherits Rectangle {
     in property <MailSummary> mail;
     in property <bool> selected: false;
     in property <bool> show-account: false;
+    in property <bool> mail-actions-enabled: true;
     in property <int> item-index: 0;
     in property <int> item-count: 0;
     callback opened(string);
@@ -114,8 +115,9 @@ export component MailRow inherits Rectangle {
 
         MIconButton {
             icon: root.mail.starred ? "star" : "star_outline";
-            label: root.mail.starred ? "Remove star" : "Add star";
+            label: !root.mail-actions-enabled ? "Star changes are unavailable while mail is read-only" : root.mail.starred ? "Remove star" : "Add star";
             selected: root.mail.starred;
+            enabled: root.mail-actions-enabled;
             compact-visual: true;
             clicked => { root.starred(root.mail.id); }
         }
@@ -134,6 +136,12 @@ export component MailboxPane inherits Rectangle {
     in property <int> inbox-count: 0;
     in property <string> status-text;
     in property <bool> initial-loading: false;
+    in property <bool> mailbox-loading: false;
+    in property <bool> mailbox-error: false;
+    in property <string> mailbox-error-title: "";
+    in property <string> mailbox-error-detail: "";
+    in property <bool> total-known: true;
+    in property <bool> mail-actions-enabled: true;
     in property <[MailSummary]> mails;
     in property <string> selected-id: "";
     in property <int> message-total: 0;
@@ -146,6 +154,9 @@ export component MailboxPane inherits Rectangle {
     callback select-mail(string);
     callback query-mail(string);
     callback toggle-star(string);
+    callback retry;
+
+    private property <bool> show-loading: root.initial-loading || root.mailbox-loading;
 
     preferred-width: root.compact-layout ? 0px : (root.wide-sidebar ? 408px : 372px);
     min-width: root.compact-layout ? 0px : 340px;
@@ -262,13 +273,13 @@ export component MailboxPane inherits Rectangle {
             }
         }
 
-        if root.initial-loading: Rectangle {
+        if root.show-loading: Rectangle {
             height: 2px;
             background: Theme.surface-container-highest;
             Rectangle { width: 62%; height: parent.height; background: Theme.primary; }
         }
 
-        if root.initial-loading: VerticalLayout {
+        if root.show-loading: VerticalLayout {
             padding-left: 6px;
             padding-right: 6px;
             padding-top: 4px;
@@ -283,7 +294,7 @@ export component MailboxPane inherits Rectangle {
             SkeletonRow { }
         }
 
-        if !root.initial-loading && root.mails.length > 0: ListView {
+        if !root.show-loading && !root.mailbox-error && root.mails.length > 0: ListView {
             accessible-role: list;
             accessible-label: root.active-folder + " messages";
             accessible-item-count: root.mails.length;
@@ -291,6 +302,7 @@ export component MailboxPane inherits Rectangle {
                 mail: mail;
                 selected: root.selected-id == mail.id;
                 show-account: root.active-account-id == "";
+                mail-actions-enabled: root.mail-actions-enabled;
                 item-index: i;
                 item-count: root.mails.length;
                 opened(id) => { root.detail-open = true; root.select-mail(id); }
@@ -298,7 +310,15 @@ export component MailboxPane inherits Rectangle {
             }
         }
 
-        if !root.initial-loading && root.mails.length == 0: EmptyState {
+        if !root.show-loading && root.mailbox-error: EmptyState {
+            title: root.mailbox-error-title;
+            detail: root.mailbox-error-detail;
+            icon: "warning";
+            action-label: "Try again";
+            action => { root.retry(); }
+        }
+
+        if !root.show-loading && !root.mailbox-error && root.mails.length == 0: EmptyState {
             title: root.search-query == "" ? "No messages here" : "No matching messages";
             detail: root.search-query == "" ? "No cached messages are available in this folder." : "Try another sender, subject, or preview keyword.";
             icon: root.search-query == "" ? "mail" : "search";
@@ -309,14 +329,18 @@ export component MailboxPane inherits Rectangle {
             }
         }
 
-        if !root.initial-loading: Rectangle {
+        if !root.show-loading && !root.mailbox-error: Rectangle {
             height: 52px;
             Rectangle { y: 0; width: parent.width; height: 1px; background: Theme.outline-variant; }
             HorizontalLayout {
                 padding-left: 14px;
                 padding-right: 8px;
                 Text {
-                    text: root.message-total == 0 ? "0 messages" : "1-" + root.mails.length + " of " + root.message-total;
+                    text: !root.total-known
+                        ? (root.mails.length == 0
+                            ? "Result count unavailable"
+                            : "Showing " + root.mails.length + (root.mails.length == 1 ? " message" : " messages"))
+                        : root.message-total == 0 ? "0 messages" : "1-" + root.mails.length + " of " + root.message-total;
                     color: Theme.on-surface-variant;
                     font-family: Theme.body-font;
                     font-size: 10px;

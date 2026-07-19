@@ -4,7 +4,9 @@ import { MaterialIcon } from "components.slint";
 export component ReaderAction inherits Rectangle {
     in property <string> icon;
     in property <string> label;
+    in property <string> disabled-reason: "";
     in property <bool> danger: false;
+    in property <bool> enabled: true;
     callback clicked;
     forward-focus: focus;
 
@@ -13,10 +15,11 @@ export component ReaderAction inherits Rectangle {
     border-radius: 4px;
     border-width: focus.has-focus ? 2px : 0px;
     border-color: Theme.focus-ring;
-    background: touch.pressed ? Theme.surface-container-highest : touch.has-hover ? Theme.surface-container-high : transparent;
+    background: !root.enabled ? transparent : touch.pressed ? Theme.surface-container-highest : touch.has-hover ? Theme.surface-container-high : transparent;
     accessible-role: button;
-    accessible-label: label;
-    accessible-action-default => { root.clicked(); }
+    accessible-label: !root.enabled && root.disabled-reason != "" ? root.disabled-reason : root.label;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.clicked(); } }
 
     MaterialIcon {
         x: (parent.width - 20px) / 2;
@@ -25,7 +28,7 @@ export component ReaderAction inherits Rectangle {
         height: 20px;
         name: root.icon;
         size: 17px;
-        icon-color: root.danger ? Theme.error : Theme.on-surface-variant;
+        icon-color: !root.enabled ? Theme.outline : root.danger ? Theme.error : Theme.on-surface-variant;
     }
     Text {
         x: 3px;
@@ -33,7 +36,7 @@ export component ReaderAction inherits Rectangle {
         width: parent.width - 6px;
         height: 27px;
         text: root.label;
-        color: root.danger ? Theme.error : Theme.on-surface;
+        color: !root.enabled ? Theme.outline : root.danger ? Theme.error : Theme.on-surface;
         font-family: Theme.body-font;
         font-size: 9px;
         font-weight: 400;
@@ -43,10 +46,15 @@ export component ReaderAction inherits Rectangle {
     }
 
     focus := FocusScope {
+        enabled: root.enabled;
         key-pressed(event) => {
             if (event.text == Key.Return || event.text == Key.Space) { root.clicked(); return accept; }
             return reject;
         }
-        touch := TouchArea { mouse-cursor: pointer; clicked => { focus.focus(); root.clicked(); } }
+        touch := TouchArea {
+            enabled: root.enabled;
+            mouse-cursor: pointer;
+            clicked => { focus.focus(); root.clicked(); }
+        }
     }
 }
