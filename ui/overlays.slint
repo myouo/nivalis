@@ -181,6 +181,7 @@ export component SettingsOverlay inherits Rectangle {
 export component MessageMenuOverlay inherits Rectangle {
     in property <bool> compact-layout: false;
     in property <bool> mail-actions-enabled: true;
+    in property <bool> mutation-loading: false;
     in property <MailDetail> selected-mail;
     in property <string> selected-id: "";
     in property <string> active-folder: "Inbox";
@@ -209,12 +210,14 @@ export component MessageMenuOverlay inherits Rectangle {
                 label: !root.mail-actions-enabled ? "Star unavailable (read-only)" : root.selected-mail.starred ? "Remove star" : "Add star";
                 icon: root.selected-mail.starred ? "star" : "star_outline";
                 enabled: root.mail-actions-enabled;
+                loading: root.mutation-loading;
                 clicked => { root.toggle-star(root.selected-id); root.message-menu-open = false; }
             }
             MButton {
                 label: !root.mail-actions-enabled ? "Unread unavailable (read-only)" : "Mark unread";
                 icon: "mark_email_unread";
                 enabled: root.mail-actions-enabled;
+                loading: root.mutation-loading;
                 clicked => { root.mark-unread(root.selected-id); root.message-menu-open = false; }
             }
             MButton {
@@ -222,6 +225,7 @@ export component MessageMenuOverlay inherits Rectangle {
                 icon: "delete";
                 variant: "danger";
                 enabled: root.mail-actions-enabled;
+                loading: root.mutation-loading;
                 clicked => { root.message-menu-open = false; root.delete-dialog-open = true; }
             }
         }
@@ -232,8 +236,8 @@ export component DeleteDialog inherits Rectangle {
     in property <string> active-folder: "Inbox";
     in property <string> selected-id: "";
     in property <bool> mail-actions-enabled: true;
+    in property <bool> mutation-loading: false;
     in-out property <bool> delete-dialog-open: false;
-    in-out property <bool> detail-open: false;
     callback delete-mail(string);
 
     z: 40;
@@ -249,14 +253,14 @@ export component DeleteDialog inherits Rectangle {
         border-color: Theme.outline;
         background: Theme.surface;
         accessible-role: region;
-        accessible-label: !root.mail-actions-enabled ? "Delete is unavailable while mail is read-only" : root.active-folder == "Trash" ? "Confirm permanently deleting this message" : "Confirm moving this message to trash";
+        accessible-label: !root.mail-actions-enabled ? "Delete is unavailable while mail is read-only" : root.mutation-loading ? "Message change in progress" : root.active-folder == "Trash" ? "Confirm permanently deleting this message" : "Confirm moving this message to trash";
         VerticalLayout {
             padding: 20px;
             spacing: 10px;
             MaterialIcon { name: "delete"; width: 32px; height: 32px; size: 24px; icon-color: Theme.error; }
             Text { text: root.active-folder == "Trash" ? "Delete this message permanently?" : "Move this message to trash?"; color: Theme.on-surface; font-family: Theme.body-font; font-size: 18px; font-weight: 500; wrap: word-wrap; }
             Text {
-                text: !root.mail-actions-enabled ? "Message changes are unavailable while the current mail source is read-only." : root.active-folder == "Trash" ? "This cannot be undone. The message will be removed from the local mailbox." : "You can undo this action from the confirmation message.";
+                text: !root.mail-actions-enabled ? "Message changes are unavailable while the current mail source is read-only." : root.mutation-loading ? "Wait for the current message change to finish." : root.active-folder == "Trash" ? "This cannot be undone. The message will be removed from the local mailbox." : "You can undo this action from the confirmation message.";
                 color: Theme.on-surface-variant;
                 font-family: Theme.body-font;
                 font-size: 11px;
@@ -266,13 +270,14 @@ export component DeleteDialog inherits Rectangle {
             HorizontalLayout {
                 spacing: 8px;
                 Rectangle { horizontal-stretch: 1; }
-                MButton { label: "Keep message"; clicked => { root.delete-dialog-open = false; } }
+                MButton { label: "Keep message"; enabled: !root.mutation-loading; clicked => { root.delete-dialog-open = false; } }
                 MButton {
                     label: !root.mail-actions-enabled ? "Delete unavailable (read-only)" : root.active-folder == "Trash" ? "Delete permanently" : "Move to trash";
                     icon: "delete";
                     variant: "danger-filled";
                     enabled: root.mail-actions-enabled;
-                    clicked => { root.delete-dialog-open = false; root.delete-mail(root.selected-id); root.detail-open = false; }
+                    loading: root.mutation-loading;
+                    clicked => { root.delete-mail(root.selected-id); }
                 }
             }
         }
@@ -284,7 +289,7 @@ export component Snackbar inherits Rectangle {
     in property <length> window-height: 800px;
     in property <string> snackbar-text;
     in property <bool> snackbar-can-undo: false;
-    in property <bool> mail-actions-enabled: true;
+    in property <bool> undo-loading: false;
     in-out property <bool> snackbar-visible: false;
     callback undo-delete;
 
@@ -299,14 +304,14 @@ export component Snackbar inherits Rectangle {
     background: Theme.surface;
     accessible-role: region;
     accessible-live-region: polite;
-    accessible-label: root.snackbar-text + (root.snackbar-can-undo && root.mail-actions-enabled ? ". Undo available." : "");
+    accessible-label: root.snackbar-text + (root.snackbar-can-undo ? (root.undo-loading ? ". Undo is loading." : ". Undo available.") : "");
     HorizontalLayout {
         padding-left: 12px;
         padding-right: 4px;
         spacing: 6px;
         MaterialIcon { name: "check_circle"; width: 22px; size: 19px; icon-color: Theme.success; }
         Text { text: root.snackbar-text; color: Theme.on-surface; font-family: Theme.body-font; font-size: 11px; font-weight: 400; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
-        if root.snackbar-can-undo && root.mail-actions-enabled: MButton { label: "Undo"; clicked => { root.undo-delete(); root.snackbar-visible = false; } }
-        MIconButton { icon: "close"; label: "Dismiss notification"; compact-visual: true; clicked => { root.snackbar-visible = false; } }
+        if root.snackbar-can-undo: MButton { label: "Undo"; loading: root.undo-loading; clicked => { root.undo-delete(); } }
+        MIconButton { icon: "close"; label: "Dismiss notification"; compact-visual: true; busy: root.undo-loading; clicked => { root.snackbar-visible = false; } }
     }
 }

@@ -338,7 +338,9 @@ impl ReadSession {
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn issue_undo(&mut self, now_ms: i64) -> Result<MutationRequest, SessionError> {
-        self.ensure_mutation_available()?;
+        if self.pending_mutation.is_some() {
+            return Err(SessionError::MutationRequestPending);
+        }
         let Some(undo) = self.undo else {
             return Err(SessionError::UndoUnavailable);
         };
@@ -422,6 +424,14 @@ impl ReadSession {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn mutation_blocks_actions(&self) -> bool {
         self.pending_mutation.is_some() || self.mutation_refresh.is_some()
+    }
+
+    pub(crate) fn mutation_request_pending(&self) -> bool {
+        self.pending_mutation.is_some()
+    }
+
+    pub(crate) fn mutation_refresh_pending(&self) -> bool {
+        self.mutation_refresh.is_some()
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1555,6 +1565,67 @@ mod tests {
         assert_eq!(session.issue_undo(101), Err(SessionError::UndoExpired));
         assert_eq!(session.undo_expires_at_ms(101), None);
         assert_eq!(session.issue_undo(101), Err(SessionError::UndoUnavailable));
+    }
+
+    #[test]
+    fn undo_can_replace_a_pending_trash_refresh_without_accepting_its_late_page() {
+        let mut session = session_with_visible(&[1]);
+        session
+            .issue_message_action(EntityKey::new(1).unwrap(), MailAction::Delete)
+            .unwrap();
+        session.complete_mutation(&mutation_reply(2, 1, moved_to_trash(1, 11, 100)));
+
+        session.issue_first_mailbox().unwrap();
+        let trash_refresh = mailbox_reply(3, 1, &[1]);
+        assert_eq!(
+            session.issue_undo(50).unwrap(),
+            MutationRequest::new(
+                request_id(4),
+                Generation::new(1),
+                MessageMutation::undo_trash(undo_token_for_test(11)),
+            )
+        );
+        assert!(session.mutation_request_pending());
+        assert!(matches!(
+            session.complete_mutation(&mutation_reply(
+                4,
+                1,
+                MutationOutcome::Restored {
+                    state: message_state(1, true, false),
+                    stats_delta: stats_delta(),
+                },
+            )),
+            MutationCompletion::Applied { .. }
+        ));
+
+        assert!(session.match_mailbox_reply(&trash_refresh).is_none());
+        assert!(session.mutation_blocks_actions());
+        session.issue_first_mailbox().unwrap();
+        commit_reply(&mut session, &mailbox_reply(5, 1, &[1]));
+        assert!(!session.mutation_blocks_actions());
+    }
+
+    #[test]
+    fn failed_undo_preserves_the_original_refresh_and_retry_slot() {
+        let mut session = session_with_visible(&[1]);
+        session
+            .issue_message_action(EntityKey::new(1).unwrap(), MailAction::Delete)
+            .unwrap();
+        session.complete_mutation(&mutation_reply(2, 1, moved_to_trash(1, 11, 100)));
+        session.issue_first_mailbox().unwrap();
+        let trash_refresh = mailbox_reply(3, 1, &[1]);
+
+        session.issue_undo(50).unwrap();
+        assert!(matches!(
+            session.complete_mutation(&mutation_failure(4, 1, FailureKind::Database)),
+            MutationCompletion::Failed { .. }
+        ));
+        commit_reply(&mut session, &trash_refresh);
+        assert!(!session.mutation_blocks_actions());
+        assert!(matches!(
+            session.issue_undo(60).unwrap(),
+            MutationRequest { .. }
+        ));
     }
 
     #[test]

@@ -10,6 +10,7 @@ export component ReaderPane inherits Rectangle {
     in property <bool> compact-layout: false;
     in property <length> window-width: 1200px;
     in property <bool> mail-actions-enabled: true;
+    in property <bool> mutation-loading: false;
     in property <bool> detail-loading: false;
     in property <bool> detail-error: false;
     in property <string> detail-error-title: "";
@@ -82,14 +83,16 @@ export component ReaderPane inherits Rectangle {
                     label: "Archive";
                     icon: "archive";
                     enabled: root.mail-actions-enabled;
+                    busy: root.mutation-loading;
                     disabled-reason: "Archive is unavailable while mail is read-only";
-                    clicked => { root.archive(root.selected-id); root.detail-open = false; }
+                    clicked => { root.archive(root.selected-id); }
                 }
                 if root.window-width >= 1000px: ReaderAction {
                     width: 76px;
                     label: "Mark unread";
                     icon: "mark_email_unread";
                     enabled: root.mail-actions-enabled;
+                    busy: root.mutation-loading;
                     disabled-reason: "Mark unread is unavailable while mail is read-only";
                     clicked => { root.mark-unread(root.selected-id); }
                 }
@@ -100,6 +103,7 @@ export component ReaderPane inherits Rectangle {
                     label: "Delete";
                     danger: true;
                     enabled: root.mail-actions-enabled;
+                    busy: root.mutation-loading;
                     disabled-reason: "Delete is unavailable while mail is read-only";
                     clicked => { root.delete-dialog-open = true; }
                 }
@@ -141,6 +145,7 @@ export component ReaderPane inherits Rectangle {
                         label: !root.mail-actions-enabled ? "Star changes are unavailable while mail is read-only" : root.selected-mail.starred ? "Remove star" : "Add star";
                         selected: root.selected-mail.starred;
                         enabled: root.mail-actions-enabled;
+                        busy: root.mutation-loading;
                         clicked => { root.toggle-star(root.selected-id); }
                     }
                     MIconButton { icon: "more_horiz"; label: "More message actions"; clicked => { root.message-menu-open = true; } }

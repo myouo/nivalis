@@ -1,23 +1,28 @@
 mod session;
 
 use self::session::{
-    DetailAcceptance, MailboxAcceptance, MailboxIntent, ReadSession, SessionError,
+    DetailAcceptance, MailAction, MailboxAcceptance, MailboxIntent, MutationCompletion,
+    MutationIntent, MutationScope, ReadSession, SessionError,
 };
 use crate::core::{
     AccountDirectoryLoadError, CoreHandle, Event, EventReceiver, MailboxLoadError,
-    MessageLoadError, SubmitError,
+    MessageLoadError, MutationSubmitError, SubmitError,
 };
-use crate::presentation::show_snackbar;
 use crate::presentation::sqlite::{
     AccountCatalog, ProjectedMailbox, ProjectedMailboxStats, ProjectionError,
 };
+use crate::presentation::{show_snackbar, show_snackbar_for};
 use crate::store::sqlite::{
     AccountDirectory, DbFailure, FailureKind, MailboxPage, MessageDetail, Tagged,
 };
 use crate::ui_identity::{AccountKey, EntityKey};
 use crate::{AccountItem, AppWindow, MailDetail, MailSummary};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
-use std::{cell::RefCell, rc::Rc, time::Duration};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 pub(crate) fn install(
     ui: &AppWindow,
@@ -65,6 +70,8 @@ impl Controller {
         ui.set_accounts(ModelRc::from(account_model.clone()));
         ui.set_has_accounts(false);
         ui.set_mail_actions_enabled(false);
+        ui.set_mutation_loading(false);
+        ui.set_undo_loading(false);
         ui.set_initial_loading(true);
         ui.set_mailbox_loading(true);
         ui.set_has_previous_mailbox_page(false);
@@ -129,6 +136,21 @@ impl Controller {
 
         let controller = self.clone();
         ui.on_retry_detail(move || controller.retry_detail());
+
+        let controller = self.clone();
+        ui.on_toggle_star(move |key| controller.toggle_star(key));
+
+        let controller = self.clone();
+        ui.on_archive(move |key| controller.archive_message(key));
+
+        let controller = self.clone();
+        ui.on_delete_mail(move |key| controller.delete_message(key));
+
+        let controller = self.clone();
+        ui.on_mark_unread(move |key| controller.mark_unread(key));
+
+        let controller = self.clone();
+        ui.on_undo_delete(move || controller.undo_delete());
     }
 
     fn start(&self) {
@@ -161,6 +183,7 @@ impl Controller {
             ui.set_mailbox_navigation_loading(false);
             ui.set_mailbox_page_number(1);
             ui.set_mailbox_error(false);
+            ui.set_mail_actions_enabled(false);
             ui.set_status_text("Loading local cache".into());
         }
 
@@ -221,7 +244,12 @@ impl Controller {
                     self.fail_detail(message_rejection(reason));
                 }
             }
-            Event::MutationFinished(_) | Event::MutationRejected { .. } => {}
+            Event::MutationFinished(reply) => self.handle_mutation(reply),
+            Event::MutationRejected {
+                request_id,
+                generation,
+                reason,
+            } => self.handle_mutation_rejection(request_id, generation, reason),
         }
     }
 
@@ -351,6 +379,7 @@ impl Controller {
             .expect("session page numbers are bounded to the Slint integer range");
         drop(state);
 
+        let selected_to_restore = self.selected_reader_key();
         self.clear_reader();
         self.mail_model.set_vec(rows);
         self.apply_stats(stats);
@@ -374,6 +403,15 @@ impl Controller {
                 }
                 .into(),
             );
+        }
+        self.sync_mutation_ui();
+        if let Some(key) = selected_to_restore
+            && visible_summary_state(self.mail_model.as_ref(), key).is_some()
+        {
+            if let Some(ui) = self.ui.upgrade() {
+                ui.set_detail_open(true);
+            }
+            self.select_message(key.encode());
         }
     }
 
@@ -450,6 +488,11 @@ impl Controller {
     }
 
     fn fail_navigation(&self, error: UserError) {
+        if self.state.borrow().mutation_refresh_pending() {
+            self.fail_mailbox(error);
+            self.sync_mutation_ui();
+            return;
+        }
         if let Some(ui) = self.ui.upgrade() {
             ui.set_mailbox_navigation_loading(false);
             ui.set_status_text(error.title.into());
@@ -574,6 +617,221 @@ impl Controller {
         }
     }
 
+    fn toggle_star(&self, key: SharedString) {
+        let Some((key, summary)) = self.visible_summary(key.as_str()) else {
+            self.reject_mutation_selection();
+            return;
+        };
+        self.submit_message_action(key, desired_star_action(summary));
+    }
+
+    fn mark_unread(&self, key: SharedString) {
+        let Some((key, summary)) = self.visible_summary(key.as_str()) else {
+            self.reject_mutation_selection();
+            return;
+        };
+        let Some(action) = desired_unread_action(summary) else {
+            if let Some(ui) = self.ui.upgrade() {
+                ui.set_status_text("Message is already unread".into());
+                show_snackbar(
+                    &ui,
+                    "Message is already unread",
+                    false,
+                    &self.snackbar_timer,
+                );
+            }
+            return;
+        };
+        self.submit_message_action(key, action);
+    }
+
+    fn archive_message(&self, key: SharedString) {
+        self.submit_keyed_action(key.as_str(), MailAction::Archive);
+    }
+
+    fn delete_message(&self, key: SharedString) {
+        self.submit_keyed_action(key.as_str(), MailAction::Delete);
+    }
+
+    fn submit_keyed_action(&self, key: &str, action: MailAction) {
+        let Some(key) = EntityKey::parse(key) else {
+            self.reject_mutation_selection();
+            return;
+        };
+        self.submit_message_action(key, action);
+    }
+
+    fn submit_message_action(&self, key: EntityKey, action: MailAction) {
+        let request = match self.state.borrow_mut().issue_message_action(key, action) {
+            Ok(request) => request,
+            Err(error) => {
+                self.notify_error(session_error(error));
+                return;
+            }
+        };
+        self.sync_mutation_ui();
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_status_text("Saving message change".into());
+        }
+        if let Err(error) = self.core.try_mutate(request) {
+            let intent = self.state.borrow_mut().cancel_mutation_submission();
+            self.sync_mutation_ui();
+            if let Some(intent) = intent {
+                self.notify_mutation_error(intent, submit_error(error));
+            }
+        }
+    }
+
+    fn undo_delete(&self) {
+        let now_ms = match unix_time_ms(SystemTime::now()) {
+            Some(now_ms) => now_ms,
+            None => {
+                self.notify_error(UserError::system_clock());
+                return;
+            }
+        };
+        let request = match self.state.borrow_mut().issue_undo(now_ms) {
+            Ok(request) => request,
+            Err(error) => {
+                self.notify_error(session_error(error));
+                return;
+            }
+        };
+        self.sync_mutation_ui();
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_status_text("Restoring message".into());
+        }
+        if let Err(error) = self.core.try_mutate(request) {
+            let intent = self.state.borrow_mut().cancel_mutation_submission();
+            self.sync_mutation_ui();
+            if let Some(intent) = intent {
+                self.notify_mutation_error(intent, submit_error(error));
+            }
+        }
+    }
+
+    fn visible_summary(&self, key: &str) -> Option<(EntityKey, SummaryState)> {
+        let key = EntityKey::parse(key)?;
+        visible_summary_state(self.mail_model.as_ref(), key).map(|summary| (key, summary))
+    }
+
+    fn reject_mutation_selection(&self) {
+        self.notify_error(UserError::selection());
+    }
+
+    fn handle_mutation(&self, reply: Tagged<crate::store::sqlite::MutationOutcome>) {
+        let failure_kind = reply.result.as_ref().err().map(|failure| failure.kind);
+        let failure = reply.result.as_ref().err().map(database_error);
+        let completion = self.state.borrow_mut().complete_mutation(&reply);
+        match completion {
+            MutationCompletion::Stale => {}
+            MutationCompletion::Failed { intent, .. } => {
+                self.sync_mutation_ui();
+                self.notify_mutation_error(
+                    intent,
+                    failure.unwrap_or_else(UserError::mutation_result),
+                );
+                if failure_kind == Some(FailureKind::NotFound) {
+                    self.reload_mailbox();
+                }
+            }
+            MutationCompletion::Applied { intent, scope } => {
+                self.finish_mutation_success(intent, scope);
+                self.refresh_after_mutation();
+            }
+            MutationCompletion::OutcomeMismatch { .. } => {
+                self.sync_mutation_ui();
+                self.notify_error(UserError::mutation_result());
+                self.refresh_after_mutation();
+            }
+        }
+    }
+
+    fn handle_mutation_rejection(
+        &self,
+        request_id: crate::core::RequestId,
+        generation: crate::core::Generation,
+        reason: MutationSubmitError,
+    ) {
+        let Some((intent, _scope)) = self
+            .state
+            .borrow_mut()
+            .reject_mutation(request_id, generation)
+        else {
+            return;
+        };
+        self.sync_mutation_ui();
+        self.notify_mutation_error(intent, mutation_rejection(reason));
+    }
+
+    fn finish_mutation_success(&self, intent: MutationIntent, scope: MutationScope) {
+        let feedback = mutation_success_feedback(intent);
+        let undo_duration = if matches!(intent, MutationIntent::MoveToTrash { .. }) {
+            let now = SystemTime::now();
+            unix_time_ms(now).and_then(|now_ms| {
+                self.state
+                    .borrow_mut()
+                    .undo_expires_at_ms(now_ms)
+                    .and_then(|deadline| undo_remaining(deadline, now))
+            })
+        } else {
+            None
+        };
+
+        if let Some(ui) = self.ui.upgrade() {
+            if feedback.close_delete_dialog {
+                ui.set_delete_dialog_open(false);
+            }
+            if feedback.close_reader && scope == MutationScope::Current {
+                ui.set_detail_open(false);
+            }
+            ui.set_status_text(feedback.status.into());
+            if let Some(duration) = undo_duration {
+                show_snackbar_for(&ui, feedback.snackbar, true, &self.snackbar_timer, duration);
+            } else {
+                show_snackbar(&ui, feedback.snackbar, false, &self.snackbar_timer);
+            }
+        }
+        self.sync_mutation_ui();
+    }
+
+    fn refresh_after_mutation(&self) {
+        self.pending_mailbox.borrow_mut().take();
+        self.submit_mailbox_navigation(MailboxIntent::First);
+    }
+
+    fn notify_mutation_error(&self, intent: MutationIntent, error: UserError) {
+        if matches!(intent, MutationIntent::UndoTrash { .. }) && self.show_undo_error(error) {
+            return;
+        }
+        self.notify_error(error);
+    }
+
+    fn show_undo_error(&self, error: UserError) -> bool {
+        let now = SystemTime::now();
+        let Some(duration) = unix_time_ms(now).and_then(|now_ms| {
+            self.state
+                .borrow_mut()
+                .undo_expires_at_ms(now_ms)
+                .and_then(|deadline| undo_remaining(deadline, now))
+        }) else {
+            return false;
+        };
+        let Some(ui) = self.ui.upgrade() else {
+            return true;
+        };
+        ui.set_status_text(error.title.into());
+        show_snackbar_for(&ui, error.detail, true, &self.snackbar_timer, duration);
+        true
+    }
+
+    fn selected_reader_key(&self) -> Option<EntityKey> {
+        let ui = self.ui.upgrade()?;
+        ui.get_detail_open()
+            .then(|| ui.get_selected_id())
+            .and_then(|key| EntityKey::parse(key.as_str()))
+    }
+
     fn change_folder(&self, folder: &str) {
         match self.state.borrow_mut().set_folder(folder) {
             Ok(false) => return,
@@ -662,6 +920,11 @@ impl Controller {
     }
 
     fn retry_mailbox(&self) {
+        if self.state.borrow().mutation_refresh_pending() {
+            self.pending_mailbox.borrow_mut().take();
+            self.submit_mailbox_navigation(MailboxIntent::First);
+            return;
+        }
         let needs_accounts = self.catalog.borrow().is_none();
         if needs_accounts && let Some(ui) = self.ui.upgrade() {
             ui.set_initial_loading(true);
@@ -692,6 +955,7 @@ impl Controller {
             ui.set_detail_loading(false);
             ui.set_detail_error(false);
             ui.set_detail_open(false);
+            ui.set_delete_dialog_open(false);
         }
     }
 
@@ -711,6 +975,7 @@ impl Controller {
         if let Some(ui) = self.ui.upgrade() {
             ui.set_has_accounts(false);
             ui.set_initial_loading(false);
+            ui.set_mail_actions_enabled(false);
         }
         self.fail_mailbox(error);
     }
@@ -726,6 +991,8 @@ impl Controller {
             ui.set_mailbox_error_title(error.title.into());
             ui.set_mailbox_error_detail(error.detail.into());
             ui.set_status_text(error.title.into());
+            ui.set_mail_actions_enabled(false);
+            ui.set_delete_dialog_open(false);
         }
     }
 
@@ -742,8 +1009,15 @@ impl Controller {
     fn core_closed(&self) {
         self.state.borrow_mut().cancel_pending();
         self.pending_mailbox.borrow_mut().take();
+        self.snackbar_timer.stop();
         let show_detail_error = self.ui.upgrade().is_some_and(|ui| {
             ui.set_initial_loading(false);
+            ui.set_mutation_loading(false);
+            ui.set_undo_loading(false);
+            ui.set_mail_actions_enabled(false);
+            ui.set_delete_dialog_open(false);
+            ui.set_snackbar_can_undo(false);
+            ui.set_snackbar_visible(false);
             ui.get_detail_loading() || !ui.get_selected_id().is_empty()
         });
         let error = submit_error(SubmitError::Closed);
@@ -759,6 +1033,121 @@ impl Controller {
             show_snackbar(&ui, error.detail, false, &self.snackbar_timer);
         }
     }
+
+    fn sync_mutation_ui(&self) {
+        let (blocked, request_pending) = {
+            let state = self.state.borrow();
+            (
+                state.mutation_blocks_actions(),
+                state.mutation_request_pending(),
+            )
+        };
+        if let Some(ui) = self.ui.upgrade() {
+            let mailbox_ready = self.catalog.borrow().is_some()
+                && !ui.get_mailbox_loading()
+                && !ui.get_mailbox_error();
+            ui.set_mutation_loading(blocked);
+            ui.set_undo_loading(request_pending);
+            ui.set_mail_actions_enabled(mailbox_ready);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SummaryState {
+    unread: bool,
+    starred: bool,
+}
+
+fn visible_summary_state(model: &VecModel<MailSummary>, key: EntityKey) -> Option<SummaryState> {
+    (0..model.row_count()).find_map(|index| {
+        let summary = model.row_data(index)?;
+        (EntityKey::parse(summary.id.as_str()) == Some(key)).then_some(SummaryState {
+            unread: summary.unread,
+            starred: summary.starred,
+        })
+    })
+}
+
+fn desired_star_action(summary: SummaryState) -> MailAction {
+    MailAction::SetStarred(!summary.starred)
+}
+
+fn desired_unread_action(summary: SummaryState) -> Option<MailAction> {
+    (!summary.unread).then_some(MailAction::SetUnread(true))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MutationSuccessFeedback {
+    status: &'static str,
+    snackbar: &'static str,
+    close_reader: bool,
+    close_delete_dialog: bool,
+}
+
+fn mutation_success_feedback(intent: MutationIntent) -> MutationSuccessFeedback {
+    match intent {
+        MutationIntent::SetUnread { unread: true, .. } => MutationSuccessFeedback {
+            status: "Message marked unread",
+            snackbar: "Message marked unread",
+            close_reader: false,
+            close_delete_dialog: false,
+        },
+        MutationIntent::SetUnread { unread: false, .. } => MutationSuccessFeedback {
+            status: "Message marked read",
+            snackbar: "Message marked read",
+            close_reader: false,
+            close_delete_dialog: false,
+        },
+        MutationIntent::SetStarred { starred: true, .. } => MutationSuccessFeedback {
+            status: "Star added",
+            snackbar: "Star added",
+            close_reader: false,
+            close_delete_dialog: false,
+        },
+        MutationIntent::SetStarred { starred: false, .. } => MutationSuccessFeedback {
+            status: "Star removed",
+            snackbar: "Star removed",
+            close_reader: false,
+            close_delete_dialog: false,
+        },
+        MutationIntent::Archive { .. } => MutationSuccessFeedback {
+            status: "Message archived",
+            snackbar: "Message archived",
+            close_reader: false,
+            close_delete_dialog: false,
+        },
+        MutationIntent::MoveToTrash { .. } => MutationSuccessFeedback {
+            status: "Message moved to Trash",
+            snackbar: "Message moved to Trash",
+            close_reader: true,
+            close_delete_dialog: true,
+        },
+        MutationIntent::DeletePermanently { .. } => MutationSuccessFeedback {
+            status: "Message permanently deleted",
+            snackbar: "Message permanently deleted",
+            close_reader: true,
+            close_delete_dialog: true,
+        },
+        MutationIntent::UndoTrash { .. } => MutationSuccessFeedback {
+            status: "Message restored",
+            snackbar: "Message restored",
+            close_reader: false,
+            close_delete_dialog: false,
+        },
+    }
+}
+
+fn unix_time_ms(now: SystemTime) -> Option<i64> {
+    let elapsed = now.duration_since(UNIX_EPOCH).ok()?;
+    i64::try_from(elapsed.as_millis()).ok()
+}
+
+fn undo_remaining(expires_at_ms: i64, now: SystemTime) -> Option<Duration> {
+    let deadline =
+        UNIX_EPOCH.checked_add(Duration::from_millis(u64::try_from(expires_at_ms).ok()?))?;
+    let remaining = deadline.duration_since(now).ok()?;
+    (!remaining.is_zero()).then_some(remaining)
 }
 
 #[derive(Clone, Copy)]
@@ -786,6 +1175,20 @@ impl UserError {
         Self {
             title: "Mailbox view changed",
             detail: "The requested page was replaced by a newer mailbox view. Continue from the current page.",
+        }
+    }
+
+    const fn mutation_result() -> Self {
+        Self {
+            title: "Message change could not be verified",
+            detail: "Nivalis will refresh the mailbox before another message change is allowed.",
+        }
+    }
+
+    const fn system_clock() -> Self {
+        Self {
+            title: "Undo is unavailable",
+            detail: "Nivalis could not read a valid system time. Check the clock and try again.",
         }
     }
 }
@@ -892,9 +1295,33 @@ fn message_rejection(error: MessageLoadError) -> UserError {
     }
 }
 
+fn mutation_rejection(error: MutationSubmitError) -> UserError {
+    match error {
+        MutationSubmitError::Busy => submit_error(SubmitError::Busy),
+        MutationSubmitError::Unavailable => submit_error(SubmitError::Closed),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn summary(id: i64, unread: bool, starred: bool) -> MailSummary {
+        MailSummary {
+            id: EntityKey::new(id).unwrap().encode(),
+            account_id: "1".into(),
+            account_label: "Account".into(),
+            sender: "Sender".into(),
+            initials: "S".into(),
+            subject: "Subject".into(),
+            preview: "Preview".into(),
+            time: "Now".into(),
+            unread,
+            starred,
+            has_attachment: false,
+            avatar_color: slint::Color::from_rgb_u8(1, 2, 3),
+        }
+    }
 
     #[test]
     fn database_failures_have_actionable_stable_messages() {
@@ -912,6 +1339,116 @@ mod tests {
             assert!(!error.title.is_empty());
             assert!(!error.detail.is_empty());
             assert!(!error.detail.contains("internal details"));
+        }
+    }
+
+    #[test]
+    fn visible_summary_drives_desired_absolute_state() {
+        let model = VecModel::from(vec![summary(1, false, false), summary(2, true, true)]);
+
+        let first = visible_summary_state(&model, EntityKey::new(1).unwrap()).unwrap();
+        let second = visible_summary_state(&model, EntityKey::new(2).unwrap()).unwrap();
+        assert_eq!(desired_star_action(first), MailAction::SetStarred(true));
+        assert_eq!(desired_star_action(second), MailAction::SetStarred(false));
+        assert_eq!(
+            desired_unread_action(first),
+            Some(MailAction::SetUnread(true))
+        );
+        assert_eq!(desired_unread_action(second), None);
+        assert_eq!(
+            visible_summary_state(&model, EntityKey::new(3).unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn undo_timer_uses_the_absolute_receipt_deadline() {
+        let now = UNIX_EPOCH + Duration::from_millis(10_250);
+        assert_eq!(
+            undo_remaining(12_000, now),
+            Some(Duration::from_millis(1_750))
+        );
+        assert_eq!(undo_remaining(10_250, now), None);
+        assert_eq!(undo_remaining(10_249, now), None);
+
+        let fractional_now = now + Duration::from_micros(500);
+        assert_eq!(
+            undo_remaining(12_000, fractional_now),
+            Some(Duration::from_micros(1_749_500))
+        );
+    }
+
+    #[test]
+    fn success_feedback_is_stable_and_only_removals_close_the_reader() {
+        let id = crate::store::sqlite::MessageId::new(1).unwrap();
+        let cases = [
+            (
+                MutationIntent::SetUnread { id, unread: true },
+                "Message marked unread",
+                false,
+                false,
+            ),
+            (
+                MutationIntent::SetStarred { id, starred: false },
+                "Star removed",
+                false,
+                false,
+            ),
+            (
+                MutationIntent::Archive { id },
+                "Message archived",
+                false,
+                false,
+            ),
+            (
+                MutationIntent::MoveToTrash { id },
+                "Message moved to Trash",
+                true,
+                true,
+            ),
+            (
+                MutationIntent::DeletePermanently { id },
+                "Message permanently deleted",
+                true,
+                true,
+            ),
+            (
+                MutationIntent::UndoTrash {
+                    id,
+                    token: crate::store::sqlite::undo_token_for_test(7),
+                },
+                "Message restored",
+                false,
+                false,
+            ),
+        ];
+
+        for (intent, message, close_reader, close_delete_dialog) in cases {
+            let feedback = mutation_success_feedback(intent);
+            assert_eq!(feedback.status, message);
+            assert_eq!(feedback.snackbar, message);
+            assert_eq!(feedback.close_reader, close_reader);
+            assert_eq!(feedback.close_delete_dialog, close_delete_dialog);
+        }
+    }
+
+    #[test]
+    fn mutation_errors_do_not_disclose_database_messages() {
+        let failure = DbFailure {
+            kind: FailureKind::Conflict,
+            message: "secret sqlite statement".into(),
+        };
+        for error in [
+            database_error(&failure),
+            UserError::mutation_result(),
+            mutation_rejection(MutationSubmitError::Busy),
+            mutation_rejection(MutationSubmitError::Unavailable),
+        ] {
+            assert!(!error.title.is_empty());
+            assert!(!error.detail.is_empty());
+            assert!(!error.title.contains("secret"));
+            assert!(!error.detail.contains("secret"));
+            assert!(!error.detail.contains("sqlite"));
         }
     }
 }

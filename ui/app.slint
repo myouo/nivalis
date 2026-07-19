@@ -34,6 +34,8 @@ export component AppWindow inherits Window {
     in property <MailDetail> selected-mail;
     in property <bool> has-accounts: true;
     in property <bool> mail-actions-enabled: true;
+    in property <bool> mutation-loading: false;
+    in property <bool> undo-loading: false;
     in property <string> selected-id: "";
     in property <int> message-total: 0;
     in property <int> inbox-count: 0;
@@ -118,7 +120,9 @@ export component AppWindow inherits Window {
 
         key-pressed(event) => {
             if (event.text == Key.Escape) {
-                if (root.delete-dialog-open) { root.delete-dialog-open = false; }
+                if (root.delete-dialog-open) {
+                    if (!root.mutation-loading) { root.delete-dialog-open = false; }
+                }
                 else if (root.message-menu-open) { root.message-menu-open = false; }
                 else if (root.account-menu-open) { root.account-menu-open = false; }
                 else if (root.settings-open) { root.settings-open = false; }
@@ -232,6 +236,7 @@ export component AppWindow inherits Window {
                                 mailbox-error-detail: root.mailbox-error-detail;
                                 total-known: root.total-known;
                                 mail-actions-enabled: root.mail-actions-enabled;
+                                mutation-loading: root.mutation-loading;
                                 mails: root.mails;
                                 selected-id: root.selected-id;
                                 message-total: root.message-total;
@@ -253,6 +258,7 @@ export component AppWindow inherits Window {
                                 compact-layout: root.compact-layout;
                                 window-width: root.width;
                                 mail-actions-enabled: root.mail-actions-enabled;
+                                mutation-loading: root.mutation-loading;
                                 detail-loading: root.detail-loading;
                                 detail-error: root.detail-error;
                                 detail-error-title: root.detail-error-title;
@@ -323,6 +329,7 @@ export component AppWindow inherits Window {
         height: parent.height;
         compact-layout: root.compact-layout;
         mail-actions-enabled: root.mail-actions-enabled;
+        mutation-loading: root.mutation-loading;
         selected-mail: root.selected-mail;
         selected-id: root.selected-id;
         active-folder: root.active-folder;
@@ -338,8 +345,8 @@ export component AppWindow inherits Window {
         active-folder: root.active-folder;
         selected-id: root.selected-id;
         mail-actions-enabled: root.mail-actions-enabled;
+        mutation-loading: root.mutation-loading;
         delete-dialog-open <=> root.delete-dialog-open;
-        detail-open <=> root.detail-open;
         delete-mail(id) => { root.delete-mail(id); }
     }
 
@@ -348,7 +355,7 @@ export component AppWindow inherits Window {
         window-height: root.height;
         snackbar-text: root.snackbar-text;
         snackbar-can-undo: root.snackbar-can-undo;
-        mail-actions-enabled: root.mail-actions-enabled;
+        undo-loading: root.undo-loading;
         snackbar-visible <=> root.snackbar-visible;
         undo-delete => { root.undo-delete(); }
     }

@@ -10,6 +10,7 @@ export component MailRow inherits Rectangle {
     in property <bool> selected: false;
     in property <bool> show-account: false;
     in property <bool> mail-actions-enabled: true;
+    in property <bool> mutation-loading: false;
     in property <int> item-index: 0;
     in property <int> item-count: 0;
     callback opened(string);
@@ -118,6 +119,7 @@ export component MailRow inherits Rectangle {
             label: !root.mail-actions-enabled ? "Star changes are unavailable while mail is read-only" : root.mail.starred ? "Remove star" : "Add star";
             selected: root.mail.starred;
             enabled: root.mail-actions-enabled;
+            busy: root.mutation-loading;
             compact-visual: true;
             clicked => { root.starred(root.mail.id); }
         }
@@ -146,6 +148,7 @@ export component MailboxPane inherits Rectangle {
     in property <string> mailbox-error-detail: "";
     in property <bool> total-known: true;
     in property <bool> mail-actions-enabled: true;
+    in property <bool> mutation-loading: false;
     in property <[MailSummary]> mails;
     in property <string> selected-id: "";
     in property <int> message-total: 0;
@@ -317,6 +320,7 @@ export component MailboxPane inherits Rectangle {
                 selected: root.selected-id == mail.id;
                 show-account: root.active-account-id == "";
                 mail-actions-enabled: root.mail-actions-enabled;
+                mutation-loading: root.mutation-loading;
                 item-index: i;
                 item-count: root.mails.length;
                 opened(id) => { root.detail-open = true; root.select-mail(id); }

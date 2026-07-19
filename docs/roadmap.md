@@ -29,7 +29,7 @@ Status: complete.
 
 Status: in progress.
 
-Checkpoint: SQLite accounts, bounded bidirectional keyset pages, persistent counters, and selected details now drive the production UI. The `0d3453c` release proves the 90MiB hard idle gate, repeated normal runs below the preferred 50MiB target, and less-than-2x growth across two exact-count 10,000-transition pagination soaks. The retained historical outlier still prevents an unconditional 50MiB guarantee. Controller writes/undo, FTS/interruption, controller integration tests, and fresh coverage of those newly activated paths remain before M1 can close.
+Checkpoint: SQLite accounts, bounded bidirectional keyset pages, persistent counters, selected details, and ordered local writes/undo now drive the production UI. The `0d3453c` release proves the 90MiB hard idle gate, repeated normal runs below the preferred 50MiB target, and less-than-2x growth across two exact-count 10,000-transition pagination soaks. The retained historical outlier still prevents an unconditional 50MiB guarantee. FTS/interruption, controller integration tests, and fresh release-memory coverage of the newly activated write/search paths remain before M1 can close.
 
 Acceptance criteria:
 
