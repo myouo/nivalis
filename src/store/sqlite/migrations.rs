@@ -2,7 +2,7 @@ use std::{error::Error, fmt};
 
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(crate) const LATEST_SCHEMA_VERSION: u32 = 9;
+pub(crate) const LATEST_SCHEMA_VERSION: u32 = 10;
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -46,6 +46,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 9,
         sql: include_str!("../../../migrations/0009_message_search.sql"),
+    },
+    Migration {
+        version: 10,
+        sql: include_str!("../../../migrations/0010_content_file_lifecycle.sql"),
     },
 ];
 
@@ -188,6 +192,8 @@ mod tests {
         "accounts",
         "attachments",
         "file_gc",
+        "file_staging",
+        "file_staging_usage",
         "folders",
         "imap_message_locations",
         "message_content",
@@ -270,6 +276,38 @@ mod tests {
                 params![id, account_id, remote_key],
             )
             .expect("insert message");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_staged_file(
+        connection: &Connection,
+        batch_token: &str,
+        file_key: &str,
+        message_id: i64,
+        account_id: i64,
+        content_generation: i64,
+        file_kind: &str,
+        part_ordinal: Option<i64>,
+        created_at_ms: i64,
+        expires_at_ms: i64,
+    ) -> rusqlite::Result<usize> {
+        connection.execute(
+            "INSERT INTO file_staging
+             (batch_token, file_key, message_id, account_id, content_generation,
+              file_kind, part_ordinal, created_at_ms, expires_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                batch_token,
+                file_key,
+                message_id,
+                account_id,
+                content_generation,
+                file_kind,
+                part_ordinal,
+                created_at_ms,
+                expires_at_ms
+            ],
+        )
     }
 
     fn mailbox_stats(connection: &Connection, account_id: i64) -> [i64; 7] {
@@ -389,6 +427,11 @@ mod tests {
                 "idx_folders_account".to_owned(),
                 "idx_folders_system_role".to_owned(),
                 "idx_file_gc_queued".to_owned(),
+                "idx_file_staging_batch".to_owned(),
+                "idx_file_staging_batch_attachment".to_owned(),
+                "idx_file_staging_batch_body".to_owned(),
+                "idx_file_staging_expiry".to_owned(),
+                "idx_file_staging_message".to_owned(),
                 "idx_attachments_file".to_owned(),
                 "idx_message_folders_folder".to_owned(),
                 "idx_message_content_body_file".to_owned(),
@@ -574,7 +617,7 @@ mod tests {
             )
             .expect("seed a pre-FTS message");
 
-        migrate(&mut connection).expect("upgrade v8 schema to v9");
+        migrate_with(&mut connection, &MIGRATIONS[..9], 9).expect("upgrade v8 schema to v9");
 
         let matching_rows = |query: &str| {
             connection
@@ -612,6 +655,393 @@ mod tests {
                 [],
             )
             .expect("verify FTS index against external message content");
+    }
+
+    #[test]
+    fn v10_upgrade_backfills_content_generation_and_is_idempotent() {
+        let mut connection = memory_connection();
+        enable_foreign_keys(&connection).expect("enable foreign keys");
+        enable_recursive_triggers(&connection).expect("enable recursive triggers");
+        migrate_with(&mut connection, &MIGRATIONS[..9], 9).expect("create v9 schema");
+        insert_account(&connection, 1, "user@example.test");
+        insert_message(&connection, 100, 1, "message-1");
+
+        migrate(&mut connection).expect("upgrade v9 schema to v10");
+
+        let generation: i64 = connection
+            .query_row(
+                "SELECT content_generation FROM messages WHERE id = 100",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read backfilled content generation");
+        assert_eq!(generation, 0);
+        let usage: i64 = connection
+            .query_row(
+                "SELECT file_count FROM file_staging_usage WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read initial staging usage");
+        assert_eq!(usage, 0);
+        assert_eq!(schema_version(&connection), 10);
+
+        migrate(&mut connection).expect("run v10 migration again");
+        assert_eq!(schema_version(&connection), 10);
+        let usage_rows: i64 = connection
+            .query_row("SELECT count(*) FROM file_staging_usage", [], |row| {
+                row.get(0)
+            })
+            .expect("count staging usage rows");
+        assert_eq!(usage_rows, 1);
+
+        let error = connection
+            .execute(
+                "UPDATE messages SET content_generation = -1 WHERE id = 100",
+                [],
+            )
+            .expect_err("content generation cannot become negative");
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(ErrorCode::ConstraintViolation)
+        );
+    }
+
+    #[test]
+    fn file_staging_enforces_identity_keys_and_survives_message_deletion() {
+        let mut connection = memory_connection();
+        migrate(&mut connection).expect("apply current schema");
+        insert_account(&connection, 1, "user@example.test");
+        insert_message(&connection, 100, 1, "message-1");
+        connection
+            .execute(
+                "UPDATE messages SET content_generation = 1 WHERE id = 100",
+                [],
+            )
+            .expect("start the first content generation");
+
+        let batch = "0123456789abcdef0123456789abcdef";
+        connection
+            .execute(
+                "INSERT INTO file_gc (file_key, queued_at_ms)
+                 VALUES ('body/00000000000000000000000000000001.txt', 0)",
+                [],
+            )
+            .expect("queue the body key before reserving it");
+        insert_staged_file(
+            &connection,
+            batch,
+            "body/00000000000000000000000000000001.txt",
+            100,
+            1,
+            1,
+            "body",
+            None,
+            0,
+            1_000,
+        )
+        .expect("stage a valid body file");
+        let gc_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM file_gc
+                 WHERE file_key = 'body/00000000000000000000000000000001.txt'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check the reserved key left the GC queue");
+        assert_eq!(gc_count, 0);
+        insert_staged_file(
+            &connection,
+            batch,
+            "attachment/00000000000000000000000000000002.bin",
+            100,
+            1,
+            1,
+            "attachment",
+            Some(0),
+            0,
+            1_000,
+        )
+        .expect("stage a valid attachment file");
+
+        for result in [
+            insert_staged_file(
+                &connection,
+                "short",
+                "attachment/00000000000000000000000000000003.bin",
+                100,
+                1,
+                2,
+                "attachment",
+                Some(0),
+                0,
+                1_000,
+            ),
+            insert_staged_file(
+                &connection,
+                "abcdefabcdefabcdefabcdefabcdefab",
+                "body/00000000000000000000000000000004.bin",
+                100,
+                1,
+                2,
+                "body",
+                None,
+                0,
+                1_000,
+            ),
+            insert_staged_file(
+                &connection,
+                "abcdefabcdefabcdefabcdefabcdefab",
+                "attachment/00000000000000000000000000000005.bin",
+                100,
+                1,
+                2,
+                "attachment",
+                Some(32),
+                0,
+                1_000,
+            ),
+            insert_staged_file(
+                &connection,
+                "abcdefabcdefabcdefabcdefabcdefab",
+                "attachment/00000000000000000000000000000009.bin",
+                100,
+                1,
+                2,
+                "attachment",
+                None,
+                0,
+                1_000,
+            ),
+            insert_staged_file(
+                &connection,
+                "abcdefabcdefabcdefabcdefabcdefab",
+                "attachment/00000000000000000000000000000006.bin",
+                100,
+                1,
+                2,
+                "attachment",
+                Some(0),
+                1_000,
+                1_000,
+            ),
+        ] {
+            let error = result.expect_err("reject malformed staging metadata");
+            assert_eq!(
+                error.sqlite_error_code(),
+                Some(ErrorCode::ConstraintViolation)
+            );
+        }
+
+        let mismatch = insert_staged_file(
+            &connection,
+            batch,
+            "attachment/00000000000000000000000000000007.bin",
+            100,
+            2,
+            1,
+            "attachment",
+            Some(1),
+            0,
+            1_000,
+        )
+        .expect_err("a batch cannot change account identity");
+        assert_eq!(
+            mismatch.sqlite_error_code(),
+            Some(ErrorCode::ConstraintViolation)
+        );
+        let competing_batch = insert_staged_file(
+            &connection,
+            "11111111111111111111111111111111",
+            "attachment/00000000000000000000000000000008.bin",
+            100,
+            1,
+            1,
+            "attachment",
+            Some(1),
+            0,
+            1_000,
+        )
+        .expect_err("one message generation has one staging batch");
+        assert_eq!(
+            competing_batch.sqlite_error_code(),
+            Some(ErrorCode::ConstraintViolation)
+        );
+        let immutable = connection
+            .execute(
+                "UPDATE file_staging SET expires_at_ms = 2_000 WHERE batch_token = ?1",
+                [batch],
+            )
+            .expect_err("staging identities and leases are immutable");
+        assert_eq!(
+            immutable.sqlite_error_code(),
+            Some(ErrorCode::ConstraintViolation)
+        );
+
+        connection
+            .execute("DELETE FROM accounts WHERE id = 1", [])
+            .expect("delete account while retaining staging recovery records");
+        let remaining: (i64, i64) = connection
+            .query_row(
+                "SELECT count(*),
+                        (SELECT file_count FROM file_staging_usage WHERE singleton = 1)
+                 FROM file_staging",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read retained staging state");
+        assert_eq!(remaining, (2, 2));
+
+        let usage_delete = connection
+            .execute("DELETE FROM file_staging_usage WHERE singleton = 1", [])
+            .expect_err("the staging usage singleton must remain present");
+        assert_eq!(
+            usage_delete.sqlite_error_code(),
+            Some(ErrorCode::ConstraintViolation)
+        );
+        let usage_rows: i64 = connection
+            .query_row("SELECT count(*) FROM file_staging_usage", [], |row| {
+                row.get(0)
+            })
+            .expect("verify the staging usage singleton remains present");
+        assert_eq!(usage_rows, 1);
+    }
+
+    #[test]
+    fn file_staging_enforces_batch_and_global_limits() {
+        let mut connection = memory_connection();
+        migrate(&mut connection).expect("apply current schema");
+
+        let batch = "ffffffffffffffffffffffffffffffff";
+        insert_staged_file(
+            &connection,
+            batch,
+            "body/ffffffffffffffffffffffffffffffff.txt",
+            1,
+            1,
+            1,
+            "body",
+            None,
+            0,
+            1_000,
+        )
+        .expect("stage the one body slot");
+        for ordinal in 0..32_i64 {
+            let token = format!("{:032x}", ordinal + 1);
+            insert_staged_file(
+                &connection,
+                batch,
+                &format!("attachment/{token}.bin"),
+                1,
+                1,
+                1,
+                "attachment",
+                Some(ordinal),
+                0,
+                1_000,
+            )
+            .expect("fill a bounded attachment slot");
+        }
+        let batch_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM file_staging WHERE batch_token = ?1",
+                [batch],
+                |row| row.get(0),
+            )
+            .expect("count a full staging batch");
+        assert_eq!(batch_count, 33);
+        let overflow = insert_staged_file(
+            &connection,
+            batch,
+            "attachment/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bin",
+            1,
+            1,
+            1,
+            "attachment",
+            Some(32),
+            0,
+            1_000,
+        )
+        .expect_err("reject a thirty-third attachment");
+        assert_eq!(
+            overflow.sqlite_error_code(),
+            Some(ErrorCode::ConstraintViolation)
+        );
+
+        connection
+            .execute("DELETE FROM file_staging", [])
+            .expect("clear the batch before testing the global cap");
+        for index in 0..256_u64 {
+            let token = format!("{index:032x}");
+            insert_staged_file(
+                &connection,
+                &token,
+                &format!("body/{token}.txt"),
+                1,
+                1,
+                i64::try_from(index + 1).unwrap(),
+                "body",
+                None,
+                0,
+                1_000,
+            )
+            .expect("fill a global staging slot");
+        }
+        let usage: i64 = connection
+            .query_row(
+                "SELECT file_count FROM file_staging_usage WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read full staging usage");
+        assert_eq!(usage, 256);
+
+        let token = format!("{:032x}", 256_u64);
+        let overflow = insert_staged_file(
+            &connection,
+            &token,
+            &format!("body/{token}.txt"),
+            1,
+            1,
+            257,
+            "body",
+            None,
+            0,
+            1_000,
+        )
+        .expect_err("reject global staging overflow");
+        assert_eq!(
+            overflow.sqlite_error_code(),
+            Some(ErrorCode::ConstraintViolation)
+        );
+
+        connection
+            .execute(
+                "DELETE FROM file_staging WHERE batch_token = ?1",
+                ["00000000000000000000000000000000"],
+            )
+            .expect("release one staging slot");
+        insert_staged_file(
+            &connection,
+            &token,
+            &format!("body/{token}.txt"),
+            1,
+            1,
+            257,
+            "body",
+            None,
+            0,
+            1_000,
+        )
+        .expect("reuse a released global staging slot");
+        let usage: i64 = connection
+            .query_row(
+                "SELECT file_count FROM file_staging_usage WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read reused staging usage");
+        assert_eq!(usage, 256);
     }
 
     #[test]
