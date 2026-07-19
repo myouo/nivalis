@@ -40,6 +40,10 @@ use super::{
         RemoteClaimOutcome, RemoteReportOutcome, RemoteReportSubmission, ReportTransition,
         claim_remote, report_remote,
     },
+    sync::{
+        InboxCursorCommit, InboxCursorOutcome, InboxReceivePage, InboxStageOutcome,
+        commit_inbox_cursor, stage_inbox_page,
+    },
 };
 
 const REQUEST_CAPACITY: usize = 16;
@@ -204,6 +208,14 @@ enum Request {
     ImportContent {
         submission: Box<ContentImportSubmission>,
         reply: oneshot::Sender<ContentImportReply>,
+    },
+    StageInbox {
+        page: Box<InboxReceivePage>,
+        reply: oneshot::Sender<InboxStageReply>,
+    },
+    CommitInboxCursor {
+        commit: Box<InboxCursorCommit>,
+        reply: oneshot::Sender<InboxCursorCommitReply>,
     },
     RunFileGc {
         staging: Arc<ContentStaging>,
@@ -470,6 +482,71 @@ impl DatabaseClient {
         }
     }
 
+    pub(crate) fn try_stage_inbox(
+        &self,
+        page: Box<InboxReceivePage>,
+    ) -> Result<oneshot::Receiver<InboxStageReply>, InboxStageSubmitFailure> {
+        let admission = lock_admission(&self.admission);
+        if !*admission {
+            return Err(InboxStageSubmitFailure {
+                reason: SubmitError::Closed,
+                page,
+            });
+        }
+        let (reply, receiver) = oneshot::channel();
+        match self.requests.try_send(Request::StageInbox { page, reply }) {
+            Ok(()) => Ok(receiver),
+            Err(TrySendError::Full(Request::StageInbox { page, .. })) => {
+                Err(InboxStageSubmitFailure {
+                    reason: SubmitError::Busy,
+                    page,
+                })
+            }
+            Err(TrySendError::Disconnected(Request::StageInbox { page, .. })) => {
+                Err(InboxStageSubmitFailure {
+                    reason: SubmitError::Closed,
+                    page,
+                })
+            }
+            Err(_) => unreachable!("try_stage_inbox only submits inbox stage requests"),
+        }
+    }
+
+    pub(crate) fn try_commit_inbox_cursor(
+        &self,
+        commit: Box<InboxCursorCommit>,
+    ) -> Result<oneshot::Receiver<InboxCursorCommitReply>, InboxCursorCommitSubmitFailure> {
+        let admission = lock_admission(&self.admission);
+        if !*admission {
+            return Err(InboxCursorCommitSubmitFailure {
+                reason: SubmitError::Closed,
+                commit,
+            });
+        }
+        let (reply, receiver) = oneshot::channel();
+        match self
+            .requests
+            .try_send(Request::CommitInboxCursor { commit, reply })
+        {
+            Ok(()) => Ok(receiver),
+            Err(TrySendError::Full(Request::CommitInboxCursor { commit, .. })) => {
+                Err(InboxCursorCommitSubmitFailure {
+                    reason: SubmitError::Busy,
+                    commit,
+                })
+            }
+            Err(TrySendError::Disconnected(Request::CommitInboxCursor { commit, .. })) => {
+                Err(InboxCursorCommitSubmitFailure {
+                    reason: SubmitError::Closed,
+                    commit,
+                })
+            }
+            Err(_) => {
+                unreachable!("try_commit_inbox_cursor only submits inbox cursor requests")
+            }
+        }
+    }
+
     pub(crate) fn try_run_file_gc(
         &self,
         staging: &Arc<ContentStaging>,
@@ -622,6 +699,91 @@ impl ContentImportExecutionFailure {
 
     pub(crate) fn into_parts(self) -> (DbFailure, Box<ContentImportSubmission>) {
         (self.failure, self.submission)
+    }
+}
+
+pub(crate) type InboxStageReply = Result<InboxStageOutcome, InboxStageExecutionFailure>;
+
+#[derive(Debug)]
+pub(crate) struct InboxStageSubmitFailure {
+    reason: SubmitError,
+    page: Box<InboxReceivePage>,
+}
+
+impl InboxStageSubmitFailure {
+    pub(crate) fn reason(&self) -> SubmitError {
+        self.reason
+    }
+
+    pub(crate) fn page(&self) -> &InboxReceivePage {
+        &self.page
+    }
+
+    pub(crate) fn into_parts(self) -> (SubmitError, Box<InboxReceivePage>) {
+        (self.reason, self.page)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct InboxStageExecutionFailure {
+    failure: DbFailure,
+    page: Box<InboxReceivePage>,
+}
+
+impl InboxStageExecutionFailure {
+    pub(crate) fn failure(&self) -> &DbFailure {
+        &self.failure
+    }
+
+    pub(crate) fn page(&self) -> &InboxReceivePage {
+        &self.page
+    }
+
+    pub(crate) fn into_parts(self) -> (DbFailure, Box<InboxReceivePage>) {
+        (self.failure, self.page)
+    }
+}
+
+pub(crate) type InboxCursorCommitReply =
+    Result<InboxCursorOutcome, InboxCursorCommitExecutionFailure>;
+
+#[derive(Debug)]
+pub(crate) struct InboxCursorCommitSubmitFailure {
+    reason: SubmitError,
+    commit: Box<InboxCursorCommit>,
+}
+
+impl InboxCursorCommitSubmitFailure {
+    pub(crate) fn reason(&self) -> SubmitError {
+        self.reason
+    }
+
+    pub(crate) fn commit(&self) -> &InboxCursorCommit {
+        &self.commit
+    }
+
+    pub(crate) fn into_parts(self) -> (SubmitError, Box<InboxCursorCommit>) {
+        (self.reason, self.commit)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct InboxCursorCommitExecutionFailure {
+    failure: DbFailure,
+    commit: Box<InboxCursorCommit>,
+}
+
+impl InboxCursorCommitExecutionFailure {
+    pub(crate) fn failure(&self) -> &DbFailure {
+        &self.failure
+    }
+
+    pub(crate) fn commit(&self) -> &InboxCursorCommit {
+        &self.commit
+    }
+
+    pub(crate) fn into_parts(self) -> (DbFailure, Box<InboxCursorCommit>) {
+        (self.failure, self.commit)
     }
 }
 
@@ -962,6 +1124,17 @@ fn run_actor(
                 let _ = reply.send(result);
                 continue;
             }
+            Request::StageInbox { page, reply } => {
+                let result = execute_inbox_stage(&mut connection, page, &control.write_gate);
+                let _ = reply.send(result);
+                continue;
+            }
+            Request::CommitInboxCursor { commit, reply } => {
+                let result =
+                    execute_inbox_cursor_commit(&mut connection, commit, &control.write_gate);
+                let _ = reply.send(result);
+                continue;
+            }
             Request::RunFileGc {
                 staging,
                 limit,
@@ -1208,6 +1381,26 @@ fn execute_content_import(
     }
 }
 
+fn execute_inbox_stage(
+    connection: &mut Connection,
+    page: Box<InboxReceivePage>,
+    write_gate: &Mutex<()>,
+) -> InboxStageReply {
+    let _write_guard = lock_write_gate(write_gate);
+    stage_inbox_page(connection, &page)
+        .map_err(|failure| InboxStageExecutionFailure { failure, page })
+}
+
+fn execute_inbox_cursor_commit(
+    connection: &mut Connection,
+    commit: Box<InboxCursorCommit>,
+    write_gate: &Mutex<()>,
+) -> InboxCursorCommitReply {
+    let _write_guard = lock_write_gate(write_gate);
+    commit_inbox_cursor(connection, &commit)
+        .map_err(|failure| InboxCursorCommitExecutionFailure { failure, commit })
+}
+
 fn execute_file_gc(
     connection: &mut Connection,
     staging: &ContentStaging,
@@ -1244,6 +1437,24 @@ fn drain_accepted_writes(
             }
             Request::ImportContent { submission, reply } => {
                 let result = execute_content_import(connection, submission, write_gate);
+                if first_failure.is_none()
+                    && let Err(failure) = &result
+                {
+                    first_failure = Some(failure.failure.clone());
+                }
+                let _ = reply.send(result);
+            }
+            Request::StageInbox { page, reply } => {
+                let result = execute_inbox_stage(connection, page, write_gate);
+                if first_failure.is_none()
+                    && let Err(failure) = &result
+                {
+                    first_failure = Some(failure.failure.clone());
+                }
+                let _ = reply.send(result);
+            }
+            Request::CommitInboxCursor { commit, reply } => {
+                let result = execute_inbox_cursor_commit(connection, commit, write_gate);
                 if first_failure.is_none()
                     && let Err(failure) = &result
                 {
@@ -1594,9 +1805,15 @@ mod tests {
         content::{ContentLimits, prepare_content},
         store::sqlite::{
             account::{AccountLifecycle, AccountPurgeOutcome},
-            domain::{AccountScope, FailureKind, FolderScope, MessageMutation, PageBoundary},
+            domain::{
+                AccountId, AccountScope, FailureKind, FolderScope, MessageMutation, PageBoundary,
+            },
             migrations::LATEST_SCHEMA_VERSION,
             remote::{RemoteCheckpoint, RemoteImapSource, RemoteReport, RemoteWorkMode},
+            sync::{
+                InboxCursorCommit, InboxCursorOutcome, InboxEnvelope, InboxFlags, InboxReceivePage,
+                InboxStageOutcome,
+            },
         },
     };
 
@@ -1663,6 +1880,59 @@ mod tests {
                     .unwrap()
                     .unwrap()
             })
+    }
+
+    fn actor_inbox_page(
+        account_id: AccountId,
+        generation: super::super::account::AccountGeneration,
+    ) -> InboxReceivePage {
+        InboxReceivePage::new(
+            account_id,
+            generation,
+            None,
+            31,
+            Some(7),
+            vec![
+                InboxEnvelope::new(
+                    7,
+                    b"Ada",
+                    b"ada@example.test",
+                    b"Actor inbox",
+                    b"Bounded preview",
+                    1_700_000_000_000,
+                    InboxFlags::new(false, true),
+                    false,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn create_actor_account(
+        client: &DatabaseClient,
+    ) -> super::super::account::AccountConfiguration {
+        let input = super::super::account::AccountConfigInput::new(
+            "89abcdef0123456789abcdef01234567",
+            "Inbox",
+            "inbox@example.test",
+            super::super::account::AccountAuthKind::AppPassword,
+            "inbox@example.test",
+            "imap.example.test",
+            993,
+            0x335244,
+        )
+        .unwrap();
+        let saved = receive_oneshot(
+            client
+                .try_write_account(Box::new(AccountWrite::Create(input)))
+                .unwrap(),
+        )
+        .unwrap();
+        let AccountWriteOutcome::Saved(configuration) = saved else {
+            panic!("expected saved actor test account");
+        };
+        configuration
     }
 
     fn claimed_remote_intent(client: &DatabaseClient) -> Box<super::super::remote::RemoteClaim> {
@@ -2300,6 +2570,122 @@ mod tests {
         assert_eq!(missing.kind, FailureKind::NotFound);
         assert!(replies.is_empty());
         runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn inbox_stage_and_cursor_commit_use_oneshot_replies() {
+        let (client, replies, runtime, _info) =
+            spawn_target(Target::Memory, REQUEST_CAPACITY, REPLY_CAPACITY).unwrap();
+        let account = create_actor_account(&client);
+        let staged = receive_oneshot(
+            client
+                .try_stage_inbox(Box::new(actor_inbox_page(
+                    account.account_id,
+                    account.generation,
+                )))
+                .unwrap(),
+        )
+        .unwrap();
+        let ticket = match staged {
+            InboxStageOutcome::Staged {
+                messages,
+                tombstoned: 0,
+                ticket,
+            } => {
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].uid, 7);
+                assert_eq!(ticket.scanned_through_uid(), Some(7));
+                ticket
+            }
+            outcome => panic!("unexpected inbox stage outcome: {outcome:?}"),
+        };
+
+        let commit = InboxCursorCommit::new(ticket, 1_700_000_001_000).unwrap();
+        let outcome =
+            receive_oneshot(client.try_commit_inbox_cursor(Box::new(commit)).unwrap()).unwrap();
+        assert_eq!(outcome, InboxCursorOutcome::ContentPending { missing: 1 });
+        assert!(replies.is_empty());
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn inbox_submissions_return_ownership_when_busy_or_closed() {
+        let (sender, _receiver) = bounded(1);
+        let connection = Connection::open_in_memory().unwrap();
+        let client = DatabaseClient {
+            requests: sender,
+            admission: Arc::new(Mutex::new(true)),
+            interrupt: Arc::new(connection.get_interrupt_handle()),
+            mailbox_control: Arc::new(MailboxQueryControl::default()),
+            next_mailbox_gate: Arc::new(Mutex::new(None)),
+            next_mailbox_long: Arc::new(AtomicBool::new(false)),
+            write_gate: Arc::new(Mutex::new(())),
+        };
+        client
+            .try_query_mailbox(RequestId::new(1).unwrap(), Generation::new(0), empty_spec())
+            .unwrap();
+
+        let busy = Box::new(actor_inbox_page(
+            AccountId::new(1).unwrap(),
+            super::super::account::AccountGeneration::new(1).unwrap(),
+        ));
+        let busy_pointer: *const InboxReceivePage = busy.as_ref();
+        let failure = client.try_stage_inbox(busy).unwrap_err();
+        assert_eq!(failure.reason(), SubmitError::Busy);
+        assert!(std::ptr::eq(busy_pointer, failure.page()));
+        assert!(std::ptr::eq(busy_pointer, failure.into_parts().1.as_ref()));
+
+        close_admission(&client.admission);
+        let closed = Box::new(actor_inbox_page(
+            AccountId::new(1).unwrap(),
+            super::super::account::AccountGeneration::new(1).unwrap(),
+        ));
+        let closed_pointer: *const InboxReceivePage = closed.as_ref();
+        let failure = client.try_stage_inbox(closed).unwrap_err();
+        assert_eq!(failure.reason(), SubmitError::Closed);
+        assert!(std::ptr::eq(closed_pointer, failure.page()));
+        assert!(std::ptr::eq(
+            closed_pointer,
+            failure.into_parts().1.as_ref()
+        ));
+    }
+
+    #[test]
+    fn shutdown_drains_an_accepted_inbox_stage() {
+        let (client, _replies, runtime, _info) =
+            spawn_target(Target::Memory, REQUEST_CAPACITY, REPLY_CAPACITY).unwrap();
+        let account = create_actor_account(&client);
+        let receiver = client
+            .try_stage_inbox(Box::new(actor_inbox_page(
+                account.account_id,
+                account.generation,
+            )))
+            .unwrap();
+
+        runtime.shutdown().unwrap();
+
+        let ticket = match receive_oneshot(receiver).unwrap() {
+            InboxStageOutcome::Staged { ticket, .. } => {
+                assert_eq!(ticket.scanned_through_uid(), Some(7));
+                ticket
+            }
+            outcome => panic!("unexpected drained inbox outcome: {outcome:?}"),
+        };
+        let closed_commit = Box::new(InboxCursorCommit::new(ticket, 1_700_000_001_000).unwrap());
+        let commit_pointer: *const InboxCursorCommit = closed_commit.as_ref();
+        let commit_failure = client.try_commit_inbox_cursor(closed_commit).unwrap_err();
+        assert_eq!(commit_failure.reason(), SubmitError::Closed);
+        assert!(std::ptr::eq(commit_pointer, commit_failure.commit()));
+        assert!(std::ptr::eq(
+            commit_pointer,
+            commit_failure.into_parts().1.as_ref()
+        ));
+
+        let closed = Box::new(actor_inbox_page(account.account_id, account.generation));
+        assert_eq!(
+            client.try_stage_inbox(closed).unwrap_err().reason(),
+            SubmitError::Closed
+        );
     }
 
     #[test]

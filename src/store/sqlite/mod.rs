@@ -9,6 +9,7 @@ mod mutation;
 mod query;
 pub(crate) mod remote;
 mod stats;
+mod sync;
 
 #[cfg(feature = "bench-harness")]
 pub(crate) use query::{MailboxQueryCounts, mailbox_query_counts};
@@ -33,6 +34,11 @@ pub(crate) use actor::{
     SubmitError as DatabaseSubmitError,
 };
 #[allow(unused_imports)]
+pub(crate) use actor::{
+    InboxCursorCommitExecutionFailure, InboxCursorCommitReply, InboxCursorCommitSubmitFailure,
+    InboxStageExecutionFailure, InboxStageReply, InboxStageSubmitFailure,
+};
+#[allow(unused_imports)]
 pub(crate) use domain::{
     AccountDirectory, AccountSummaryDto, AccountUnreadDto, MailSummaryDto, MailboxStatsDto,
     PageBoundary, PageCursor,
@@ -45,6 +51,11 @@ pub(crate) use domain::{
 };
 #[allow(unused_imports)]
 pub(crate) use file_gc::FileGcOutcome;
+#[allow(unused_imports)]
+pub(crate) use sync::{
+    InboxCursorCommit, InboxCursorOutcome, InboxCursorTicket, InboxEnvelope, InboxFlags,
+    InboxReceivePage, InboxStageOutcome, InboxValidationError, StagedInboxMessage,
+};
 
 #[cfg(test)]
 pub(crate) use domain::{MessageState, UndoReceipt};
