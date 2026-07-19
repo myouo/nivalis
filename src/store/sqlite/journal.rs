@@ -802,11 +802,14 @@ fn ensure_global_child_capacity(
     }
 }
 
-fn ensure_payload_budget(transaction: &Transaction<'_>, intent_id: i64) -> Result<(), DbFailure> {
+pub(super) fn ensure_payload_budget(
+    transaction: &Transaction<'_>,
+    intent_id: i64,
+) -> Result<(), DbFailure> {
     let bytes: i64 = transaction
         .query_row(
             "SELECT
-                 256 + length(CAST(target_key AS BLOB))
+                 256 + length(CAST(i.target_key AS BLOB))
                  + coalesce((
                      SELECT sum(32 + length(CAST(folder_key AS BLOB)))
                      FROM remote_change_intent_folders WHERE intent_id = ?1
@@ -820,7 +823,10 @@ fn ensure_payload_budget(transaction: &Transaction<'_>, intent_id: i64) -> Resul
                      )
                      FROM remote_change_intent_imap_sources WHERE intent_id = ?1
                    ), 0)
-             FROM remote_change_intents WHERE id = ?1",
+                 + CASE WHEN a.provider COLLATE NOCASE = 'jmap' THEN 512 ELSE 0 END
+             FROM remote_change_intents AS i
+             JOIN accounts AS a ON a.id = i.account_id
+             WHERE i.id = ?1",
             [intent_id],
             |row| row.get(0),
         )

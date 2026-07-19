@@ -10,7 +10,7 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select_biased};
 use rusqlite::{Connection, InterruptHandle, OpenFlags, limits::Limit};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use super::{
     domain::{
@@ -19,6 +19,7 @@ use super::{
     migrations::migrate,
     mutation::mutate_message,
     query::{open_message, query_mailbox},
+    remote::{RemoteClaimOutcome, claim_remote},
 };
 
 const REQUEST_CAPACITY: usize = 16;
@@ -41,6 +42,10 @@ enum Request {
         request_id: RequestId,
         generation: Generation,
         mutation: MessageMutation,
+    },
+    ClaimRemote {
+        account_id: i64,
+        reply: oneshot::Sender<Result<RemoteClaimOutcome, DbFailure>>,
     },
     #[cfg(test)]
     RunLongQuery { started: Sender<()> },
@@ -120,6 +125,15 @@ impl DatabaseClient {
     pub(crate) fn interrupt_queries(&self) {
         let _write_guard = lock_write_gate(&self.write_gate);
         self.interrupt.interrupt();
+    }
+
+    pub(crate) fn try_claim_remote(
+        &self,
+        account_id: i64,
+    ) -> Result<oneshot::Receiver<Result<RemoteClaimOutcome, DbFailure>>, SubmitError> {
+        let (reply, receiver) = oneshot::channel();
+        self.try_submit(Request::ClaimRemote { account_id, reply })?;
+        Ok(receiver)
     }
 
     fn try_submit(&self, request: Request) -> Result<(), SubmitError> {
@@ -352,6 +366,13 @@ fn run_actor(
                 generation,
                 result: execute_mutation(&mut connection, mutation, &write_gate),
             }),
+            Request::ClaimRemote { account_id, reply } => {
+                if !reply.is_closed() {
+                    let result = execute_remote_claim(&mut connection, account_id, &write_gate);
+                    let _ = reply.send(result);
+                }
+                continue;
+            }
             #[cfg(test)]
             Request::RunLongQuery { started } => {
                 let _ = started.send(());
@@ -388,6 +409,15 @@ fn execute_mutation(
 ) -> Result<super::domain::MutationOutcome, DbFailure> {
     let _write_guard = lock_write_gate(write_gate);
     mutate_message(connection, mutation, current_time_ms()?)
+}
+
+fn execute_remote_claim(
+    connection: &mut Connection,
+    account_id: i64,
+    write_gate: &Mutex<()>,
+) -> Result<RemoteClaimOutcome, DbFailure> {
+    let _write_guard = lock_write_gate(write_gate);
+    claim_remote(connection, account_id, current_time_ms()?)
 }
 
 fn drain_accepted_mutations(
@@ -721,6 +751,21 @@ mod tests {
             })
     }
 
+    fn receive_remote_claim(
+        receiver: oneshot::Receiver<Result<RemoteClaimOutcome, DbFailure>>,
+    ) -> Result<RemoteClaimOutcome, DbFailure> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(1), receiver)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            })
+    }
+
     fn temporary_database_path() -> PathBuf {
         static NEXT_PATH: AtomicU64 = AtomicU64::new(1);
         std::env::temp_dir().join(format!(
@@ -734,6 +779,43 @@ mod tests {
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(format!("{}-wal", path.display()));
         let _ = fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    fn seed_remote_intent(path: &std::path::Path) -> i64 {
+        remove_database_files(path);
+        let mut connection = Connection::open(path).unwrap();
+        configure(&mut connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO accounts
+                     (id, provider, remote_key, name, address, state, accent_rgb)
+                 VALUES (1, 'imap', 'account', 'Personal',
+                         'user@example.test', 'active', 0)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO remote_change_intents
+                     (account_id, target_key, local_revision,
+                      unread_base, unread_desired, not_before_ms,
+                      created_at_ms, updated_at_ms)
+                 VALUES (1, 'message', 1, 1, 0, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        let intent_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO remote_change_intent_imap_sources
+                     (intent_id, folder_key, uid_validity, uid,
+                      remote_seen, remote_flagged)
+                 VALUES (?1, 'inbox', 1, 1, 0, 0)",
+                [intent_id],
+            )
+            .unwrap();
+        drop(connection);
+        intent_id
     }
 
     #[test]
@@ -781,6 +863,26 @@ mod tests {
     }
 
     #[test]
+    fn remote_claim_round_trip_bypasses_the_ui_reply_channel() {
+        let path = temporary_database_path();
+        let intent_id = seed_remote_intent(&path);
+        let (client, replies, runtime, _info) =
+            spawn_target(Target::File(path.clone()), REQUEST_CAPACITY, REPLY_CAPACITY).unwrap();
+
+        let receiver = client.try_claim_remote(1).unwrap();
+        let claim = receive_remote_claim(receiver).unwrap();
+
+        let RemoteClaimOutcome::Claimed(claim) = claim else {
+            panic!("expected a claimed remote intent");
+        };
+        assert_eq!(claim.lease.intent_id, intent_id);
+        assert_eq!(claim.mode, super::super::remote::RemoteWorkMode::Apply);
+        assert!(replies.is_empty());
+        runtime.shutdown().unwrap();
+        remove_database_files(&path);
+    }
+
+    #[test]
     fn full_request_queue_reports_busy_without_blocking() {
         let (sender, _receiver) = bounded(1);
         let connection = Connection::open_in_memory().unwrap();
@@ -798,6 +900,75 @@ mod tests {
             client.try_query_mailbox(RequestId::new(2).unwrap(), Generation::new(0), empty_spec(),),
             Err(SubmitError::Busy)
         );
+        assert!(matches!(client.try_claim_remote(1), Err(SubmitError::Busy)));
+    }
+
+    #[test]
+    fn shutdown_drops_a_queued_remote_claim_without_leasing() {
+        let path = temporary_database_path();
+        let intent_id = seed_remote_intent(&path);
+        let (client, _replies, runtime, _info) =
+            spawn_target(Target::File(path.clone()), 2, REPLY_CAPACITY).unwrap();
+        let (started_tx, started_rx) = bounded(1);
+        client.try_run_long_query(started_tx).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let receiver = client.try_claim_remote(1).unwrap();
+
+        runtime.shutdown().unwrap();
+
+        let receive_result = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(receiver);
+        assert!(receive_result.is_err());
+        let connection = Connection::open(&path).unwrap();
+        let stored: (String, Option<i64>, Option<i64>, i64) = connection
+            .query_row(
+                "SELECT state, leased_version, lease_expires_at_ms, attempt_count
+                 FROM remote_change_intents WHERE id = ?1",
+                [intent_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, ("ready".into(), None, None, 0));
+        drop(connection);
+        remove_database_files(&path);
+    }
+
+    #[test]
+    fn cancelled_remote_claim_is_skipped_before_leasing() {
+        let path = temporary_database_path();
+        let intent_id = seed_remote_intent(&path);
+        let (client, mut replies, runtime, _info) =
+            spawn_target(Target::File(path.clone()), 3, REPLY_CAPACITY).unwrap();
+        let (started_tx, started_rx) = bounded(1);
+        client.try_run_long_query(started_tx).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let receiver = client.try_claim_remote(1).unwrap();
+        drop(receiver);
+        client
+            .try_query_mailbox(RequestId::new(1).unwrap(), Generation::new(0), empty_spec())
+            .unwrap();
+
+        client.interrupt_queries();
+        let DbReply::Mailbox(reply) = receive_reply(&mut replies) else {
+            panic!("expected mailbox reply after the cancelled claim");
+        };
+        reply.result.unwrap();
+        runtime.shutdown().unwrap();
+
+        let connection = Connection::open(&path).unwrap();
+        let stored: (String, Option<i64>, Option<i64>, i64) = connection
+            .query_row(
+                "SELECT state, leased_version, lease_expires_at_ms, attempt_count
+                 FROM remote_change_intents WHERE id = ?1",
+                [intent_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, ("ready".into(), None, None, 0));
+        drop(connection);
+        remove_database_files(&path);
     }
 
     #[test]

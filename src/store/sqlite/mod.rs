@@ -4,6 +4,7 @@ mod journal;
 mod migrations;
 mod mutation;
 mod query;
+pub(crate) mod remote;
 mod stats;
 
 pub(crate) use actor::{
