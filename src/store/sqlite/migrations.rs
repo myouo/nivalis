@@ -171,6 +171,8 @@ mod tests {
         migrate_with,
     };
 
+    const MEMORY_FIXTURE_SQL: &str = include_str!("../../../scripts/fixtures/memory.sql");
+
     const TABLES: &[&str] = &[
         "account_mailbox_stats",
         "account_object_states",
@@ -354,6 +356,60 @@ mod tests {
                 "idx_remote_intents_global_due".to_owned(),
             ])
         );
+    }
+
+    #[test]
+    fn memory_fixture_matches_the_current_schema_and_resource_bounds() {
+        let mut connection = memory_connection();
+        migrate(&mut connection).expect("apply current schema");
+
+        connection
+            .execute_batch(MEMORY_FIXTURE_SQL)
+            .expect("seed bounded memory fixture");
+
+        let counts = connection
+            .query_row(
+                "SELECT (SELECT count(*) FROM accounts),
+                        (SELECT count(*) FROM folders),
+                        (SELECT count(*) FROM messages),
+                        (SELECT count(*) FROM message_content),
+                        (SELECT count(*) FROM account_mailbox_stats WHERE dirty)",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .expect("read fixture counts");
+        assert_eq!(counts, (64, 64, 51, 51, 0));
+
+        let bounds = connection
+            .query_row(
+                "SELECT max(length(CAST(preview AS BLOB))),
+                        max(length(CAST(reader_excerpt AS BLOB)))
+                 FROM messages
+                 JOIN message_content ON message_content.message_id = messages.id",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .expect("read fixture text bounds");
+        assert_eq!(bounds, (2_048, 65_536));
+
+        let integrity: String = connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .expect("check fixture integrity");
+        assert_eq!(integrity, "ok");
+        let foreign_key_violation = connection
+            .prepare("PRAGMA foreign_key_check")
+            .expect("prepare foreign-key check")
+            .exists([])
+            .expect("run foreign-key check");
+        assert!(!foreign_key_violation);
     }
 
     #[test]
