@@ -1,5 +1,5 @@
 use crate::AppWindow;
-use slint::{ComponentHandle, Timer, TimerMode};
+use slint::{ComponentHandle, Model, Timer, TimerMode};
 use std::cell::Cell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -94,7 +94,13 @@ pub(crate) fn install_memory_stress(ui: &AppWindow) -> Option<Rc<Timer>> {
                     }
                     _ => {
                         ui.set_delete_dialog_open(false);
-                        ui.set_detail_open(false);
+                        let mails = ui.get_mails();
+                        if let Some(mail) = mails.row_data(current % mails.row_count().max(1)) {
+                            ui.set_detail_open(true);
+                            ui.invoke_select_mail(mail.id);
+                        } else {
+                            ui.set_detail_open(false);
+                        }
                     }
                 }
                 step.set(current + 1);
