@@ -1,6 +1,6 @@
 use crate::store::sqlite::{
-    AccountDirectory, AccountSummaryDto, AccountUnreadDto, MailSummaryDto, MailboxPage,
-    MailboxStatsDto, MessageDetail, PageCursor,
+    AccountDirectory, AccountGeneration, AccountId, AccountSummaryDto, AccountUnreadDto,
+    MailSummaryDto, MailboxPage, MailboxStatsDto, MessageDetail, PageCursor,
 };
 use crate::ui_identity::{AccountKey, EntityKey};
 use crate::{AccountItem, MailDetail, MailSummary};
@@ -14,8 +14,15 @@ const MAX_TIMESTAMP_MS: i64 = 253_402_300_799_999;
 
 #[derive(Clone, Debug)]
 struct CatalogAccount {
-    database_id: i64,
+    database_id: AccountId,
+    configuration_generation: AccountGeneration,
     item: AccountItem,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AccountOperationTarget {
+    pub(crate) account_id: AccountId,
+    pub(crate) expected_generation: AccountGeneration,
 }
 
 #[derive(Clone, Debug)]
@@ -39,7 +46,7 @@ impl AccountCatalog {
         for row in directory.rows.into_vec() {
             if accounts
                 .iter()
-                .any(|account: &CatalogAccount| account.database_id == row.id)
+                .any(|account: &CatalogAccount| account.database_id.get() == row.id)
             {
                 return Err(ProjectionError::DuplicateAccountId(row.id));
             }
@@ -53,6 +60,7 @@ impl AccountCatalog {
             has_error |= projected.item.has_error;
             accounts.push(CatalogAccount {
                 database_id: projected.database_id,
+                configuration_generation: projected.configuration_generation,
                 item: projected.item,
             });
         }
@@ -97,8 +105,21 @@ impl AccountCatalog {
             AccountKey::Account(id) => self
                 .accounts
                 .iter()
-                .any(|account| account.database_id == id.get()),
+                .any(|account| account.database_id.get() == id.get()),
         }
+    }
+
+    pub(crate) fn operation_target(&self, key: AccountKey) -> Option<AccountOperationTarget> {
+        let AccountKey::Account(id) = key else {
+            return None;
+        };
+        self.accounts
+            .iter()
+            .find(|account| account.database_id.get() == id.get())
+            .map(|account| AccountOperationTarget {
+                account_id: account.database_id,
+                expected_generation: account.configuration_generation,
+            })
     }
 
     pub(crate) fn active_item(&self, key: AccountKey) -> Option<AccountItem> {
@@ -107,7 +128,7 @@ impl AccountCatalog {
             AccountKey::Account(id) => self
                 .accounts
                 .iter()
-                .find(|account| account.database_id == id.get())
+                .find(|account| account.database_id.get() == id.get())
                 .map(|account| account.item.clone()),
         }
     }
@@ -243,30 +264,40 @@ impl AccountCatalog {
         }
         self.accounts
             .iter()
-            .find(|account| account.database_id == id)
+            .find(|account| account.database_id.get() == id)
             .ok_or(ProjectionError::UnknownAccount(id))
     }
 }
 
 #[derive(Debug)]
 struct ProjectedAccount {
-    database_id: i64,
+    database_id: AccountId,
+    configuration_generation: AccountGeneration,
     raw_unread: u64,
     item: AccountItem,
 }
 
 fn project_account(row: AccountSummaryDto) -> Result<ProjectedAccount, ProjectionError> {
-    let key = EntityKey::new(row.id).ok_or(ProjectionError::InvalidId {
+    let database_id = AccountId::new(row.id).map_err(|_| ProjectionError::InvalidId {
         entity: "account",
         value: row.id,
     })?;
+    let key = EntityKey::new(row.id).expect("validated account id is a UI entity key");
+    let configuration_generation =
+        AccountGeneration::new(row.configuration_generation).map_err(|_| {
+            ProjectionError::InvalidAccountGeneration {
+                account_id: row.id,
+                value: row.configuration_generation,
+            }
+        })?;
     let name = boxed_string(row.name);
     let address = boxed_string(row.address);
     let (status, has_error) = account_status(&row.state);
     let unread_count = project_count("account.inbox_unread", row.inbox_unread)?;
 
     Ok(ProjectedAccount {
-        database_id: row.id,
+        database_id,
+        configuration_generation,
         raw_unread: row.inbox_unread,
         item: AccountItem {
             id: AccountKey::Account(key).encode(),
@@ -328,6 +359,7 @@ pub(crate) enum ProjectionError {
     TooManyAccountStats { found: usize, maximum: usize },
     InvalidId { entity: &'static str, value: i64 },
     DuplicateAccountId(i64),
+    InvalidAccountGeneration { account_id: i64, value: i64 },
     UnknownAccount(i64),
     CountOverflow { field: &'static str, value: u64 },
     InvalidTimestamp(i64),
@@ -358,6 +390,10 @@ impl fmt::Display for ProjectionError {
             Self::DuplicateAccountId(id) => {
                 write!(formatter, "account identity {id} is duplicated")
             }
+            Self::InvalidAccountGeneration { account_id, value } => write!(
+                formatter,
+                "account identity {account_id} has invalid configuration generation {value}"
+            ),
             Self::UnknownAccount(id) => {
                 write!(formatter, "account identity {id} is not catalogued")
             }
@@ -483,6 +519,7 @@ mod tests {
     fn account(id: i64, unread: u64) -> AccountSummaryDto {
         AccountSummaryDto {
             id,
+            configuration_generation: 1,
             name: format!("Account {id}").into_boxed_str(),
             address: format!("account-{id}@example.test").into_boxed_str(),
             state: "active".into(),
@@ -565,6 +602,46 @@ mod tests {
         assert_eq!(catalog.account_items()[1].id, "9223372036854775807");
         assert_eq!(projected.rows[0].id, "9223372036854775807");
         assert_eq!(projected.rows[0].account_id, "9223372036854775807");
+    }
+
+    #[test]
+    fn account_operation_target_keeps_the_private_generation_fence() {
+        let mut row = account(7, 0);
+        row.configuration_generation = 73;
+        let catalog = AccountCatalog::try_from_directory(AccountDirectory {
+            rows: vec![row].into_boxed_slice(),
+        })
+        .unwrap();
+
+        let target = catalog
+            .operation_target(AccountKey::Account(EntityKey::new(7).unwrap()))
+            .expect("catalogued account has an operation target");
+        assert_eq!(target.account_id.get(), 7);
+        assert_eq!(target.expected_generation.get(), 73);
+        assert_eq!(catalog.operation_target(AccountKey::All), None);
+        assert_eq!(
+            catalog.operation_target(AccountKey::Account(EntityKey::new(8).unwrap())),
+            None
+        );
+    }
+
+    #[test]
+    fn account_projection_rejects_non_positive_generation_fences() {
+        for value in [0, -1] {
+            let mut row = account(7, 0);
+            row.configuration_generation = value;
+
+            assert_eq!(
+                AccountCatalog::try_from_directory(AccountDirectory {
+                    rows: vec![row].into_boxed_slice(),
+                })
+                .unwrap_err(),
+                ProjectionError::InvalidAccountGeneration {
+                    account_id: 7,
+                    value,
+                }
+            );
+        }
     }
 
     #[test]

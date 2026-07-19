@@ -14,7 +14,7 @@ use super::domain::{
 use super::stats::query_mailbox_stats;
 
 const ACCOUNT_DIRECTORY_SQL: &str = "
-    SELECT a.id, a.name, a.address,
+    SELECT a.id, a.configuration_generation, a.name, a.address,
            CASE
                WHEN a.state IN ('removing_credentials', 'removing_cache') THEN 'removing'
                WHEN connection.account_id IS NULL THEN 'needs_setup'
@@ -95,21 +95,31 @@ pub(super) fn query_account_directory(
         .query_map([row_limit], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
+                row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
                 row.get::<_, Option<i64>>(6)?,
-                row.get::<_, Option<bool>>(7)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<bool>>(8)?,
             ))
         })
         .map_err(DbFailure::database)?;
 
     let mut rows = Vec::with_capacity(MAX_ACCOUNT_STATS + 1);
     for row in mapped {
-        let (id, name, address, state, accent_rgb, stats_account_id, inbox_unread, dirty) =
-            row.map_err(DbFailure::database)?;
+        let (
+            id,
+            configuration_generation,
+            name,
+            address,
+            state,
+            accent_rgb,
+            stats_account_id,
+            inbox_unread,
+            dirty,
+        ) = row.map_err(DbFailure::database)?;
         let (Some(stats_account_id), Some(inbox_unread), Some(dirty)) =
             (stats_account_id, inbox_unread, dirty)
         else {
@@ -130,6 +140,7 @@ pub(super) fn query_account_directory(
         let removing = state == "removing";
         rows.push(AccountSummaryDto {
             id,
+            configuration_generation,
             name: name.into_boxed_str(),
             address: address.into_boxed_str(),
             state: state.into_boxed_str(),
@@ -496,11 +507,12 @@ mod tests {
         connection
             .execute_batch(
                 "INSERT INTO accounts
-                     (id, provider, remote_key, name, address, sort_order, state, accent_rgb)
+                     (id, provider, remote_key, name, address, sort_order, state, accent_rgb,
+                      configuration_generation)
                  VALUES
-                     (2, 'imap', 'two', 'Two', 'two@example.test', 10, 'active', 258),
-                     (3, 'jmap', 'three', 'Three', 'three@example.test', 0, 'offline', 515),
-                     (1, 'imap', 'one', 'One', 'one@example.test', 10, 'auth_required', 1);
+                     (2, 'imap', 'two', 'Two', 'two@example.test', 10, 'active', 258, 21),
+                     (3, 'jmap', 'three', 'Three', 'three@example.test', 0, 'offline', 515, 31),
+                     (1, 'imap', 'one', 'One', 'one@example.test', 10, 'auth_required', 1, 11);
                  UPDATE account_mailbox_stats
                  SET inbox_total = CASE account_id
                          WHEN 1 THEN 4 WHEN 2 THEN 6 ELSE 2 END,
@@ -519,6 +531,7 @@ mod tests {
             [
                 AccountSummaryDto {
                     id: 3,
+                    configuration_generation: 31,
                     name: "Three".into(),
                     address: "three@example.test".into(),
                     state: "needs_setup".into(),
@@ -527,6 +540,7 @@ mod tests {
                 },
                 AccountSummaryDto {
                     id: 1,
+                    configuration_generation: 11,
                     name: "One".into(),
                     address: "one@example.test".into(),
                     state: "needs_setup".into(),
@@ -535,6 +549,7 @@ mod tests {
                 },
                 AccountSummaryDto {
                     id: 2,
+                    configuration_generation: 21,
                     name: "Two".into(),
                     address: "two@example.test".into(),
                     state: "needs_setup".into(),

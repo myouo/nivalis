@@ -205,6 +205,7 @@ pub(crate) struct AccountUnreadDto {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct AccountSummaryDto {
     pub(crate) id: i64,
+    pub(crate) configuration_generation: i64,
     pub(crate) name: Box<str>,
     pub(crate) address: Box<str>,
     pub(crate) state: Box<str>,
