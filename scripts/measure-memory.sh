@@ -21,6 +21,7 @@ hard_gate=${NIVALIS_MEMORY_HARD_GATE:-0}
 hard_cap_kib=${NIVALIS_MEMORY_HARD_CAP_KIB:-92160}
 growth_limit_percent=${NIVALIS_MEMORY_GROWTH_LIMIT_PERCENT:-100}
 stress_steps=${NIVALIS_STRESS_STEPS:-}
+test_case=${NIVALIS_MEMORY_TEST_CASE:-}
 
 is_bounded_positive_decimal() {
     local value=$1
@@ -64,6 +65,20 @@ if [[ -n "$stress_steps" && "$stress_scenario" != "mixed" && "$stress_scenario" 
 fi
 if [[ -n "$stress_steps" && "$stress_scenario" == "pagination" ]] && ((stress_steps % 2 != 0)); then
     printf 'Pagination stress requires an even NIVALIS_STRESS_STEPS value\n' >&2
+    exit 1
+fi
+if [[ -z "$test_case" ]]; then
+    if [[ -n "$stress_steps" ]]; then
+        test_case="${stress_scenario}-stress"
+    elif ((resize_stress_width > 0 && resize_stress_height > 0)); then
+        test_case=resize
+    else
+        test_case=idle
+    fi
+fi
+if [[ ! "$test_case" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]]; then
+    printf 'NIVALIS_MEMORY_TEST_CASE must be a lowercase CSV-safe identifier: %s\n' \
+        "$test_case" >&2
     exit 1
 fi
 
@@ -129,7 +144,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-printf 'renderer,platform,run,seconds,rss_kib,pss_kib,uss_kib,anonymous_kib,cpu_percent,vm_hwm_kib\n'
+printf 'test_case,renderer,platform,run,seconds,rss_kib,pss_kib,uss_kib,anonymous_kib,cpu_percent,vm_hwm_kib\n'
 
 for ((run = 1; run <= runs; run++)); do
     run_log_file=$log_file
@@ -263,9 +278,9 @@ for ((run = 1; run <= runs; run++)); do
                 "$pid" "$metrics" >&2
             exit 1
         fi
-        printf '%s,%s,%d,%d,%d,%d,%d,%d,%s,%d\n' \
-            "$renderer" "$platform" "$run" "$seconds" "$rss_kib" "$pss_kib" \
-            "$uss_kib" "$anonymous_kib" "$cpu_percent" "$vm_hwm_kib"
+        printf '%s,%s,%s,%d,%d,%d,%d,%d,%d,%s,%d\n' \
+            "$test_case" "$renderer" "$platform" "$run" "$seconds" "$rss_kib" \
+            "$pss_kib" "$uss_kib" "$anonymous_kib" "$cpu_percent" "$vm_hwm_kib"
 
         if ((baseline_rss_kib == 0)); then
             baseline_rss_kib=$rss_kib
