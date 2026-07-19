@@ -50,11 +50,14 @@ Status: pending.
 
 Acceptance criteria:
 
-- MIME parsing enforces raw size, header, part-count, nesting, decoded-byte, and quoted-history limits.
-- Metadata and bounded previews commit to SQLite while raw bodies and attachments stream to private temporary files followed by atomic moves.
-- Opening one message materializes only its bounded native reader model; closing it releases parsing and body buffers.
-- Attachment access validates ownership and paths. The file-GC janitor rechecks database references immediately before unlinking.
-- Malformed and adversarial MIME fixtures cannot escape limits or cause unbounded resident growth.
+- MIME parsing enforces finite raw-size, header, part-count, nesting, and decoded-byte budgets before materializing bounded content.
+- Bodies and attachments stream to private files without retaining whole-message payloads in the UI or SQLite actor.
+- SQLite generation fencing atomically replaces a message's body and attachment references, rejecting stale writers.
+- A bounded, delayed file-GC janitor rechecks SQLite references immediately before removing an orphan.
+- One end-to-end test imports a message, opens and closes its bounded reader state, removes its references, and verifies orphan collection.
+- The release binary is measured immediately for warm-idle memory and repeated import/open/close/collection growth against the project memory contract.
+
+Recorded deferrals that do not block M2: persistent reservation restart recovery, lease renewal, and a strict recovery protocol move to M7; any existing reservation schema is groundwork rather than an M2 gate. Directory-capability `openat`/`unlinkat` hardening, cross-platform ACL and reparse-point handling, deep fuzzing and Miri, stronger HTML handling, and more sophisticated quoted-history extraction also move to M7. Strict commit-ambiguity handling for irreplaceable outbound data belongs to the M5 outbox contract.
 
 ## M3: accounts and security boundary
 
@@ -89,6 +92,7 @@ Acceptance criteria:
 - MIME output streams to a private file and a bounded SQLite outbox is the source of truth for delivery attempts.
 - SMTP submission supports cancellation, bounded retry/backoff, authentication recovery, permanent failure, and user-visible delivery state.
 - A successful UI result means the message was durably queued or explicitly delivered; no simulated send path remains.
+- Irreplaceable outbound data uses a strict reservation and commit-recovery protocol so an ambiguous result cannot silently lose or duplicate a delivery attempt.
 
 ## M6: multi-account scheduling and optional JMAP
 
@@ -111,4 +115,5 @@ Acceptance criteria:
 - Responsive breakpoints, focus containment/restoration, screen-reader semantics, high contrast, reduced motion, font scaling, and minimum target sizes are verified.
 - Idle, large mailbox, repeated search/open/close, attachment, offline/reconnect, send retry, and multi-account synchronization workloads run for release-representative durations.
 - Supported reference environments stay below 90 MiB idle RSS, target 50 MiB where documented, and remain below 2x settled growth.
+- Content storage hardening covers reservation recovery and lease expiry, directory-relative file operations, supported-platform ACL or reparse-point behavior, adversarial fuzzing and Miri, and the documented HTML and quoted-history policy.
 - Packages, upgrades, rollback behavior, diagnostics, privacy documentation, GPLv3 notices, and corresponding-source materials are ready for distribution.
