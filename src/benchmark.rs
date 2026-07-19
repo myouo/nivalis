@@ -41,6 +41,7 @@ pub(crate) fn install_memory_stress(
         Ok("write-search") => install_write_search_stress(ui, steps, delay, interval),
         Ok("content") => install_content_stress(ui, database, content_path, steps, delay),
         Ok("account-diagnostic") => install_account_diagnostic_stress(ui, steps, delay, interval),
+        Ok("account-receive") => install_account_receive_stress(ui, steps, delay, interval),
         Ok("mixed") | Err(_) => install_mixed_stress(ui, steps, delay, interval),
         Ok(scenario) => {
             eprintln!(
@@ -421,6 +422,498 @@ fn fail_account_diagnostic_stress(
     ui.set_status_text("Account diagnostic memory stress failed".into());
     eprintln!(
         "NIVALIS_STRESS_ERROR scenario=account-diagnostic reason={reason} cleanup_required={}",
+        u8::from(cleanup_required)
+    );
+    stop_stress(ui, timer);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccountReceiveMailboxExpectation {
+    Empty,
+    Single,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccountReceiveGate {
+    Waiting,
+    Ready,
+    Failed(&'static str),
+}
+
+#[derive(Clone, Copy)]
+struct AccountReceiveMailboxObservation {
+    account_selected: bool,
+    loading: bool,
+    error: bool,
+    total_known: bool,
+    message_total: i32,
+    rows: usize,
+    has_previous: bool,
+    has_next: bool,
+    first_account_matches: bool,
+    first_id_present: bool,
+}
+
+fn account_receive_mailbox_gate(
+    observation: AccountReceiveMailboxObservation,
+    expectation: AccountReceiveMailboxExpectation,
+) -> AccountReceiveGate {
+    if !observation.account_selected || observation.loading {
+        return AccountReceiveGate::Waiting;
+    }
+    if observation.error {
+        return AccountReceiveGate::Failed("mailbox_error");
+    }
+    if observation.message_total < 0 {
+        return AccountReceiveGate::Failed("mailbox_count_invalid");
+    }
+
+    match expectation {
+        AccountReceiveMailboxExpectation::Empty => {
+            if observation.total_known
+                && observation.message_total == 0
+                && observation.rows == 0
+                && !observation.has_previous
+                && !observation.has_next
+            {
+                AccountReceiveGate::Ready
+            } else if observation.message_total > 0 || observation.rows > 0 {
+                AccountReceiveGate::Failed("fixture_not_empty")
+            } else {
+                AccountReceiveGate::Waiting
+            }
+        }
+        AccountReceiveMailboxExpectation::Single => {
+            if observation.message_total > 1 || observation.rows > 1 {
+                return AccountReceiveGate::Failed("import_count_mismatch");
+            }
+            if observation.total_known
+                && observation.message_total == 1
+                && observation.rows == 1
+                && !observation.has_previous
+                && !observation.has_next
+            {
+                if !observation.first_account_matches || !observation.first_id_present {
+                    AccountReceiveGate::Failed("imported_message_invalid")
+                } else {
+                    AccountReceiveGate::Ready
+                }
+            } else {
+                AccountReceiveGate::Waiting
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AccountReceiveReaderObservation {
+    detail_open: bool,
+    loading: bool,
+    error: bool,
+    selected_id_matches: bool,
+    detail_id_matches: bool,
+    body_present: bool,
+}
+
+fn account_receive_reader_gate(observation: AccountReceiveReaderObservation) -> AccountReceiveGate {
+    if observation.loading {
+        return AccountReceiveGate::Waiting;
+    }
+    if observation.error {
+        return AccountReceiveGate::Failed("detail_error");
+    }
+    if !observation.detail_open {
+        return AccountReceiveGate::Failed("reader_closed_early");
+    }
+    if !observation.selected_id_matches || !observation.detail_id_matches {
+        return AccountReceiveGate::Failed("opened_message_mismatch");
+    }
+    if !observation.body_present {
+        return AccountReceiveGate::Failed("message_body_empty");
+    }
+    AccountReceiveGate::Ready
+}
+
+#[derive(Debug)]
+enum AccountReceivePhase {
+    WaitingForInitialState,
+    Diagnosing,
+    WaitingForCatalog {
+        account_id: SharedString,
+    },
+    WaitingForAccountMailbox {
+        account_id: SharedString,
+    },
+    Syncing {
+        account_id: SharedString,
+    },
+    WaitingForImport {
+        account_id: SharedString,
+    },
+    Opening {
+        account_id: SharedString,
+        message_id: SharedString,
+    },
+    ClosingReader {
+        account_id: SharedString,
+    },
+    Removing {
+        account_id: SharedString,
+    },
+    WaitingForRemoval {
+        account_id: SharedString,
+    },
+    Complete,
+}
+
+struct AccountReceiveStress {
+    phase: AccountReceivePhase,
+    started: Instant,
+    deadline: Instant,
+    transition_timeout: Duration,
+    cleanup_required: bool,
+}
+
+impl AccountReceiveStress {
+    fn advance(&mut self, phase: AccountReceivePhase) {
+        self.phase = phase;
+        self.deadline = Instant::now() + self.transition_timeout;
+    }
+}
+
+fn install_account_receive_stress(
+    ui: &AppWindow,
+    steps: usize,
+    delay: u64,
+    interval: u64,
+) -> Option<Rc<Timer>> {
+    if steps != 1 {
+        eprintln!(
+            "NIVALIS_STRESS_ERROR scenario=account-receive reason=steps_must_equal_one steps={steps} cleanup_required=0"
+        );
+        return None;
+    }
+    let timeout = std::env::var("NIVALIS_STRESS_TRANSITION_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(ACCOUNT_DIAGNOSTIC_DEFAULT_TIMEOUT_MS)
+        .max(1);
+    let transition_timeout = Duration::from_millis(timeout);
+    let timer = Rc::new(Timer::default());
+    let timer_weak = Rc::downgrade(&timer);
+    let ui_weak = ui.as_weak();
+
+    Timer::single_shot(Duration::from_millis(delay), move || {
+        let Some(timer) = timer_weak.upgrade() else {
+            return;
+        };
+        let started = Instant::now();
+        let state = Rc::new(RefCell::new(AccountReceiveStress {
+            phase: AccountReceivePhase::WaitingForInitialState,
+            started,
+            deadline: started + transition_timeout,
+            transition_timeout,
+            cleanup_required: false,
+        }));
+        let state_for_timer = state.clone();
+        let timer_for_callback = Rc::downgrade(&timer);
+        timer.start(
+            TimerMode::Repeated,
+            Duration::from_millis(interval.max(25)),
+            move || {
+                let Some(timer) = timer_for_callback.upgrade() else {
+                    return;
+                };
+                let Some(ui) = ui_weak.upgrade() else {
+                    return;
+                };
+                let mut state = state_for_timer.borrow_mut();
+                if Instant::now() >= state.deadline {
+                    fail_account_receive_stress(
+                        &ui,
+                        &timer,
+                        "transition_timeout",
+                        state.cleanup_required,
+                    );
+                    state.phase = AccountReceivePhase::Complete;
+                    return;
+                }
+
+                match &state.phase {
+                    AccountReceivePhase::WaitingForInitialState => {
+                        if ui.get_initial_loading() || ui.get_mailbox_loading() {
+                            return;
+                        }
+                        if ui.get_mailbox_error() {
+                            fail_account_receive_stress(
+                                &ui,
+                                &timer,
+                                "initial_mailbox_error",
+                                false,
+                            );
+                            state.phase = AccountReceivePhase::Complete;
+                            return;
+                        }
+                        if ui.get_has_accounts() {
+                            fail_account_receive_stress(
+                                &ui,
+                                &timer,
+                                "fixture_not_empty",
+                                false,
+                            );
+                            state.phase = AccountReceivePhase::Complete;
+                            return;
+                        }
+                        let config = match AccountDiagnosticConfig::load() {
+                            Ok(config) => config,
+                            Err(reason) => {
+                                fail_account_receive_stress(&ui, &timer, reason, false);
+                                state.phase = AccountReceivePhase::Complete;
+                                return;
+                            }
+                        };
+                        let secret = match std::str::from_utf8(&config.secret) {
+                            Ok(secret) => SharedString::from(secret),
+                            Err(_) => {
+                                fail_account_receive_stress(
+                                    &ui,
+                                    &timer,
+                                    "secret_file_invalid",
+                                    false,
+                                );
+                                state.phase = AccountReceivePhase::Complete;
+                                return;
+                            }
+                        };
+                        ui.invoke_add_account(
+                            config.name.into(),
+                            config.address.into(),
+                            config.login.into(),
+                            config.host.into(),
+                            config.port.into(),
+                            secret,
+                        );
+                        state.cleanup_required = true;
+                        state.advance(AccountReceivePhase::Diagnosing);
+                    }
+                    AccountReceivePhase::Diagnosing => {
+                        if ui.get_account_operation_loading() {
+                            return;
+                        }
+                        if !ui.get_account_operation_error().is_empty() {
+                            fail_account_receive_stress(&ui, &timer, "diagnostic_failed", true);
+                            state.phase = AccountReceivePhase::Complete;
+                            return;
+                        }
+                        let account_id = ui.get_managed_account_id();
+                        if account_id.is_empty() {
+                            fail_account_receive_stress(
+                                &ui,
+                                &timer,
+                                "account_identity_missing",
+                                true,
+                            );
+                            state.phase = AccountReceivePhase::Complete;
+                            return;
+                        }
+                        if classify_account_diagnostic(
+                            ui.get_managed_account_status().as_str(),
+                            ui.get_managed_account_has_error(),
+                        ) != Some(AccountDiagnosticExpectation::Ready)
+                        {
+                            fail_account_receive_stress(
+                                &ui,
+                                &timer,
+                                "diagnostic_mismatch",
+                                true,
+                            );
+                            state.phase = AccountReceivePhase::Complete;
+                            return;
+                        }
+                        state.advance(AccountReceivePhase::WaitingForCatalog { account_id });
+                    }
+                    AccountReceivePhase::WaitingForCatalog { account_id } => {
+                        if !account_model_contains(&ui, account_id.as_str()) {
+                            return;
+                        }
+                        let account_id = account_id.clone();
+                        if ui.get_active_account_id().as_str() != account_id.as_str() {
+                            ui.invoke_switch_account(account_id.clone());
+                        }
+                        state.advance(AccountReceivePhase::WaitingForAccountMailbox {
+                            account_id,
+                        });
+                    }
+                    AccountReceivePhase::WaitingForAccountMailbox { account_id } => {
+                        match account_receive_mailbox_gate(
+                            account_receive_mailbox_observation(&ui, account_id.as_str()),
+                            AccountReceiveMailboxExpectation::Empty,
+                        ) {
+                            AccountReceiveGate::Waiting => {}
+                            AccountReceiveGate::Failed(reason) => {
+                                fail_account_receive_stress(&ui, &timer, reason, true);
+                                state.phase = AccountReceivePhase::Complete;
+                            }
+                            AccountReceiveGate::Ready => {
+                                let account_id = account_id.clone();
+                                ui.invoke_sync_account(account_id.clone());
+                                state.advance(AccountReceivePhase::Syncing { account_id });
+                            }
+                        }
+                    }
+                    AccountReceivePhase::Syncing { account_id } => {
+                        if ui.get_sync_loading() || ui.get_account_operation_loading() {
+                            return;
+                        }
+                        if !ui.get_account_operation_error().is_empty() {
+                            fail_account_receive_stress(&ui, &timer, "sync_failed", true);
+                            state.phase = AccountReceivePhase::Complete;
+                            return;
+                        }
+                        let account_id = account_id.clone();
+                        state.advance(AccountReceivePhase::WaitingForImport { account_id });
+                    }
+                    AccountReceivePhase::WaitingForImport { account_id } => {
+                        match account_receive_mailbox_gate(
+                            account_receive_mailbox_observation(&ui, account_id.as_str()),
+                            AccountReceiveMailboxExpectation::Single,
+                        ) {
+                            AccountReceiveGate::Waiting => {}
+                            AccountReceiveGate::Failed(reason) => {
+                                fail_account_receive_stress(&ui, &timer, reason, true);
+                                state.phase = AccountReceivePhase::Complete;
+                            }
+                            AccountReceiveGate::Ready => {
+                                let account_id = account_id.clone();
+                                let Some(message) = ui.get_mails().row_data(0) else {
+                                    fail_account_receive_stress(
+                                        &ui,
+                                        &timer,
+                                        "imported_message_missing",
+                                        true,
+                                    );
+                                    state.phase = AccountReceivePhase::Complete;
+                                    return;
+                                };
+                                let message_id = message.id;
+                                ui.set_detail_open(true);
+                                ui.invoke_select_mail(message_id.clone());
+                                state.advance(AccountReceivePhase::Opening {
+                                    account_id,
+                                    message_id,
+                                });
+                            }
+                        }
+                    }
+                    AccountReceivePhase::Opening {
+                        account_id,
+                        message_id,
+                    } => {
+                        let detail = ui.get_selected_mail();
+                        let gate = account_receive_reader_gate(AccountReceiveReaderObservation {
+                            detail_open: ui.get_detail_open(),
+                            loading: ui.get_detail_loading(),
+                            error: ui.get_detail_error(),
+                            selected_id_matches: ui.get_selected_id().as_str()
+                                == message_id.as_str(),
+                            detail_id_matches: detail.id.as_str() == message_id.as_str(),
+                            body_present: !detail.body.as_str().trim().is_empty(),
+                        });
+                        match gate {
+                            AccountReceiveGate::Waiting => {}
+                            AccountReceiveGate::Failed(reason) => {
+                                fail_account_receive_stress(&ui, &timer, reason, true);
+                                state.phase = AccountReceivePhase::Complete;
+                            }
+                            AccountReceiveGate::Ready => {
+                                let account_id = account_id.clone();
+                                ui.invoke_switch_account(SharedString::default());
+                                state.advance(AccountReceivePhase::ClosingReader { account_id });
+                            }
+                        }
+                    }
+                    AccountReceivePhase::ClosingReader { account_id } => {
+                        if !ui.get_active_account_id().is_empty()
+                            || ui.get_mailbox_loading()
+                            || ui.get_mailbox_navigation_loading()
+                            || ui.get_detail_open()
+                            || ui.get_detail_loading()
+                            || !ui.get_selected_id().is_empty()
+                            || !ui.get_selected_mail().id.is_empty()
+                        {
+                            return;
+                        }
+                        let account_id = account_id.clone();
+                        ui.invoke_remove_account(account_id.clone());
+                        state.advance(AccountReceivePhase::Removing { account_id });
+                    }
+                    AccountReceivePhase::Removing { account_id } => {
+                        if ui.get_account_operation_loading() {
+                            return;
+                        }
+                        if !ui.get_account_operation_error().is_empty() {
+                            fail_account_receive_stress(&ui, &timer, "removal_failed", true);
+                            state.phase = AccountReceivePhase::Complete;
+                            return;
+                        }
+                        let account_id = account_id.clone();
+                        state.advance(AccountReceivePhase::WaitingForRemoval { account_id });
+                    }
+                    AccountReceivePhase::WaitingForRemoval { account_id } => {
+                        if account_model_contains(&ui, account_id.as_str()) {
+                            return;
+                        }
+                        state.cleanup_required = false;
+                        ui.set_status_text("Account receive memory stress complete".into());
+                        eprintln!(
+                            "NIVALIS_STRESS_RESULT scenario=account-receive steps=1 imported=1 opened=1 closed=1 removed=1 elapsed_ms={}",
+                            state.started.elapsed().as_millis()
+                        );
+                        stop_stress(&ui, &timer);
+                        state.phase = AccountReceivePhase::Complete;
+                    }
+                    AccountReceivePhase::Complete => {}
+                }
+            },
+        );
+    });
+
+    Some(timer)
+}
+
+fn account_receive_mailbox_observation(
+    ui: &AppWindow,
+    expected_account_id: &str,
+) -> AccountReceiveMailboxObservation {
+    let mails = ui.get_mails();
+    let first = mails.row_data(0);
+    AccountReceiveMailboxObservation {
+        account_selected: ui.get_active_account_id().as_str() == expected_account_id,
+        loading: ui.get_initial_loading()
+            || ui.get_mailbox_loading()
+            || ui.get_mailbox_navigation_loading(),
+        error: ui.get_mailbox_error(),
+        total_known: ui.get_total_known(),
+        message_total: ui.get_message_total(),
+        rows: mails.row_count(),
+        has_previous: ui.get_has_previous_mailbox_page(),
+        has_next: ui.get_has_next_mailbox_page(),
+        first_account_matches: first
+            .as_ref()
+            .is_some_and(|mail| mail.account_id.as_str() == expected_account_id),
+        first_id_present: first.is_some_and(|mail| !mail.id.is_empty()),
+    }
+}
+
+fn fail_account_receive_stress(
+    ui: &AppWindow,
+    timer: &Timer,
+    reason: &str,
+    cleanup_required: bool,
+) {
+    ui.set_status_text("Account receive memory stress failed".into());
+    eprintln!(
+        "NIVALIS_STRESS_ERROR scenario=account-receive reason={reason} cleanup_required={}",
         u8::from(cleanup_required)
     );
     stop_stress(ui, timer);
@@ -1491,6 +1984,122 @@ mod tests {
         assert!(is_loopback_imap_host("127.0.0.1"));
         assert!(is_loopback_imap_host("::1"));
         assert!(!is_loopback_imap_host("imap.example.test"));
+    }
+
+    #[test]
+    fn account_receive_mailbox_gate_requires_exact_bounded_signatures() {
+        let empty = AccountReceiveMailboxObservation {
+            account_selected: true,
+            loading: false,
+            error: false,
+            total_known: true,
+            message_total: 0,
+            rows: 0,
+            has_previous: false,
+            has_next: false,
+            first_account_matches: false,
+            first_id_present: false,
+        };
+        assert_eq!(
+            account_receive_mailbox_gate(empty, AccountReceiveMailboxExpectation::Empty),
+            AccountReceiveGate::Ready
+        );
+        assert_eq!(
+            account_receive_mailbox_gate(empty, AccountReceiveMailboxExpectation::Single),
+            AccountReceiveGate::Waiting
+        );
+
+        let single = AccountReceiveMailboxObservation {
+            message_total: 1,
+            rows: 1,
+            first_account_matches: true,
+            first_id_present: true,
+            ..empty
+        };
+        assert_eq!(
+            account_receive_mailbox_gate(single, AccountReceiveMailboxExpectation::Single),
+            AccountReceiveGate::Ready
+        );
+        assert_eq!(
+            account_receive_mailbox_gate(single, AccountReceiveMailboxExpectation::Empty),
+            AccountReceiveGate::Failed("fixture_not_empty")
+        );
+        assert_eq!(
+            account_receive_mailbox_gate(
+                AccountReceiveMailboxObservation {
+                    rows: 2,
+                    message_total: 2,
+                    ..single
+                },
+                AccountReceiveMailboxExpectation::Single,
+            ),
+            AccountReceiveGate::Failed("import_count_mismatch")
+        );
+        assert_eq!(
+            account_receive_mailbox_gate(
+                AccountReceiveMailboxObservation {
+                    first_account_matches: false,
+                    ..single
+                },
+                AccountReceiveMailboxExpectation::Single,
+            ),
+            AccountReceiveGate::Failed("imported_message_invalid")
+        );
+        assert_eq!(
+            account_receive_mailbox_gate(
+                AccountReceiveMailboxObservation {
+                    loading: true,
+                    error: true,
+                    ..single
+                },
+                AccountReceiveMailboxExpectation::Single,
+            ),
+            AccountReceiveGate::Waiting
+        );
+    }
+
+    #[test]
+    fn account_receive_reader_gate_rejects_unreadable_or_wrong_details() {
+        let ready = AccountReceiveReaderObservation {
+            detail_open: true,
+            loading: false,
+            error: false,
+            selected_id_matches: true,
+            detail_id_matches: true,
+            body_present: true,
+        };
+        assert_eq!(
+            account_receive_reader_gate(ready),
+            AccountReceiveGate::Ready
+        );
+        assert_eq!(
+            account_receive_reader_gate(AccountReceiveReaderObservation {
+                loading: true,
+                ..ready
+            }),
+            AccountReceiveGate::Waiting
+        );
+        assert_eq!(
+            account_receive_reader_gate(AccountReceiveReaderObservation {
+                body_present: false,
+                ..ready
+            }),
+            AccountReceiveGate::Failed("message_body_empty")
+        );
+        assert_eq!(
+            account_receive_reader_gate(AccountReceiveReaderObservation {
+                detail_id_matches: false,
+                ..ready
+            }),
+            AccountReceiveGate::Failed("opened_message_mismatch")
+        );
+        assert_eq!(
+            account_receive_reader_gate(AccountReceiveReaderObservation {
+                error: true,
+                ..ready
+            }),
+            AccountReceiveGate::Failed("detail_error")
+        );
     }
 
     #[cfg(unix)]
