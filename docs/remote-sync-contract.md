@@ -2,7 +2,7 @@
 
 ## Status
 
-This document is the normative boundary between Nivalis' SQLite actor and its future IMAP and JMAP adapters. Schema v7 implements the bounded locator, object-state, journal, and legacy-reconciliation storage described here. Local flags, Archive, Trash, Trash undo, and permanent deletion now reduce into that journal atomically, including frozen folder and locator snapshots, terminal tombstones, version compaction, and complete rollback on resource limits. The SQLite actor now exposes bounded, versioned claim snapshots with one global lease, conservative expiry recovery, and exact wake-up times. Report processing and provider execution do not exist yet. The controller must not switch to SQLite, and providers must not issue remote writes, until synchronization merge/reconciliation and the fenced report path implement this contract.
+This document is the normative boundary between Nivalis' SQLite actor and its future IMAP and JMAP adapters. Schema v8 implements the bounded locator, object-state, journal, legacy-reconciliation, and placement-rebase reservation storage described here. Local flags, Archive, Trash, Trash undo, and permanent deletion now reduce into that journal atomically, including frozen folder and locator snapshots, terminal tombstones, version compaction, and complete rollback on resource limits. The SQLite actor now exposes bounded, versioned claim snapshots with one global lease, conservative expiry recovery, exact wake-up times, and reserved capacity for merging a confirmed placement with a newer local desired version. Report processing and provider execution do not exist yet. The controller must not switch to SQLite, and providers must not issue remote writes, until synchronization merge/reconciliation and the fenced report path implement this contract.
 
 The journal records the latest desired state of a logical message, not a history of UI actions. Local state, statistics, undo/tombstone data, and the journal change must commit in one SQLite `BEGIN IMMEDIATE` transaction.
 
@@ -85,6 +85,7 @@ Permanent local deletion writes a terminal intent, freezes all known locators, a
 - At most 4,096 intents per account and 16,384 globally.
 - At most 256 base and 256 desired folder keys per intent.
 - At most 65,536 frozen folder/locator child rows globally.
+- Placement leases reserve their bounded rebase growth inside the same 65,536-row global budget.
 - Claim one complete intent at a time; metadata prefetch may inspect at most 16 parent rows.
 - A claimed provider payload, including folder keys and locators, is limited to 320 KiB.
 - Attempts are capped at 1,000. Error code and detail fields are capped at 64 and 1,024 UTF-8 bytes.
