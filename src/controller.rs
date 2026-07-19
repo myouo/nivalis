@@ -1,6 +1,8 @@
 mod session;
 
-use self::session::{DetailAcceptance, ReadSession, SessionError};
+use self::session::{
+    DetailAcceptance, MailboxAcceptance, MailboxIntent, ReadSession, SessionError,
+};
 use crate::core::{
     AccountDirectoryLoadError, CoreHandle, Event, EventReceiver, MailboxLoadError,
     MessageLoadError, SubmitError,
@@ -43,11 +45,16 @@ struct Controller {
     core: CoreHandle,
     state: RefCell<ReadSession>,
     catalog: RefCell<Option<AccountCatalog>>,
-    pending_mailbox: RefCell<Option<MailboxPage>>,
+    pending_mailbox: RefCell<Option<PendingMailboxProjection>>,
     mail_model: Rc<VecModel<MailSummary>>,
     account_model: Rc<VecModel<AccountItem>>,
     search_timer: Rc<Timer>,
     snackbar_timer: Rc<Timer>,
+}
+
+struct PendingMailboxProjection {
+    acceptance: MailboxAcceptance,
+    page: MailboxPage,
 }
 
 impl Controller {
@@ -60,6 +67,10 @@ impl Controller {
         ui.set_mail_actions_enabled(false);
         ui.set_initial_loading(true);
         ui.set_mailbox_loading(true);
+        ui.set_has_previous_mailbox_page(false);
+        ui.set_has_next_mailbox_page(false);
+        ui.set_mailbox_navigation_loading(false);
+        ui.set_mailbox_page_number(1);
         ui.set_mailbox_error(false);
         ui.set_detail_loading(false);
         ui.set_detail_error(false);
@@ -111,6 +122,12 @@ impl Controller {
         ui.on_retry_mailbox(move || controller.retry_mailbox());
 
         let controller = self.clone();
+        ui.on_previous_mailbox_page(move || controller.navigate_previous());
+
+        let controller = self.clone();
+        ui.on_next_mailbox_page(move || controller.navigate_next());
+
+        let controller = self.clone();
         ui.on_retry_detail(move || controller.retry_detail());
     }
 
@@ -139,6 +156,10 @@ impl Controller {
         self.clear_reader();
         if let Some(ui) = self.ui.upgrade() {
             ui.set_mailbox_loading(true);
+            ui.set_has_previous_mailbox_page(false);
+            ui.set_has_next_mailbox_page(false);
+            ui.set_mailbox_navigation_loading(false);
+            ui.set_mailbox_page_number(1);
             ui.set_mailbox_error(false);
             ui.set_status_text("Loading local cache".into());
         }
@@ -178,12 +199,12 @@ impl Controller {
                 generation,
                 reason,
             } => {
-                if self
+                if let Some(intent) = self
                     .state
                     .borrow_mut()
                     .reject_mailbox(request_id, generation)
                 {
-                    self.fail_mailbox(mailbox_rejection(reason));
+                    self.fail_mailbox_request(intent, mailbox_rejection(reason));
                 }
             }
             Event::MessageLoaded(reply) => self.handle_detail(reply),
@@ -251,40 +272,53 @@ impl Controller {
         let pending_page = self.pending_mailbox.borrow_mut().take();
         if scope_reset {
             self.reload_mailbox();
-        } else if let Some(page) = pending_page {
-            self.apply_mailbox(page);
+        } else if let Some(pending) = pending_page {
+            self.apply_mailbox(pending.acceptance, pending.page);
         }
     }
 
     fn handle_mailbox(&self, reply: Tagged<MailboxPage>) {
-        if !self.state.borrow_mut().accept_mailbox(&reply) {
+        let Some(acceptance) = self.state.borrow_mut().match_mailbox_reply(&reply) else {
             return;
-        }
+        };
         let page = match reply.result {
             Ok(page) => page,
             Err(failure) => {
-                self.fail_mailbox(database_error(&failure));
+                self.fail_mailbox_request(acceptance.intent(), database_error(&failure));
                 return;
             }
         };
         if self.catalog.borrow().is_none() || self.state.borrow().accounts_pending() {
-            *self.pending_mailbox.borrow_mut() = Some(page);
+            *self.pending_mailbox.borrow_mut() =
+                Some(PendingMailboxProjection { acceptance, page });
             return;
         }
-        self.apply_mailbox(page);
+        self.apply_mailbox(acceptance, page);
     }
 
-    fn apply_mailbox(&self, page: MailboxPage) {
+    fn apply_mailbox(&self, acceptance: MailboxAcceptance, page: MailboxPage) {
+        let commit = match acceptance.stage(&page) {
+            Ok(commit) => commit,
+            Err(SessionError::EmptyNavigationPage) => {
+                self.recover_changed_mailbox();
+                return;
+            }
+            Err(error) => {
+                self.fail_mailbox_request(acceptance.intent(), session_error(error));
+                return;
+            }
+        };
         let projected = {
             let catalog = self.catalog.borrow();
             let Some(catalog) = catalog.as_ref() else {
-                *self.pending_mailbox.borrow_mut() = Some(page);
+                *self.pending_mailbox.borrow_mut() =
+                    Some(PendingMailboxProjection { acceptance, page });
                 return;
             };
             match catalog.project_mailbox(page) {
                 Ok(projected) => projected,
                 Err(error) => {
-                    self.fail_mailbox(projection_error(&error));
+                    self.fail_mailbox_request(acceptance.intent(), projection_error(&error));
                     return;
                 }
             }
@@ -297,28 +331,129 @@ impl Controller {
             next_cursor,
         } = projected;
         let row_count = rows.len();
-        let has_more = next_cursor.is_some();
-        debug_assert!(
-            previous_cursor.is_none(),
-            "the read-only controller only requests the first mailbox page"
-        );
-        debug_assert_eq!(has_more, self.state.borrow().next_cursor().is_some());
+        let (committed, replacement_pending) = {
+            let mut state = self.state.borrow_mut();
+            let committed = state.commit_mailbox(commit);
+            (committed, state.mailbox_pending())
+        };
+        if !committed {
+            if !replacement_pending {
+                self.fail_mailbox_request(acceptance.intent(), UserError::mailbox_changed());
+            }
+            return;
+        }
+        let state = self.state.borrow();
+        debug_assert_eq!(previous_cursor, state.previous_cursor());
+        debug_assert_eq!(next_cursor, state.next_cursor());
+        let has_previous = state.previous_cursor().is_some();
+        let has_next = state.next_cursor().is_some();
+        let page_number = i32::try_from(state.page_number())
+            .expect("session page numbers are bounded to the Slint integer range");
+        drop(state);
+
+        self.clear_reader();
         self.mail_model.set_vec(rows);
         self.apply_stats(stats);
         if let Some(ui) = self.ui.upgrade() {
             ui.set_mailbox_loading(false);
+            ui.set_has_previous_mailbox_page(has_previous);
+            ui.set_has_next_mailbox_page(has_next);
+            ui.set_mailbox_navigation_loading(false);
+            ui.set_mailbox_page_number(page_number);
             ui.set_mailbox_error(false);
             ui.set_initial_loading(false);
             ui.set_status_text(
-                if has_more {
-                    "More cached messages available"
+                if page_number > 1 {
+                    format!("Page {page_number} loaded from local cache")
+                } else if has_next {
+                    "More cached messages available".to_owned()
                 } else if row_count == 0 {
-                    "Local cache is empty"
+                    "Local cache is empty".to_owned()
                 } else {
-                    "Local cache ready"
+                    "Local cache ready".to_owned()
                 }
                 .into(),
             );
+        }
+    }
+
+    fn navigate_next(&self) {
+        self.submit_mailbox_navigation(MailboxIntent::Next);
+    }
+
+    fn navigate_previous(&self) {
+        self.submit_mailbox_navigation(MailboxIntent::Previous);
+    }
+
+    fn submit_mailbox_navigation(&self, intent: MailboxIntent) {
+        let query = {
+            let mut state = self.state.borrow_mut();
+            match intent {
+                MailboxIntent::First => state.issue_first_mailbox(),
+                MailboxIntent::Next => state.issue_next_mailbox(),
+                MailboxIntent::Previous => state.issue_previous_mailbox(),
+            }
+        };
+        let query = match query {
+            Ok(query) => query,
+            Err(SessionError::MailboxRequestPending | SessionError::NavigationUnavailable) => {
+                return;
+            }
+            Err(error) => {
+                self.fail_navigation(session_error(error));
+                return;
+            }
+        };
+
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_mailbox_navigation_loading(true);
+            ui.set_mailbox_error(false);
+            ui.set_status_text(
+                match intent {
+                    MailboxIntent::First => "Refreshing the first page",
+                    MailboxIntent::Next => "Loading the next page",
+                    MailboxIntent::Previous => "Loading the previous page",
+                }
+                .into(),
+            );
+        }
+        if let Err(error) = self.core.try_query_mailbox(query) {
+            self.state.borrow_mut().cancel_mailbox_submission();
+            self.fail_navigation(submit_error(error));
+        }
+    }
+
+    fn recover_changed_mailbox(&self) {
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_status_text("Mailbox changed; refreshing the first page".into());
+            show_snackbar(
+                &ui,
+                "Mailbox contents changed; returning to the first page",
+                false,
+                &self.snackbar_timer,
+            );
+        }
+        self.submit_mailbox_navigation(MailboxIntent::First);
+    }
+
+    fn fail_mailbox_request(&self, intent: MailboxIntent, error: UserError) {
+        let preserves_page = intent != MailboxIntent::First
+            || self
+                .ui
+                .upgrade()
+                .is_some_and(|ui| ui.get_mailbox_navigation_loading());
+        if preserves_page {
+            self.fail_navigation(error);
+        } else {
+            self.fail_mailbox(error);
+        }
+    }
+
+    fn fail_navigation(&self, error: UserError) {
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_mailbox_navigation_loading(false);
+            ui.set_status_text(error.title.into());
+            show_snackbar(&ui, error.detail, false, &self.snackbar_timer);
         }
     }
 
@@ -583,6 +718,10 @@ impl Controller {
     fn fail_mailbox(&self, error: UserError) {
         if let Some(ui) = self.ui.upgrade() {
             ui.set_mailbox_loading(false);
+            ui.set_has_previous_mailbox_page(false);
+            ui.set_has_next_mailbox_page(false);
+            ui.set_mailbox_navigation_loading(false);
+            ui.set_mailbox_page_number(1);
             ui.set_mailbox_error(true);
             ui.set_mailbox_error_title(error.title.into());
             ui.set_mailbox_error_detail(error.detail.into());
@@ -642,6 +781,13 @@ impl UserError {
             detail: "Refresh the mailbox and choose the item again.",
         }
     }
+
+    const fn mailbox_changed() -> Self {
+        Self {
+            title: "Mailbox view changed",
+            detail: "The requested page was replaced by a newer mailbox view. Continue from the current page.",
+        }
+    }
 }
 
 fn database_error(failure: &DbFailure) -> UserError {
@@ -679,10 +825,25 @@ fn session_error(error: SessionError) -> UserError {
             title: "Search is too long",
             detail: "Shorten the search to 256 UTF-8 bytes and try again.",
         },
+        SessionError::MailboxRequestPending => UserError {
+            title: "Mailbox navigation is already running",
+            detail: "Wait for the current page to finish loading before trying again.",
+        },
+        SessionError::NavigationUnavailable => UserError {
+            title: "That mailbox page is unavailable",
+            detail: "The mailbox may have changed. Refresh it and try again.",
+        },
+        SessionError::EmptyNavigationPage => UserError {
+            title: "Mailbox contents changed",
+            detail: "Nivalis will refresh the first page so you can continue.",
+        },
+        SessionError::MailboxPageTooLarge => UserError::mail_data(),
         SessionError::InvalidIdentity
         | SessionError::InvalidFolder
         | SessionError::MessageNotVisible => UserError::selection(),
-        SessionError::RequestIdExhausted | SessionError::GenerationExhausted => UserError {
+        SessionError::RequestIdExhausted
+        | SessionError::GenerationExhausted
+        | SessionError::PageNumberExhausted => UserError {
             title: "Mail session reached a safety limit",
             detail: "Restart Nivalis before continuing.",
         },

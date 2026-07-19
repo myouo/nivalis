@@ -51,6 +51,10 @@ export component AppWindow inherits Window {
     in-out property <bool> detail-open: false;
     in-out property <bool> initial-loading: false;
     in property <bool> mailbox-loading: false;
+    in property <bool> has-previous-mailbox-page: false;
+    in property <bool> has-next-mailbox-page: false;
+    in property <bool> mailbox-navigation-loading: false;
+    in property <int> mailbox-page-number: 1;
     in property <bool> mailbox-error: false;
     in property <string> mailbox-error-title: "";
     in property <string> mailbox-error-detail: "";
@@ -99,6 +103,8 @@ export component AppWindow inherits Window {
     callback delete-mail(string);
     callback mark-unread(string);
     callback retry-mailbox;
+    callback previous-mailbox-page;
+    callback next-mailbox-page;
     callback retry-detail;
     callback switch-account(string);
     callback undo-delete;
@@ -217,6 +223,10 @@ export component AppWindow inherits Window {
                                 status-text: root.status-text;
                                 initial-loading: root.initial-loading;
                                 mailbox-loading: root.mailbox-loading;
+                                has-previous-mailbox-page: root.has-previous-mailbox-page;
+                                has-next-mailbox-page: root.has-next-mailbox-page;
+                                mailbox-navigation-loading: root.mailbox-navigation-loading;
+                                mailbox-page-number: root.mailbox-page-number;
                                 mailbox-error: root.mailbox-error;
                                 mailbox-error-title: root.mailbox-error-title;
                                 mailbox-error-detail: root.mailbox-error-detail;
@@ -235,6 +245,8 @@ export component AppWindow inherits Window {
                                 query-mail(query) => { root.query-mail(query); }
                                 toggle-star(id) => { root.toggle-star(id); }
                                 retry => { root.retry-mailbox(); }
+                                previous-mailbox-page => { root.previous-mailbox-page(); }
+                                next-mailbox-page => { root.next-mailbox-page(); }
                             }
 
                             if !root.compact-layout || root.detail-open: ReaderPane {

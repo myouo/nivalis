@@ -137,6 +137,10 @@ export component MailboxPane inherits Rectangle {
     in property <string> status-text;
     in property <bool> initial-loading: false;
     in property <bool> mailbox-loading: false;
+    in property <bool> has-previous-mailbox-page: false;
+    in property <bool> has-next-mailbox-page: false;
+    in property <bool> mailbox-navigation-loading: false;
+    in property <int> mailbox-page-number: 1;
     in property <bool> mailbox-error: false;
     in property <string> mailbox-error-title: "";
     in property <string> mailbox-error-detail: "";
@@ -155,6 +159,8 @@ export component MailboxPane inherits Rectangle {
     callback query-mail(string);
     callback toggle-star(string);
     callback retry;
+    callback previous-mailbox-page;
+    callback next-mailbox-page;
 
     private property <bool> show-loading: root.initial-loading || root.mailbox-loading;
 
@@ -279,6 +285,14 @@ export component MailboxPane inherits Rectangle {
             Rectangle { width: 62%; height: parent.height; background: Theme.primary; }
         }
 
+        if root.mailbox-navigation-loading && !root.show-loading: Rectangle {
+            height: 2px;
+            background: Theme.surface-container-highest;
+            accessible-role: progress-indicator;
+            accessible-label: "Loading mailbox page";
+            Rectangle { x: (parent.width - self.width) / 2; width: 30%; height: parent.height; background: Theme.primary; }
+        }
+
         if root.show-loading: VerticalLayout {
             padding-left: 6px;
             padding-right: 6px;
@@ -336,19 +350,35 @@ export component MailboxPane inherits Rectangle {
                 padding-left: 14px;
                 padding-right: 8px;
                 Text {
-                    text: !root.total-known
-                        ? (root.mails.length == 0
-                            ? "Result count unavailable"
-                            : "Showing " + root.mails.length + (root.mails.length == 1 ? " message" : " messages"))
-                        : root.message-total == 0 ? "0 messages" : "1-" + root.mails.length + " of " + root.message-total;
+                    text: "Page " + root.mailbox-page-number
+                        + "  ·  Showing " + root.mails.length + (root.mails.length == 1 ? " message" : " messages")
+                        + (root.total-known ? "  ·  " + root.message-total + " total" : "  ·  Total unavailable");
                     color: Theme.on-surface-variant;
                     font-family: Theme.body-font;
                     font-size: 10px;
                     vertical-alignment: center;
                     horizontal-stretch: 1;
+                    overflow: elide;
+                    accessible-role: region;
+                    accessible-live-region: polite;
+                    accessible-label: self.text;
                 }
-                MIconButton { icon: "chevron_left"; label: "Previous page"; enabled: false; compact-visual: true; }
-                MIconButton { icon: "chevron_right"; label: "Next page"; enabled: false; compact-visual: true; }
+                MIconButton {
+                    icon: "chevron_left";
+                    label: "Previous page";
+                    enabled: root.has-previous-mailbox-page;
+                    busy: root.mailbox-navigation-loading;
+                    compact-visual: true;
+                    clicked => { root.previous-mailbox-page(); }
+                }
+                MIconButton {
+                    icon: "chevron_right";
+                    label: "Next page";
+                    enabled: root.has-next-mailbox-page;
+                    busy: root.mailbox-navigation-loading;
+                    compact-visual: true;
+                    clicked => { root.next-mailbox-page(); }
+                }
             }
         }
     }

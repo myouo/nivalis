@@ -104,14 +104,17 @@ export component MIconButton inherits Rectangle {
     in property <bool> danger: false;
     in property <bool> inverse: false;
     in property <bool> enabled: true;
+    in property <bool> busy: false;
     in property <bool> compact-visual: false;
     callback clicked;
     forward-focus: focus;
 
     accessible-role: button;
-    accessible-label: label;
-    accessible-enabled: enabled;
-    accessible-action-default => { if (root.enabled) { root.clicked(); } }
+    accessible-label: busy
+        ? (enabled ? label + ", unavailable while the current action is loading" : label + ", unavailable")
+        : label;
+    accessible-enabled: enabled && !busy;
+    accessible-action-default => { if (root.enabled && !root.busy) { root.clicked(); } }
 
     width: 48px;
     height: 48px;
@@ -140,20 +143,22 @@ export component MIconButton inherits Rectangle {
         height: 22px;
         name: root.icon;
         size: root.compact-visual ? 16px : 18px;
-        icon-color: !root.enabled ? Theme.outline : root.inverse ? Theme.on-inverse-surface : root.danger ? Theme.error : root.selected ? Theme.on-primary-container : Theme.on-surface-variant;
+        icon-color: !root.enabled || root.busy ? Theme.outline : root.inverse ? Theme.on-inverse-surface : root.danger ? Theme.error : root.selected ? Theme.on-primary-container : Theme.on-surface-variant;
     }
 
     focus := FocusScope {
-        enabled: root.enabled;
+        // Keep an existing focus anchor while an asynchronous action makes the
+        // button temporarily unavailable, without adding it to the Tab order.
+        focus-on-tab-navigation: root.enabled && !root.busy;
         key-pressed(event) => {
             if (event.text == Key.Return || event.text == Key.Space) {
-                root.clicked();
+                if (root.enabled && !root.busy) { root.clicked(); }
                 return accept;
             }
             return reject;
         }
         touch := TouchArea {
-            enabled: root.enabled;
+            enabled: root.enabled && !root.busy;
             mouse-cursor: pointer;
             clicked => { focus.focus(); root.clicked(); }
         }
