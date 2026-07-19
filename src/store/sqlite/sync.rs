@@ -17,6 +17,26 @@ const MAX_TIMESTAMP_MS: i64 = 253_402_300_799_999;
 const INBOX_REMOTE_KEY: &str = "inbox";
 const KNOWN_FLAG_BITS: u8 = InboxFlags::SEEN | InboxFlags::FLAGGED;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct InboxCheckpoint {
+    pub(crate) expected_cursor: Option<u32>,
+    pub(crate) uid_validity: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InboxCheckpointOutcome {
+    Current(InboxCheckpoint),
+    Stale,
+    NotFound,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ActiveImapAccountFence {
+    Current,
+    Stale,
+    NotFound,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct InboxFlags(u8);
 
@@ -298,6 +318,62 @@ pub(crate) enum InboxValidationError {
     Flags(u8),
 }
 
+pub(super) fn load_inbox_checkpoint(
+    connection: &Connection,
+    account_id: AccountId,
+    expected_generation: AccountGeneration,
+) -> Result<InboxCheckpointOutcome, DbFailure> {
+    match active_imap_account_fence(connection, account_id, expected_generation)? {
+        ActiveImapAccountFence::Stale => return Ok(InboxCheckpointOutcome::Stale),
+        ActiveImapAccountFence::NotFound => return Ok(InboxCheckpointOutcome::NotFound),
+        ActiveImapAccountFence::Current => {}
+    }
+
+    let stored = connection
+        .query_row(
+            "SELECT folder.role, state.uid_validity, state.change_cursor
+             FROM folders AS folder
+             LEFT JOIN sync_state AS state ON state.folder_id = folder.id
+             WHERE folder.account_id = ?1 AND folder.remote_key = ?2",
+            params![account_id.get(), INBOX_REMOTE_KEY],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(DbFailure::database)?;
+    let Some((role, stored_uid_validity, stored_cursor)) = stored else {
+        return Ok(InboxCheckpointOutcome::Current(InboxCheckpoint::default()));
+    };
+    if role != "inbox" {
+        return Err(DbFailure::conflict(
+            "canonical IMAP inbox has a conflicting folder role",
+        ));
+    }
+    let uid_validity = stored_uid_validity
+        .map(|value| {
+            u32::try_from(value)
+                .ok()
+                .filter(|value| *value != 0)
+                .ok_or_else(|| DbFailure::database("stored IMAP UIDVALIDITY is invalid"))
+        })
+        .transpose()?;
+    let expected_cursor = stored_cursor.as_deref().map(parse_cursor).transpose()?;
+    if expected_cursor.is_some() && uid_validity.is_none() {
+        return Err(DbFailure::database(
+            "stored IMAP cursor has no UIDVALIDITY fence",
+        ));
+    }
+    Ok(InboxCheckpointOutcome::Current(InboxCheckpoint {
+        expected_cursor,
+        uid_validity,
+    }))
+}
+
 pub(super) fn stage_inbox_page(
     connection: &mut Connection,
     page: &InboxReceivePage,
@@ -482,26 +558,52 @@ struct CursorWindowMessage {
 }
 
 fn account_fence_matches(
-    transaction: &Transaction<'_>,
+    connection: &Connection,
     account_id: AccountId,
     expected_generation: AccountGeneration,
 ) -> Result<bool, DbFailure> {
-    transaction
+    active_imap_account_fence(connection, account_id, expected_generation)
+        .map(|outcome| outcome == ActiveImapAccountFence::Current)
+}
+
+pub(super) fn active_imap_account_fence(
+    connection: &Connection,
+    account_id: AccountId,
+    expected_generation: AccountGeneration,
+) -> Result<ActiveImapAccountFence, DbFailure> {
+    let account = connection
         .query_row(
-            "SELECT EXISTS (
-                 SELECT 1
-                 FROM accounts AS account
-                 JOIN account_connections AS connection
-                   ON connection.account_id = account.id
-                 WHERE account.id = ?1
-                   AND account.configuration_generation = ?2
-                   AND account.provider = 'imap'
-                   AND account.state = 'active'
-             )",
-            params![account_id.get(), expected_generation.get()],
-            |row| row.get(0),
+            "SELECT account.configuration_generation, account.provider, account.state,
+                    EXISTS (
+                        SELECT 1 FROM account_connections AS configured
+                        WHERE configured.account_id = account.id
+                    )
+             FROM accounts AS account
+             WHERE account.id = ?1",
+            [account_id.get()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            },
         )
-        .map_err(DbFailure::database)
+        .optional()
+        .map_err(DbFailure::database)?;
+    let Some((generation, provider, state, configured)) = account else {
+        return Ok(ActiveImapAccountFence::NotFound);
+    };
+    if generation == expected_generation.get()
+        && provider == "imap"
+        && state == "active"
+        && configured
+    {
+        Ok(ActiveImapAccountFence::Current)
+    } else {
+        Ok(ActiveImapAccountFence::Stale)
+    }
 }
 
 fn load_inbox(

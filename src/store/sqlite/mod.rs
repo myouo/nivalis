@@ -53,8 +53,9 @@ pub(crate) use domain::{
 pub(crate) use file_gc::FileGcOutcome;
 #[allow(unused_imports)]
 pub(crate) use sync::{
-    InboxCursorCommit, InboxCursorOutcome, InboxCursorTicket, InboxEnvelope, InboxFlags,
-    InboxReceivePage, InboxStageOutcome, InboxValidationError, StagedInboxMessage,
+    InboxCheckpoint, InboxCheckpointOutcome, InboxCursorCommit, InboxCursorOutcome,
+    InboxCursorTicket, InboxEnvelope, InboxFlags, InboxReceivePage, InboxStageOutcome,
+    InboxValidationError, StagedInboxMessage,
 };
 
 #[cfg(test)]

@@ -2,8 +2,8 @@ use crate::{
     AppWindow,
     content::{ContentLimits, ContentStaging, FileKey, prepare_content},
     store::sqlite::{
-        ContentImportSubmission, DatabaseClient, DatabaseSubmitError, FileGcOutcome,
-        MailboxQueryCounts, MessageId, mailbox_query_counts,
+        AccountGeneration, AccountId, ContentImportSubmission, DatabaseClient, DatabaseSubmitError,
+        FileGcOutcome, MailboxQueryCounts, MessageId, mailbox_query_counts,
     },
 };
 use slint::{ComponentHandle, Model, SharedString, Timer, TimerMode};
@@ -590,7 +590,9 @@ fn run_content_cycle(
 
     let submission = Box::new(ContentImportSubmission::new(
         message_id,
-        CONTENT_TARGET_ACCOUNT_ID,
+        AccountId::new(CONTENT_TARGET_ACCOUNT_ID)
+            .expect("content benchmark account identity is positive"),
+        AccountGeneration::new(1).expect("content benchmark generation is positive"),
         published,
     ));
     let import_reply = database

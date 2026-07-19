@@ -28,6 +28,23 @@ SELECT
     (id * 200000) % 16777216
 FROM sequence;
 
+INSERT INTO account_connections (
+    account_id,
+    credential_key,
+    auth_kind,
+    login_name,
+    imap_host,
+    imap_port
+)
+VALUES (
+    51,
+    '00000000000000000000000000000033',
+    'app_password',
+    'account-51@example.test',
+    'imap.example.test',
+    993
+);
+
 WITH RECURSIVE sequence(id) AS (
     VALUES (1)
     UNION ALL

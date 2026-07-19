@@ -19,7 +19,7 @@ use crate::content::{ContentStaging, PublishedContent};
 
 use super::{
     account::{
-        AccountRecord, AccountWrite, AccountWriteOutcome, PendingCacheRemoval,
+        AccountGeneration, AccountRecord, AccountWrite, AccountWriteOutcome, PendingCacheRemoval,
         PendingCredentialRemoval, begin_account_removal, begin_diagnostic,
         configure_existing_account, confirm_account_credentials_removed, create_account,
         load_account, load_pending_cache_removals, load_pending_credential_removals,
@@ -30,7 +30,8 @@ use super::{
         finalize_content_with_commit_hook, reserve_content,
     },
     domain::{
-        DbFailure, DbReply, Generation, MessageId, MessageMutation, PageSpec, RequestId, Tagged,
+        AccountId, DbFailure, DbReply, Generation, MessageId, MessageMutation, PageSpec, RequestId,
+        Tagged,
     },
     file_gc::{FileGcOutcome, run_file_gc},
     migrations::migrate,
@@ -41,8 +42,9 @@ use super::{
         claim_remote, report_remote,
     },
     sync::{
-        InboxCursorCommit, InboxCursorOutcome, InboxReceivePage, InboxStageOutcome,
-        commit_inbox_cursor, stage_inbox_page,
+        ActiveImapAccountFence, InboxCheckpointOutcome, InboxCursorCommit, InboxCursorOutcome,
+        InboxReceivePage, InboxStageOutcome, active_imap_account_fence, commit_inbox_cursor,
+        load_inbox_checkpoint, stage_inbox_page,
     },
 };
 
@@ -186,6 +188,11 @@ enum Request {
     LoadAccount {
         account_id: super::domain::AccountId,
         reply: oneshot::Sender<Result<AccountRecord, DbFailure>>,
+    },
+    LoadInboxCheckpoint {
+        account_id: AccountId,
+        expected_generation: AccountGeneration,
+        reply: oneshot::Sender<Result<InboxCheckpointOutcome, DbFailure>>,
     },
     LoadPendingCredentialRemovals {
         reply: oneshot::Sender<PendingCredentialRemovalReply>,
@@ -355,6 +362,20 @@ impl DatabaseClient {
     ) -> Result<oneshot::Receiver<Result<AccountRecord, DbFailure>>, SubmitError> {
         let (reply, receiver) = oneshot::channel();
         self.try_submit(Request::LoadAccount { account_id, reply })?;
+        Ok(receiver)
+    }
+
+    pub(crate) fn try_load_inbox_checkpoint(
+        &self,
+        account_id: AccountId,
+        expected_generation: AccountGeneration,
+    ) -> Result<oneshot::Receiver<Result<InboxCheckpointOutcome, DbFailure>>, SubmitError> {
+        let (reply, receiver) = oneshot::channel();
+        self.try_submit(Request::LoadInboxCheckpoint {
+            account_id,
+            expected_generation,
+            reply,
+        })?;
         Ok(receiver)
     }
 
@@ -641,15 +662,22 @@ impl AccountWriteExecutionFailure {
 #[derive(Debug)]
 pub(crate) struct ContentImportSubmission {
     message_id: MessageId,
-    account_id: i64,
+    account_id: AccountId,
+    expected_generation: AccountGeneration,
     content: PublishedContent,
 }
 
 impl ContentImportSubmission {
-    pub(crate) fn new(message_id: MessageId, account_id: i64, content: PublishedContent) -> Self {
+    pub(crate) fn new(
+        message_id: MessageId,
+        account_id: AccountId,
+        expected_generation: AccountGeneration,
+        content: PublishedContent,
+    ) -> Self {
         Self {
             message_id,
             account_id,
+            expected_generation,
             content,
         }
     }
@@ -1087,6 +1115,20 @@ fn run_actor(
                 }
                 continue;
             }
+            Request::LoadInboxCheckpoint {
+                account_id,
+                expected_generation,
+                reply,
+            } => {
+                if !reply.is_closed() {
+                    let _ = reply.send(load_inbox_checkpoint(
+                        &connection,
+                        account_id,
+                        expected_generation,
+                    ));
+                }
+                continue;
+            }
             Request::LoadPendingCredentialRemovals { reply } => {
                 if !reply.is_closed() {
                     let _ = reply.send(load_pending_credential_removals(&connection));
@@ -1351,6 +1393,23 @@ fn execute_content_import(
 ) -> ContentImportReply {
     let _write_guard = lock_write_gate(write_gate);
     let result = (|| {
+        match active_imap_account_fence(
+            connection,
+            submission.account_id,
+            submission.expected_generation,
+        )? {
+            ActiveImapAccountFence::Current => {}
+            ActiveImapAccountFence::Stale => {
+                return Err(DbFailure::conflict(
+                    "content import account changed or is not active; reload and retry",
+                ));
+            }
+            ActiveImapAccountFence::NotFound => {
+                return Err(DbFailure::not_found(
+                    "content import account no longer exists",
+                ));
+            }
+        }
         let now_ms = current_time_ms()?;
         let expires_at_ms = now_ms
             .checked_add(CONTENT_IMPORT_TTL_MS)
@@ -1358,7 +1417,7 @@ fn execute_content_import(
         let record = submission.content.record();
         let request = ReserveContentRequest::new(
             submission.message_id,
-            submission.account_id,
+            submission.account_id.get(),
             next_content_batch_token(),
             ContentManifest::from_record(&record)?,
             now_ms,
@@ -1811,8 +1870,8 @@ mod tests {
             migrations::LATEST_SCHEMA_VERSION,
             remote::{RemoteCheckpoint, RemoteImapSource, RemoteReport, RemoteWorkMode},
             sync::{
-                InboxCursorCommit, InboxCursorOutcome, InboxEnvelope, InboxFlags, InboxReceivePage,
-                InboxStageOutcome,
+                InboxCheckpointOutcome, InboxCursorCommit, InboxCursorOutcome, InboxEnvelope,
+                InboxFlags, InboxReceivePage, InboxStageOutcome,
             },
         },
     };
@@ -2000,6 +2059,11 @@ mod tests {
                  VALUES
                      (1, 'imap', 'account', 'Personal',
                       'user@example.test', 'active', 0);
+                 INSERT INTO account_connections
+                     (account_id, credential_key, auth_kind, login_name, imap_host, imap_port)
+                 VALUES
+                     (1, '0123456789abcdef0123456789abcdef', 'app_password',
+                      'user@example.test', 'imap.example.test', 993);
                  INSERT INTO messages
                      (id, account_id, remote_key, received_at_ms)
                  VALUES (1, 1, 'message', 0);",
@@ -2086,7 +2150,8 @@ mod tests {
             client
                 .try_import_content(Box::new(ContentImportSubmission::new(
                     MessageId::new(1).unwrap(),
-                    1,
+                    AccountId::new(1).unwrap(),
+                    AccountGeneration::new(1).unwrap(),
                     first,
                 )))
                 .unwrap(),
@@ -2122,7 +2187,8 @@ mod tests {
             client
                 .try_import_content(Box::new(ContentImportSubmission::new(
                     MessageId::new(1).unwrap(),
-                    1,
+                    AccountId::new(1).unwrap(),
+                    AccountGeneration::new(1).unwrap(),
                     second,
                 )))
                 .unwrap(),
@@ -2182,7 +2248,8 @@ mod tests {
 
         let busy = Box::new(ContentImportSubmission::new(
             MessageId::new(1).unwrap(),
-            1,
+            AccountId::new(1).unwrap(),
+            AccountGeneration::new(1).unwrap(),
             publish_test_content(&staging, "Busy", "body"),
         ));
         let busy_pointer: *const ContentImportSubmission = busy.as_ref();
@@ -2194,7 +2261,8 @@ mod tests {
         close_admission(&client.admission);
         let closed = Box::new(ContentImportSubmission::new(
             MessageId::new(1).unwrap(),
-            1,
+            AccountId::new(1).unwrap(),
+            AccountGeneration::new(1).unwrap(),
             publish_test_content(&staging, "Closed", "body"),
         ));
         let closed_pointer: *const ContentImportSubmission = closed.as_ref();
@@ -2207,7 +2275,8 @@ mod tests {
             spawn_target(Target::Memory, REQUEST_CAPACITY, REPLY_CAPACITY).unwrap();
         let rejected = Box::new(ContentImportSubmission::new(
             MessageId::new(99).unwrap(),
-            1,
+            AccountId::new(1).unwrap(),
+            AccountGeneration::new(1).unwrap(),
             publish_test_content(&staging, "Missing", "body"),
         ));
         let rejected_pointer: *const ContentImportSubmission = rejected.as_ref();
@@ -2220,6 +2289,53 @@ mod tests {
         drop(recovered);
 
         runtime.shutdown().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_account_generation_fences_content_before_import() {
+        let path = temporary_database_path();
+        seed_content_message(&path);
+        let (root, staging) = temporary_content_staging("account-fence");
+        let published = publish_test_content(&staging, "Fenced", "must not import");
+        let body_key = published.record().body_file_key.unwrap();
+        let (client, _replies, runtime, _info) =
+            spawn_target(Target::File(path.clone()), REQUEST_CAPACITY, REPLY_CAPACITY).unwrap();
+
+        let failure = receive_oneshot(
+            client
+                .try_import_content(Box::new(ContentImportSubmission::new(
+                    MessageId::new(1).unwrap(),
+                    AccountId::new(1).unwrap(),
+                    AccountGeneration::new(2).unwrap(),
+                    published,
+                )))
+                .unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(failure.failure().kind, FailureKind::Conflict);
+        drop(failure);
+        runtime.shutdown().unwrap();
+
+        let connection = Connection::open(&path).unwrap();
+        let stored: (i64, i64, i64) = connection
+            .query_row(
+                "SELECT content_generation,
+                        EXISTS (SELECT 1 FROM message_content WHERE message_id = 1),
+                        EXISTS (SELECT 1 FROM file_staging WHERE message_id = 1)
+                 FROM messages WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (0, 0, 0));
+        assert_eq!(
+            staging.open_file(&body_key).unwrap_err().kind,
+            std::io::ErrorKind::NotFound
+        );
+
+        drop(connection);
+        remove_database_files(&path);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2238,7 +2354,8 @@ mod tests {
         let receiver = client
             .try_import_content(Box::new(ContentImportSubmission::new(
                 MessageId::new(1).unwrap(),
-                1,
+                AccountId::new(1).unwrap(),
+                AccountGeneration::new(1).unwrap(),
                 published,
             )))
             .unwrap();
@@ -2604,6 +2721,112 @@ mod tests {
         let outcome =
             receive_oneshot(client.try_commit_inbox_cursor(Box::new(commit)).unwrap()).unwrap();
         assert_eq!(outcome, InboxCursorOutcome::ContentPending { missing: 1 });
+        assert!(replies.is_empty());
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn inbox_checkpoint_read_distinguishes_current_stale_and_missing() {
+        let (client, replies, runtime, _info) =
+            spawn_target(Target::Memory, REQUEST_CAPACITY, REPLY_CAPACITY).unwrap();
+        let account = create_actor_account(&client);
+
+        assert_eq!(
+            receive_oneshot(
+                client
+                    .try_load_inbox_checkpoint(account.account_id, account.generation)
+                    .unwrap()
+            )
+            .unwrap(),
+            InboxCheckpointOutcome::Current(Default::default())
+        );
+        assert_eq!(
+            receive_oneshot(
+                client
+                    .try_load_inbox_checkpoint(
+                        account.account_id,
+                        AccountGeneration::new(account.generation.get() + 1).unwrap(),
+                    )
+                    .unwrap()
+            )
+            .unwrap(),
+            InboxCheckpointOutcome::Stale
+        );
+        assert_eq!(
+            receive_oneshot(
+                client
+                    .try_load_inbox_checkpoint(
+                        AccountId::new(account.account_id.get() + 1).unwrap(),
+                        account.generation,
+                    )
+                    .unwrap()
+            )
+            .unwrap(),
+            InboxCheckpointOutcome::NotFound
+        );
+
+        let empty_page = InboxReceivePage::new(
+            account.account_id,
+            account.generation,
+            None,
+            31,
+            Some(7),
+            Vec::new(),
+        )
+        .unwrap();
+        let staged =
+            receive_oneshot(client.try_stage_inbox(Box::new(empty_page)).unwrap()).unwrap();
+        let InboxStageOutcome::Staged { ticket, .. } = staged else {
+            panic!("expected current inbox stage");
+        };
+        assert_eq!(
+            receive_oneshot(
+                client
+                    .try_commit_inbox_cursor(Box::new(
+                        InboxCursorCommit::new(ticket, 1_700_000_001_000).unwrap()
+                    ))
+                    .unwrap()
+            )
+            .unwrap(),
+            InboxCursorOutcome::Committed {
+                scanned_through_uid: Some(7)
+            }
+        );
+        assert_eq!(
+            receive_oneshot(
+                client
+                    .try_load_inbox_checkpoint(account.account_id, account.generation)
+                    .unwrap()
+            )
+            .unwrap(),
+            InboxCheckpointOutcome::Current(super::super::sync::InboxCheckpoint {
+                expected_cursor: Some(7),
+                uid_validity: Some(31),
+            })
+        );
+
+        let disabled = receive_oneshot(
+            client
+                .try_write_account(Box::new(AccountWrite::SetEnabled {
+                    account_id: account.account_id,
+                    expected_generation: account.generation,
+                    enabled: false,
+                }))
+                .unwrap(),
+        )
+        .unwrap();
+        let AccountWriteOutcome::Saved(disabled) = disabled else {
+            panic!("expected disabled account");
+        };
+        assert_eq!(
+            receive_oneshot(
+                client
+                    .try_load_inbox_checkpoint(disabled.account_id, disabled.generation)
+                    .unwrap()
+            )
+            .unwrap(),
+            InboxCheckpointOutcome::Stale
+        );
         assert!(replies.is_empty());
         runtime.shutdown().unwrap();
     }
