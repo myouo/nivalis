@@ -20,6 +20,10 @@ remove_data_dir=0
 hard_gate=${NIVALIS_MEMORY_HARD_GATE:-0}
 hard_cap_kib=${NIVALIS_MEMORY_HARD_CAP_KIB:-92160}
 growth_limit_percent=${NIVALIS_MEMORY_GROWTH_LIMIT_PERCENT:-100}
+cpu_settle_gate=${NIVALIS_MEMORY_CPU_SETTLE_GATE:-$hard_gate}
+cpu_settle_grace_seconds=${NIVALIS_MEMORY_CPU_SETTLE_GRACE_SECONDS:-5}
+cpu_settle_seconds=${NIVALIS_MEMORY_CPU_SETTLE_SECONDS:-10}
+cpu_settle_max_percent=${NIVALIS_MEMORY_CPU_SETTLE_MAX_PERCENT:-0.00}
 stress_steps=${NIVALIS_STRESS_STEPS:-}
 test_case=${NIVALIS_MEMORY_TEST_CASE:-}
 
@@ -41,6 +45,26 @@ if [[ "$hard_gate" != "0" && "$hard_gate" != "1" ]]; then
     printf 'NIVALIS_MEMORY_HARD_GATE must be 0 or 1: %s\n' "$hard_gate" >&2
     exit 1
 fi
+if [[ "$cpu_settle_gate" != "0" && "$cpu_settle_gate" != "1" ]]; then
+    printf 'NIVALIS_MEMORY_CPU_SETTLE_GATE must be 0 or 1: %s\n' "$cpu_settle_gate" >&2
+    exit 1
+fi
+if ! is_bounded_nonnegative_decimal "$cpu_settle_grace_seconds" 2147483647; then
+    printf 'NIVALIS_MEMORY_CPU_SETTLE_GRACE_SECONDS must be a non-negative integer: %s\n' \
+        "$cpu_settle_grace_seconds" >&2
+    exit 1
+fi
+if ! is_bounded_positive_decimal "$cpu_settle_seconds" 2147483647; then
+    printf 'NIVALIS_MEMORY_CPU_SETTLE_SECONDS must be a positive integer: %s\n' \
+        "$cpu_settle_seconds" >&2
+    exit 1
+fi
+if [[ ! "$cpu_settle_max_percent" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+    ! awk -v value="$cpu_settle_max_percent" 'BEGIN { exit !(value <= 100) }'; then
+    printf 'NIVALIS_MEMORY_CPU_SETTLE_MAX_PERCENT must be between 0 and 100: %s\n' \
+        "$cpu_settle_max_percent" >&2
+    exit 1
+fi
 if ! is_bounded_positive_decimal "$runs" 2147483647; then
     printf 'NIVALIS_MEMORY_RUNS must be a positive decimal integer: %s\n' "$runs" >&2
     exit 1
@@ -59,12 +83,15 @@ if [[ -n "$stress_steps" ]] && ! is_bounded_positive_decimal "$stress_steps" 214
     exit 1
 fi
 stress_scenario=${NIVALIS_STRESS_SCENARIO:-mixed}
-if [[ -n "$stress_steps" && "$stress_scenario" != "mixed" && "$stress_scenario" != "pagination" ]]; then
+if [[ -n "$stress_steps" && "$stress_scenario" != "mixed" &&
+    "$stress_scenario" != "pagination" && "$stress_scenario" != "write-search" ]]; then
     printf 'Unsupported NIVALIS_STRESS_SCENARIO: %s\n' "$stress_scenario" >&2
     exit 1
 fi
-if [[ -n "$stress_steps" && "$stress_scenario" == "pagination" ]] && ((stress_steps % 2 != 0)); then
-    printf 'Pagination stress requires an even NIVALIS_STRESS_STEPS value\n' >&2
+if [[ -n "$stress_steps" &&
+    ("$stress_scenario" == "pagination" || "$stress_scenario" == "write-search") ]] &&
+    ((stress_steps % 2 != 0)); then
+    printf '%s stress requires an even NIVALIS_STRESS_STEPS value\n' "$stress_scenario" >&2
     exit 1
 fi
 if [[ -z "$test_case" ]]; then
@@ -98,6 +125,11 @@ for sample in "${sample_points[@]}"; do
 done
 if ((hard_gate)) && ((${#sample_points[@]} < 2)); then
     printf 'NIVALIS_MEMORY_HARD_GATE requires at least two samples for the growth check\n' >&2
+    exit 1
+fi
+if ((cpu_settle_gate &&
+    previous_sample + cpu_settle_grace_seconds + cpu_settle_seconds > 2147483647)); then
+    printf 'CPU settle sample time exceeds the supported range\n' >&2
     exit 1
 fi
 
@@ -143,6 +175,69 @@ cleanup() {
     fi
 }
 trap cleanup EXIT INT TERM
+
+sample_process_metrics() {
+    if ! kill -0 "$pid" 2>/dev/null; then
+        cat "$run_log_file" >&2
+        exit 1
+    fi
+
+    current_cpu_ticks=$(awk '{ print $14 + $15 }' "/proc/$pid/stat")
+    current_wall_ns=$(date +%s%N)
+    cpu_percent=$(awk \
+        -v cpu_ticks="$((current_cpu_ticks - previous_cpu_ticks))" \
+        -v wall_ns="$((current_wall_ns - previous_wall_ns))" \
+        -v clock_ticks="$clock_ticks" \
+        'BEGIN { printf "%.2f", 100 * cpu_ticks * 1000000000 / clock_ticks / wall_ns }')
+    previous_cpu_ticks=$current_cpu_ticks
+    previous_wall_ns=$current_wall_ns
+    vm_hwm_kib=$(awk '$1 == "VmHWM:" { print $2; exit }' "/proc/$pid/status")
+    if ! is_bounded_positive_decimal "$vm_hwm_kib" 2147483647; then
+        printf 'Could not read a positive VmHWM value for process %s: %s\n' \
+            "$pid" "$vm_hwm_kib" >&2
+        exit 1
+    fi
+    metrics=$(awk '
+        /^Rss:/ { rss = $2 }
+        /^Pss:/ { pss = $2 }
+        /^Private_Clean:/ { private_clean = $2 }
+        /^Private_Dirty:/ { private_dirty = $2 }
+        /^Anonymous:/ { anonymous = $2 }
+        END {
+            printf "%d %d %d %d", rss, pss, private_clean + private_dirty,
+                anonymous
+        }
+    ' "/proc/$pid/smaps_rollup")
+    read -r rss_kib pss_kib uss_kib anonymous_kib <<<"$metrics"
+    if ! is_bounded_positive_decimal "$rss_kib" 2147483647 ||
+        ! is_bounded_positive_decimal "$pss_kib" 2147483647 ||
+        ! is_bounded_nonnegative_decimal "$uss_kib" 2147483647 ||
+        ! is_bounded_nonnegative_decimal "$anonymous_kib" 2147483647; then
+        printf 'Could not read bounded smaps metrics for process %s: %s\n' \
+            "$pid" "$metrics" >&2
+        exit 1
+    fi
+}
+
+record_sample() {
+    local seconds=$1
+    printf '%s,%s,%s,%d,%d,%d,%d,%d,%d,%s,%d\n' \
+        "$test_case" "$renderer" "$platform" "$run" "$seconds" "$rss_kib" \
+        "$pss_kib" "$uss_kib" "$anonymous_kib" "$cpu_percent" "$vm_hwm_kib"
+
+    if ((baseline_rss_kib == 0)); then
+        baseline_rss_kib=$rss_kib
+        baseline_pss_kib=$pss_kib
+    fi
+    settled_rss_kib=$rss_kib
+    settled_pss_kib=$pss_kib
+
+    if ((hard_gate)) && ((rss_kib >= hard_cap_kib || vm_hwm_kib >= hard_cap_kib)); then
+        printf 'Memory hard cap failed on run %d at %ss: RSS=%dKiB VmHWM=%dKiB; both must be below %dKiB\n' \
+            "$run" "$seconds" "$rss_kib" "$vm_hwm_kib" "$hard_cap_kib" >&2
+        exit 1
+    fi
+}
 
 printf 'test_case,renderer,platform,run,seconds,rss_kib,pss_kib,uss_kib,anonymous_kib,cpu_percent,vm_hwm_kib\n'
 
@@ -238,74 +333,9 @@ for ((run = 1; run <= runs; run++)); do
         fi
         previous=$seconds
 
-        if ! kill -0 "$pid" 2>/dev/null; then
-            cat "$run_log_file" >&2
-            exit 1
-        fi
-
-        current_cpu_ticks=$(awk '{ print $14 + $15 }' "/proc/$pid/stat")
-        current_wall_ns=$(date +%s%N)
-        cpu_percent=$(awk \
-            -v cpu_ticks="$((current_cpu_ticks - previous_cpu_ticks))" \
-            -v wall_ns="$((current_wall_ns - previous_wall_ns))" \
-            -v clock_ticks="$clock_ticks" \
-            'BEGIN { printf "%.2f", 100 * cpu_ticks * 1000000000 / clock_ticks / wall_ns }')
-        previous_cpu_ticks=$current_cpu_ticks
-        previous_wall_ns=$current_wall_ns
-        vm_hwm_kib=$(awk '$1 == "VmHWM:" { print $2; exit }' "/proc/$pid/status")
-        if ! is_bounded_positive_decimal "$vm_hwm_kib" 2147483647; then
-            printf 'Could not read a positive VmHWM value for process %s: %s\n' \
-                "$pid" "$vm_hwm_kib" >&2
-            exit 1
-        fi
-        metrics=$(awk '
-            /^Rss:/ { rss = $2 }
-            /^Pss:/ { pss = $2 }
-            /^Private_Clean:/ { private_clean = $2 }
-            /^Private_Dirty:/ { private_dirty = $2 }
-            /^Anonymous:/ { anonymous = $2 }
-            END {
-                printf "%d %d %d %d", rss, pss, private_clean + private_dirty,
-                    anonymous
-            }
-        ' "/proc/$pid/smaps_rollup")
-        read -r rss_kib pss_kib uss_kib anonymous_kib <<<"$metrics"
-        if ! is_bounded_positive_decimal "$rss_kib" 2147483647 ||
-            ! is_bounded_positive_decimal "$pss_kib" 2147483647 ||
-            ! is_bounded_nonnegative_decimal "$uss_kib" 2147483647 ||
-            ! is_bounded_nonnegative_decimal "$anonymous_kib" 2147483647; then
-            printf 'Could not read bounded smaps metrics for process %s: %s\n' \
-                "$pid" "$metrics" >&2
-            exit 1
-        fi
-        printf '%s,%s,%s,%d,%d,%d,%d,%d,%d,%s,%d\n' \
-            "$test_case" "$renderer" "$platform" "$run" "$seconds" "$rss_kib" \
-            "$pss_kib" "$uss_kib" "$anonymous_kib" "$cpu_percent" "$vm_hwm_kib"
-
-        if ((baseline_rss_kib == 0)); then
-            baseline_rss_kib=$rss_kib
-            baseline_pss_kib=$pss_kib
-        fi
-        settled_rss_kib=$rss_kib
-        settled_pss_kib=$pss_kib
-
-        if ((hard_gate)) && ((rss_kib >= hard_cap_kib || vm_hwm_kib >= hard_cap_kib)); then
-            printf 'Memory hard cap failed on run %d at %ss: RSS=%dKiB VmHWM=%dKiB; both must be below %dKiB\n' \
-                "$run" "$seconds" "$rss_kib" "$vm_hwm_kib" "$hard_cap_kib" >&2
-            exit 1
-        fi
+        sample_process_metrics
+        record_sample "$seconds"
     done
-
-    if ((hard_gate)); then
-        growth_factor=$((100 + growth_limit_percent))
-        if ((settled_rss_kib * 100 >= baseline_rss_kib * growth_factor ||
-            settled_pss_kib * 100 >= baseline_pss_kib * growth_factor)); then
-            printf 'Memory growth gate failed on run %d: baseline RSS/PSS=%d/%dKiB, settled=%d/%dKiB; growth must be below %d%%\n' \
-                "$run" "$baseline_rss_kib" "$baseline_pss_kib" \
-                "$settled_rss_kib" "$settled_pss_kib" "$growth_limit_percent" >&2
-            exit 1
-        fi
-    fi
 
     if [[ -n "$stress_steps" ]]; then
         mapfile -t stress_errors < <(grep -E '^NIVALIS_STRESS_ERROR ' "$run_log_file" || true)
@@ -337,6 +367,23 @@ for ((run = 1; run <= runs; run++)); do
                     "$stress_result" >&2
                 exit 1
             fi
+        elif [[ "$stress_scenario" == "write-search" ]]; then
+            write_search_pattern='^NIVALIS_STRESS_RESULT scenario=write-search cycles=([1-9][0-9]*) writes=([1-9][0-9]*) searches=([1-9][0-9]*) clears=([1-9][0-9]*) first_queries=([1-9][0-9]*) after_queries=0 before_queries=0 target_id=51 final_page=1 final_query=empty final_starred=(true|false) elapsed_ms=(0|[1-9][0-9]*)$'
+            if [[ ! "$stress_result" =~ $write_search_pattern ]]; then
+                printf 'Write-search stress completion marker has an invalid format: %s\n' \
+                    "$stress_result" >&2
+                exit 1
+            fi
+            expected_first_queries=$((stress_steps * 3))
+            if [[ "${BASH_REMATCH[1]}" != "$stress_steps" ||
+                "${BASH_REMATCH[2]}" != "$stress_steps" ||
+                "${BASH_REMATCH[3]}" != "$stress_steps" ||
+                "${BASH_REMATCH[4]}" != "$stress_steps" ||
+                "${BASH_REMATCH[5]}" != "$expected_first_queries" ]]; then
+                printf 'Write-search stress completion counts do not match the requested cycles: %s\n' \
+                    "$stress_result" >&2
+                exit 1
+            fi
         else
             mixed_pattern='^NIVALIS_STRESS_RESULT scenario=mixed steps=([1-9][0-9]*) elapsed_ms=(0|[1-9][0-9]*)$'
             if [[ ! "$stress_result" =~ $mixed_pattern || "${BASH_REMATCH[1]}" != "$stress_steps" ]]; then
@@ -346,6 +393,36 @@ for ((run = 1; run <= runs; run++)); do
             fi
         fi
         printf '%s\n' "$stress_result" >&2
+    fi
+
+    if ((cpu_settle_gate)); then
+        if ((cpu_settle_grace_seconds > 0)); then
+            sleep "$cpu_settle_grace_seconds"
+        fi
+        previous_cpu_ticks=$(awk '{ print $14 + $15 }' "/proc/$pid/stat")
+        previous_wall_ns=$(date +%s%N)
+        sleep "$cpu_settle_seconds"
+        settled_seconds=$((previous + cpu_settle_grace_seconds + cpu_settle_seconds))
+        sample_process_metrics
+        record_sample "$settled_seconds"
+        if ! awk -v actual="$cpu_percent" -v maximum="$cpu_settle_max_percent" \
+            'BEGIN { exit !(actual <= maximum) }'; then
+            printf 'CPU settle gate failed on run %d: %s%% over %ss exceeds %s%%\n' \
+                "$run" "$cpu_percent" "$cpu_settle_seconds" \
+                "$cpu_settle_max_percent" >&2
+            exit 1
+        fi
+    fi
+
+    if ((hard_gate)); then
+        growth_factor=$((100 + growth_limit_percent))
+        if ((settled_rss_kib * 100 >= baseline_rss_kib * growth_factor ||
+            settled_pss_kib * 100 >= baseline_pss_kib * growth_factor)); then
+            printf 'Memory growth gate failed on run %d: baseline RSS/PSS=%d/%dKiB, settled=%d/%dKiB; growth must be below %d%%\n' \
+                "$run" "$baseline_rss_kib" "$baseline_pss_kib" \
+                "$settled_rss_kib" "$settled_pss_kib" "$growth_limit_percent" >&2
+            exit 1
+        fi
     fi
 
     kill "$pid" 2>/dev/null || true

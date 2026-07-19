@@ -22,8 +22,8 @@ if [[ ! -f "$database" ]]; then
 fi
 
 schema_version=$(sqlite3 "$database" 'PRAGMA user_version;')
-if [[ "$schema_version" != "8" ]]; then
-    printf 'Expected schema version 8, found %s\n' "$schema_version" >&2
+if [[ "$schema_version" != "9" ]]; then
+    printf 'Expected schema version 9, found %s\n' "$schema_version" >&2
     exit 1
 fi
 
@@ -73,17 +73,33 @@ projection=$(sqlite3 -separator '|' "$database" \
             (SELECT id FROM ordered LIMIT 1),
             (SELECT id FROM ordered LIMIT 1 OFFSET 49),
             (SELECT id FROM ordered LIMIT 1 OFFSET 50);")
+search=$(sqlite3 -separator '|' "$database" \
+    "SELECT (SELECT count(*)
+               FROM message_search
+              WHERE message_search MATCH '\"bounded mailbox\"'),
+            (SELECT count(*)
+               FROM message_search
+              WHERE message_search MATCH '\"message 51\"'),
+            (SELECT min(rowid)
+               FROM message_search
+              WHERE message_search MATCH '\"message 51\"'),
+            (SELECT max(rowid)
+               FROM message_search
+              WHERE message_search MATCH '\"message 51\"');")
+sqlite3 "$database" \
+    "INSERT INTO message_search(message_search, rank) VALUES ('integrity-check', 1);"
 
 if [[ "$integrity" != "ok" || -n "$foreign_key_violations" ]]; then
     printf 'Seeded memory fixture failed SQLite integrity checks\n' >&2
     exit 1
 fi
-if [[ "$counts" != "64|64|51|51|0" || "$bounds" != "2048|2048|65536|65536" || "$projection" != "50|1|51|2|1" ]]; then
+if [[ "$counts" != "64|64|51|51|0" || "$bounds" != "2048|2048|65536|65536" ||
+    "$projection" != "50|1|51|2|1" || "$search" != "51|1|51|51" ]]; then
     printf 'Seeded memory fixture did not preserve its resource bounds\n' >&2
     exit 1
 fi
 
 IFS='|' read -r first_count second_count first_id first_last_id second_id <<<"$projection"
-printf 'Seeded %s (%s; preview/detail min/max %s bytes; pages %s|%s; first IDs %s..%s; second ID %s)\n' \
+printf 'Seeded %s (%s; preview/detail min/max %s bytes; pages %s|%s; first IDs %s..%s; second ID %s; FTS %s)\n' \
     "$database" "$counts" "$bounds" "$first_count" "$second_count" \
-    "$first_id" "$first_last_id" "$second_id"
+    "$first_id" "$first_last_id" "$second_id" "$search"

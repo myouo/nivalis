@@ -457,6 +457,23 @@ mod tests {
             .expect("read fixture text bounds");
         assert_eq!(bounds, (2_048, 2_048, 65_536, 65_536));
 
+        let search = connection
+            .query_row(
+                "SELECT count(*), min(rowid), max(rowid)
+                   FROM message_search
+                  WHERE message_search MATCH '\"message 51\"'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .expect("query fixture FTS identity");
+        assert_eq!(search, (1, 51, 51));
+
         let first_spec = PageSpec::new(
             AccountScope::All,
             FolderScope::Inbox,

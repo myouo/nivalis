@@ -46,6 +46,33 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Validate memory evidence layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          declare -A revisions=()
+          for file in docs/measurements/*.csv; do
+            name=$(basename "$file" .csv)
+            if [[ ! "$name" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}-([0-9a-f]{7})$ ]]; then
+              printf 'Invalid measurement filename: %s\n' "$file" >&2
+              exit 1
+            fi
+            revision=${BASH_REMATCH[1]}
+            if [[ -n "${revisions[$revision]:-}" ]]; then
+              printf 'Multiple measurement files for revision %s\n' "$revision" >&2
+              exit 1
+            fi
+            revisions[$revision]=1
+            if [[ $(head -n 1 "$file") != test_case,* ]]; then
+              printf 'Measurement file lacks the test_case field: %s\n' "$file" >&2
+              exit 1
+            fi
+            awk -F, 'NR == 1 { columns = NF } NF != columns { exit 1 }' "$file" || {
+              printf 'Measurement file has inconsistent columns: %s\n' "$file" >&2
+              exit 1
+            }
+          done
+
       - name: Run tests
         run: cargo test --locked
 
@@ -54,3 +81,93 @@ jobs:
 
       - name: Lint all targets
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  release-smoke:
+    name: Release GUI smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Install Linux runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            pkg-config \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libxkbcommon-x11-0 \
+            sqlite3 \
+            xauth \
+            xdotool \
+            xvfb
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2.9.1
+        with:
+          cache-on-failure: true
+
+      - name: Build production and benchmark releases
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release
+          install -m 755 target/release/nivalis-mail target/release/nivalis-mail-production
+          cargo build --locked --release --features bench-harness
+
+      - name: Exercise schema, writes, search, and pagination
+        shell: bash
+        run: |
+          set -euo pipefail
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          mkdir -p "$work/data"
+
+          xvfb-run -a -s '-screen 0 1280x1024x24' env \
+            NIVALIS_MEMORY_DATA_DIR="$work/data" \
+            NIVALIS_MEMORY_TEST_CASE=ci-init \
+            NIVALIS_MEMORY_SAMPLES=1 \
+            scripts/measure-memory.sh target/release/nivalis-mail-production \
+            > "$work/init.csv"
+          scripts/seed-memory-fixture.sh "$work/data"
+
+          xvfb-run -a -s '-screen 0 1280x1024x24' env \
+            NIVALIS_MEMORY_DATA_DIR="$work/data" \
+            NIVALIS_MEMORY_TEST_CASE=write-search-smoke \
+            NIVALIS_STRESS_SCENARIO=write-search \
+            NIVALIS_STRESS_STEPS=2 \
+            NIVALIS_STRESS_DELAY_MS=250 \
+            NIVALIS_STRESS_INTERVAL_MS=2 \
+            NIVALIS_STRESS_TRANSITION_TIMEOUT_MS=5000 \
+            NIVALIS_MEMORY_LOG="$work/write-search.log" \
+            NIVALIS_MEMORY_SAMPLES='1 40' \
+            NIVALIS_MEMORY_CPU_SETTLE_GATE=1 \
+            NIVALIS_MEMORY_CPU_SETTLE_GRACE_SECONDS=5 \
+            NIVALIS_MEMORY_CPU_SETTLE_SECONDS=10 \
+            NIVALIS_MEMORY_CPU_SETTLE_MAX_PERCENT=1.00 \
+            scripts/measure-memory.sh target/release/nivalis-mail \
+            > "$work/write-search.csv"
+
+          xvfb-run -a -s '-screen 0 1280x1024x24' env \
+            NIVALIS_MEMORY_DATA_DIR="$work/data" \
+            NIVALIS_MEMORY_TEST_CASE=pagination-smoke \
+            NIVALIS_STRESS_SCENARIO=pagination \
+            NIVALIS_STRESS_STEPS=2 \
+            NIVALIS_STRESS_DELAY_MS=250 \
+            NIVALIS_STRESS_INTERVAL_MS=2 \
+            NIVALIS_STRESS_TRANSITION_TIMEOUT_MS=5000 \
+            NIVALIS_MEMORY_LOG="$work/pagination.log" \
+            NIVALIS_MEMORY_SAMPLES='1 40' \
+            NIVALIS_MEMORY_CPU_SETTLE_GATE=1 \
+            NIVALIS_MEMORY_CPU_SETTLE_GRACE_SECONDS=5 \
+            NIVALIS_MEMORY_CPU_SETTLE_SECONDS=10 \
+            NIVALIS_MEMORY_CPU_SETTLE_MAX_PERCENT=1.00 \
+            scripts/measure-memory.sh target/release/nivalis-mail \
+            > "$work/pagination.csv"
+
+          awk -F, 'NF != 11 { exit 1 }' \
+            "$work/init.csv" "$work/write-search.csv" "$work/pagination.csv"
