@@ -1,5 +1,8 @@
 use std::{
-    fmt, io,
+    fmt,
+    future::{Future, poll_fn},
+    io,
+    num::NonZeroU32,
     pin::Pin,
     sync::{Arc, OnceLock},
     task::{Context, Poll},
@@ -7,18 +10,19 @@ use std::{
 };
 
 use async_imap::{
-    Client,
+    Client, Session,
     error::Error as ImapError,
-    imap_proto::types::{Response, Status},
+    imap_proto::types::{AttributeValue, Response, Status},
 };
 use rustls::{ClientConfig, Error as RustlsError, crypto, pki_types::ServerName};
 use rustls_platform_verifier::BuilderVerifierExt;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
+    sync::oneshot,
     time::{Instant, timeout_at},
 };
-use tokio_rustls::TlsConnector;
+use tokio_rustls::{TlsConnector, client::TlsStream};
 
 use crate::credentials::Secret;
 
@@ -28,6 +32,18 @@ const MAX_SERVER_BYTES: usize = 256 * 1024;
 const MAX_CLIENT_BYTES: usize = 64 * 1024;
 const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGOUT_TIMEOUT: Duration = Duration::from_secs(1);
+const INBOX_FETCH_TIMEOUT: Duration = Duration::from_secs(45);
+const MAX_INBOX_MESSAGES: usize = 16;
+const MAX_INBOX_LITERAL_BYTES: usize = 1024 * 1024;
+const MAX_INBOX_PAGE_LITERAL_BYTES: usize = 4 * 1024 * 1024;
+const MAX_INBOX_SERVER_BYTES: usize = MAX_INBOX_PAGE_LITERAL_BYTES + 512 * 1024;
+const MAX_INBOX_CLIENT_BYTES: usize = 64 * 1024;
+const MAX_INTERNAL_DATE_BYTES: usize = 64;
+const MAX_ENVELOPE_SUBJECT_BYTES: usize = 998;
+const MAX_ENVELOPE_NAME_BYTES: usize = 320;
+const MAX_ENVELOPE_MAILBOX_BYTES: usize = 320;
+const MAX_ENVELOPE_HOST_BYTES: usize = 253;
+const MAX_ENVELOPE_MESSAGE_ID_BYTES: usize = 998;
 
 static PLATFORM_CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
 
@@ -45,22 +61,7 @@ impl ImapDiagnosticRequest {
         login: &str,
         secret: Secret,
     ) -> Result<Self, ImapDiagnosticInputError> {
-        if host.is_empty()
-            || host.len() > MAX_HOST_BYTES
-            || host.trim() != host
-            || ServerName::try_from(host.to_owned()).is_err()
-        {
-            return Err(ImapDiagnosticInputError::Host);
-        }
-        if port == 0 {
-            return Err(ImapDiagnosticInputError::Port);
-        }
-        if login.is_empty() || login.len() > MAX_LOGIN_BYTES || login.trim() != login {
-            return Err(ImapDiagnosticInputError::Login);
-        }
-        if std::str::from_utf8(secret.expose()).is_err() {
-            return Err(ImapDiagnosticInputError::SecretEncoding);
-        }
+        validate_connection_input(host, port, login, &secret)?;
         Ok(Self {
             host: host.into(),
             port,
@@ -82,6 +83,181 @@ pub(crate) enum ImapDiagnosticInputError {
     Port,
     Login,
     SecretEncoding,
+}
+
+pub(crate) struct ImapInboxFetchRequest {
+    host: Box<str>,
+    port: u16,
+    login: Box<str>,
+    secret: Secret,
+    first_uid: NonZeroU32,
+    expected_uid_validity: Option<NonZeroU32>,
+}
+
+impl ImapInboxFetchRequest {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        host: &str,
+        port: u16,
+        login: &str,
+        secret: Secret,
+        first_uid: u32,
+        expected_uid_validity: Option<u32>,
+    ) -> Result<Self, ImapInboxFetchInputError> {
+        validate_connection_input(host, port, login, &secret)
+            .map_err(ImapInboxFetchInputError::Connection)?;
+        let first_uid = NonZeroU32::new(first_uid).ok_or(ImapInboxFetchInputError::FirstUid)?;
+        let expected_uid_validity = expected_uid_validity
+            .map(|value| {
+                NonZeroU32::new(value).ok_or(ImapInboxFetchInputError::ExpectedUidValidity)
+            })
+            .transpose()?;
+        Ok(Self {
+            host: host.into(),
+            port,
+            login: login.into(),
+            secret,
+            first_uid,
+            expected_uid_validity,
+        })
+    }
+}
+
+impl fmt::Debug for ImapInboxFetchRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ImapInboxFetchRequest([REDACTED])")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImapInboxFetchInputError {
+    Connection(ImapDiagnosticInputError),
+    FirstUid,
+    ExpectedUidValidity,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ImapInboxFlags {
+    pub(crate) seen: bool,
+    pub(crate) flagged: bool,
+    pub(crate) answered: bool,
+    pub(crate) draft: bool,
+    pub(crate) deleted: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ImapInboxEnvelope {
+    pub(crate) subject: Box<[u8]>,
+    pub(crate) from_name: Box<[u8]>,
+    pub(crate) from_mailbox: Box<[u8]>,
+    pub(crate) from_host: Box<[u8]>,
+    pub(crate) message_id: Box<[u8]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ImapInboxContent {
+    Fetched(Box<[u8]>),
+    Oversized { declared_bytes: u32 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ImapInboxMessage {
+    pub(crate) uid: NonZeroU32,
+    pub(crate) flags: ImapInboxFlags,
+    pub(crate) internal_date: Box<str>,
+    pub(crate) envelope: ImapInboxEnvelope,
+    pub(crate) declared_bytes: u32,
+    pub(crate) content: ImapInboxContent,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ImapInboxPage {
+    pub(crate) uid_validity: NonZeroU32,
+    pub(crate) uid_next: NonZeroU32,
+    pub(crate) scanned_through_uid: Option<NonZeroU32>,
+    pub(crate) next_uid: Option<NonZeroU32>,
+    pub(crate) messages: Box<[ImapInboxMessage]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImapInboxFetchFailure {
+    Authentication,
+    Permission,
+    Certificate,
+    Timeout,
+    Offline,
+    Protocol,
+    ResourceLimit,
+    Cancelled,
+    MissingUidValidity,
+    MissingUidNext,
+    UidValidityChanged { expected: u32, actual: u32 },
+}
+
+impl fmt::Display for ImapInboxFetchFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Authentication => "the IMAP server rejected the account credentials",
+            Self::Permission => "the account cannot read its IMAP inbox",
+            Self::Certificate => "the IMAP server certificate could not be verified",
+            Self::Timeout => "the IMAP inbox fetch timed out",
+            Self::Offline => "the IMAP server connection was lost",
+            Self::Protocol => "the server returned an invalid IMAP inbox response",
+            Self::ResourceLimit => "the IMAP inbox fetch exceeded its resource limit",
+            Self::Cancelled => "the IMAP inbox fetch was cancelled",
+            Self::MissingUidValidity => "the IMAP inbox did not provide UIDVALIDITY",
+            Self::MissingUidNext => "the IMAP inbox did not provide UIDNEXT",
+            Self::UidValidityChanged { .. } => "the IMAP inbox UIDVALIDITY changed",
+        })
+    }
+}
+
+impl std::error::Error for ImapInboxFetchFailure {}
+
+pub(crate) struct ImapInboxFetchCancelHandle(Option<oneshot::Sender<()>>);
+
+impl ImapInboxFetchCancelHandle {
+    pub(crate) fn cancel(mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+pub(crate) struct ImapInboxFetchCancellation(oneshot::Receiver<()>);
+
+pub(crate) fn imap_inbox_fetch_cancellation_pair()
+-> (ImapInboxFetchCancelHandle, ImapInboxFetchCancellation) {
+    let (sender, receiver) = oneshot::channel();
+    (
+        ImapInboxFetchCancelHandle(Some(sender)),
+        ImapInboxFetchCancellation(receiver),
+    )
+}
+
+fn validate_connection_input(
+    host: &str,
+    port: u16,
+    login: &str,
+    secret: &Secret,
+) -> Result<(), ImapDiagnosticInputError> {
+    if host.is_empty()
+        || host.len() > MAX_HOST_BYTES
+        || host.trim() != host
+        || ServerName::try_from(host.to_owned()).is_err()
+    {
+        return Err(ImapDiagnosticInputError::Host);
+    }
+    if port == 0 {
+        return Err(ImapDiagnosticInputError::Port);
+    }
+    if login.is_empty() || login.len() > MAX_LOGIN_BYTES || login.trim() != login {
+        return Err(ImapDiagnosticInputError::Login);
+    }
+    if std::str::from_utf8(secret.expose()).is_err() {
+        return Err(ImapDiagnosticInputError::SecretEncoding);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -167,19 +343,60 @@ async fn diagnose_with_connector(
     limits: DiagnosticLimits,
 ) -> Result<(), ImapDiagnosticFailure> {
     let deadline = Instant::now() + limits.timeout;
-    let server_name = ServerName::try_from(request.host.to_string()).map_err(|_| {
+    let (mut session, login_capabilities) = open_app_password_session(
+        request.host.as_ref(),
+        request.port,
+        request.login.as_ref(),
+        &request.secret,
+        connector,
+        deadline,
+        limits.max_server_bytes,
+        limits.max_client_bytes,
+    )
+    .await?;
+    require_imap_capability(&mut session, login_capabilities, deadline).await?;
+
+    match timeout_at(deadline, session.examine("INBOX")).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            return Err(failure(
+                ImapDiagnosticStage::Mailbox,
+                imap_failure_kind(&error, ImapDiagnosticStage::Mailbox),
+            ));
+        }
+        Err(_) => return Err(timeout_failure(ImapDiagnosticStage::Mailbox)),
+    }
+
+    let _ = tokio::time::timeout(LOGOUT_TIMEOUT, session.logout()).await;
+    Ok(())
+}
+
+type AuthenticatedSession = Session<BoundedIo<TlsStream<TcpStream>>>;
+
+#[allow(clippy::too_many_arguments)]
+async fn open_app_password_session(
+    host: &str,
+    port: u16,
+    login: &str,
+    secret: &Secret,
+    connector: TlsConnector,
+    deadline: Instant,
+    max_server_bytes: usize,
+    max_client_bytes: usize,
+) -> Result<
+    (
+        AuthenticatedSession,
+        Option<async_imap::types::Capabilities>,
+    ),
+    ImapDiagnosticFailure,
+> {
+    let server_name = ServerName::try_from(host.to_owned()).map_err(|_| {
         failure(
             ImapDiagnosticStage::Tls,
             ImapDiagnosticFailureKind::Protocol,
         )
     })?;
-
-    let tcp = match timeout_at(
-        deadline,
-        TcpStream::connect((request.host.as_ref(), request.port)),
-    )
-    .await
-    {
+    let tcp = match timeout_at(deadline, TcpStream::connect((host, port))).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(error)) => {
             return Err(failure(
@@ -190,7 +407,6 @@ async fn diagnose_with_connector(
         Err(_) => return Err(timeout_failure(ImapDiagnosticStage::Connect)),
     };
     let _ = tcp.set_nodelay(true);
-
     let tls = match timeout_at(deadline, connector.connect(server_name, tcp)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(error)) => {
@@ -198,9 +414,7 @@ async fn diagnose_with_connector(
         }
         Err(_) => return Err(timeout_failure(ImapDiagnosticStage::Tls)),
     };
-    let stream = BoundedIo::new(tls, limits.max_server_bytes, limits.max_client_bytes);
-    let mut client = Client::new(stream);
-
+    let mut client = Client::new(BoundedIo::new(tls, max_server_bytes, max_client_bytes));
     let greeting = match timeout_at(deadline, client.read_response()).await {
         Ok(Ok(Some(greeting))) => greeting,
         Ok(Ok(None)) => {
@@ -229,29 +443,27 @@ async fn diagnose_with_connector(
             ImapDiagnosticFailureKind::Protocol,
         ));
     }
-
-    let password = std::str::from_utf8(request.secret.expose()).map_err(|_| {
+    let password = std::str::from_utf8(secret.expose()).map_err(|_| {
         failure(
             ImapDiagnosticStage::Authenticate,
             ImapDiagnosticFailureKind::Authentication,
         )
     })?;
-    let (mut session, login_capabilities) = match timeout_at(
-        deadline,
-        client.login_with_capabilities(request.login.as_ref(), password),
-    )
-    .await
-    {
-        Ok(Ok(session)) => session,
-        Ok(Err((error, _client))) => {
-            return Err(failure(
-                ImapDiagnosticStage::Authenticate,
-                imap_failure_kind(&error, ImapDiagnosticStage::Authenticate),
-            ));
-        }
-        Err(_) => return Err(timeout_failure(ImapDiagnosticStage::Authenticate)),
-    };
+    match timeout_at(deadline, client.login_with_capabilities(login, password)).await {
+        Ok(Ok(session)) => Ok(session),
+        Ok(Err((error, _client))) => Err(failure(
+            ImapDiagnosticStage::Authenticate,
+            imap_failure_kind(&error, ImapDiagnosticStage::Authenticate),
+        )),
+        Err(_) => Err(timeout_failure(ImapDiagnosticStage::Authenticate)),
+    }
+}
 
+async fn require_imap_capability(
+    session: &mut AuthenticatedSession,
+    login_capabilities: Option<async_imap::types::Capabilities>,
+    deadline: Instant,
+) -> Result<(), ImapDiagnosticFailure> {
     let capabilities = match login_capabilities {
         Some(capabilities) => capabilities,
         None => match timeout_at(deadline, session.capabilities()).await {
@@ -265,26 +477,554 @@ async fn diagnose_with_connector(
             Err(_) => return Err(timeout_failure(ImapDiagnosticStage::Capability)),
         },
     };
-    if !capabilities.has_str("IMAP4rev1") && !capabilities.has_str("IMAP4rev2") {
-        return Err(failure(
+    if capabilities.has_str("IMAP4rev1") || capabilities.has_str("IMAP4rev2") {
+        Ok(())
+    } else {
+        Err(failure(
             ImapDiagnosticStage::Capability,
             ImapDiagnosticFailureKind::Protocol,
-        ));
+        ))
     }
+}
 
-    match timeout_at(deadline, session.examine("INBOX")).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => {
-            return Err(failure(
-                ImapDiagnosticStage::Mailbox,
-                imap_failure_kind(&error, ImapDiagnosticStage::Mailbox),
-            ));
+pub(crate) async fn fetch_canonical_inbox(
+    request: ImapInboxFetchRequest,
+) -> Result<ImapInboxPage, ImapInboxFetchFailure> {
+    let connector = platform_connector().map_err(map_diagnostic_failure)?;
+    fetch_canonical_inbox_with_connector(request, connector, InboxFetchLimits::production(), None)
+        .await
+}
+
+pub(crate) async fn fetch_canonical_inbox_cancellable(
+    request: ImapInboxFetchRequest,
+    cancellation: ImapInboxFetchCancellation,
+) -> Result<ImapInboxPage, ImapInboxFetchFailure> {
+    let connector = platform_connector().map_err(map_diagnostic_failure)?;
+    fetch_canonical_inbox_with_connector(
+        request,
+        connector,
+        InboxFetchLimits::production(),
+        Some(cancellation),
+    )
+    .await
+}
+
+async fn fetch_canonical_inbox_with_connector(
+    request: ImapInboxFetchRequest,
+    connector: TlsConnector,
+    limits: InboxFetchLimits,
+    cancellation: Option<ImapInboxFetchCancellation>,
+) -> Result<ImapInboxPage, ImapInboxFetchFailure> {
+    let operation = fetch_canonical_inbox_inner(request, connector, limits);
+    let Some(ImapInboxFetchCancellation(receiver)) = cancellation else {
+        return operation.await;
+    };
+    let mut operation = Box::pin(operation);
+    let mut receiver = Some(Box::pin(receiver));
+    poll_fn(move |context| {
+        if let Some(signal) = receiver.as_mut() {
+            match signal.as_mut().poll(context) {
+                Poll::Ready(Ok(())) => {
+                    return Poll::Ready(Err(ImapInboxFetchFailure::Cancelled));
+                }
+                Poll::Ready(Err(_)) => receiver = None,
+                Poll::Pending => {}
+            }
         }
-        Err(_) => return Err(timeout_failure(ImapDiagnosticStage::Mailbox)),
+        operation.as_mut().poll(context)
+    })
+    .await
+}
+
+async fn fetch_canonical_inbox_inner(
+    request: ImapInboxFetchRequest,
+    connector: TlsConnector,
+    limits: InboxFetchLimits,
+) -> Result<ImapInboxPage, ImapInboxFetchFailure> {
+    let deadline = Instant::now() + limits.timeout;
+    let (mut session, login_capabilities) = open_app_password_session(
+        request.host.as_ref(),
+        request.port,
+        request.login.as_ref(),
+        &request.secret,
+        connector,
+        deadline,
+        limits.max_server_bytes,
+        limits.max_client_bytes,
+    )
+    .await
+    .map_err(map_diagnostic_failure)?;
+    require_imap_capability(&mut session, login_capabilities, deadline)
+        .await
+        .map_err(map_diagnostic_failure)?;
+
+    let mailbox = match timeout_at(deadline, session.examine("INBOX")).await {
+        Ok(Ok(mailbox)) => mailbox,
+        Ok(Err(error)) => return Err(map_receive_imap_error(&error, true)),
+        Err(_) => return Err(ImapInboxFetchFailure::Timeout),
+    };
+    let uid_validity = mailbox
+        .uid_validity
+        .and_then(NonZeroU32::new)
+        .ok_or(ImapInboxFetchFailure::MissingUidValidity)?;
+    if let Some(expected) = request.expected_uid_validity
+        && expected != uid_validity
+    {
+        return Err(ImapInboxFetchFailure::UidValidityChanged {
+            expected: expected.get(),
+            actual: uid_validity.get(),
+        });
+    }
+    let uid_next = mailbox
+        .uid_next
+        .and_then(NonZeroU32::new)
+        .ok_or(ImapInboxFetchFailure::MissingUidNext)?;
+    let first_uid = request.first_uid.get();
+    if mailbox.exists == 0 || uid_next.get() <= first_uid {
+        let scanned_through = first_uid
+            .saturating_sub(1)
+            .max(uid_next.get().saturating_sub(1));
+        let _ = tokio::time::timeout(LOGOUT_TIMEOUT, session.logout()).await;
+        return Ok(ImapInboxPage {
+            uid_validity,
+            uid_next,
+            scanned_through_uid: NonZeroU32::new(scanned_through),
+            next_uid: None,
+            messages: Box::new([]),
+        });
     }
 
+    let span = u32::try_from(limits.max_messages.saturating_sub(1)).unwrap_or(u32::MAX);
+    let mut last_uid = first_uid.saturating_add(span);
+    last_uid = last_uid.min(uid_next.get().saturating_sub(1));
+    let mut metadata = fetch_metadata(&mut session, first_uid, last_uid, deadline, limits).await?;
+    metadata.sort_unstable_by_key(|message| message.uid);
+
+    let mut messages = Vec::with_capacity(metadata.len());
+    let mut literal_bytes = 0_usize;
+    let mut deferred_uid = None;
+    for metadata in metadata {
+        let declared_bytes = usize::try_from(metadata.declared_bytes)
+            .map_err(|_| ImapInboxFetchFailure::ResourceLimit)?;
+        let content = if declared_bytes > limits.max_message_literal_bytes {
+            ImapInboxContent::Oversized {
+                declared_bytes: metadata.declared_bytes,
+            }
+        } else {
+            let next_total = literal_bytes
+                .checked_add(declared_bytes)
+                .ok_or(ImapInboxFetchFailure::ResourceLimit)?;
+            if next_total > limits.max_page_literal_bytes {
+                deferred_uid = Some(metadata.uid);
+                break;
+            }
+            let raw = fetch_body(
+                &mut session,
+                metadata.uid,
+                metadata.declared_bytes,
+                deadline,
+                limits,
+            )
+            .await?;
+            literal_bytes = literal_bytes
+                .checked_add(raw.len())
+                .ok_or(ImapInboxFetchFailure::ResourceLimit)?;
+            if literal_bytes > limits.max_page_literal_bytes {
+                return Err(ImapInboxFetchFailure::ResourceLimit);
+            }
+            ImapInboxContent::Fetched(raw)
+        };
+        messages.push(ImapInboxMessage {
+            uid: metadata.uid,
+            flags: metadata.flags,
+            internal_date: metadata.internal_date,
+            envelope: metadata.envelope,
+            declared_bytes: metadata.declared_bytes,
+            content,
+        });
+    }
+    let scanned_through_uid = deferred_uid
+        .and_then(|uid| uid.get().checked_sub(1))
+        .and_then(NonZeroU32::new)
+        .or_else(|| NonZeroU32::new(last_uid));
+    let next_uid = deferred_uid.or_else(|| {
+        last_uid
+            .checked_add(1)
+            .filter(|next| *next < uid_next.get())
+            .and_then(NonZeroU32::new)
+    });
     let _ = tokio::time::timeout(LOGOUT_TIMEOUT, session.logout()).await;
+    Ok(ImapInboxPage {
+        uid_validity,
+        uid_next,
+        scanned_through_uid,
+        next_uid,
+        messages: messages.into_boxed_slice(),
+    })
+}
+
+#[derive(Clone, Copy)]
+struct InboxFetchLimits {
+    timeout: Duration,
+    max_server_bytes: usize,
+    max_client_bytes: usize,
+    max_messages: usize,
+    max_message_literal_bytes: usize,
+    max_page_literal_bytes: usize,
+}
+
+impl InboxFetchLimits {
+    const fn production() -> Self {
+        Self {
+            timeout: INBOX_FETCH_TIMEOUT,
+            max_server_bytes: MAX_INBOX_SERVER_BYTES,
+            max_client_bytes: MAX_INBOX_CLIENT_BYTES,
+            max_messages: MAX_INBOX_MESSAGES,
+            max_message_literal_bytes: MAX_INBOX_LITERAL_BYTES,
+            max_page_literal_bytes: MAX_INBOX_PAGE_LITERAL_BYTES,
+        }
+    }
+}
+
+struct InboxMetadata {
+    uid: NonZeroU32,
+    flags: ImapInboxFlags,
+    internal_date: Box<str>,
+    envelope: ImapInboxEnvelope,
+    declared_bytes: u32,
+}
+
+async fn fetch_metadata(
+    session: &mut AuthenticatedSession,
+    first_uid: u32,
+    last_uid: u32,
+    deadline: Instant,
+    limits: InboxFetchLimits,
+) -> Result<Vec<InboxMetadata>, ImapInboxFetchFailure> {
+    let command =
+        format!("UID FETCH {first_uid}:{last_uid} (UID FLAGS INTERNALDATE RFC822.SIZE ENVELOPE)");
+    let id = match timeout_at(deadline, session.run_command(command)).await {
+        Ok(Ok(id)) => id,
+        Ok(Err(error)) => return Err(map_receive_imap_error(&error, false)),
+        Err(_) => return Err(ImapInboxFetchFailure::Timeout),
+    };
+    let mut messages = Vec::with_capacity(limits.max_messages);
+    loop {
+        let response = read_receive_response(session, deadline).await?;
+        match response {
+            ReceiveResponse::Done { tag, status } if tag == id => {
+                require_ok_status(status)?;
+                break;
+            }
+            ReceiveResponse::Done { .. } => return Err(ImapInboxFetchFailure::Protocol),
+            ReceiveResponse::Fetch(fetch) => {
+                if messages.len() == limits.max_messages {
+                    return Err(ImapInboxFetchFailure::ResourceLimit);
+                }
+                let message = parse_metadata(fetch)?;
+                if !(first_uid..=last_uid).contains(&message.uid.get())
+                    || messages
+                        .iter()
+                        .any(|existing: &InboxMetadata| existing.uid == message.uid)
+                {
+                    return Err(ImapInboxFetchFailure::Protocol);
+                }
+                messages.push(message);
+            }
+            ReceiveResponse::Bye => return Err(ImapInboxFetchFailure::Offline),
+            ReceiveResponse::Other => {}
+        }
+    }
+    Ok(messages)
+}
+
+async fn fetch_body(
+    session: &mut AuthenticatedSession,
+    uid: NonZeroU32,
+    declared_bytes: u32,
+    deadline: Instant,
+    limits: InboxFetchLimits,
+) -> Result<Box<[u8]>, ImapInboxFetchFailure> {
+    let id = match timeout_at(
+        deadline,
+        session.run_command(format!("UID FETCH {} (UID BODY.PEEK[])", uid.get())),
+    )
+    .await
+    {
+        Ok(Ok(id)) => id,
+        Ok(Err(error)) => return Err(map_receive_imap_error(&error, false)),
+        Err(_) => return Err(ImapInboxFetchFailure::Timeout),
+    };
+    let mut body = None;
+    loop {
+        let response = read_receive_response(session, deadline).await?;
+        match response {
+            ReceiveResponse::Done { tag, status } if tag == id => {
+                require_ok_status(status)?;
+                break;
+            }
+            ReceiveResponse::Done { .. } => return Err(ImapInboxFetchFailure::Protocol),
+            ReceiveResponse::Fetch(fetch) => {
+                let Some(body_response) = parse_body(fetch)? else {
+                    continue;
+                };
+                if body_response.uid != uid || body.is_some() {
+                    return Err(ImapInboxFetchFailure::Protocol);
+                }
+                if body_response.bytes.len() > limits.max_message_literal_bytes {
+                    return Err(ImapInboxFetchFailure::ResourceLimit);
+                }
+                body = Some(body_response.bytes);
+            }
+            ReceiveResponse::Bye => return Err(ImapInboxFetchFailure::Offline),
+            ReceiveResponse::Other => {}
+        }
+    }
+    let body = body.ok_or(ImapInboxFetchFailure::Protocol)?;
+    if body.len() != declared_bytes as usize {
+        return Err(ImapInboxFetchFailure::Protocol);
+    }
+    Ok(body)
+}
+
+async fn read_receive_response(
+    session: &mut AuthenticatedSession,
+    deadline: Instant,
+) -> Result<ReceiveResponse, ImapInboxFetchFailure> {
+    match timeout_at(deadline, session.read_response()).await {
+        Ok(Ok(Some(response))) => project_receive_response(response.parsed()),
+        Ok(Ok(None)) => Err(ImapInboxFetchFailure::Offline),
+        Ok(Err(error)) => Err(map_receive_io_error(&error)),
+        Err(_) => Err(ImapInboxFetchFailure::Timeout),
+    }
+}
+
+enum ReceiveResponse {
+    Done {
+        tag: async_imap::imap_proto::RequestId,
+        status: ReceiveStatus,
+    },
+    Fetch(ProjectedFetch),
+    Bye,
+    Other,
+}
+
+#[derive(Clone, Copy)]
+enum ReceiveStatus {
+    Ok,
+    No,
+    Bad,
+    PreAuth,
+    Bye,
+}
+
+#[derive(Default)]
+struct ProjectedFetch {
+    uid: Option<u32>,
+    flags: Option<ImapInboxFlags>,
+    internal_date: Option<Box<str>>,
+    declared_bytes: Option<u32>,
+    envelope: Option<ImapInboxEnvelope>,
+    body: Option<Box<[u8]>>,
+}
+
+fn project_receive_response(
+    response: &Response<'_>,
+) -> Result<ReceiveResponse, ImapInboxFetchFailure> {
+    match response {
+        Response::Done { tag, status, .. } => Ok(ReceiveResponse::Done {
+            tag: tag.clone(),
+            status: project_status(status),
+        }),
+        Response::Fetch(_, attributes) => {
+            let mut fetch = ProjectedFetch::default();
+            for attribute in attributes {
+                project_fetch_attribute(&mut fetch, attribute)?;
+            }
+            Ok(ReceiveResponse::Fetch(fetch))
+        }
+        Response::Data {
+            status: Status::Bye,
+            ..
+        } => Ok(ReceiveResponse::Bye),
+        _ => Ok(ReceiveResponse::Other),
+    }
+}
+
+fn project_status(status: &Status) -> ReceiveStatus {
+    match status {
+        Status::Ok => ReceiveStatus::Ok,
+        Status::No => ReceiveStatus::No,
+        Status::Bad => ReceiveStatus::Bad,
+        Status::PreAuth => ReceiveStatus::PreAuth,
+        Status::Bye => ReceiveStatus::Bye,
+    }
+}
+
+fn project_fetch_attribute(
+    fetch: &mut ProjectedFetch,
+    attribute: &AttributeValue<'_>,
+) -> Result<(), ImapInboxFetchFailure> {
+    match attribute {
+        AttributeValue::Uid(value) => set_once(&mut fetch.uid, *value)?,
+        AttributeValue::Flags(values) => {
+            let parsed = ImapInboxFlags {
+                seen: has_flag(values, "\\Seen"),
+                flagged: has_flag(values, "\\Flagged"),
+                answered: has_flag(values, "\\Answered"),
+                draft: has_flag(values, "\\Draft"),
+                deleted: has_flag(values, "\\Deleted"),
+            };
+            set_once(&mut fetch.flags, parsed)?;
+        }
+        AttributeValue::InternalDate(value) => {
+            if value.len() > MAX_INTERNAL_DATE_BYTES {
+                return Err(ImapInboxFetchFailure::ResourceLimit);
+            }
+            set_once(&mut fetch.internal_date, value.to_string().into_boxed_str())?;
+        }
+        AttributeValue::Rfc822Size(value) => set_once(&mut fetch.declared_bytes, *value)?,
+        AttributeValue::Envelope(value) => {
+            set_once(&mut fetch.envelope, project_envelope(value)?)?;
+        }
+        AttributeValue::BodySection {
+            section: None,
+            data: Some(bytes),
+            ..
+        }
+        | AttributeValue::Rfc822(Some(bytes)) => {
+            set_once(&mut fetch.body, bytes.as_ref().into())?;
+        }
+        _ => {}
+    }
     Ok(())
+}
+
+fn parse_metadata(fetch: ProjectedFetch) -> Result<InboxMetadata, ImapInboxFetchFailure> {
+    if fetch.body.is_some() {
+        return Err(ImapInboxFetchFailure::Protocol);
+    }
+    Ok(InboxMetadata {
+        uid: fetch
+            .uid
+            .and_then(NonZeroU32::new)
+            .ok_or(ImapInboxFetchFailure::Protocol)?,
+        flags: fetch.flags.ok_or(ImapInboxFetchFailure::Protocol)?,
+        internal_date: fetch.internal_date.ok_or(ImapInboxFetchFailure::Protocol)?,
+        envelope: fetch.envelope.ok_or(ImapInboxFetchFailure::Protocol)?,
+        declared_bytes: fetch
+            .declared_bytes
+            .ok_or(ImapInboxFetchFailure::Protocol)?,
+    })
+}
+
+struct ProjectedBody {
+    uid: NonZeroU32,
+    bytes: Box<[u8]>,
+}
+
+fn parse_body(fetch: ProjectedFetch) -> Result<Option<ProjectedBody>, ImapInboxFetchFailure> {
+    let Some(body) = fetch.body else {
+        return Ok(None);
+    };
+    let uid = fetch
+        .uid
+        .and_then(NonZeroU32::new)
+        .ok_or(ImapInboxFetchFailure::Protocol)?;
+    Ok(Some(ProjectedBody { uid, bytes: body }))
+}
+
+fn set_once<T>(slot: &mut Option<T>, value: T) -> Result<(), ImapInboxFetchFailure> {
+    if slot.replace(value).is_some() {
+        Err(ImapInboxFetchFailure::Protocol)
+    } else {
+        Ok(())
+    }
+}
+
+fn has_flag(flags: &[std::borrow::Cow<'_, str>], expected: &str) -> bool {
+    flags
+        .iter()
+        .any(|flag| flag.as_ref().eq_ignore_ascii_case(expected))
+}
+
+fn project_envelope(
+    envelope: &async_imap::imap_proto::types::Envelope<'_>,
+) -> Result<ImapInboxEnvelope, ImapInboxFetchFailure> {
+    let from = envelope
+        .from
+        .as_ref()
+        .and_then(|addresses| addresses.first());
+    Ok(ImapInboxEnvelope {
+        subject: bounded_envelope_bytes(envelope.subject.as_deref(), MAX_ENVELOPE_SUBJECT_BYTES)?,
+        from_name: bounded_envelope_bytes(
+            from.and_then(|address| address.name.as_deref()),
+            MAX_ENVELOPE_NAME_BYTES,
+        )?,
+        from_mailbox: bounded_envelope_bytes(
+            from.and_then(|address| address.mailbox.as_deref()),
+            MAX_ENVELOPE_MAILBOX_BYTES,
+        )?,
+        from_host: bounded_envelope_bytes(
+            from.and_then(|address| address.host.as_deref()),
+            MAX_ENVELOPE_HOST_BYTES,
+        )?,
+        message_id: bounded_envelope_bytes(
+            envelope.message_id.as_deref(),
+            MAX_ENVELOPE_MESSAGE_ID_BYTES,
+        )?,
+    })
+}
+
+fn bounded_envelope_bytes(
+    value: Option<&[u8]>,
+    maximum: usize,
+) -> Result<Box<[u8]>, ImapInboxFetchFailure> {
+    let value = value.unwrap_or_default();
+    if value.len() > maximum {
+        Err(ImapInboxFetchFailure::ResourceLimit)
+    } else {
+        Ok(value.into())
+    }
+}
+
+fn require_ok_status(status: ReceiveStatus) -> Result<(), ImapInboxFetchFailure> {
+    match status {
+        ReceiveStatus::Ok => Ok(()),
+        ReceiveStatus::No => Err(ImapInboxFetchFailure::Permission),
+        ReceiveStatus::Bad | ReceiveStatus::PreAuth => Err(ImapInboxFetchFailure::Protocol),
+        ReceiveStatus::Bye => Err(ImapInboxFetchFailure::Offline),
+    }
+}
+
+fn map_diagnostic_failure(failure: ImapDiagnosticFailure) -> ImapInboxFetchFailure {
+    match failure.kind {
+        ImapDiagnosticFailureKind::Authentication => ImapInboxFetchFailure::Authentication,
+        ImapDiagnosticFailureKind::Permission => ImapInboxFetchFailure::Permission,
+        ImapDiagnosticFailureKind::Certificate => ImapInboxFetchFailure::Certificate,
+        ImapDiagnosticFailureKind::Timeout => ImapInboxFetchFailure::Timeout,
+        ImapDiagnosticFailureKind::Offline => ImapInboxFetchFailure::Offline,
+        ImapDiagnosticFailureKind::Protocol => ImapInboxFetchFailure::Protocol,
+    }
+}
+
+fn map_receive_imap_error(error: &ImapError, mailbox: bool) -> ImapInboxFetchFailure {
+    match error {
+        ImapError::No(_) if mailbox => ImapInboxFetchFailure::Permission,
+        ImapError::No(_) | ImapError::Bad(_) => ImapInboxFetchFailure::Protocol,
+        ImapError::Io(error) => map_receive_io_error(error),
+        ImapError::ConnectionLost => ImapInboxFetchFailure::Offline,
+        _ => ImapInboxFetchFailure::Protocol,
+    }
+}
+
+fn map_receive_io_error(error: &io::Error) -> ImapInboxFetchFailure {
+    match error.kind() {
+        io::ErrorKind::FileTooLarge => ImapInboxFetchFailure::ResourceLimit,
+        io::ErrorKind::TimedOut => ImapInboxFetchFailure::Timeout,
+        io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput => ImapInboxFetchFailure::Protocol,
+        _ => ImapInboxFetchFailure::Offline,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -321,7 +1061,9 @@ fn tls_failure_kind(error: &io::Error) -> ImapDiagnosticFailureKind {
         ImapDiagnosticFailureKind::Certificate
     } else {
         match error.kind() {
-            io::ErrorKind::InvalidData => ImapDiagnosticFailureKind::Protocol,
+            io::ErrorKind::InvalidData | io::ErrorKind::FileTooLarge => {
+                ImapDiagnosticFailureKind::Protocol
+            }
             io::ErrorKind::PermissionDenied => ImapDiagnosticFailureKind::Permission,
             io::ErrorKind::TimedOut => ImapDiagnosticFailureKind::Timeout,
             _ => ImapDiagnosticFailureKind::Offline,
@@ -331,7 +1073,7 @@ fn tls_failure_kind(error: &io::Error) -> ImapDiagnosticFailureKind {
 
 fn io_failure_kind(error: &io::Error) -> ImapDiagnosticFailureKind {
     match error.kind() {
-        io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput => {
+        io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput | io::ErrorKind::FileTooLarge => {
             ImapDiagnosticFailureKind::Protocol
         }
         io::ErrorKind::PermissionDenied => ImapDiagnosticFailureKind::Permission,
@@ -390,7 +1132,7 @@ impl<T: AsyncRead + Unpin> AsyncRead for BoundedIo<T> {
         let this = self.get_mut();
         if this.read_remaining == 0 {
             return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+                io::ErrorKind::FileTooLarge,
                 "IMAP response byte limit exceeded",
             )));
         }
@@ -419,7 +1161,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for BoundedIo<T> {
         let this = self.get_mut();
         if this.write_remaining == 0 {
             return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+                io::ErrorKind::FileTooLarge,
                 "IMAP request byte limit exceeded",
             )));
         }
@@ -1147,6 +1889,33 @@ mod tests {
     }
 
     #[test]
+    fn rejects_an_oversized_literal_before_the_parser_can_reserve_it() {
+        run_async(async {
+            let (mut server, client) = tokio::io::duplex(256);
+            server
+                .write_all(
+                    b"* OK status text may end in {64}\r\n\
+                      * 1 FETCH (BODY[] {268435456}\r\n",
+                )
+                .await
+                .unwrap();
+            drop(server);
+
+            let mut client = Client::new(BoundedIo::new(client, 1024, 1024));
+            let status = client.read_response().await.unwrap().unwrap();
+            assert!(matches!(
+                status.parsed(),
+                Response::Data {
+                    status: Status::Ok,
+                    ..
+                }
+            ));
+            let error = client.read_response().await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+        });
+    }
+
+    #[test]
     fn request_input_bounds_are_exact_and_debug_is_redacted() {
         let host = format!(
             "{}.{}.{}.{}",
@@ -1200,5 +1969,564 @@ mod tests {
                 .unwrap_err(),
             ImapDiagnosticInputError::SecretEncoding
         );
+    }
+}
+
+#[cfg(test)]
+mod inbox_fetch_tests {
+    use std::{future::Future, net::SocketAddr, sync::Arc};
+
+    use rcgen::{CertifiedKey, generate_simple_self_signed};
+    use rustls::{ClientConfig, RootCertStore, ServerConfig, pki_types::PrivateKeyDer};
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        net::{TcpListener, TcpStream},
+        sync::oneshot,
+        task::JoinHandle,
+    };
+    use tokio_rustls::{TlsAcceptor, TlsConnector, server::TlsStream as ServerTlsStream};
+
+    use super::*;
+
+    const HOST: &str = "127.0.0.1";
+    const LOGIN: &str = "receive@example.test";
+    const PASSWORD: &[u8] = b"receive-password";
+    const UID_VALIDITY: u32 = 777;
+    const TEST_TIMEOUT: Duration = Duration::from_secs(3);
+    const RAW_ONE: &[u8] =
+        b"From: Alice <alice@example.test>\r\nSubject: First\r\nMessage-ID: <one@example.test>\r\n\r\nHello one.\r\n";
+    const RAW_TWO: &[u8] =
+        b"From: Bob <bob@example.test>\r\nSubject: Second\r\nMessage-ID: <two@example.test>\r\n\r\nHello two.\r\n";
+
+    #[derive(Clone)]
+    struct FixtureMessage {
+        uid: u32,
+        declared_bytes: u32,
+        raw: Box<[u8]>,
+    }
+
+    struct ServerPlan {
+        uid_validity: Option<u32>,
+        omit_uid_next: bool,
+        uid_next_override: Option<u32>,
+        messages: Vec<FixtureMessage>,
+        metadata_status: Option<&'static str>,
+        extra_metadata: usize,
+        stall_body: Option<oneshot::Sender<()>>,
+    }
+
+    impl ServerPlan {
+        fn messages(messages: Vec<FixtureMessage>) -> Self {
+            Self {
+                uid_validity: Some(UID_VALIDITY),
+                omit_uid_next: false,
+                uid_next_override: None,
+                messages,
+                metadata_status: None,
+                extra_metadata: 0,
+                stall_body: None,
+            }
+        }
+    }
+
+    struct TestServer {
+        address: SocketAddr,
+        connector: TlsConnector,
+        task: JoinHandle<Vec<Box<str>>>,
+    }
+
+    fn run_async<F: Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    fn fixture(uid: u32, raw: &[u8]) -> FixtureMessage {
+        FixtureMessage {
+            uid,
+            declared_bytes: u32::try_from(raw.len()).unwrap(),
+            raw: raw.into(),
+        }
+    }
+
+    fn limits() -> InboxFetchLimits {
+        InboxFetchLimits {
+            timeout: TEST_TIMEOUT,
+            max_server_bytes: 64 * 1024,
+            max_client_bytes: 16 * 1024,
+            max_messages: 2,
+            max_message_literal_bytes: 1024,
+            max_page_literal_bytes: 2048,
+        }
+    }
+
+    fn request(port: u16, expected_uid_validity: Option<u32>) -> ImapInboxFetchRequest {
+        request_from(port, 1, expected_uid_validity)
+    }
+
+    fn request_from(
+        port: u16,
+        first_uid: u32,
+        expected_uid_validity: Option<u32>,
+    ) -> ImapInboxFetchRequest {
+        ImapInboxFetchRequest::new(
+            HOST,
+            port,
+            LOGIN,
+            Secret::new(PASSWORD.to_vec()).unwrap(),
+            first_uid,
+            expected_uid_validity,
+        )
+        .unwrap()
+    }
+
+    fn test_tls() -> (TlsAcceptor, TlsConnector) {
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec![HOST.to_owned()]).unwrap();
+        let certificate = cert.der().clone();
+        let private_key: PrivateKeyDer<'static> = signing_key.into();
+        let provider = Arc::new(crypto::ring::default_provider());
+        let server = ServerConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate.clone()], private_key)
+            .unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(certificate).unwrap();
+        let client = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        (
+            TlsAcceptor::from(Arc::new(server)),
+            TlsConnector::from(Arc::new(client)),
+        )
+    }
+
+    async fn spawn_server(plan: ServerPlan) -> TestServer {
+        let (acceptor, connector) = test_tls();
+        let listener = TcpListener::bind((HOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let stream = acceptor.accept(tcp).await.unwrap();
+            run_server(stream, plan).await
+        });
+        TestServer {
+            address,
+            connector,
+            task,
+        }
+    }
+
+    async fn read_command(stream: &mut BufReader<ServerTlsStream<TcpStream>>) -> Option<Box<str>> {
+        let mut command = String::new();
+        match stream.read_line(&mut command).await {
+            Ok(0) | Err(_) => None,
+            Ok(_) => {
+                assert!(command.ends_with("\r\n"));
+                command.truncate(command.len() - 2);
+                Some(command.into_boxed_str())
+            }
+        }
+    }
+
+    fn command_tag(command: &str) -> &str {
+        command.split_whitespace().next().unwrap()
+    }
+
+    fn command_name(command: &str) -> Option<&str> {
+        command.split_whitespace().nth(1)
+    }
+
+    async fn tagged(
+        stream: &mut BufReader<ServerTlsStream<TcpStream>>,
+        command: &str,
+        response: &str,
+    ) {
+        stream
+            .get_mut()
+            .write_all(format!("{} {response}\r\n", command_tag(command)).as_bytes())
+            .await
+            .unwrap();
+    }
+
+    async fn write_metadata(
+        stream: &mut BufReader<ServerTlsStream<TcpStream>>,
+        sequence: usize,
+        message: &FixtureMessage,
+    ) {
+        let response = format!(
+            "* {sequence} FETCH (UID {} FLAGS (\\Seen \\Flagged) INTERNALDATE \"20-Jul-2026 12:00:00 +0000\" RFC822.SIZE {} ENVELOPE (\"20 Jul 2026 12:00:00 +0000\" \"Message {}\" ((\"Sender {}\" NIL \"sender\" \"example.test\")) NIL NIL NIL NIL NIL NIL \"<{}@example.test>\"))\r\n",
+            message.uid, message.declared_bytes, message.uid, message.uid, message.uid,
+        );
+        stream
+            .get_mut()
+            .write_all(response.as_bytes())
+            .await
+            .unwrap();
+    }
+
+    async fn run_server(stream: ServerTlsStream<TcpStream>, mut plan: ServerPlan) -> Vec<Box<str>> {
+        let mut stream = BufReader::new(stream);
+        stream
+            .get_mut()
+            .write_all(b"* OK receive fixture ready\r\n")
+            .await
+            .unwrap();
+        let Some(login) = read_command(&mut stream).await else {
+            return Vec::new();
+        };
+        assert_eq!(command_name(&login), Some("LOGIN"));
+        tagged(
+            &mut stream,
+            &login,
+            "OK [CAPABILITY IMAP4rev1] authenticated",
+        )
+        .await;
+        let Some(examine) = read_command(&mut stream).await else {
+            return vec![login];
+        };
+        assert_eq!(command_name(&examine), Some("EXAMINE"));
+        let exists = plan.messages.len() + plan.extra_metadata;
+        stream
+            .get_mut()
+            .write_all(format!("* {exists} EXISTS\r\n").as_bytes())
+            .await
+            .unwrap();
+        if let Some(uid_validity) = plan.uid_validity {
+            stream
+                .get_mut()
+                .write_all(format!("* OK [UIDVALIDITY {uid_validity}] epoch\r\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        let uid_next = plan.uid_next_override.unwrap_or_else(|| {
+            plan.messages
+                .last()
+                .map_or(1, |message| message.uid.saturating_add(1))
+        });
+        if !plan.omit_uid_next {
+            stream
+                .get_mut()
+                .write_all(format!("* OK [UIDNEXT {uid_next}] next\r\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        tagged(&mut stream, &examine, "OK [READ-ONLY] selected").await;
+        let mut commands = vec![login, examine];
+
+        let Some(metadata) = read_command(&mut stream).await else {
+            return commands;
+        };
+        commands.push(metadata.clone());
+        if command_name(&metadata) == Some("LOGOUT") {
+            tagged(&mut stream, &metadata, "OK logout complete").await;
+            return commands;
+        }
+        assert!(metadata.contains("UID FETCH 1:"));
+        if let Some(status) = plan.metadata_status {
+            tagged(&mut stream, &metadata, status).await;
+            let _ = read_command(&mut stream).await;
+            return commands;
+        }
+        for (index, message) in plan.messages.iter().enumerate() {
+            write_metadata(&mut stream, index + 1, message).await;
+        }
+        for extra in 0..plan.extra_metadata {
+            write_metadata(
+                &mut stream,
+                plan.messages.len() + extra + 1,
+                &fixture(
+                    u32::try_from(plan.messages.len() + extra + 1).unwrap(),
+                    b"x",
+                ),
+            )
+            .await;
+        }
+        tagged(&mut stream, &metadata, "OK metadata complete").await;
+
+        while let Some(command) = read_command(&mut stream).await {
+            commands.push(command.clone());
+            if command_name(&command) == Some("LOGOUT") {
+                tagged(&mut stream, &command, "OK logout complete").await;
+                break;
+            }
+            assert!(command.contains("UID FETCH"));
+            if let Some(reached) = plan.stall_body.take() {
+                let _ = reached.send(());
+                let _ = read_command(&mut stream).await;
+                break;
+            }
+            let uid: u32 = command.split_whitespace().nth(3).unwrap().parse().unwrap();
+            let message = plan
+                .messages
+                .iter()
+                .find(|message| message.uid == uid)
+                .unwrap();
+            let response = format!(
+                "* {uid} FETCH (UID {uid} BODY[] {{{}}}\r\n",
+                message.raw.len()
+            );
+            stream
+                .get_mut()
+                .write_all(response.as_bytes())
+                .await
+                .unwrap();
+            stream.get_mut().write_all(&message.raw).await.unwrap();
+            stream.get_mut().write_all(b")\r\n").await.unwrap();
+            tagged(&mut stream, &command, "OK body complete").await;
+        }
+        commands
+    }
+
+    async fn finish(server: TestServer) -> Vec<Box<str>> {
+        tokio::time::timeout(TEST_TIMEOUT, server.task)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn fetches_a_bounded_page_and_handles_an_empty_inbox() {
+        run_async(async {
+            let server = spawn_server(ServerPlan::messages(vec![
+                fixture(1, RAW_ONE),
+                fixture(2, RAW_TWO),
+            ]))
+            .await;
+            let page = fetch_canonical_inbox_with_connector(
+                request(server.address.port(), Some(UID_VALIDITY)),
+                server.connector.clone(),
+                limits(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(page.uid_validity.get(), UID_VALIDITY);
+            assert_eq!(page.uid_next.get(), 3);
+            assert_eq!(page.scanned_through_uid.unwrap().get(), 2);
+            assert_eq!(page.next_uid, None);
+            assert_eq!(page.messages.len(), 2);
+            assert_eq!(page.messages[0].uid.get(), 1);
+            assert!(page.messages[0].flags.seen);
+            assert!(page.messages[0].flags.flagged);
+            assert_eq!(page.messages[0].envelope.subject.as_ref(), b"Message 1");
+            assert_eq!(
+                page.messages[0].content,
+                ImapInboxContent::Fetched(RAW_ONE.into())
+            );
+            let commands = finish(server).await;
+            assert_eq!(
+                commands
+                    .iter()
+                    .filter_map(|command| command_name(command))
+                    .collect::<Vec<_>>(),
+                ["LOGIN", "EXAMINE", "UID", "UID", "UID", "LOGOUT"]
+            );
+
+            let empty = spawn_server(ServerPlan::messages(Vec::new())).await;
+            let page = fetch_canonical_inbox_with_connector(
+                request(empty.address.port(), None),
+                empty.connector.clone(),
+                limits(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(page.messages.is_empty());
+            assert_eq!(page.scanned_through_uid, None);
+            assert_eq!(page.next_uid, None);
+            assert_eq!(finish(empty).await.len(), 3);
+
+            let mut historical_empty_plan = ServerPlan::messages(Vec::new());
+            historical_empty_plan.uid_next_override = Some(1000);
+            let historical_empty = spawn_server(historical_empty_plan).await;
+            let page = fetch_canonical_inbox_with_connector(
+                request_from(historical_empty.address.port(), 101, Some(UID_VALIDITY)),
+                historical_empty.connector.clone(),
+                limits(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(page.uid_next.get(), 1000);
+            assert_eq!(page.scanned_through_uid.unwrap().get(), 999);
+            assert_eq!(page.next_uid, None);
+            assert_eq!(finish(historical_empty).await.len(), 3);
+        });
+    }
+
+    #[test]
+    fn rejects_missing_uidvalidity_uidnext_or_changed_epoch() {
+        run_async(async {
+            let mut missing_plan = ServerPlan::messages(vec![fixture(1, RAW_ONE)]);
+            missing_plan.uid_validity = None;
+            let missing = spawn_server(missing_plan).await;
+            assert_eq!(
+                fetch_canonical_inbox_with_connector(
+                    request(missing.address.port(), None),
+                    missing.connector.clone(),
+                    limits(),
+                    None,
+                )
+                .await,
+                Err(ImapInboxFetchFailure::MissingUidValidity)
+            );
+            finish(missing).await;
+
+            let mut missing_next_plan = ServerPlan::messages(vec![fixture(1, RAW_ONE)]);
+            missing_next_plan.omit_uid_next = true;
+            let missing_next = spawn_server(missing_next_plan).await;
+            assert_eq!(
+                fetch_canonical_inbox_with_connector(
+                    request(missing_next.address.port(), None),
+                    missing_next.connector.clone(),
+                    limits(),
+                    None,
+                )
+                .await,
+                Err(ImapInboxFetchFailure::MissingUidNext)
+            );
+            finish(missing_next).await;
+
+            let changed = spawn_server(ServerPlan::messages(vec![fixture(1, RAW_ONE)])).await;
+            assert_eq!(
+                fetch_canonical_inbox_with_connector(
+                    request(changed.address.port(), Some(UID_VALIDITY + 1)),
+                    changed.connector.clone(),
+                    limits(),
+                    None,
+                )
+                .await,
+                Err(ImapInboxFetchFailure::UidValidityChanged {
+                    expected: UID_VALIDITY + 1,
+                    actual: UID_VALIDITY,
+                })
+            );
+            finish(changed).await;
+        });
+    }
+
+    #[test]
+    fn reports_tagged_failures_and_response_count_limits() {
+        run_async(async {
+            for (status, expected) in [
+                ("NO fetch denied", ImapInboxFetchFailure::Permission),
+                ("BAD invalid fetch", ImapInboxFetchFailure::Protocol),
+            ] {
+                let mut plan = ServerPlan::messages(vec![fixture(1, RAW_ONE)]);
+                plan.metadata_status = Some(status);
+                let server = spawn_server(plan).await;
+                assert_eq!(
+                    fetch_canonical_inbox_with_connector(
+                        request(server.address.port(), None),
+                        server.connector.clone(),
+                        limits(),
+                        None,
+                    )
+                    .await,
+                    Err(expected)
+                );
+                finish(server).await;
+            }
+
+            let mut plan = ServerPlan::messages(vec![fixture(1, RAW_ONE), fixture(2, RAW_TWO)]);
+            plan.extra_metadata = 1;
+            let server = spawn_server(plan).await;
+            assert_eq!(
+                fetch_canonical_inbox_with_connector(
+                    request(server.address.port(), None),
+                    server.connector.clone(),
+                    limits(),
+                    None,
+                )
+                .await,
+                Err(ImapInboxFetchFailure::ResourceLimit)
+            );
+            finish(server).await;
+        });
+    }
+
+    #[test]
+    fn marks_single_message_oversize_and_defers_page_overflow() {
+        run_async(async {
+            let mut oversized_message = fixture(1, RAW_ONE);
+            oversized_message.declared_bytes = 1025;
+            let oversized = spawn_server(ServerPlan::messages(vec![oversized_message])).await;
+            let page = fetch_canonical_inbox_with_connector(
+                request(oversized.address.port(), None),
+                oversized.connector.clone(),
+                limits(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                page.messages[0].content,
+                ImapInboxContent::Oversized {
+                    declared_bytes: 1025
+                }
+            );
+            assert_eq!(page.scanned_through_uid.unwrap().get(), 1);
+            assert_eq!(page.next_uid, None);
+            assert_eq!(finish(oversized).await.len(), 4);
+
+            let server = spawn_server(ServerPlan::messages(vec![
+                fixture(1, RAW_ONE),
+                fixture(2, RAW_TWO),
+            ]))
+            .await;
+            let mut page_limits = limits();
+            page_limits.max_page_literal_bytes = RAW_ONE.len();
+            let page = fetch_canonical_inbox_with_connector(
+                request(server.address.port(), None),
+                server.connector.clone(),
+                page_limits,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(page.messages.len(), 1);
+            assert_eq!(page.scanned_through_uid.unwrap().get(), 1);
+            assert_eq!(page.next_uid.unwrap().get(), 2);
+            let commands = finish(server).await;
+            assert_eq!(
+                commands
+                    .iter()
+                    .filter(|command| command.contains("BODY.PEEK"))
+                    .count(),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn returns_a_fixed_error_when_cancelled_during_a_body() {
+        run_async(async {
+            let (reached_tx, reached_rx) = oneshot::channel();
+            let mut plan = ServerPlan::messages(vec![fixture(1, RAW_ONE)]);
+            plan.stall_body = Some(reached_tx);
+            let server = spawn_server(plan).await;
+            let (cancel, cancellation) = imap_inbox_fetch_cancellation_pair();
+            let fetch = tokio::spawn(fetch_canonical_inbox_with_connector(
+                request(server.address.port(), None),
+                server.connector.clone(),
+                limits(),
+                Some(cancellation),
+            ));
+            tokio::time::timeout(TEST_TIMEOUT, reached_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            cancel.cancel();
+            assert_eq!(fetch.await.unwrap(), Err(ImapInboxFetchFailure::Cancelled));
+            finish(server).await;
+        });
     }
 }
