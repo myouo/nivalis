@@ -4,28 +4,28 @@
 
 Nivalis uses the following Linux release acceptance criteria:
 
-- Default idle proportional set size (PSS) below 90MiB.
-- Stretch target: default idle resident set size (RSS) below 50MiB at the tested viewport.
+- Default idle resident set size (RSS) below 90MiB.
+- Stretch target: default idle RSS below 50MiB at the tested viewport.
 - Settled PSS and RSS after bounded interaction or maximize/restore stress below 2x their pre-stress baselines.
 - Idle CPU returns to 0% over a 10-second interval after startup or stress settles.
 
-RSS includes every resident shared page mapped by the process. PSS divides shared pages by their current number of mappers. USS is `Private_Clean + Private_Dirty`. The benchmark records all three from `/proc/<pid>/smaps_rollup`; PSS is the primary cross-process pass/fail metric.
+RSS includes every resident shared page mapped by the process. PSS divides shared pages by their current number of mappers. USS is `Private_Clean + Private_Dirty`. The benchmark records all three from `/proc/<pid>/smaps_rollup`; RSS is the conservative release gate, while PSS and USS distinguish shared mappings from private growth.
 
 These numbers are machine- and viewport-specific. Software framebuffer memory grows with physical pixel area, and PSS varies with the set of concurrently running processes.
 
 ## Configuration
 
-- Measurement date and host: 2026-07-18, Linux 7.1.2-zen3-1-zen x86_64, Rust 1.96.1.
-- Measurement revision: `0d19797`, schema v1, before transactional mutations; the current schema-v6 build requires a fresh run before release gating.
-- Build: stripped `cargo build --release`, 18.4MiB executable, `opt-level = "s"`.
-- Current unmeasured build: schema v6 at `257a533`, 19,342,200-byte stripped release executable.
+- Measurement date and host: 2026-07-19, Linux 7.1.2-zen3-1-zen x86_64, Rust 1.96.1.
+- Measurement revision: `f639c4b`, schema v8; application runtime last changed at `1051596` and the measurement harness changed at `f639c4b`.
+- Production build: stripped `cargo build --release`, `opt-level = "s"`, 19,506,296 bytes (18.60MiB), SHA-256 `5bb8f0470de1b19f5945b179ee57404c8f195c6b1a17240705cd50688b3b1240`.
+- Interaction build: stripped `cargo build --release --features bench-harness`, 19,513,336 bytes, SHA-256 `892370e1885215dbc932b7596680fb1280b453593bac700cb094fe56bb17b1bf`.
 - UI state: light theme, three-pane inbox, ten local demo messages.
-- Backend state: active single-connection SQLite actor, empty private database, WAL mode, 1MiB page cache limit.
+- Backend state: active bounded Tokio core and single-connection SQLite actor, isolated empty private database, WAL mode, 1MiB page cache limit.
 - Default renderer: `winit` + `skia-software` (Skia CPU rasterization and partial rendering).
 - GPU override: `NIVALIS_RENDERER=skia`.
 - X11 viewport: 1200x900 physical pixels, scale factor 1.
 - Native Wayland baseline: default 1200x800 logical window, forced scale factor 1 for repeatability.
-- Sampling: fresh process, `/proc/<pid>/smaps_rollup`, interval CPU from `/proc/<pid>/stat`.
+- Sampling: fresh process, `/proc/<pid>/smaps_rollup`, interval CPU from `/proc/<pid>/stat`; the harness verifies the requested X11 geometry and fails if interaction stress does not finish.
 
 ## Idle Results
 
@@ -33,28 +33,30 @@ Values below are the worst stable samples across the stated fresh-process runs.
 
 | Renderer | Platform | Runs | RSS | PSS | USS | Result |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
-| Skia software | X11 | 3 | 37.0MiB | 24.6MiB | 21.2MiB | Pass, SQLite active |
+| Skia software | X11 | 3 | 37.80MiB | 24.02MiB | 20.78MiB | Current schema-v8 pass |
 | Skia software | Wayland | 3 historical | 41.5MiB | 22.4MiB | 17.5MiB | Pre-SQLite reference |
 | Skia OpenGL | X11 | 1 historical | 248.0MiB | 81.9MiB | 34.0MiB | Pre-SQLite reference; RSS stretch fail |
 
-The Skia software path is the product default because this mail UI is mostly static and partial rendering leaves measured idle CPU at 0.00%. The OpenGL renderer remains an explicit opt-in for workloads where GPU throughput is more important than process RSS.
+The current row is the worst stable sample from three fresh production processes at 5, 10, 20, and 30 seconds. Their stable RSS values were 37.80, 36.99, and 37.16MiB. RSS was unchanged from 10 through 30 seconds in every run, and interval CPU was 0.00% after startup. This passes both the 90MiB release gate and the 50MiB stretch target on the reference configuration.
 
-The X11 idle row was refreshed after SQLite activation. All three 10-second samples settled at 0.00% interval CPU. The observed difference from the earlier X11 UI-only row was about +1.3MiB RSS / +2.8MiB PSS / +2.8MiB USS, below the 4MiB activation budget. The Wayland and OpenGL rows remain historical references and must be refreshed before they are used as current backend gates.
+One additional production process was sampled at 30, 60, 120, 180, and 300 seconds. RSS stayed exactly 38,512KiB (37.61MiB) from 30 through 300 seconds; PSS moved from 24,557 to 24,566KiB (+0.04%), USS from 21,248 to 21,264KiB (+0.08%), and anonymous memory stayed at 8,176KiB. Interval CPU was 0.00% from 60 seconds onward. The Wayland and OpenGL rows remain historical references and must be refreshed before they are used as current backend gates.
 
 ## Growth Results
 
 | Scenario | Baseline RSS/PSS/USS | Settled RSS/PSS/USS | Growth RSS/PSS/USS | Result |
 | --- | --- | --- | --- | --- |
-| 2,000 high-frequency UI actions, X11 | 36.8/23.2/19.3MiB | 41.1/27.3/23.7MiB | 11.9%/17.3%/22.6% | Pass, SQLite active |
+| 10,000 high-frequency UI actions, X11, 300s | 37.61/23.90/20.67MiB | 42.10/28.39/25.16MiB | 11.93%/18.80%/21.75% | Current schema-v8 pass |
 | Resize 1200x900 to 2560x1440 and restore, X11 | 34.8/20.1/16.3MiB | 44.8/25.0/16.1MiB | 28.9%/24.0%/-1.2% | Historical pass |
-| Resize 1200x900 to 3840x2400 and restore, X11 | 36.6/24.2/20.9MiB | 66.7/39.3/20.9MiB | 82.4%/62.4%/0.2% | Pass, SQLite active |
+| Resize 1200x900 to 3840x2400 and restore, X11 | 37.34/23.75/20.55MiB | 67.48/38.84/20.58MiB | 80.71%/63.54%/0.11% | Current schema-v8 growth pass |
 | Native Wayland maximize and restore | 38.5/20.0/15.5MiB | 64.2/33.0/15.9MiB | 66.7%/65.3%/2.6% | Historical pass |
 
-The deterministic interaction run repeatedly selected and starred messages, opened and destroyed settings/account/composer components, issued debounced searches and guarded sync requests, and briefly loaded a 64KiB compose body. The 30-second interval CPU returned to 0.00%. The current interaction and 3840x2400 rows include the active SQLite actor; the remaining growth rows are earlier UI-only references.
+The deterministic interaction run repeatedly selected and starred messages, opened and destroyed settings/account/composer components, issued debounced searches and guarded sync requests, and briefly loaded a 64KiB compose body. It completed 10,000 steps in 44.239 seconds. RSS remained exactly 43,112KiB from 90 through 300 seconds and interval CPU returned to 0.00%, so the post-workload working set both stayed below 50MiB and stabilized far below the 100% growth limit.
 
-## Release Profile A/B
+The 3840x2400 production resize began at 5 seconds and restored to 1200x900 at 10 seconds. At 60 seconds, RSS remained below the 90MiB hard gate and below 2x baseline, but exceeded the 50MiB idle stretch target. PSS grew less than RSS while USS changed by only 0.11%, which is consistent with retained shared surface mappings rather than equivalent private-heap growth. The 2560x1440 and Wayland rows are historical UI-only references.
 
-The same 2,000-step X11 workload was built with three Rust optimization levels. The production default uses `s`, which kept active throughput close to `3` while avoiding most of its code-working-set cost.
+## Historical Release Profile A/B
+
+An earlier 2,000-step X11 workload compared three Rust optimization levels. These rows explain the retained `s` default but are not schema-v8 release-gate measurements.
 
 | Profile | Optimization | Executable | Stress RSS | Timed event completion |
 | --- | --- | ---: | ---: | ---: |
@@ -73,31 +75,43 @@ cargo build --release
 scripts/measure-memory.sh target/release/nivalis-mail
 ```
 
-Run five fresh X11 processes:
+Run three fresh X11 processes with the release-gate sample points:
 
 ```bash
-NIVALIS_MEMORY_RUNS=5 NIVALIS_MEMORY_SAMPLES="5 10" \
+NIVALIS_MEMORY_RUNS=3 NIVALIS_MEMORY_SAMPLES="5 10 20 30" \
   scripts/measure-memory.sh target/release/nivalis-mail
 ```
 
-Run the bounded interaction scenario:
+Run the five-minute pure-idle soak:
 
 ```bash
-cargo build --release --features bench-harness
-NIVALIS_STRESS_STEPS=2000 \
-NIVALIS_MEMORY_SAMPLES="3 6 9 12 20 30" \
+NIVALIS_MEMORY_SAMPLES="30 60 120 180 300" \
   scripts/measure-memory.sh target/release/nivalis-mail
 ```
 
-Run the native Wayland maximize/restore scenario:
+Run the 10,000-step interaction scenario and retain its completion log:
 
 ```bash
 cargo build --release --features bench-harness
-NIVALIS_MEMORY_PLATFORM=wayland \
-NIVALIS_MAXIMIZE_STRESS=1 \
-NIVALIS_MEMORY_SAMPLES="3 7 12 20" \
+NIVALIS_STRESS_STEPS=10000 \
+NIVALIS_MEMORY_LOG=/tmp/nivalis-memory-stress.log \
+NIVALIS_MEMORY_SAMPLES="3 6 15 30 45 60 90 120 180 300" \
   scripts/measure-memory.sh target/release/nivalis-mail
 ```
+
+Run the production 3840x2400 resize and restore scenario:
+
+```bash
+cargo build --release
+NIVALIS_RESIZE_STRESS_WIDTH=3840 \
+NIVALIS_RESIZE_STRESS_HEIGHT=2400 \
+NIVALIS_RESIZE_STRESS_AT=5 \
+NIVALIS_RESIZE_STRESS_DURATION=5 \
+NIVALIS_MEMORY_SAMPLES="3 6 9 12 20 30 60" \
+  scripts/measure-memory.sh target/release/nivalis-mail
+```
+
+The script creates and removes an isolated private data directory unless `NIVALIS_MEMORY_DATA_DIR` is set to an absolute persistent path. Set `NIVALIS_MEMORY_LOG` to retain application output; otherwise the temporary log is removed.
 
 ## Implementation Notes
 
@@ -110,4 +124,5 @@ NIVALIS_MEMORY_SAMPLES="3 7 12 20" \
 - SQLite mailbox replies retain one 50-row page plus persistent counters and at most 64 per-account unread values. Statistic rebuilds aggregate in SQLite and do not materialize mailbox-wide Rust collections.
 - The measured database directory was mode `0700`; SQLite, WAL, and shared-memory files were mode `0600`. Thread inspection showed `nivalis-core` and `nivalis-sqlite` without an additional reply-bridge thread.
 - A 280-character list preview and a 16,384-character reader shaping boundary prevent a malformed single-line body from multiplying text layout work. The full reader body remains available through explicit progressive loading.
+- The current gate covers UI/component churn plus the constructed core and SQLite actor. It does not exercise future IMAP/JMAP sessions, MIME parsing, attachment transfers, multi-account synchronization, or provider payloads. Those paths require a separate representative sync soak before a provider-enabled release can inherit this result.
 - A production IMAP/JMAP adapter must keep the page boundary, store message bodies and attachments on disk, and bound rendered quoted history. Loading arbitrary multi-megabyte bodies into one text paragraph cannot satisfy a fixed process-memory ceiling.
