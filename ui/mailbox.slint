@@ -130,7 +130,7 @@ export component MailboxPane inherits Rectangle {
     in property <bool> wide-sidebar: true;
     in property <string> active-folder: "Inbox";
     in property <string> active-account-name;
-    in property <string> data-source-label: "Local sample";
+    in property <string> data-source-label: "Local cache";
     in property <string> active-account-id: "";
     in property <bool> active-account-error: false;
     in property <int> inbox-count: 0;
@@ -250,7 +250,7 @@ export component MailboxPane inherits Rectangle {
         if root.active-account-error && !root.error-banner-dismissed: Rectangle {
             height: 48px;
             accessible-role: region;
-            accessible-label: "Sample account warning.";
+            accessible-label: "Account needs attention.";
             accessible-live-region: polite;
             Rectangle {
                 x: 8px;
@@ -267,8 +267,8 @@ export component MailboxPane inherits Rectangle {
                 padding-right: 8px;
                 spacing: 7px;
                 MaterialIcon { name: "warning"; width: 19px; size: 17px; icon-color: Theme.warning; }
-                Text { text: "Sample account warning"; color: Theme.on-tertiary-container; font-family: Theme.body-font; font-size: 10px; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
-                MButton { width: 124px; label: "View sample account"; variant: "text"; clicked => { root.account-menu-open = true; } }
+                Text { text: "Account needs attention"; color: Theme.on-tertiary-container; font-family: Theme.body-font; font-size: 10px; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                MButton { width: 124px; label: "View account"; variant: "text"; clicked => { root.account-menu-open = true; } }
                 MIconButton { icon: "close"; label: "Dismiss account warning"; compact-visual: true; clicked => { root.error-banner-dismissed = true; } }
             }
         }

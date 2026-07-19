@@ -37,14 +37,6 @@ pub(crate) enum AccountKey {
 }
 
 impl AccountKey {
-    pub(crate) fn from_scope_id(value: i64) -> Option<Self> {
-        if value == 0 {
-            Some(Self::All)
-        } else {
-            EntityKey::new(value).map(Self::Account)
-        }
-    }
-
     pub(crate) fn parse(value: &str) -> Option<Self> {
         if value.is_empty() {
             Some(Self::All)
@@ -96,7 +88,6 @@ mod tests {
     #[test]
     fn empty_account_key_means_all_accounts_only() {
         assert_eq!(AccountKey::parse(""), Some(AccountKey::All));
-        assert_eq!(AccountKey::from_scope_id(0), Some(AccountKey::All));
         assert_eq!(AccountKey::All.encode().as_str(), "");
 
         let account = EntityKey::new(i64::MAX).unwrap();
@@ -104,6 +95,6 @@ mod tests {
             AccountKey::parse(AccountKey::Account(account).encode().as_str()),
             Some(AccountKey::Account(account))
         );
-        assert_eq!(AccountKey::from_scope_id(-1), None);
+        assert_eq!(AccountKey::parse("-1"), None);
     }
 }

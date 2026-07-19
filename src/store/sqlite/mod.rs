@@ -16,11 +16,14 @@ pub(crate) use actor::{
     RemoteReportExecutionFailure, RemoteReportReply, RemoteReportSubmitFailure,
 };
 #[allow(unused_imports)]
-pub(crate) use domain::{AccountDirectory, AccountSummaryDto};
+pub(crate) use domain::{
+    AccountDirectory, AccountSummaryDto, AccountUnreadDto, MailSummaryDto, MailboxStatsDto,
+    PageCursor,
+};
 pub(crate) use domain::{AccountScope, FolderScope};
 pub(crate) use domain::{
-    AccountStatsDelta, DbReply, Generation, MailboxPage, MessageDetail, MessageId, MessageMutation,
-    MutationOutcome, PageSpec, RequestId, Tagged, UndoToken,
+    AccountStatsDelta, DbFailure, DbReply, FailureKind, Generation, MailboxPage, MessageDetail,
+    MessageId, MessageMutation, MutationOutcome, PageSpec, RequestId, Tagged, UndoToken,
 };
 
 pub(crate) fn spawn(

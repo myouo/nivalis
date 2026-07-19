@@ -16,7 +16,7 @@ These numbers are machine- and viewport-specific. Software framebuffer memory gr
 ## Configuration
 
 - Measurement date and host: 2026-07-19, Linux 7.1.2-zen3-1-zen x86_64, Rust 1.96.1.
-- Measurement revision: `f639c4b`, schema v8; application runtime last changed at `1051596` and the measurement harness changed at `f639c4b`.
+- Historical pre-controller-cutover revision: `f639c4b`, schema v8; application runtime last changed at `1051596` and the measurement harness changed at `f639c4b`.
 - Production build: stripped `cargo build --release`, `opt-level = "s"`, 19,506,296 bytes (18.60MiB), SHA-256 `5bb8f0470de1b19f5945b179ee57404c8f195c6b1a17240705cd50688b3b1240`.
 - Interaction build: stripped `cargo build --release --features bench-harness`, 19,513,336 bytes, SHA-256 `892370e1885215dbc932b7596680fb1280b453593bac700cb094fe56bb17b1bf`.
 - UI state: light theme, three-pane inbox, ten local demo messages.
@@ -33,11 +33,11 @@ Values below are the worst stable samples across the stated fresh-process runs.
 
 | Renderer | Platform | Runs | RSS | PSS | USS | Result |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
-| Skia software | X11 | 3 | 37.80MiB | 24.02MiB | 20.78MiB | Current schema-v8 pass |
+| Skia software | X11 | 3 historical | 37.80MiB | 24.02MiB | 20.78MiB | Pre-controller-cutover pass |
 | Skia software | Wayland | 3 historical | 41.5MiB | 22.4MiB | 17.5MiB | Pre-SQLite reference |
 | Skia OpenGL | X11 | 1 historical | 248.0MiB | 81.9MiB | 34.0MiB | Pre-SQLite reference; RSS stretch fail |
 
-The current row is the worst stable sample from three fresh production processes at 5, 10, 20, and 30 seconds. Their stable RSS values were 37.80, 36.99, and 37.16MiB. RSS was unchanged from 10 through 30 seconds in every run, and interval CPU was 0.00% after startup. This passes both the 90MiB release gate and the 50MiB stretch target on the reference configuration.
+The pre-controller-cutover row is the worst stable sample from three fresh production processes at 5, 10, 20, and 30 seconds. Their stable RSS values were 37.80, 36.99, and 37.16MiB. RSS was unchanged from 10 through 30 seconds in every run, and interval CPU was 0.00% after startup. That historical build passed both the 90MiB release gate and the 50MiB stretch target on the reference configuration; the current SQLite-controller build cannot inherit the result.
 
 One additional production process was sampled at 30, 60, 120, 180, and 300 seconds. RSS stayed exactly 38,512KiB (37.61MiB) from 30 through 300 seconds; PSS moved from 24,557 to 24,566KiB (+0.04%), USS from 21,248 to 21,264KiB (+0.08%), and anonymous memory stayed at 8,176KiB. Interval CPU was 0.00% from 60 seconds onward. The Wayland and OpenGL rows remain historical references and must be refreshed before they are used as current backend gates.
 
@@ -45,9 +45,9 @@ One additional production process was sampled at 30, 60, 120, 180, and 300 secon
 
 | Scenario | Baseline RSS/PSS/USS | Settled RSS/PSS/USS | Growth RSS/PSS/USS | Result |
 | --- | --- | --- | --- | --- |
-| 10,000 high-frequency UI actions, X11, 300s | 37.61/23.90/20.67MiB | 42.10/28.39/25.16MiB | 11.93%/18.80%/21.75% | Current schema-v8 pass |
+| 10,000 high-frequency UI actions, X11, 300s | 37.61/23.90/20.67MiB | 42.10/28.39/25.16MiB | 11.93%/18.80%/21.75% | Historical pre-cutover pass |
 | Resize 1200x900 to 2560x1440 and restore, X11 | 34.8/20.1/16.3MiB | 44.8/25.0/16.1MiB | 28.9%/24.0%/-1.2% | Historical pass |
-| Resize 1200x900 to 3840x2400 and restore, X11 | 37.34/23.75/20.55MiB | 67.48/38.84/20.58MiB | 80.71%/63.54%/0.11% | Current schema-v8 growth pass |
+| Resize 1200x900 to 3840x2400 and restore, X11 | 37.34/23.75/20.55MiB | 67.48/38.84/20.58MiB | 80.71%/63.54%/0.11% | Historical pre-cutover pass |
 | Native Wayland maximize and restore | 38.5/20.0/15.5MiB | 64.2/33.0/15.9MiB | 66.7%/65.3%/2.6% | Historical pass |
 
 The historical deterministic interaction run repeatedly selected and starred messages, opened and destroyed settings/account/composer components, issued debounced searches and guarded simulated sync requests, and briefly loaded a 64KiB compose body. It completed 10,000 steps in 44.239 seconds. RSS remained exactly 43,112KiB from 90 through 300 seconds and interval CPU returned to 0.00%, so the post-workload working set both stayed below 50MiB and stabilized far below the 100% growth limit. Those unavailable composer and simulated-sync paths have since been removed; the current harness exercises only enabled menu, reader, selection, and search churn, so M1 must record a fresh result rather than compare a new run directly with this historical workload.
@@ -118,11 +118,11 @@ The script creates and removes an isolated private data directory unless `NIVALI
 - Slint officially supports selecting the `winit-skia-software` renderer while retaining Skia: <https://docs.slint.dev/latest/docs/slint/guide/backends-and-renderers/backend_winit/>.
 - Linux PSS/RSS definitions come from the kernel procfs documentation: <https://docs.kernel.org/filesystems/proc.html>.
 - `ListView` virtualizes instantiated rows, while the additional 50-summary page cap bounds the backing UI model: <https://docs.slint.dev/latest/docs/slint/reference/std-widgets/views/listview/>.
-- Page rows, totals, navigation counts, and account unread counts are produced in one Store pass. Stable presentation text uses shared handles, and only count changes update account rows.
+- Page rows, persistent totals, navigation counts, and account unread counts are produced by one bounded SQLite query and projection. Stable presentation text uses shared handles, and only count changes update account rows.
 - The production binary excludes the benchmark timers. Local cache content renders on the first normal frame; the loading state remains available for real asynchronous I/O.
 - Core-to-UI mailbox and reader projections use independent latest-value slots. The 128-slot event channel contains only lightweight control values and at most one notification per projection class.
 - SQLite mailbox replies retain one 50-row page plus persistent counters and at most 64 per-account unread values. Statistic rebuilds aggregate in SQLite and do not materialize mailbox-wide Rust collections.
 - The measured database directory was mode `0700`; SQLite, WAL, and shared-memory files were mode `0600`. Thread inspection showed `nivalis-core` and `nivalis-sqlite` without an additional reply-bridge thread.
-- A 280-character list preview and a 16,384-character reader shaping boundary prevent a malformed single-line body from multiplying text layout work. The full reader body remains available through explicit progressive loading.
-- The current gate covers UI/component churn plus the constructed core and SQLite actor. It does not exercise future IMAP/JMAP sessions, MIME parsing, attachment transfers, multi-account synchronization, or provider payloads. Those paths require a separate representative sync soak before a provider-enabled release can inherit this result.
+- A 2,048-byte stored preview and 64KiB reader-excerpt boundary prevent malformed content from multiplying text layout work. Full-body loading remains unavailable until the bounded file-content pipeline is connected.
+- The historical gate covered the former demo UI/component churn plus the constructed core and SQLite actor. It did not exercise the current SQLite-controller projection path, IMAP/JMAP sessions, MIME parsing, attachment transfers, multi-account synchronization, or provider payloads. Each newly activated path requires an appropriate fresh soak before release.
 - A production IMAP/JMAP adapter must keep the page boundary, store message bodies and attachments on disk, and bound rendered quoted history. Loading arbitrary multi-megabyte bodies into one text paragraph cannot satisfy a fixed process-memory ceiling.

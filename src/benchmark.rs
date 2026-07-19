@@ -1,5 +1,5 @@
 use crate::AppWindow;
-use slint::{ComponentHandle, SharedString, Timer, TimerMode};
+use slint::{ComponentHandle, Timer, TimerMode};
 use std::cell::Cell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -48,6 +48,7 @@ pub(crate) fn install_memory_stress(ui: &AppWindow) -> Option<Rc<Timer>> {
                     ui.set_detail_open(false);
                     ui.set_search_query("".into());
                     ui.invoke_query_mail("".into());
+                    ui.invoke_filter_folder("Inbox".into());
                     ui.set_status_text("Memory stress complete".into());
                     eprintln!(
                         "NIVALIS_STRESS_RESULT steps={steps} elapsed_ms={}",
@@ -63,11 +64,14 @@ pub(crate) fn install_memory_stress(ui: &AppWindow) -> Option<Rc<Timer>> {
                     return;
                 }
 
-                const IDS: [&str; 10] = ["1", "2", "3", "4", "5", "8", "9", "10", "11", "12"];
-                let id = SharedString::from(IDS[current % IDS.len()]);
+                const FOLDERS: [&str; 5] = ["Inbox", "Unread", "Starred", "Archive", "Trash"];
                 match current % 8 {
-                    0 => ui.invoke_select_mail(id),
-                    1 => ui.invoke_toggle_star(id),
+                    0 => ui.invoke_filter_folder(FOLDERS[current % FOLDERS.len()].into()),
+                    1 => {
+                        let query = if current % 16 == 1 { "mail" } else { "" };
+                        ui.set_search_query(query.into());
+                        ui.invoke_query_mail(query.into());
+                    }
                     2 => {
                         ui.set_account_menu_open(false);
                         ui.set_settings_open(true);
@@ -90,9 +94,7 @@ pub(crate) fn install_memory_stress(ui: &AppWindow) -> Option<Rc<Timer>> {
                     }
                     _ => {
                         ui.set_delete_dialog_open(false);
-                        let query = if current % 16 == 7 { "maya" } else { "" };
-                        ui.set_search_query(query.into());
-                        ui.invoke_query_mail(query.into());
+                        ui.set_detail_open(false);
                     }
                 }
                 step.set(current + 1);
