@@ -199,7 +199,7 @@ impl AccountCatalog {
             sender,
             initials,
             subject: display_subject(row.subject),
-            preview: boxed_string(row.preview),
+            preview: display_preview(&row.preview),
             time: format_utc(row.received_at_ms)?,
             unread: row.unread,
             starred: row.starred,
@@ -441,6 +441,25 @@ fn display_subject(subject: Box<str>) -> SharedString {
     } else {
         boxed_string(subject)
     }
+}
+
+fn display_preview(preview: &str) -> SharedString {
+    let mut normalized = String::with_capacity(preview.len());
+    let mut pending_space = false;
+
+    for character in preview.chars() {
+        if character.is_whitespace() || character.is_control() {
+            pending_space = !normalized.is_empty();
+            continue;
+        }
+        if pending_space {
+            normalized.push(' ');
+            pending_space = false;
+        }
+        normalized.push(character);
+    }
+
+    normalized.into()
 }
 
 fn initials(value: &str) -> SharedString {
@@ -759,6 +778,17 @@ mod tests {
         assert_eq!(projected.rows[0].sender, "fallback@example.test");
         assert_eq!(projected.rows[0].subject, "(No subject)");
         assert_eq!(projected.rows[0].time, "1970-01-01 00:00 UTC");
+    }
+
+    #[test]
+    fn mailbox_preview_is_projected_as_stable_single_line_text() {
+        let catalog = catalog_with([1]);
+        let mut row = summary(1, 1);
+        row.preview = "  First line\r\n\tSecond\u{0007}line　中文  ".into();
+
+        let projected = catalog.project_mailbox(page(vec![row], Some(1))).unwrap();
+
+        assert_eq!(projected.rows[0].preview, "First line Second line 中文");
     }
 
     #[test]

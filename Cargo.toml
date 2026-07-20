@@ -53,7 +53,7 @@ zeroize = { version = "=1.9.0", default-features = false, features = ["alloc"] }
 zbus-secret-service-keyring-store = { version = "=1.0.0", default-features = false, features = ["crypto-rust"] }
 
 [dev-dependencies]
-i-slint-backend-testing = { version = "=1.17.1", default-features = false }
+i-slint-backend-testing = { version = "=1.17.1", default-features = false, features = ["renderer-skia"] }
 rcgen = { version = "=0.14.8", default-features = false, features = ["crypto", "ring"] }
 
 [build-dependencies]

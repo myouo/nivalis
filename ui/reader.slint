@@ -111,8 +111,15 @@ export component ReaderPane inherits Rectangle {
             }
         }
 
-        ScrollView {
+        reader-scroll := ScrollView {
+            // Mail bodies can contain long URLs, tracking tokens, or other text whose
+            // unwrapped preferred width is much wider than the reader. Keep the
+            // viewport tied to the visible pane so the content lays out vertically.
+            viewport-width: self.visible-width;
+            horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+
             VerticalLayout {
+                width: reader-scroll.visible-width;
                 alignment: start;
                 padding-left: root.compact-layout ? 18px : 22px;
                 padding-right: root.compact-layout ? 18px : 28px;
@@ -152,17 +159,36 @@ export component ReaderPane inherits Rectangle {
                 }
 
                 HorizontalLayout {
-                    height: 48px;
+                    height: 60px;
                     spacing: 10px;
-                    AccountAvatar { initials: root.selected-mail.initials; avatar-color: root.selected-mail.avatar-color; avatar-size: 42px; }
+                    VerticalLayout {
+                        width: 42px;
+                        height: 60px;
+                        alignment: center;
+                        AccountAvatar {
+                            initials: root.selected-mail.initials;
+                            avatar-color: root.selected-mail.avatar-color;
+                            avatar-size: 42px;
+                        }
+                    }
                     VerticalLayout {
                         alignment: center;
-                        spacing: 2px;
+                        spacing: 1px;
                         horizontal-stretch: 1;
-                        HorizontalLayout {
-                            spacing: 5px;
-                            Text { text: root.selected-mail.sender; color: Theme.on-surface; font-family: Theme.body-font; font-size: 13px; font-weight: 500; vertical-alignment: center; }
-                            Text { text: "<" + root.selected-mail.email + ">"; color: Theme.on-surface-variant; font-family: Theme.body-font; font-size: 10px; vertical-alignment: center; overflow: elide; }
+                        Text {
+                            text: root.selected-mail.sender;
+                            color: Theme.on-surface;
+                            font-family: Theme.body-font;
+                            font-size: 13px;
+                            font-weight: 500;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: root.selected-mail.email;
+                            color: Theme.on-surface-variant;
+                            font-family: Theme.body-font;
+                            font-size: 10px;
+                            overflow: elide;
                         }
                     }
                     Text { text: root.selected-mail.date; color: Theme.on-surface-variant; font-family: Theme.body-font; font-size: 10px; vertical-alignment: center; }
@@ -170,14 +196,30 @@ export component ReaderPane inherits Rectangle {
                 }
 
                 Rectangle { height: 1px; background: Theme.outline-variant; }
-                Text {
-                    text: root.selected-mail.body;
-                    color: Theme.on-surface;
-                    font-family: Theme.body-font;
-                    font-size: 13px;
-                    font-weight: 400;
-                    wrap: word-wrap;
+                VerticalLayout {
+                    padding-left: 2px;
+                    padding-right: 2px;
+                    padding-top: 8px;
+                    padding-bottom: 4px;
                     vertical-stretch: 0;
+
+                    body-text := Text {
+                        text: root.selected-mail.body == ""
+                            ? "This message has no plain-text content."
+                            : root.selected-mail.body;
+                        color: root.selected-mail.body == "" ? Theme.on-surface-variant : Theme.on-surface;
+                        font-family: Theme.body-font;
+                        font-size: 14px;
+                        font-weight: 400;
+                        font-italic: root.selected-mail.body == "";
+                        // Character wrapping is the safe fallback for long URLs and
+                        // generated tokens that have no word boundaries.
+                        wrap: char-wrap;
+                        horizontal-alignment: left;
+                        vertical-alignment: top;
+                        horizontal-stretch: 1;
+                        vertical-stretch: 0;
+                    }
                 }
 
                 if root.selected-mail.body-truncated: Rectangle {
