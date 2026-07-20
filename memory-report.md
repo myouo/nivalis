@@ -13,24 +13,26 @@ The harness samples `/proc/<pid>/smaps_rollup` and `/proc/<pid>/stat`, verifies 
 ## Current Checkpoint
 
 - Date and host: 2026-07-20, Linux 7.1.2-zen3-1-zen x86_64, Rust 1.96.1.
-- Release-code revision: `b852f10fffc8bb5352a36e0af0be18a66ff8e13c`, SQLite schema v12.
+- Release-code revision: `24d616f8b947965acc32998438608d7714eaaf19`, SQLite schema v13.
 - Renderer and viewport: Winit + `skia-software`, X11, 1200x900 physical pixels, scale factor 1.
-- Production build: 22,442,328 bytes, SHA-256 `39e1b511bef56c0446ad1776a77b84cf119917368dd9dbea81aabfbc6490ab61`.
-- Evidence: [`docs/measurements/2026-07-20-b852f10.csv`](docs/measurements/2026-07-20-b852f10.csv), SHA-256 `09ddd3a6b69ccfaacdf27a10edbcb8d424dce054fbcc2106b85befe577c32a4c`.
+- Production build: 23,047,256 bytes, SHA-256 `53c944b40cba4adfe1ba47ec6c7ba57adeef2bd77829f6c4a79ad1c562b56dc3`.
+- Release benchmark build: 23,118,552 bytes, SHA-256 `ae8a97d8b43ed0512410ddc624eb5672306236301be4fd281cf48e95e8255206`.
+- Evidence: [`docs/measurements/2026-07-20-24d616f.csv`](docs/measurements/2026-07-20-24d616f.csv), SHA-256 `30e3bb17071166e8ec458948114f1446c84eca589fcfdc3f354dd97bc523ed71`.
 
-The single 18-row CSV uses `test_case` for three production idle runs. No runtime log, certificate, secret, key, or second evidence file is committed for this hash. Commit `326ee3d` changes only CI policy after the measured code revision and produces the same release source tree.
+The single 25-line CSV has one header and 24 samples across `m5-idle` and `m5-account-send`. Its 14 fields start with `test_case`; no runtime log, certificate, secret, key, fixture, or second evidence file is committed for this hash. The production binary supplies the three idle runs. The separately identified release benchmark binary only enables the bounded UI driver used for the account-send lifecycle.
 
 ## Results
 
-| Test case | Runs | Peak RSS | Worst PSS | Worst USS | Result |
+| Test case | Runs | Baseline at 10s | Peak and settled RSS | PSS change | Result |
 | --- | ---: | ---: | ---: | ---: | --- |
-| M5 empty-account production idle | 3 | 37,864KiB (36.98MiB) | 28,137KiB | 25,092KiB | 90MiB gate and 50MiB target pass |
+| M5 production idle | 3 | 37,548-38,760KiB RSS | 38,760KiB (37.85MiB) peak | Stable; worst 29,042KiB | 90MiB gate and 50MiB target pass |
+| M5 loopback account send | 1 | 38,772KiB RSS / 28,930KiB PSS | 42,856KiB (41.85MiB) | 32,538KiB settled | 10.53% RSS / 12.47% PSS growth; pass |
 
-Each run samples 5, 10, 20, 30, and 45 seconds, then uses a separate ten-second CPU window after a five-second grace period for the 60-second settled row. The largest baseline-to-settled change is +0.04% PSS and +0.03% RSS; all RSS/PSS and swap-inclusive values stay far below 2x. Every settled CPU value is 0.00%, and every swap value is zero.
+Each run samples 5, 10, 20, 60, and 120 seconds, then uses a separate ten-second CPU window after a five-second grace period for the 135-second settled row. The account-send workload starts after the ten-second baseline and completes one real loopback account setup, credential-store round trip, IMAP diagnostic, durable draft queue, SMTP STARTTLS DATA transfer, Sent projection, account removal, and delayed private-file cleanup. Its 42,856KiB peak is also its 135-second settled RSS. USS peaks at 29,212KiB. All RSS/PSS and swap-inclusive values stay far below 2x, every final CPU value is 0.00%, and every swap value is zero.
 
-This proves that the production binary remains below the idle contract after schema v12, the custom outbound MIME writer, Lettre SMTP transport, Rustls, the global outbox drainer, and the compose controller became active. It does not exercise a credential load, SMTP connection, DATA transfer, retry, uncertain result, or terminal-state recovery, so it does not close the M5 post-workload growth gate.
+The exact account-send completion marker reports `queued=1 delivered=1 sent_visible=1 drafts=0 removed=1`. After the measured process exits, without a cleanup restart, `accounts`, `messages`, `local_drafts`, `outbox`, `outbox_recipients`, `file_staging`, `message_content`, `attachments`, and `file_gc` all contain zero rows. `PRAGMA integrity_check` returns `ok`, `PRAGMA foreign_key_check` returns no rows, and the private content tree contains no files. These checks prove that the durable janitor wakes independently of lossy UI status and closes the measured lifecycle without retained database or file artifacts.
 
-The prior M4 evidence at `d5a6c43` remains the latest measured receive workload: its loopback add/diagnose/receive/import/open/close/remove lifecycle peaked and settled at 37,024KiB RSS, grew 12.67% RSS and 17.13% PSS, and returned to 0.00% CPU. Real providers, automatic paging, multiple accounts, loopback sending, and multi-hour protocol soaks remain outside the combined proven matrix. The retained historical 68.62MiB outlier also prevents an unconditional 50MiB guarantee beyond the documented workloads.
+This closes the M5 idle and successful-send memory gates after the persistent Outbox, explicit cancellation and uncertain-result management, credential-repair entry, bounded shutdown, and durable janitor became active. Unit and vertical tests cover safe retry, authentication replacement, ambiguous outcomes, and cancellation; the measured network workload itself is one successful send, not a retry or credential-repair soak. The prior M4 evidence at `d5a6c43` remains the receive-workload gate. Real providers, automatic paging, multiple accounts, endpoint reconfiguration, complete successful credential-repair UI automation, repeated reconnects, and multi-hour protocol soaks remain outside the combined proven matrix. The retained historical 68.62MiB outlier also prevents an unconditional 50MiB guarantee beyond the documented workloads.
 
 ## Evidence Layout
 
@@ -38,6 +40,7 @@ The prior M4 evidence at `d5a6c43` remains the latest measured receive workload:
 
 | Revision | Milestone | Evidence |
 | --- | --- | --- |
+| `24d616f` | M5 managed drafts, Outbox, SMTP, and cleanup | `2026-07-20-24d616f.csv` |
 | `b852f10` | M5 SMTP-enabled production idle | `2026-07-20-b852f10.csv` |
 | `d5a6c43` | M4 bounded receive | `2026-07-20-d5a6c43.csv` |
 | `528c2b4` | M3 accounts and diagnostic | `2026-07-20-528c2b4.csv` |
@@ -48,23 +51,29 @@ The other CSVs are retained investigation checkpoints, not current gates. Their 
 
 ## Reproduce
 
-The current M5 idle checkpoint needs `xdotool` and an X11 session:
+The current M5 gate needs `xdotool`, `sqlite3`, OpenSSL, Python 3, an X11 session, and an unlocked Linux Secret Service session:
 
 ```bash
 set -euo pipefail
-revision=b852f10fffc8bb5352a36e0af0be18a66ff8e13c
+revision=24d616f8b947965acc32998438608d7714eaaf19
 [[ $(git rev-parse HEAD) == "$revision" ]]
-work=$(mktemp -d /tmp/nivalis-memory-b852f10.XXXXXX)
+work=$(mktemp -d /tmp/nivalis-memory-24d616f.XXXXXX)
 
 cargo build --locked --release
 install -m 755 target/release/nivalis-mail "$work/nivalis-mail-production"
-[[ $(stat -c %s "$work/nivalis-mail-production") == 22442328 ]]
+[[ $(stat -c %s "$work/nivalis-mail-production") == 23047256 ]]
 [[ $(sha256sum "$work/nivalis-mail-production" | cut -d' ' -f1) == \
-  39e1b511bef56c0446ad1776a77b84cf119917368dd9dbea81aabfbc6490ab61 ]]
+  53c944b40cba4adfe1ba47ec6c7ba57adeef2bd77829f6c4a79ad1c562b56dc3 ]]
+
+cargo build --locked --release --features bench-harness
+install -m 755 target/release/nivalis-mail "$work/nivalis-mail-bench"
+[[ $(stat -c %s "$work/nivalis-mail-bench") == 23118552 ]]
+[[ $(sha256sum "$work/nivalis-mail-bench" | cut -d' ' -f1) == \
+  ae8a97d8b43ed0512410ddc624eb5672306236301be4fd281cf48e95e8255206 ]]
 
 mkdir -p "$work/idle"
 NIVALIS_MEMORY_DATA_DIR="$work/idle" NIVALIS_MEMORY_TEST_CASE=m5-idle \
-NIVALIS_MEMORY_RUNS=3 NIVALIS_MEMORY_SAMPLES="5 10 20 30 45" \
+NIVALIS_MEMORY_RUNS=3 NIVALIS_MEMORY_SAMPLES="5 10 20 60 120" \
 NIVALIS_MEMORY_HARD_GATE=1 NIVALIS_MEMORY_HARD_CAP_KIB=92160 \
 NIVALIS_MEMORY_GROWTH_LIMIT_PERCENT=100 \
 NIVALIS_MEMORY_CPU_SETTLE_GATE=1 \
@@ -73,9 +82,68 @@ NIVALIS_MEMORY_CPU_SETTLE_SECONDS=10 \
 NIVALIS_MEMORY_CPU_SETTLE_MAX_PERCENT=0.00 \
 NIVALIS_MEMORY_LOG="$work/idle.log" \
   scripts/measure-memory.sh "$work/nivalis-mail-production" > "$work/idle.csv"
-[[ $(sha256sum "$work/idle.csv" | cut -d' ' -f1) == \
-  09ddd3a6b69ccfaacdf27a10edbcb8d424dce054fbcc2106b85befe577c32a4c ]]
 ```
+
+Create a private, no-newline fake secret and the same one-day localhost CA/server certificate described in the prior M4 procedure below. Start one bounded TLS IMAP fixture on port 19997 that accepts LOGIN, CAPABILITY, EXAMINE of an empty INBOX, and LOGOUT. Start one bounded SMTP fixture on port 1587 that advertises STARTTLS, requires TLS 1.2 or newer and AUTH PLAIN/LOGIN, accepts exactly one MAIL/RCPT/DATA transaction, limits command lines to 32KiB and DATA to 9MiB, returns `250` after the terminator, and accepts QUIT. The measured fixtures used a dual-stack `::` listener and the generated localhost certificate, so reproduce them only on an isolated or appropriately firewalled test host. The application harness independently rejects non-loopback account endpoints.
+
+```bash
+mkdir -p "$work/account-send"
+printf '%s' 'not-a-real-password' > "$work/loopback.secret"
+chmod 600 "$work/loopback.secret"
+
+# Start the one-connection IMAP TLS and SMTP STARTTLS fixtures described above,
+# wait for both listeners, then run the measurement.
+
+SSL_CERT_FILE="$work/ca.crt" \
+NIVALIS_MEMORY_DATA_DIR="$work/account-send" \
+NIVALIS_MEMORY_TEST_CASE=m5-account-send \
+NIVALIS_STRESS_SCENARIO=account-send NIVALIS_STRESS_STEPS=1 \
+NIVALIS_STRESS_DELAY_MS=15000 NIVALIS_STRESS_INTERVAL_MS=25 \
+NIVALIS_STRESS_TRANSITION_TIMEOUT_MS=45000 \
+NIVALIS_STRESS_ACCOUNT_NAME='Memory send' \
+NIVALIS_STRESS_ACCOUNT_ADDRESS=memory@localhost \
+NIVALIS_STRESS_ACCOUNT_LOGIN=memory@localhost \
+NIVALIS_STRESS_ACCOUNT_IMAP_HOST=localhost \
+NIVALIS_STRESS_ACCOUNT_IMAP_PORT=19997 \
+NIVALIS_STRESS_ACCOUNT_SMTP_HOST=localhost \
+NIVALIS_STRESS_ACCOUNT_SMTP_PORT=1587 \
+NIVALIS_STRESS_ACCOUNT_SECRET_FILE="$work/loopback.secret" \
+NIVALIS_STRESS_ACCOUNT_EXPECTED_RESULT=ready \
+NIVALIS_MEMORY_SAMPLES="5 10 20 60 120" \
+NIVALIS_MEMORY_HARD_GATE=1 NIVALIS_MEMORY_HARD_CAP_KIB=92160 \
+NIVALIS_MEMORY_GROWTH_LIMIT_PERCENT=100 \
+NIVALIS_MEMORY_CPU_SETTLE_GATE=1 \
+NIVALIS_MEMORY_CPU_SETTLE_GRACE_SECONDS=5 \
+NIVALIS_MEMORY_CPU_SETTLE_SECONDS=10 \
+NIVALIS_MEMORY_CPU_SETTLE_MAX_PERCENT=0.00 \
+NIVALIS_MEMORY_LOG="$work/account-send.log" \
+  scripts/measure-memory.sh "$work/nivalis-mail-bench" > "$work/account-send.csv"
+```
+
+Require both fixture processes to exit successfully, then require the exact completion marker and verify durable cleanup after the measured process has exited; do not restart the application to make this check pass:
+
+```bash
+[[ $(grep -Ec '^NIVALIS_STRESS_RESULT scenario=account-send steps=1 queued=1 delivered=1 sent_visible=1 drafts=0 removed=1 elapsed_ms=(0|[1-9][0-9]*)$' "$work/account-send.log") == 1 ]]
+! grep -q '^NIVALIS_STRESS_ERROR ' "$work/account-send.log"
+
+db="$work/account-send/mail.sqlite3"
+for table in accounts messages local_drafts outbox outbox_recipients \
+  file_staging message_content attachments file_gc; do
+  [[ $(sqlite3 "$db" "SELECT count(*) FROM $table;") == 0 ]]
+done
+[[ $(sqlite3 "$db" 'PRAGMA integrity_check;') == ok ]]
+[[ -z $(sqlite3 "$db" 'PRAGMA foreign_key_check;') ]]
+[[ -z $(find "$work/account-send/content" -type f -print) ]]
+
+{ head -n 1 "$work/idle.csv"; tail -n +2 "$work/idle.csv"; \
+  tail -n +2 "$work/account-send.csv"; } > "$work/2026-07-20-24d616f.csv"
+[[ $(wc -l < "$work/2026-07-20-24d616f.csv") == 25 ]]
+[[ $(head -n 1 "$work/2026-07-20-24d616f.csv" | awk -F, '{print NF}') == 14 ]]
+[[ $(sha256sum "$work/2026-07-20-24d616f.csv" | cut -d' ' -f1) == \
+  30e3bb17071166e8ec458948114f1446c84eca589fcfdc3f354dd97bc523ed71 ]]
+```
+
+If setup fails with `cleanup_required=1`, preserve the data directory and use the production removal path to delete the test keyring item before discarding the fixture. A new run may have a different elapsed-time suffix and CSV hash while still satisfying the same marker, bounds, and cleanup gates.
 
 ### Prior M4 Receive Gate
 
