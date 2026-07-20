@@ -21,7 +21,7 @@ use crate::{
     credentials::{self, CredentialClient, CredentialRuntime},
     store::sqlite::{
         self, DatabaseClient, DatabaseInfo, DatabaseReplies, DatabaseRuntime, DatabaseSubmitError,
-        DbReply,
+        DbReply, MutationOutcome,
     },
 };
 use std::{
@@ -339,7 +339,9 @@ async fn run_core(
             CoreInput::AccountCommandsClosed => account_commands = None,
             CoreInput::ComposeCommandsClosed => compose_commands = None,
             CoreInput::OutboxStatusesClosed => outbox_statuses = None,
-            CoreInput::AccountProgress => {}
+            CoreInput::AccountProgress => {
+                let _ = file_gc_wakeups.try_send(());
+            }
             CoreInput::AccountFailure(error) => return Err(error.into()),
             CoreInput::AccountCommand(command) => {
                 account_workflows
@@ -628,6 +630,10 @@ async fn run_core(
                 active_mutations = active_mutations
                     .checked_sub(1)
                     .ok_or(RuntimeError::MutationAccounting)?;
+                let collect_files = matches!(
+                    &reply.result,
+                    Ok(MutationOutcome::PermanentlyDeleted { .. })
+                );
                 let undelivered_failure = reply
                     .result
                     .as_ref()
@@ -652,6 +658,9 @@ async fn run_core(
                         }
                         (Ok(()), None) => Ok(()),
                     };
+                }
+                if collect_files {
+                    let _ = file_gc_wakeups.try_send(());
                 }
             }
         }
@@ -793,7 +802,7 @@ async fn run_file_janitor(
 
         match wakeups.recv().await {
             Some(()) => delay = FILE_GC_INITIAL_DELAY,
-            None => return FileJanitorExit::WakeChannel,
+            None => shutting_down = true,
         }
     }
 }
@@ -1921,6 +1930,46 @@ mod tests {
         assert_eq!(sent.rows.len(), 1);
         assert_eq!(sent.rows[0].id, draft.message_id);
 
+        let removed = wait_for(
+            core.try_account_operation(AccountOperation::Remove {
+                request_id: RequestId::new(92).unwrap(),
+                account_id: account.account_id,
+                expected_generation: account.generation,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            removed.result,
+            Ok(AccountOperationSuccess::Removed {
+                account_id: account.account_id,
+            })
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let connection = Connection::open(&path).unwrap();
+            let pending_gc = connection
+                .query_row("SELECT count(*) FROM file_gc", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap();
+            drop(connection);
+            let body_files = fs::read_dir(content_root.join("body"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+                .count();
+            if pending_gc == 0 && body_files == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "account removal left {pending_gc} GC rows and {body_files} body files"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
         runtime.shutdown().unwrap();
         drop(core);
         let connection = Connection::open(&path).unwrap();
@@ -1936,7 +1985,7 @@ mod tests {
             .filter_map(Result::ok)
             .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
             .count();
-        assert_eq!(body_files, 1);
+        assert_eq!(body_files, 0);
         remove_database_files(&path);
         fs::remove_dir_all(content_root).unwrap();
     }
@@ -1961,12 +2010,31 @@ mod tests {
             Some(content_root.clone()),
         )
         .unwrap();
+        let initial = wait_for(
+            core.try_compose_operation(ComposeOperation::SaveAndClose(
+                ComposeDraftInput::new(
+                    account.account_id,
+                    account.generation,
+                    None,
+                    "bob@example.test",
+                    "Initial subject",
+                    "This body must be replaced during shutdown.",
+                )
+                .unwrap(),
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let ComposeSuccess::Saved(initial) = initial else {
+            panic!("initial compose save must persist a draft")
+        };
         let response = core
             .try_compose_operation(ComposeOperation::SaveAndClose(
                 ComposeDraftInput::new(
                     account.account_id,
                     account.generation,
-                    None,
+                    Some(initial),
                     "bob@example.test",
                     "Shutdown-safe subject",
                     "Accepted body must reach durable storage.",
@@ -1993,7 +2061,19 @@ mod tests {
             .unwrap();
         assert_eq!(subject, "Shutdown-safe subject");
         assert!(content_root.join(body_key).is_file());
+        let pending_gc = connection
+            .query_row("SELECT count(*) FROM file_gc", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(pending_gc, 0);
         drop(connection);
+        let body_files = fs::read_dir(content_root.join("body"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .count();
+        assert_eq!(body_files, 1);
         remove_database_files(&path);
         fs::remove_dir_all(content_root).unwrap();
     }
