@@ -1,0 +1,16 @@
+{
+  "name": "nivalis-development-hooks",
+  "private": true,
+  "packageManager": "npm@11.12.1",
+  "scripts": {
+    "prepare": "husky",
+    "test:commit": "scripts/check-local.sh commit",
+    "test:push": "scripts/check-local.sh push"
+  },
+  "devDependencies": {
+    "husky": "9.1.7"
+  },
+  "engines": {
+    "node": "^20.17.0 || >=22.9.0"
+  }
+}

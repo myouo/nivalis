@@ -32,6 +32,16 @@ The default low-memory profile uses Skia CPU rasterization with partial renderin
 NIVALIS_RENDERER=skia cargo run --release
 ```
 
+## Local quality gates
+
+Install the development-only Git hooks after cloning (Node.js `^20.17.0` or `>=22.9.0`):
+
+```bash
+npm ci
+```
+
+Husky runs `scripts/check-local.sh commit` before commits, merge commits, and applied patches: the index must match the worktree, formatting must be clean, and the default Rust test suite must pass. Before every push, `scripts/check-local.sh push` requires a clean worktree and a pushed commit matching the tested `HEAD`, then repeats those checks and also runs the benchmark-harness tests plus Clippy across all targets and features. The same commands can be run manually with `npm run test:commit` and `npm run test:push`; GitHub Actions remains the remote verification layer.
+
 ## Experience
 
 - Frameless 40px title bar, 248px collapsible sidebar, 54px rail, and adaptive single-pane reading below 760px
