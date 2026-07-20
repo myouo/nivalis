@@ -196,6 +196,15 @@ export component AppWindow inherits Window {
             }
         }
 
+        KeyBinding {
+            keys: @keys(F5);
+            activated => {
+                if (root.active-account-id != "" && !root.sync-loading && !root.blocking-overlay-open) {
+                    root.sync-account(root.active-account-id);
+                }
+            }
+        }
+
         key-pressed(event) => {
             if (event.text == Key.Escape) {
                 if (root.account-credential-open) {

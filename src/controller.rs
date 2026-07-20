@@ -3477,6 +3477,38 @@ mod tests {
     const CONTROLLER_TIMEOUT: Duration = Duration::from_secs(5);
     static NEXT_DATABASE_ID: AtomicU64 = AtomicU64::new(1);
 
+    fn verify_f5_sync_shortcut() {
+        let ui = AppWindow::new().expect("create shortcut test window");
+        let synced_account = Rc::new(RefCell::new(None));
+        let synced_account_for_callback = synced_account.clone();
+        ui.on_sync_account(move |account_id| {
+            *synced_account_for_callback.borrow_mut() = Some(account_id.to_string());
+        });
+        ui.set_active_account_id("account-7".into());
+
+        ui.window()
+            .dispatch_event(slint::platform::WindowEvent::KeyPressed {
+                text: slint::platform::Key::F5.into(),
+            });
+        assert_eq!(synced_account.borrow().as_deref(), Some("account-7"));
+
+        *synced_account.borrow_mut() = None;
+        ui.set_sync_loading(true);
+        ui.window()
+            .dispatch_event(slint::platform::WindowEvent::KeyPressed {
+                text: slint::platform::Key::F5.into(),
+            });
+        assert!(synced_account.borrow().is_none());
+
+        ui.set_sync_loading(false);
+        ui.set_settings_open(true);
+        ui.window()
+            .dispatch_event(slint::platform::WindowEvent::KeyPressed {
+                text: slint::platform::Key::F5.into(),
+            });
+        assert!(synced_account.borrow().is_none());
+    }
+
     #[test]
     fn compose_input_bound_preserves_utf8_boundaries() {
         assert_eq!(bounded_utf8_prefix("plain", 5), "plain");
@@ -4068,6 +4100,7 @@ mod tests {
     #[test]
     fn production_controller_drives_sqlite_success_empty_and_error_states() {
         i_slint_backend_testing::init_integration_test_with_system_time();
+        verify_f5_sync_shortcut();
 
         let database = TestDatabase::new("mailbox");
         database.seed_bounded_mailbox();
