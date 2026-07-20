@@ -73,6 +73,8 @@ struct Controller {
     outbox_cancel_pending: Cell<bool>,
     compose_identity: Cell<Option<ComposeDraftIdentity>>,
     compose_target: Cell<Option<AccountOperationTarget>>,
+    compose_dirty: Cell<bool>,
+    window_close_pending: Cell<bool>,
     account_request_id: Cell<u64>,
     account_cancelable: Cell<bool>,
     pending_account_selection: Cell<Option<i64>>,
@@ -153,6 +155,8 @@ impl Controller {
             outbox_cancel_pending: Cell::new(false),
             compose_identity: Cell::new(None),
             compose_target: Cell::new(None),
+            compose_dirty: Cell::new(false),
+            window_close_pending: Cell::new(false),
             account_request_id: Cell::new(1),
             account_cancelable: Cell::new(false),
             pending_account_selection: Cell::new(None),
@@ -254,6 +258,9 @@ impl Controller {
         ui.on_compose_input_edited(move |field, value| {
             controller.bound_compose_input(field.as_str(), value);
         });
+
+        let controller = self.clone();
+        ui.on_window_close(move || controller.request_window_close());
 
         let controller = self.clone();
         ui.on_open_outbox(move || controller.load_outbox(true));
@@ -1099,6 +1106,8 @@ impl Controller {
         }
         self.compose_target.set(Some(target));
         self.compose_identity.set(None);
+        self.compose_dirty.set(false);
+        self.window_close_pending.set(false);
         if let Some(ui) = self.ui.upgrade() {
             ui.set_compose_to(SharedString::default());
             ui.set_compose_subject(SharedString::default());
@@ -1126,6 +1135,7 @@ impl Controller {
                 Ok(Ok(ComposeSuccess::Loaded(Some(draft)))) if draft.locked_for_delivery => {
                     controller.finish_compose_task();
                     controller.compose_identity.set(None);
+                    controller.compose_dirty.set(false);
                     if let Some(ui) = controller.ui.upgrade() {
                         ui.set_composer_status("Previous message is already queued".into());
                         show_snackbar(
@@ -1139,6 +1149,7 @@ impl Controller {
                 Ok(Ok(ComposeSuccess::Loaded(Some(draft)))) => {
                     controller.finish_compose_task();
                     controller.compose_identity.set(Some(draft.identity));
+                    controller.compose_dirty.set(false);
                     if let Some(ui) = controller.ui.upgrade() {
                         ui.set_compose_to(draft.to.as_ref().into());
                         ui.set_compose_subject(draft.subject.as_ref().into());
@@ -1148,6 +1159,7 @@ impl Controller {
                 }
                 Ok(Ok(ComposeSuccess::Loaded(None))) => {
                     controller.finish_compose_task();
+                    controller.compose_dirty.set(false);
                     if let Some(ui) = controller.ui.upgrade() {
                         ui.set_composer_status("New draft".into());
                     }
@@ -1603,6 +1615,13 @@ impl Controller {
             ),
             _ => return,
         };
+        if let Some(ui) = self.ui.upgrade()
+            && ui.get_composer_open()
+            && !ui.get_composer_loading()
+        {
+            self.compose_dirty.set(true);
+            ui.set_composer_status("Changes not yet saved".into());
+        }
         if value.as_str().len() <= limit {
             return;
         }
@@ -1649,11 +1668,15 @@ impl Controller {
     }
 
     fn finish_compose_success(&self, feedback: &'static str) {
+        let exit_after_save = self.window_close_pending.replace(false);
         self.finish_compose_task();
         self.close_composer();
         if let Some(ui) = self.ui.upgrade() {
             ui.set_status_text(feedback.into());
             show_snackbar(&ui, feedback, false, &self.snackbar_timer);
+            if exit_after_save {
+                ui.invoke_window_exit_approved();
+            }
         }
     }
 
@@ -1663,6 +1686,7 @@ impl Controller {
     }
 
     fn finish_compose_task_with_error(&self, error: UserError) {
+        self.window_close_pending.set(false);
         self.finish_compose_task();
         self.show_compose_error(error);
     }
@@ -1679,6 +1703,7 @@ impl Controller {
     fn close_composer(&self) {
         self.compose_identity.set(None);
         self.compose_target.set(None);
+        self.compose_dirty.set(false);
         if let Some(ui) = self.ui.upgrade() {
             ui.set_composer_open(false);
             ui.set_composer_loading(false);
@@ -1688,6 +1713,43 @@ impl Controller {
             ui.set_composer_error(SharedString::default());
             ui.set_composer_status(SharedString::default());
         }
+    }
+
+    fn request_window_close(self: &Rc<Self>) {
+        let Some(ui) = self.ui.upgrade() else {
+            return;
+        };
+        if !ui.get_composer_open() || !self.compose_dirty.get() {
+            ui.invoke_window_exit_approved();
+            return;
+        }
+        if self.window_close_pending.get() {
+            ui.set_composer_error(
+                "Nivalis is saving this draft before closing. Keep the window open briefly.".into(),
+            );
+            return;
+        }
+        if self
+            .compose_task
+            .borrow()
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+        {
+            ui.set_composer_status("Draft action still running".into());
+            ui.set_composer_error(
+                "Nivalis kept this window open so unsaved changes are not lost. Wait for the current draft action, then close again."
+                    .into(),
+            );
+            ui.set_status_text("Window kept open to protect the draft".into());
+            return;
+        }
+
+        self.window_close_pending.set(true);
+        self.save_compose_draft(
+            ui.get_compose_to(),
+            ui.get_compose_subject(),
+            ui.get_compose_body(),
+        );
     }
 
     fn handle_outbox_status(self: &Rc<Self>, status: OutboxStatus) {
@@ -3894,6 +3956,81 @@ mod tests {
         harness.ui.invoke_filter_folder("Archive".into());
         harness.drive_until("Archive folder", |ui| mailbox_ready(ui, 1, 1));
         assert!(model_contains(&harness.ui, "51"));
+
+        harness.ui.invoke_switch_account("51".into());
+        harness.drive_until("configured-account Archive", |ui| mailbox_ready(ui, 1, 1));
+        crate::platform::install_window_handlers(&harness.ui);
+        let close_approved = Rc::new(Cell::new(false));
+        let approved_callback = close_approved.clone();
+        harness.ui.on_window_exit_approved(move || {
+            approved_callback.set(true);
+            slint::quit_event_loop().expect("stop protected close test loop");
+        });
+        harness.ui.set_composer_open(true);
+        harness.ui.invoke_open_composer();
+
+        let phase = Rc::new(Cell::new(0_u8));
+        let poll_phase = phase.clone();
+        let poll_ui = harness.ui.as_weak();
+        let poll_controller = harness.controller.clone();
+        let poll_close_approved = close_approved.clone();
+        let poll_timer = Timer::default();
+        poll_timer.start(TimerMode::Repeated, Duration::from_millis(10), move || {
+            let Some(ui) = poll_ui.upgrade() else {
+                return;
+            };
+            if poll_phase.get() == 0 && !ui.get_composer_loading() {
+                assert!(
+                    ui.get_composer_error().is_empty(),
+                    "composer failed to load: {} / {}",
+                    ui.get_composer_status(),
+                    ui.get_composer_error()
+                );
+                ui.set_compose_to("not-an-address".into());
+                ui.set_compose_subject("Protected close draft".into());
+                ui.set_compose_body("This body must be durable before the window closes.".into());
+                ui.invoke_compose_input_edited(
+                    "body".into(),
+                    "This body must be durable before the window closes.".into(),
+                );
+                assert!(poll_controller.compose_dirty.get());
+
+                ui.window()
+                    .dispatch_event(slint::platform::WindowEvent::CloseRequested);
+                assert!(!poll_close_approved.get());
+                assert!(ui.get_composer_open());
+                assert!(!ui.get_composer_loading());
+                assert!(!poll_controller.window_close_pending.get());
+                assert_eq!(
+                    ui.get_composer_status().as_str(),
+                    "Check the message fields"
+                );
+                assert!(ui.get_composer_error().contains("valid comma-separated"));
+
+                ui.set_compose_to("recipient@example.test".into());
+                ui.invoke_compose_input_edited("to".into(), "recipient@example.test".into());
+                ui.window()
+                    .dispatch_event(slint::platform::WindowEvent::CloseRequested);
+                assert!(!poll_close_approved.get());
+                assert!(ui.get_composer_open());
+                assert!(ui.get_composer_loading());
+                assert_eq!(ui.get_composer_status().as_str(), "Saving draft");
+                poll_phase.set(1);
+            }
+        });
+        let timed_out = close_approved.clone();
+        Timer::single_shot(Duration::from_secs(5), move || {
+            if !timed_out.get() {
+                slint::quit_event_loop().expect("stop timed-out protected close test loop");
+            }
+        });
+        slint::run_event_loop_until_quit().expect("run protected close test loop");
+        poll_timer.stop();
+        assert!(close_approved.get(), "dirty draft close did not complete");
+        assert_eq!(phase.get(), 1);
+        assert!(!harness.ui.get_composer_open());
+        assert!(!harness.controller.compose_dirty.get());
+        assert!(!harness.controller.window_close_pending.get());
         harness.shutdown();
 
         let connection = Connection::open(&database.path).expect("inspect controller database");
@@ -3923,6 +4060,32 @@ mod tests {
             )
             .expect("read persisted controller outcomes");
         assert_eq!(persisted, (false, true, 0, 1, "inbox".to_owned()));
+        let (draft_subject, body_file_key, body_byte_count) = connection
+            .query_row(
+                "SELECT message.subject, content.body_file_key, content.body_byte_count
+                   FROM local_drafts AS draft
+                   JOIN messages AS message ON message.id = draft.message_id
+                   JOIN message_content AS content ON content.message_id = draft.message_id
+                  WHERE message.account_id = 51
+                  ORDER BY draft.updated_at_ms DESC
+                  LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .expect("read protected close draft");
+        assert_eq!(draft_subject, "Protected close draft");
+        assert_eq!(body_byte_count, 51);
+        assert_eq!(
+            fs::read_to_string(database.path.with_file_name("content").join(body_file_key))
+                .expect("read protected private draft body"),
+            "This body must be durable before the window closes."
+        );
         drop(connection);
 
         let empty_database = TestDatabase::new("empty");
