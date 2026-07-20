@@ -15,6 +15,7 @@ const ACCOUNT_PURGE_ATTACHMENT_BATCH: usize = 16;
 const ACCOUNT_PURGE_STAGING_BATCH: usize = 16;
 const ACCOUNT_PURGE_PROVIDER_BATCH: usize = 16;
 const PENDING_REMOVAL_LIMIT: usize = 64;
+const ACCOUNT_SYNC_TARGET_LIMIT: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AccountAuthKind {
@@ -284,6 +285,12 @@ pub(crate) struct AccountSetupTarget {
     pub(crate) address: Box<str>,
     pub(crate) accent_rgb: u32,
     pub(crate) removal_pending: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AccountSyncTarget {
+    pub(crate) account_id: AccountId,
+    pub(crate) generation: AccountGeneration,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -583,6 +590,44 @@ pub(super) fn load_account(
     account_id: AccountId,
 ) -> Result<AccountRecord, DbFailure> {
     load_account_record_from(connection, account_id)
+}
+
+pub(super) fn load_sync_targets(
+    connection: &Connection,
+) -> Result<Box<[AccountSyncTarget]>, DbFailure> {
+    let row_limit = i64::try_from(ACCOUNT_SYNC_TARGET_LIMIT + 1)
+        .map_err(|_| DbFailure::resource_limit("account sync target limit is invalid"))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT account.id, account.configuration_generation
+             FROM accounts AS account
+             JOIN account_connections AS connection ON connection.account_id = account.id
+             WHERE account.state = 'active'
+             ORDER BY account.sort_order, account.id
+             LIMIT ?1",
+        )
+        .map_err(DbFailure::database)?;
+    let rows = statement
+        .query_map([row_limit], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(DbFailure::database)?;
+
+    let mut targets = Vec::with_capacity(ACCOUNT_SYNC_TARGET_LIMIT + 1);
+    for row in rows {
+        let (account_id, generation) = row.map_err(DbFailure::database)?;
+        targets.push(AccountSyncTarget {
+            account_id: AccountId::new(account_id)
+                .map_err(|error| DbFailure::database(error.to_string()))?,
+            generation: AccountGeneration::from_database(generation)?,
+        });
+    }
+    if targets.len() > ACCOUNT_SYNC_TARGET_LIMIT {
+        return Err(DbFailure::resource_limit(format!(
+            "account sync target count exceeds the {ACCOUNT_SYNC_TARGET_LIMIT}-account limit"
+        )));
+    }
+    Ok(targets.into_boxed_slice())
 }
 
 pub(super) fn load_pending_credential_removals(
@@ -2085,6 +2130,142 @@ mod tests {
                 .unwrap(),
             AccountPurgeOutcome::Complete(_)
         ));
+    }
+
+    #[test]
+    fn sync_targets_are_bounded_filtered_and_stably_ordered() {
+        let connection = database();
+        for (id, generation, sort_order, state, configured) in [
+            (9_i64, 19_i64, 1_i64, "active", true),
+            (2, 2, 0, "disabled", true),
+            (7, 17, 0, "active", false),
+            (5, 15, 0, "active", true),
+            (8, 18, 0, "removing_credentials", true),
+            (6, 16, 0, "removing_cache", true),
+            (4, 14, 1, "active", true),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO accounts
+                         (id, provider, remote_key, name, address, sort_order, state,
+                          accent_rgb, configuration_generation)
+                     VALUES (?1, 'imap', ?2, ?2, ?2, ?3, ?4, 0, ?5)",
+                    params![
+                        id,
+                        format!("sync-account-{id}"),
+                        sort_order,
+                        state,
+                        generation
+                    ],
+                )
+                .unwrap();
+            if configured {
+                connection
+                    .execute(
+                        "INSERT INTO account_connections
+                             (account_id, credential_key, auth_kind, login_name,
+                              imap_host, imap_port)
+                         VALUES (?1, ?2, 'app_password', 'owner@example.test',
+                                 'imap.example.test', 993)",
+                        params![id, format!("{id:032x}")],
+                    )
+                    .unwrap();
+            }
+        }
+
+        let targets = load_sync_targets(&connection).unwrap();
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| (target.account_id.get(), target.generation.get()))
+                .collect::<Vec<_>>(),
+            vec![(5, 15), (4, 14), (9, 19)]
+        );
+
+        connection
+            .execute("DROP TRIGGER reject_account_limit_insert", [])
+            .unwrap();
+        for id in 10_i64..=70 {
+            connection
+                .execute(
+                    "INSERT INTO accounts
+                         (id, provider, remote_key, name, address, sort_order, state,
+                          accent_rgb, configuration_generation)
+                     VALUES (?1, 'imap', ?2, ?2, ?2, ?1, 'active', 0, ?1)",
+                    params![id, format!("overflow-account-{id}")],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO account_connections
+                         (account_id, credential_key, auth_kind, login_name,
+                          imap_host, imap_port)
+                     VALUES (?1, ?2, 'app_password', 'owner@example.test',
+                             'imap.example.test', 993)",
+                    params![id, format!("{id:032x}")],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            load_sync_targets(&connection).unwrap().len(),
+            ACCOUNT_SYNC_TARGET_LIMIT
+        );
+        let id = 71_i64;
+        connection
+            .execute(
+                "INSERT INTO accounts
+                     (id, provider, remote_key, name, address, sort_order, state,
+                      accent_rgb, configuration_generation)
+                 VALUES (?1, 'imap', ?2, ?2, ?2, ?1, 'active', 0, ?1)",
+                params![id, format!("overflow-account-{id}")],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO account_connections
+                     (account_id, credential_key, auth_kind, login_name,
+                      imap_host, imap_port)
+                 VALUES (?1, ?2, 'app_password', 'owner@example.test',
+                         'imap.example.test', 993)",
+                params![id, format!("{id:032x}")],
+            )
+            .unwrap();
+        let failure = load_sync_targets(&connection).unwrap_err();
+        assert_eq!(failure.kind, FailureKind::ResourceLimit);
+    }
+
+    #[test]
+    fn sync_targets_reject_invalid_database_identity_and_generation() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE accounts (
+                     id INTEGER,
+                     configuration_generation INTEGER,
+                     sort_order INTEGER,
+                     state TEXT
+                 );
+                 CREATE TABLE account_connections (account_id INTEGER);
+                 INSERT INTO accounts VALUES (0, 1, 0, 'active');
+                 INSERT INTO account_connections VALUES (0);",
+            )
+            .unwrap();
+
+        let invalid_id = load_sync_targets(&connection).unwrap_err();
+        assert_eq!(invalid_id.kind, FailureKind::Database);
+
+        connection.execute("DELETE FROM accounts", []).unwrap();
+        connection
+            .execute("DELETE FROM account_connections", [])
+            .unwrap();
+        connection
+            .execute("INSERT INTO accounts VALUES (1, 0, 0, 'active')", [])
+            .unwrap();
+        connection
+            .execute("INSERT INTO account_connections VALUES (1)", [])
+            .unwrap();
+        let invalid_generation = load_sync_targets(&connection).unwrap_err();
+        assert_eq!(invalid_generation.kind, FailureKind::Database);
     }
 
     #[test]

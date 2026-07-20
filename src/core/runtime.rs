@@ -73,6 +73,7 @@ pub(crate) fn spawn(
         production_imap_inbox_fetch,
         production_smtp_submit,
         Some(content_root),
+        true,
     )
 }
 
@@ -91,6 +92,7 @@ pub(crate) fn spawn_with_database(
         production_imap_inbox_fetch,
         production_smtp_submit,
         Some(content_root),
+        true,
     )?;
     Ok((core, events, runtime, benchmark_database))
 }
@@ -138,9 +140,11 @@ fn spawn_with_components_and_probe(
         production_imap_inbox_fetch,
         production_smtp_submit,
         None,
+        false,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_with_sync_components(
     event_capacity: usize,
     database: DatabaseParts,
@@ -149,6 +153,7 @@ fn spawn_with_sync_components(
     inbox_fetch_probe: ImapInboxFetchProbe,
     smtp_submit_probe: SmtpSubmitProbe,
     content_root: Option<PathBuf>,
+    auto_sync_enabled: bool,
 ) -> Result<(CoreHandle, EventReceiver, CoreRuntime), StartError> {
     let staging = content_root
         .as_ref()
@@ -195,6 +200,7 @@ fn spawn_with_sync_components(
                 diagnostic_probe,
                 inbox_fetch_probe,
                 content_root,
+                auto_sync_enabled,
             );
             let outbox_task = staging.as_ref().map(|staging| {
                 runtime.spawn(run_outbox_driver(
@@ -341,6 +347,21 @@ async fn run_core(
             CoreInput::OutboxStatusesClosed => outbox_statuses = None,
             CoreInput::AccountProgress => {
                 let _ = file_gc_wakeups.try_send(());
+                if let Some(status) = account_workflows.take_background_status()
+                    && !send_event(&events, &mut shutdown, Event::AccountSyncStatus(status)).await
+                {
+                    return finish_accepted_work(
+                        &mut commands,
+                        &mut compose_commands,
+                        staging.as_deref(),
+                        &outbox_wakeups,
+                        &database,
+                        &mut database_replies,
+                        active_mutations,
+                        None,
+                    )
+                    .await;
+                }
             }
             CoreInput::AccountFailure(error) => return Err(error.into()),
             CoreInput::AccountCommand(command) => {
@@ -939,6 +960,18 @@ async fn next_input(
             Poll::Pending => {}
         }
 
+        if account_workflows.can_start_user_operation()
+            && let Some(account_commands) = account_commands.as_mut()
+        {
+            match account_commands.poll_recv(context) {
+                Poll::Ready(Some(command)) => {
+                    return Poll::Ready(CoreInput::AccountCommand(command));
+                }
+                Poll::Ready(None) => return Poll::Ready(CoreInput::AccountCommandsClosed),
+                Poll::Pending => {}
+            }
+        }
+
         match account_workflows.poll_progress(context) {
             Poll::Ready(Ok(())) => return Poll::Ready(CoreInput::AccountProgress),
             Poll::Ready(Err(error)) => return Poll::Ready(CoreInput::AccountFailure(error)),
@@ -949,18 +982,6 @@ async fn next_input(
             match outbox_statuses.poll_recv(context) {
                 Poll::Ready(Some(status)) => return Poll::Ready(CoreInput::OutboxStatus(status)),
                 Poll::Ready(None) => return Poll::Ready(CoreInput::OutboxStatusesClosed),
-                Poll::Pending => {}
-            }
-        }
-
-        if account_workflows.can_start_user_operation()
-            && let Some(account_commands) = account_commands.as_mut()
-        {
-            match account_commands.poll_recv(context) {
-                Poll::Ready(Some(command)) => {
-                    return Poll::Ready(CoreInput::AccountCommand(command));
-                }
-                Poll::Ready(None) => return Poll::Ready(CoreInput::AccountCommandsClosed),
                 Poll::Pending => {}
             }
         }
@@ -1344,17 +1365,21 @@ mod tests {
     use super::*;
     use crate::{
         core::{
-            AccountConfigDraft, AccountDirectoryQuery, AccountOperation, AccountOperationSuccess,
-            AccountScope, AccountSetupMode, ComposeDraftInput, ComposeOperation, ComposeSuccess,
-            FolderScope, Generation, MailboxQuery, MessageId, MessageQuery, PageBoundary, PageSpec,
-            RequestId, account::ImapDiagnosticFuture,
+            AccountConfigDraft, AccountDirectoryQuery, AccountOperation, AccountOperationFailure,
+            AccountOperationSuccess, AccountScope, AccountSetupMode, AccountSyncStatus,
+            AccountWorkflowFailureKind, AccountWorkflowStage, ComposeDraftInput, ComposeOperation,
+            ComposeSuccess, FolderScope, Generation, InboxSyncFailureKind, MailboxQuery, MessageId,
+            MessageQuery, PageBoundary, PageSpec, RequestId, account::ImapDiagnosticFuture,
         },
         credentials::{
             CredentialDeleteOutcome, CredentialFailure, CredentialFailureKind, CredentialLocator,
             CredentialOperation, CredentialOutcome, Secret,
         },
         network::{
-            imap::{ImapDiagnosticFailure, ImapDiagnosticRequest},
+            imap::{
+                ImapDiagnosticFailure, ImapDiagnosticRequest, ImapInboxFetchFailure,
+                ImapInboxFetchRequest, ImapInboxPage,
+            },
             smtp::{
                 SmtpDataFence, SmtpSubmissionCancellation, SmtpSubmissionFailure,
                 SmtpSubmissionFailureKind, SmtpSubmissionReceipt, SmtpSubmissionRequest,
@@ -1371,6 +1396,7 @@ mod tests {
     use rusqlite::Connection;
     use std::{
         fs,
+        num::NonZeroU32,
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -1462,6 +1488,9 @@ mod tests {
     static STUBBORN_SMTP_DROPPED: AtomicBool = AtomicBool::new(false);
     static CANCEL_SMTP_CALLS: AtomicUsize = AtomicUsize::new(0);
     static CANCEL_AFTER_DATA_READY: AtomicBool = AtomicBool::new(false);
+    static AUTO_SYNC_PROBE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static AUTO_SYNC_PROBE_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    static AUTO_SYNC_PROBE_PEAK: AtomicUsize = AtomicUsize::new(0);
 
     struct PendingDiagnostic;
 
@@ -1482,6 +1511,53 @@ mod tests {
 
     fn pending_diagnostic(_: ImapDiagnosticRequest) -> ImapDiagnosticFuture {
         Box::pin(PendingDiagnostic)
+    }
+
+    struct AutoSyncProbeGuard;
+
+    impl AutoSyncProbeGuard {
+        fn enter() -> Self {
+            let active = AUTO_SYNC_PROBE_ACTIVE.fetch_add(1, Ordering::AcqRel) + 1;
+            AUTO_SYNC_PROBE_PEAK.fetch_max(active, Ordering::AcqRel);
+            Self
+        }
+    }
+
+    impl Drop for AutoSyncProbeGuard {
+        fn drop(&mut self) {
+            AUTO_SYNC_PROBE_ACTIVE.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    fn empty_inbox_page(
+        uid_next: u32,
+        scanned_through_uid: Option<u32>,
+        next_uid: Option<u32>,
+    ) -> ImapInboxPage {
+        ImapInboxPage {
+            uid_validity: NonZeroU32::new(41).unwrap(),
+            uid_next: NonZeroU32::new(uid_next).unwrap(),
+            scanned_through_uid: scanned_through_uid.and_then(NonZeroU32::new),
+            next_uid: next_uid.and_then(NonZeroU32::new),
+            messages: Box::new([]),
+        }
+    }
+
+    fn sequenced_auto_sync_fetch(
+        _request: ImapInboxFetchRequest,
+    ) -> crate::core::sync::ImapInboxFetchFuture {
+        let call = AUTO_SYNC_PROBE_CALLS.fetch_add(1, Ordering::AcqRel);
+        Box::pin(async move {
+            let _guard = AutoSyncProbeGuard::enter();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            match call {
+                0 => Ok(empty_inbox_page(3, Some(1), Some(2))),
+                1 => Err(ImapInboxFetchFailure::Offline),
+                2 => Ok(empty_inbox_page(1, None, None)),
+                3 => Ok(empty_inbox_page(2, Some(1), None)),
+                _ => panic!("automatic sync issued more than four immediate probes"),
+            }
+        })
     }
 
     fn fenced_successful_smtp(
@@ -1622,6 +1698,137 @@ mod tests {
         configuration
     }
 
+    fn create_auto_sync_account(
+        database: &DatabaseClient,
+        credential_key: &str,
+        label: &str,
+    ) -> AccountConfiguration {
+        let address = format!("{}@example.test", label.to_ascii_lowercase());
+        let input = AccountConfigInput::new(
+            credential_key,
+            label,
+            &address,
+            AccountAuthKind::AppPassword,
+            &address,
+            "imap.example.test",
+            993,
+            0x335577,
+        )
+        .unwrap();
+        let outcome = wait_for(
+            database
+                .try_write_account(Box::new(AccountWrite::Create(input)))
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let AccountWriteOutcome::Saved(configuration) = outcome else {
+            panic!("automatic sync account creation must return configuration")
+        };
+        configuration
+    }
+
+    #[test]
+    fn automatic_sync_rotates_three_accounts_and_contains_offline_failure() {
+        const CREDENTIALS: [&str; 3] = [
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "cccccccccccccccccccccccccccccccc",
+        ];
+
+        AUTO_SYNC_PROBE_CALLS.store(0, Ordering::Release);
+        AUTO_SYNC_PROBE_ACTIVE.store(0, Ordering::Release);
+        AUTO_SYNC_PROBE_PEAK.store(0, Ordering::Release);
+        let path = temporary_database_path();
+        let content_root = path.with_extension("auto-sync-content");
+        remove_database_files(&path);
+        let _ = fs::remove_dir_all(&content_root);
+
+        let database = sqlite::spawn(path.clone()).unwrap();
+        let account_a = create_auto_sync_account(&database.0, CREDENTIALS[0], "A");
+        let account_b = create_auto_sync_account(&database.0, CREDENTIALS[1], "B");
+        let account_c = create_auto_sync_account(&database.0, CREDENTIALS[2], "C");
+        let store: Arc<CredentialStore> =
+            keyring_core::mock::Store::new().expect("create shared credential store");
+        let credential_parts = credentials::spawn_with_test_factory(move || Ok(Arc::clone(&store)));
+        let credential_client = credential_parts.0.clone();
+        for credential_key in CREDENTIALS {
+            let stored = wait_for(
+                credential_client
+                    .try_submit(CredentialOperation::Store {
+                        locator: CredentialLocator::parse(credential_key).unwrap(),
+                        secret: Secret::new(b"shared-auto-sync-secret".to_vec()).unwrap(),
+                    })
+                    .unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(matches!(stored, CredentialOutcome::Stored));
+        }
+
+        let (core, mut events, runtime) = spawn_with_sync_components(
+            EVENT_CAPACITY,
+            database,
+            credential_parts,
+            successful_diagnostic,
+            sequenced_auto_sync_fetch,
+            production_smtp_submit,
+            Some(content_root.clone()),
+            true,
+        )
+        .unwrap();
+        let statuses = wait_for(async {
+            let mut statuses = Vec::with_capacity(4);
+            while statuses.len() < 4 {
+                match events.recv().await {
+                    Some(Event::AccountSyncStatus(status)) => statuses.push(status),
+                    Some(_) => {}
+                    None => panic!("core event stream closed before automatic sync completed"),
+                }
+            }
+            statuses
+        });
+
+        assert_eq!(
+            statuses,
+            vec![
+                AccountSyncStatus::Synced {
+                    account_id: account_a.account_id,
+                    generation: account_a.generation,
+                    imported: 0,
+                    has_more: true,
+                },
+                AccountSyncStatus::Failed(AccountOperationFailure {
+                    account_id: Some(account_b.account_id),
+                    generation: Some(account_b.generation),
+                    stage: AccountWorkflowStage::FetchInbox,
+                    kind: AccountWorkflowFailureKind::InboxSync(InboxSyncFailureKind::Offline),
+                }),
+                AccountSyncStatus::Synced {
+                    account_id: account_c.account_id,
+                    generation: account_c.generation,
+                    imported: 0,
+                    has_more: false,
+                },
+                AccountSyncStatus::Synced {
+                    account_id: account_a.account_id,
+                    generation: account_a.generation,
+                    imported: 0,
+                    has_more: false,
+                },
+            ]
+        );
+        assert_eq!(AUTO_SYNC_PROBE_CALLS.load(Ordering::Acquire), 4);
+        assert_eq!(AUTO_SYNC_PROBE_ACTIVE.load(Ordering::Acquire), 0);
+        assert_eq!(AUTO_SYNC_PROBE_PEAK.load(Ordering::Acquire), 1);
+
+        runtime.shutdown().unwrap();
+        drop(core);
+        drop(events);
+        remove_database_files(&path);
+        fs::remove_dir_all(content_root).unwrap();
+    }
+
     fn diagnostic_fixture(
         diagnostic_probe: ImapDiagnosticProbe,
     ) -> (
@@ -1735,6 +1942,7 @@ mod tests {
             production_imap_inbox_fetch,
             fenced_successful_smtp,
             Some(content_root.clone()),
+            false,
         )
         .unwrap();
 
@@ -1801,6 +2009,7 @@ mod tests {
             production_imap_inbox_fetch,
             fenced_successful_smtp,
             Some(content_root.clone()),
+            false,
         )
         .unwrap();
         let saved = wait_for(
@@ -1837,6 +2046,7 @@ mod tests {
             production_imap_inbox_fetch,
             fenced_successful_smtp,
             Some(content_root.clone()),
+            false,
         )
         .unwrap();
         let loaded = wait_for(
@@ -2008,6 +2218,7 @@ mod tests {
             production_imap_inbox_fetch,
             fenced_successful_smtp,
             Some(content_root.clone()),
+            false,
         )
         .unwrap();
         let initial = wait_for(
@@ -2118,6 +2329,7 @@ mod tests {
             production_imap_inbox_fetch,
             pending_smtp_after_fence,
             Some(content_root.clone()),
+            false,
         )
         .unwrap();
         let queued = wait_for(
@@ -2185,6 +2397,7 @@ mod tests {
             production_imap_inbox_fetch,
             unexpected_smtp_after_restart,
             Some(content_root.clone()),
+            false,
         )
         .unwrap();
         core.try_query_account_directory(account_directory_query(901, 1))
@@ -2255,6 +2468,7 @@ mod tests {
             production_imap_inbox_fetch,
             stubborn_smtp_after_fence,
             Some(content_root.clone()),
+            false,
         )
         .unwrap();
         let queued = wait_for(
@@ -2329,6 +2543,7 @@ mod tests {
             production_imap_inbox_fetch,
             cancellable_smtp_after_fence,
             Some(content_root.clone()),
+            false,
         )
         .unwrap();
         let queued = wait_for(

@@ -19,11 +19,12 @@ use crate::content::{ContentStaging, PublishedContent};
 
 use super::{
     account::{
-        AccountGeneration, AccountRecord, AccountWrite, AccountWriteOutcome, PendingCacheRemoval,
-        PendingCredentialRemoval, begin_account_removal, begin_diagnostic,
+        AccountGeneration, AccountRecord, AccountSyncTarget, AccountWrite, AccountWriteOutcome,
+        PendingCacheRemoval, PendingCredentialRemoval, begin_account_removal, begin_diagnostic,
         configure_existing_account, confirm_account_credentials_removed, create_account,
         load_account, load_pending_cache_removals, load_pending_credential_removals,
-        purge_removed_account, record_diagnostic, set_account_enabled, update_account,
+        load_sync_targets, purge_removed_account, record_diagnostic, set_account_enabled,
+        update_account,
     },
     content::{
         ContentBatchToken, ContentManifest, ReserveContentRequest,
@@ -69,6 +70,7 @@ const CONTENT_IMPORT_TTL_MS: i64 = 60 * 1_000;
 
 pub(crate) type PendingCredentialRemovalReply = Result<Box<[PendingCredentialRemoval]>, DbFailure>;
 pub(crate) type PendingCacheRemovalReply = Result<Box<[PendingCacheRemoval]>, DbFailure>;
+pub(crate) type AccountSyncTargetsReply = Result<Box<[AccountSyncTarget]>, DbFailure>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MailboxDbKey {
@@ -200,6 +202,9 @@ enum Request {
     LoadAccount {
         account_id: super::domain::AccountId,
         reply: oneshot::Sender<Result<AccountRecord, DbFailure>>,
+    },
+    LoadSyncTargets {
+        reply: oneshot::Sender<AccountSyncTargetsReply>,
     },
     LoadInboxCheckpoint {
         account_id: AccountId,
@@ -378,6 +383,14 @@ impl DatabaseClient {
     ) -> Result<oneshot::Receiver<Result<AccountRecord, DbFailure>>, SubmitError> {
         let (reply, receiver) = oneshot::channel();
         self.try_submit(Request::LoadAccount { account_id, reply })?;
+        Ok(receiver)
+    }
+
+    pub(crate) fn try_load_sync_targets(
+        &self,
+    ) -> Result<oneshot::Receiver<AccountSyncTargetsReply>, SubmitError> {
+        let (reply, receiver) = oneshot::channel();
+        self.try_submit(Request::LoadSyncTargets { reply })?;
         Ok(receiver)
     }
 
@@ -1286,6 +1299,12 @@ fn run_actor(
             Request::LoadAccount { account_id, reply } => {
                 if !reply.is_closed() {
                     let _ = reply.send(load_account(&connection, account_id));
+                }
+                continue;
+            }
+            Request::LoadSyncTargets { reply } => {
+                if !reply.is_closed() {
+                    let _ = reply.send(load_sync_targets(&connection));
                 }
                 continue;
             }
@@ -3096,6 +3115,67 @@ mod tests {
         assert_eq!(directory.rows[0].inbox_unread, 3);
         assert_eq!(directory.rows[1].id, 2);
         assert_eq!(directory.rows[1].inbox_unread, 5);
+        runtime.shutdown().unwrap();
+        remove_database_files(&path);
+    }
+
+    #[test]
+    fn sync_target_read_uses_oneshot_and_filters_lifecycle_in_stable_order() {
+        let path = temporary_database_path();
+        remove_database_files(&path);
+        let mut connection = Connection::open(&path).unwrap();
+        configure(&mut connection).unwrap();
+        for (id, generation, sort_order, state, configured) in [
+            (8_i64, 28_i64, 0_i64, "active", true),
+            (3, 23, 1, "active", true),
+            (5, 25, 1, "active", true),
+            (1, 21, 0, "disabled", true),
+            (2, 22, 0, "removing_credentials", true),
+            (4, 24, 0, "removing_cache", true),
+            (6, 26, 0, "active", false),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO accounts
+                         (id, provider, remote_key, name, address, sort_order, state,
+                          accent_rgb, configuration_generation)
+                     VALUES (?1, 'imap', ?2, ?2, ?2, ?3, ?4, 0, ?5)",
+                    params![
+                        id,
+                        format!("sync-target-{id}"),
+                        sort_order,
+                        state,
+                        generation
+                    ],
+                )
+                .unwrap();
+            if configured {
+                connection
+                    .execute(
+                        "INSERT INTO account_connections
+                             (account_id, credential_key, auth_kind, login_name,
+                              imap_host, imap_port)
+                         VALUES (?1, ?2, 'app_password', 'owner@example.test',
+                                 'imap.example.test', 993)",
+                        params![id, format!("{id:032x}")],
+                    )
+                    .unwrap();
+            }
+        }
+        drop(connection);
+
+        let (client, replies, runtime, _info) =
+            spawn_target(Target::File(path.clone()), REQUEST_CAPACITY, REPLY_CAPACITY).unwrap();
+        let targets = receive_oneshot(client.try_load_sync_targets().unwrap()).unwrap();
+
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| (target.account_id.get(), target.generation.get()))
+                .collect::<Vec<_>>(),
+            vec![(8, 28), (3, 23), (5, 25)]
+        );
+        assert!(replies.is_empty());
         runtime.shutdown().unwrap();
         remove_database_files(&path);
     }

@@ -221,6 +221,13 @@ impl ReadSession {
         folder_label(self.folder)
     }
 
+    pub(crate) fn shows_inbox_sync_updates(&self) -> bool {
+        matches!(
+            self.folder,
+            FolderScope::Inbox | FolderScope::Starred | FolderScope::Unread
+        )
+    }
+
     pub(crate) fn search(&self) -> &str {
         &self.search
     }

@@ -20,9 +20,9 @@ pub(crate) use query::{MailboxQueryCounts, mailbox_query_counts};
 pub(crate) use account::{
     AccountAuthKind, AccountConfigInput, AccountConfiguration, AccountDiagnostic,
     AccountDiagnosticKind, AccountGeneration, AccountLifecycle, AccountPurgeOutcome, AccountRecord,
-    AccountRemovalTicket, AccountSetupTarget, AccountValidationError, AccountWrite,
-    AccountWriteOutcome, DiagnosticCommit, DiagnosticEpoch, DiagnosticRecord, DiagnosticTicket,
-    PendingCacheRemoval, PendingCredentialRemoval, RemovedAccount, SmtpSecurity,
+    AccountRemovalTicket, AccountSetupTarget, AccountSyncTarget, AccountValidationError,
+    AccountWrite, AccountWriteOutcome, DiagnosticCommit, DiagnosticEpoch, DiagnosticRecord,
+    DiagnosticTicket, PendingCacheRemoval, PendingCredentialRemoval, RemovedAccount, SmtpSecurity,
 };
 #[allow(unused_imports)]
 pub(crate) use actor::{

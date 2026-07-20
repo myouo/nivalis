@@ -7,7 +7,7 @@ use self::session::{
 use crate::core::{
     AccountConfigDraft, AccountDirectoryLoadError, AccountOperation, AccountOperationFailure,
     AccountOperationResponseError, AccountOperationSubmitError, AccountOperationSuccess,
-    AccountSetupMode, AccountWorkflowFailureKind, COMPOSE_BODY_BYTE_LIMIT,
+    AccountSetupMode, AccountSyncStatus, AccountWorkflowFailureKind, COMPOSE_BODY_BYTE_LIMIT,
     COMPOSE_SUBJECT_BYTE_LIMIT, COMPOSE_TO_FIELD_BYTE_LIMIT, ComposeDraftIdentity,
     ComposeDraftInput, ComposeFailure, ComposeFailureKind, ComposeOperation,
     ComposeOperationResponseError, ComposeOperationSubmitError, ComposeSuccess, CoreHandle, Event,
@@ -403,7 +403,54 @@ impl Controller {
                 generation,
                 reason,
             } => self.handle_mutation_rejection(request_id, generation, reason),
+            Event::AccountSyncStatus(status) => self.handle_account_sync_status(status),
             Event::OutboxStatus(status) => self.handle_outbox_status(status),
+        }
+    }
+
+    fn handle_account_sync_status(&self, status: AccountSyncStatus) {
+        match status {
+            AccountSyncStatus::Synced {
+                account_id,
+                imported,
+                has_more,
+                ..
+            } => {
+                self.issue_accounts();
+                if !self.sync_status_is_visible(account_id) {
+                    return;
+                }
+                if let Some(ui) = self.ui.upgrade()
+                    && !foreground_feedback_active(&ui)
+                {
+                    ui.set_status_text(sync_success_feedback(imported, has_more).into());
+                }
+                if imported > 0 && self.state.borrow().shows_inbox_sync_updates() {
+                    self.refresh_after_mutation();
+                }
+            }
+            AccountSyncStatus::Failed(failure) => {
+                if failure
+                    .account_id
+                    .is_some_and(|account_id| !self.sync_status_is_visible(account_id))
+                {
+                    return;
+                }
+                let error = account_operation_error(failure);
+                if let Some(ui) = self.ui.upgrade()
+                    && !foreground_feedback_active(&ui)
+                {
+                    ui.set_status_text(error.title.into());
+                    show_snackbar(&ui, error.detail, false, &self.snackbar_timer);
+                }
+            }
+        }
+    }
+
+    fn sync_status_is_visible(&self, account_id: crate::store::sqlite::AccountId) -> bool {
+        match self.state.borrow().account() {
+            AccountKey::All => true,
+            AccountKey::Account(selected) => selected.get() == account_id.get(),
         }
     }
 
@@ -3213,6 +3260,15 @@ fn account_operation_error(failure: AccountOperationFailure) -> UserError {
         AccountWorkflowFailureKind::InvalidLocator
         | AccountWorkflowFailureKind::UnexpectedReply => UserError::account_result(),
     }
+}
+
+fn foreground_feedback_active(ui: &AppWindow) -> bool {
+    ui.get_snackbar_visible()
+        || ui.get_account_operation_loading()
+        || ui.get_sync_loading()
+        || ui.get_mutation_loading()
+        || ui.get_outbox_action_loading()
+        || ui.get_composer_loading()
 }
 
 fn inbox_sync_error(kind: InboxSyncFailureKind) -> UserError {

@@ -123,7 +123,11 @@ Recorded follow-ups that do not block M5: CC/BCC, attachments, HTML or rich-text
 
 ## M6: multi-account scheduling and optional JMAP
 
-Status: pending.
+Status: in progress.
+
+Checkpoint: production startup now loads at most 64 active configured accounts through one bounded SQLite query and serves them from one `VecDeque` scheduler on the existing current-thread core. Each turn runs one existing bounded IMAP INBOX page in the account workflow's single global task slot; no account owns a runtime, worker, connection pool, or timer. Stable rotation, immediate tail requeue for `has_more`, five-minute successful polling, and 30-second-to-one-hour failure backoff share one wake deadline. Manual sync promotes the same generation-fenced target and uses the same slot. Account setup/removal reloads the candidate set, generation replacement invalidates stale completions, and over-capacity scheduling pauses with actionable feedback rather than stopping the core. A three-account vertical test proves `A, B(failed), C, A(more)` service order and a peak provider concurrency of one.
+
+Remaining milestone work: execute the existing durable desired-state journal against IMAP, merge incoming provider state without overwriting newer local intent, make the SMTP claimant fair across account FIFO heads, add provider compatibility fixtures, and measure release idle plus settled multi-account growth. Optional bounded JMAP remains behind those provider-neutral convergence semantics and must not expand the default dependency tree.
 
 Acceptance criteria:
 

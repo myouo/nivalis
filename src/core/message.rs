@@ -1,5 +1,5 @@
 use super::{
-    account::{AccountOperation, AccountOperationReply},
+    account::{AccountOperation, AccountOperationReply, AccountSyncStatus},
     compose::{ComposeOperation, ComposeReply},
     outbox_driver::{OutboxStatus, SmtpCancellationTracker},
 };
@@ -73,6 +73,7 @@ pub(crate) enum Event {
         generation: Generation,
         reason: MutationSubmitError,
     },
+    AccountSyncStatus(AccountSyncStatus),
     OutboxStatus(OutboxStatus),
 }
 

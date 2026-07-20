@@ -5,13 +5,14 @@ mod message;
 mod outbound;
 mod outbox_driver;
 mod runtime;
+mod scheduler;
 mod sync;
 
 #[allow(unused_imports)]
 pub(crate) use account::{
     AccountConfigDraft, AccountOperation, AccountOperationFailure, AccountOperationReply,
-    AccountOperationSuccess, AccountSetupMode, AccountWorkflowFailureKind, AccountWorkflowStage,
-    InboxSyncFailureKind,
+    AccountOperationSuccess, AccountSetupMode, AccountSyncStatus, AccountWorkflowFailureKind,
+    AccountWorkflowStage, InboxSyncFailureKind,
 };
 pub(crate) use message::{CoreHandle, Event, EventReceiver, OutboxCancelOutcome};
 pub(crate) use outbox_driver::{OutboxDriverFault, OutboxStatus};

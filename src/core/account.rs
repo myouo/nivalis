@@ -4,7 +4,7 @@ use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use tokio::{
@@ -24,20 +24,24 @@ use crate::{
     store::sqlite::{
         AccountAuthKind, AccountConfigInput, AccountConfiguration, AccountDiagnosticKind,
         AccountGeneration, AccountId, AccountLifecycle, AccountPurgeOutcome, AccountRecord,
-        AccountRemovalTicket, AccountValidationError, AccountWrite, AccountWriteOutcome,
-        AccountWriteReply, DatabaseClient, DatabaseSubmitError, DiagnosticCommit, DiagnosticRecord,
-        DiagnosticTicket, FailureKind, PendingCacheRemoval, PendingCredentialRemoval, RequestId,
-        SmtpSecurity,
+        AccountRemovalTicket, AccountSyncTarget, AccountValidationError, AccountWrite,
+        AccountWriteOutcome, AccountWriteReply, DatabaseClient, DatabaseSubmitError,
+        DiagnosticCommit, DiagnosticRecord, DiagnosticTicket, FailureKind, PendingCacheRemoval,
+        PendingCredentialRemoval, RequestId, SmtpSecurity,
     },
 };
 
 #[cfg(test)]
 use super::sync::production_imap_inbox_fetch;
-use super::sync::{ImapInboxFetchProbe, SyncInboxFuture, SyncInboxOutcome, start_inbox_sync};
+use super::{
+    scheduler::{SchedulerError, SyncCompletion, SyncScheduler, SyncToken},
+    sync::{ImapInboxFetchProbe, SyncInboxFuture, SyncInboxOutcome, start_inbox_sync},
+};
 
 #[cfg_attr(not(test), allow(dead_code))]
 const PLACEHOLDER_CREDENTIAL_KEY: &str = "00000000000000000000000000000000";
 const RECOVERY_SUBMISSION_RETRY: Duration = Duration::from_millis(10);
+const SCHEDULER_SUBMISSION_RETRY: Duration = Duration::from_millis(10);
 
 pub(super) type ImapDiagnosticFuture =
     Pin<Box<dyn Future<Output = Result<(), ImapDiagnosticFailure>> + 'static>>;
@@ -271,6 +275,17 @@ pub(crate) struct AccountOperationFailure {
 pub(crate) struct AccountOperationReply {
     pub(crate) request_id: RequestId,
     pub(crate) result: Result<AccountOperationSuccess, AccountOperationFailure>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AccountSyncStatus {
+    Synced {
+        account_id: AccountId,
+        generation: AccountGeneration,
+        imported: u8,
+        has_more: bool,
+    },
+    Failed(AccountOperationFailure),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1095,6 +1110,9 @@ pub(super) struct AccountWorkflows {
     content_root: Option<std::path::PathBuf>,
     recovery: RecoveryState,
     active: Option<ActiveTask>,
+    scheduler: SyncScheduler,
+    auto_sync: AutoSyncState,
+    background_status: Option<AccountSyncStatus>,
 }
 
 impl AccountWorkflows {
@@ -1110,6 +1128,7 @@ impl AccountWorkflows {
             diagnostic_probe,
             production_imap_inbox_fetch,
             None,
+            false,
         )
     }
 
@@ -1119,6 +1138,7 @@ impl AccountWorkflows {
         diagnostic_probe: ImapDiagnosticProbe,
         inbox_fetch_probe: ImapInboxFetchProbe,
         content_root: Option<std::path::PathBuf>,
+        auto_sync_enabled: bool,
     ) -> Self {
         Self {
             database,
@@ -1128,7 +1148,18 @@ impl AccountWorkflows {
             content_root,
             recovery: RecoveryState::SubmitCredentialScan,
             active: None,
+            scheduler: SyncScheduler::new(),
+            auto_sync: if auto_sync_enabled {
+                AutoSyncState::SubmitTargets
+            } else {
+                AutoSyncState::Disabled
+            },
+            background_status: None,
         }
+    }
+
+    pub(super) fn take_background_status(&mut self) -> Option<AccountSyncStatus> {
+        self.background_status.take()
     }
 
     pub(super) fn can_start_user_operation(&self) -> bool {
@@ -1218,6 +1249,7 @@ impl AccountWorkflows {
                 self.active = Some(ActiveTask {
                     identity: Identity::new(account_id, expected_generation),
                     reply: Some(UserReply { request_id, reply }),
+                    sync_token: None,
                     state: ActiveTaskState::LoadingRetry {
                         account_id,
                         expected_generation,
@@ -1252,6 +1284,7 @@ impl AccountWorkflows {
                 self.active = Some(ActiveTask {
                     identity: Identity::new(account_id, expected_generation),
                     reply: Some(UserReply { request_id, reply }),
+                    sync_token: None,
                     state: ActiveTaskState::LoadingDiagnostic {
                         account_id,
                         expected_generation,
@@ -1278,9 +1311,46 @@ impl AccountWorkflows {
                     });
                     return Ok(());
                 };
+                let token = match self.scheduler.take_manual(
+                    account_id,
+                    expected_generation,
+                    Instant::now(),
+                ) {
+                    Ok(Some(token)) => token,
+                    Ok(None) => {
+                        let _ = reply.send(AccountOperationReply {
+                            request_id,
+                            result: Err(AccountOperationFailure {
+                                account_id: Some(account_id),
+                                generation: Some(expected_generation),
+                                stage: AccountWorkflowStage::FetchInbox,
+                                kind: AccountWorkflowFailureKind::Busy,
+                            }),
+                        });
+                        return Ok(());
+                    }
+                    Err(SchedulerError::TooManyTargets) => {
+                        let _ = reply.send(AccountOperationReply {
+                            request_id,
+                            result: Err(AccountOperationFailure {
+                                account_id: Some(account_id),
+                                generation: Some(expected_generation),
+                                stage: AccountWorkflowStage::FetchInbox,
+                                kind: AccountWorkflowFailureKind::InboxSync(
+                                    InboxSyncFailureKind::ResourceLimit,
+                                ),
+                            }),
+                        });
+                        return Ok(());
+                    }
+                    Err(SchedulerError::TokenExhausted) => {
+                        return Err(AccountDriverError::WorkflowRejected);
+                    }
+                };
                 self.active = Some(ActiveTask {
                     identity: Identity::new(account_id, expected_generation),
                     reply: Some(UserReply { request_id, reply }),
+                    sync_token: Some(token),
                     state: ActiveTaskState::Syncing(start_inbox_sync(
                         self.database.clone(),
                         self.credentials.clone(),
@@ -1317,6 +1387,7 @@ impl AccountWorkflows {
                 self.active = Some(ActiveTask {
                     identity: Identity::new(account_id, expected_generation),
                     reply: Some(UserReply { request_id, reply }),
+                    sync_token: None,
                     state: ActiveTaskState::LoadingRemoval {
                         account_id,
                         expected_generation,
@@ -1342,16 +1413,35 @@ impl AccountWorkflows {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(TaskProgress::Advanced)) => return Poll::Ready(Ok(())),
                 Poll::Ready(Ok(TaskProgress::Cancelled)) => {
-                    self.active.take();
+                    let active = self.active.take().expect("active account task was polled");
+                    if let Some(token) = active.sync_token {
+                        let completed =
+                            self.scheduler
+                                .complete(token, SyncCompletion::Failed, Instant::now());
+                        debug_assert!(completed, "cancelled sync token must still be current");
+                    }
                     return Poll::Ready(Ok(()));
                 }
                 Poll::Ready(Ok(TaskProgress::Finished(outcome))) => {
                     let mut active = self.active.take().expect("active account task was polled");
+                    let reload_targets = outcome_changes_sync_targets(&outcome);
+                    if let Some(token) = active.sync_token {
+                        let completion = sync_completion(&outcome);
+                        let completed = self.scheduler.complete(token, completion, Instant::now());
+                        debug_assert!(completed, "finished sync token must still be current");
+                        if active.reply.is_none() {
+                            self.background_status =
+                                Some(project_background_sync(outcome.clone(), active.identity));
+                        }
+                    }
                     if let Some(user) = active.reply.take() {
                         let _ = user.reply.send(AccountOperationReply {
                             request_id: user.request_id,
                             result: project_outcome(outcome, active.identity),
                         });
+                    }
+                    if reload_targets {
+                        self.request_sync_target_reload();
                     }
                     return Poll::Ready(Ok(()));
                 }
@@ -1485,7 +1575,124 @@ impl AccountWorkflows {
                 context.waker().wake_by_ref();
                 Poll::Ready(Ok(()))
             }
-            RecoveryState::Complete => Poll::Pending,
+            RecoveryState::Complete => self.poll_auto_sync(context),
+        }
+    }
+
+    fn request_sync_target_reload(&mut self) {
+        if !matches!(self.auto_sync, AutoSyncState::Disabled) {
+            self.auto_sync = AutoSyncState::SubmitTargets;
+        }
+    }
+
+    fn poll_auto_sync(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), AccountDriverError>> {
+        match &mut self.auto_sync {
+            AutoSyncState::Disabled => Poll::Pending,
+            AutoSyncState::SubmitTargets => match self.database.try_load_sync_targets() {
+                Ok(receiver) => {
+                    self.auto_sync = AutoSyncState::LoadingTargets(receiver);
+                    context.waker().wake_by_ref();
+                    Poll::Ready(Ok(()))
+                }
+                Err(DatabaseSubmitError::Busy) => {
+                    self.auto_sync = AutoSyncState::WaitingToSubmit(Box::pin(time::sleep(
+                        SCHEDULER_SUBMISSION_RETRY,
+                    )));
+                    Poll::Ready(Ok(()))
+                }
+                Err(DatabaseSubmitError::Closed) => {
+                    Poll::Ready(Err(AccountDriverError::DatabaseClosed))
+                }
+            },
+            AutoSyncState::LoadingTargets(receiver) => {
+                let targets = match Pin::new(receiver).poll(context) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(Ok(targets))) => targets,
+                    Poll::Ready(Ok(Err(failure))) if failure.kind == FailureKind::ResourceLimit => {
+                        self.auto_sync = AutoSyncState::Paused;
+                        self.background_status =
+                            Some(AccountSyncStatus::Failed(AccountOperationFailure {
+                                account_id: None,
+                                generation: None,
+                                stage: AccountWorkflowStage::LoadConfiguration,
+                                kind: AccountWorkflowFailureKind::Database(
+                                    FailureKind::ResourceLimit,
+                                ),
+                            }));
+                        return Poll::Ready(Ok(()));
+                    }
+                    Poll::Ready(Ok(Err(failure))) => {
+                        return Poll::Ready(Err(AccountDriverError::Recovery(failure.kind)));
+                    }
+                    Poll::Ready(Err(_)) => {
+                        return Poll::Ready(Err(AccountDriverError::DatabaseClosed));
+                    }
+                };
+                let targets = targets
+                    .iter()
+                    .map(|target| (target.account_id, target.generation));
+                self.scheduler
+                    .replace_targets(targets, Instant::now())
+                    .map_err(|_| AccountDriverError::WorkflowRejected)?;
+                self.auto_sync = AutoSyncState::Ready;
+                context.waker().wake_by_ref();
+                Poll::Ready(Ok(()))
+            }
+            AutoSyncState::WaitingToSubmit(delay) => match delay.as_mut().poll(context) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(()) => {
+                    self.auto_sync = AutoSyncState::SubmitTargets;
+                    context.waker().wake_by_ref();
+                    Poll::Ready(Ok(()))
+                }
+            },
+            AutoSyncState::WaitingForDeadline(delay) => match delay.as_mut().poll(context) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(()) => {
+                    self.auto_sync = AutoSyncState::Ready;
+                    context.waker().wake_by_ref();
+                    Poll::Ready(Ok(()))
+                }
+            },
+            AutoSyncState::Paused => Poll::Pending,
+            AutoSyncState::Ready => {
+                let Some(content_root) = self.content_root.clone() else {
+                    self.auto_sync = AutoSyncState::Disabled;
+                    return Poll::Pending;
+                };
+                match self.scheduler.take_next(Instant::now()) {
+                    Ok(Some(token)) => {
+                        self.active = Some(ActiveTask {
+                            identity: Identity::new(token.account_id(), token.generation()),
+                            reply: None,
+                            sync_token: Some(token),
+                            state: ActiveTaskState::Syncing(start_inbox_sync(
+                                self.database.clone(),
+                                self.credentials.clone(),
+                                self.inbox_fetch_probe,
+                                content_root,
+                                token.account_id(),
+                                token.generation(),
+                            )),
+                        });
+                        Poll::Ready(Ok(()))
+                    }
+                    Ok(None) => {
+                        if let Some(deadline) = self.scheduler.wake_deadline() {
+                            self.auto_sync = AutoSyncState::WaitingForDeadline(Box::pin(
+                                time::sleep_until(deadline.into()),
+                            ));
+                            Poll::Ready(Ok(()))
+                        } else {
+                            Poll::Pending
+                        }
+                    }
+                    Err(_) => Poll::Ready(Err(AccountDriverError::WorkflowRejected)),
+                }
+            }
         }
     }
 }
@@ -1520,6 +1727,18 @@ enum RecoveryState {
     Complete,
 }
 
+enum AutoSyncState {
+    Disabled,
+    SubmitTargets,
+    LoadingTargets(
+        oneshot::Receiver<Result<Box<[AccountSyncTarget]>, crate::store::sqlite::DbFailure>>,
+    ),
+    WaitingToSubmit(Pin<Box<Sleep>>),
+    WaitingForDeadline(Pin<Box<Sleep>>),
+    Paused,
+    Ready,
+}
+
 struct UserReply {
     request_id: RequestId,
     reply: oneshot::Sender<AccountOperationReply>,
@@ -1543,6 +1762,7 @@ impl Identity {
 struct ActiveTask {
     identity: Identity,
     reply: Option<UserReply>,
+    sync_token: Option<SyncToken>,
     state: ActiveTaskState,
 }
 
@@ -1597,6 +1817,7 @@ impl ActiveTask {
         Ok(Self {
             identity,
             reply,
+            sync_token: None,
             state: ActiveTaskState::Workflow(Box::new(workflow)),
         })
     }
@@ -2303,6 +2524,52 @@ fn request_identity(request: &AccountWorkflowRequest) -> Identity {
         AccountWorkflowRequest::ResumeRemove(ticket) => {
             Identity::new(ticket.account_id, ticket.generation)
         }
+    }
+}
+
+fn outcome_changes_sync_targets(outcome: &AccountWorkflowOutcome) -> bool {
+    matches!(
+        outcome,
+        AccountWorkflowOutcome::CredentialStored(_)
+            | AccountWorkflowOutcome::CredentialPending { .. }
+            | AccountWorkflowOutcome::AccountRemoved { .. }
+            | AccountWorkflowOutcome::RemovalPending { .. }
+    )
+}
+
+fn sync_completion(outcome: &AccountWorkflowOutcome) -> SyncCompletion {
+    match outcome {
+        AccountWorkflowOutcome::InboxSynced { has_more: true, .. } => SyncCompletion::HasMore,
+        AccountWorkflowOutcome::InboxSynced {
+            has_more: false, ..
+        } => SyncCompletion::Complete,
+        _ => SyncCompletion::Failed,
+    }
+}
+
+fn project_background_sync(
+    outcome: AccountWorkflowOutcome,
+    identity: Identity,
+) -> AccountSyncStatus {
+    match project_outcome(outcome, identity) {
+        Ok(AccountOperationSuccess::Synced {
+            account_id,
+            generation,
+            imported,
+            has_more,
+        }) => AccountSyncStatus::Synced {
+            account_id,
+            generation,
+            imported,
+            has_more,
+        },
+        Err(failure) => AccountSyncStatus::Failed(failure),
+        Ok(_) => AccountSyncStatus::Failed(AccountOperationFailure {
+            account_id: identity.account_id,
+            generation: identity.generation,
+            stage: AccountWorkflowStage::FetchInbox,
+            kind: AccountWorkflowFailureKind::UnexpectedReply,
+        }),
     }
 }
 
