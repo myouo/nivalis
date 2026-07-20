@@ -29,6 +29,7 @@ test_case=${NIVALIS_MEMORY_TEST_CASE:-}
 account_diagnostic_delay_ms=${NIVALIS_STRESS_DELAY_MS:-5000}
 account_receive_delay_ms=${NIVALIS_STRESS_DELAY_MS:-5000}
 account_send_delay_ms=${NIVALIS_STRESS_DELAY_MS:-5000}
+existing_account_sync_delay_ms=${NIVALIS_STRESS_DELAY_MS:-5000}
 
 is_bounded_positive_decimal() {
     local value=$1
@@ -89,7 +90,8 @@ stress_scenario=${NIVALIS_STRESS_SCENARIO:-mixed}
 if [[ -n "$stress_steps" && "$stress_scenario" != "mixed" &&
     "$stress_scenario" != "pagination" && "$stress_scenario" != "write-search" &&
     "$stress_scenario" != "content" && "$stress_scenario" != "account-diagnostic" &&
-    "$stress_scenario" != "account-receive" && "$stress_scenario" != "account-send" ]]; then
+    "$stress_scenario" != "account-receive" && "$stress_scenario" != "account-send" &&
+    "$stress_scenario" != "existing-account-sync" ]]; then
     printf 'Unsupported NIVALIS_STRESS_SCENARIO: %s\n' "$stress_scenario" >&2
     exit 1
 fi
@@ -105,6 +107,10 @@ if [[ "$stress_scenario" == "account-send" && "$stress_steps" != "1" ]]; then
     printf 'account-send stress requires NIVALIS_STRESS_STEPS=1\n' >&2
     exit 1
 fi
+if [[ "$stress_scenario" == "existing-account-sync" && "$stress_steps" != "1" ]]; then
+    printf 'existing-account-sync stress requires NIVALIS_STRESS_STEPS=1\n' >&2
+    exit 1
+fi
 if [[ "$stress_scenario" == "account-diagnostic" && -z "$data_dir" ]]; then
     printf 'account-diagnostic stress requires an explicit persistent NIVALIS_MEMORY_DATA_DIR or NIVALIS_DATA_DIR\n' >&2
     exit 1
@@ -117,6 +123,21 @@ if [[ "$stress_scenario" == "account-send" && -z "$data_dir" ]]; then
     printf 'account-send stress requires an explicit persistent NIVALIS_MEMORY_DATA_DIR or NIVALIS_DATA_DIR\n' >&2
     exit 1
 fi
+if [[ "$stress_scenario" == "existing-account-sync" && -z "$data_dir" ]]; then
+    printf 'existing-account-sync stress requires an explicit persistent NIVALIS_MEMORY_DATA_DIR or NIVALIS_DATA_DIR\n' >&2
+    exit 1
+fi
+if [[ "$stress_scenario" == "existing-account-sync" ]]; then
+    if [[ "${NIVALIS_STRESS_ALLOW_LIVE_SYNC:-}" != "1" ]]; then
+        printf 'existing-account-sync stress requires NIVALIS_STRESS_ALLOW_LIVE_SYNC=1\n' >&2
+        exit 1
+    fi
+    if ! is_bounded_positive_decimal \
+        "${NIVALIS_STRESS_EXISTING_ACCOUNT_ID:-}" 9223372036854775807; then
+        printf 'existing-account-sync stress requires a canonical positive account id\n' >&2
+        exit 1
+    fi
+fi
 if [[ "$stress_scenario" == "account-diagnostic" && "$cpu_settle_gate" != "1" ]]; then
     printf 'account-diagnostic stress requires NIVALIS_MEMORY_CPU_SETTLE_GATE=1\n' >&2
     exit 1
@@ -127,6 +148,10 @@ if [[ "$stress_scenario" == "account-receive" && "$cpu_settle_gate" != "1" ]]; t
 fi
 if [[ "$stress_scenario" == "account-send" && "$cpu_settle_gate" != "1" ]]; then
     printf 'account-send stress requires NIVALIS_MEMORY_CPU_SETTLE_GATE=1\n' >&2
+    exit 1
+fi
+if [[ "$stress_scenario" == "existing-account-sync" && "$cpu_settle_gate" != "1" ]]; then
+    printf 'existing-account-sync stress requires NIVALIS_MEMORY_CPU_SETTLE_GATE=1\n' >&2
     exit 1
 fi
 if [[ "$stress_scenario" == "account-diagnostic" ]] &&
@@ -142,6 +167,11 @@ fi
 if [[ "$stress_scenario" == "account-send" ]] &&
     ! is_bounded_positive_decimal "$account_send_delay_ms" 2147483647; then
     printf 'account-send stress requires a positive bounded NIVALIS_STRESS_DELAY_MS\n' >&2
+    exit 1
+fi
+if [[ "$stress_scenario" == "existing-account-sync" ]] &&
+    ! is_bounded_positive_decimal "$existing_account_sync_delay_ms" 2147483647; then
+    printf 'existing-account-sync stress requires a positive bounded NIVALIS_STRESS_DELAY_MS\n' >&2
     exit 1
 fi
 if [[ "$stress_scenario" == "account-send" ]]; then
@@ -251,6 +281,11 @@ fi
 if [[ "$stress_scenario" == "account-send" ]] &&
     ((account_send_delay_ms <= sample_points[0] * 1000)); then
     printf 'account-send stress must start after the first memory baseline sample\n' >&2
+    exit 1
+fi
+if [[ "$stress_scenario" == "existing-account-sync" ]] &&
+    ((existing_account_sync_delay_ms <= sample_points[0] * 1000)); then
+    printf 'existing-account-sync stress must start after the first memory baseline sample\n' >&2
     exit 1
 fi
 if ((hard_gate)) && ((${#sample_points[@]} < 2)); then
@@ -555,6 +590,13 @@ for ((run = 1; run <= runs; run++)); do
                 printf 'Account-send stress completion marker has an invalid format: %s\n' \
                     "$stress_result" >&2
                 printf 'Account send recovery data retained at %s\n' "$data_dir" >&2
+                exit 1
+            fi
+        elif [[ "$stress_scenario" == "existing-account-sync" ]]; then
+            existing_account_sync_pattern='^NIVALIS_STRESS_RESULT scenario=existing-account-sync steps=1 manual_sync=1 timestamp=1 database=1 ui=1 elapsed_ms=(0|[1-9][0-9]*)$'
+            if [[ ! "$stress_result" =~ $existing_account_sync_pattern ]]; then
+                printf 'Existing-account-sync completion marker has an invalid format: %s\n' \
+                    "$stress_result" >&2
                 exit 1
             fi
         elif [[ "$stress_scenario" == "account-receive" ]]; then

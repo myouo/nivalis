@@ -5,8 +5,9 @@ use crate::{
         AccountGeneration, AccountId, ContentImportSubmission, DatabaseClient, DatabaseSubmitError,
         FileGcOutcome, MailboxQueryCounts, MessageId, mailbox_query_counts,
     },
+    ui_identity::EntityKey,
 };
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use slint::{ComponentHandle, Model, SharedString, Timer, TimerMode};
 use std::cell::{Cell, RefCell};
 use std::fs::File;
@@ -24,7 +25,7 @@ pub(crate) fn automatic_sync_enabled() -> bool {
 fn automatic_sync_enabled_for_scenario(scenario: Option<&str>) -> bool {
     !matches!(
         scenario,
-        Some("account-diagnostic" | "account-receive" | "account-send")
+        Some("account-diagnostic" | "account-receive" | "account-send" | "existing-account-sync")
     )
 }
 
@@ -56,6 +57,9 @@ pub(crate) fn install_memory_stress(
         Ok("account-diagnostic") => install_account_diagnostic_stress(ui, steps, delay, interval),
         Ok("account-receive") => {
             install_account_receive_stress(ui, database_path, content_path, steps, delay, interval)
+        }
+        Ok("existing-account-sync") => {
+            install_existing_account_sync(ui, database_path, steps, delay, interval)
         }
         Ok("account-send") => install_account_send_stress(ui, steps, delay, interval),
         Ok("mixed") | Err(_) => install_mixed_stress(ui, steps, delay, interval),
@@ -1165,6 +1169,522 @@ fn fail_account_receive_stress(
         "NIVALIS_STRESS_ERROR scenario=account-receive reason={reason} cleanup_required={}",
         u8::from(cleanup_required)
     );
+    stop_stress(ui, timer);
+}
+
+const EXISTING_ACCOUNT_SYNC_PAGE_LIMIT: usize = 50;
+
+struct ExistingAccountSyncConfig {
+    account_id: i64,
+    account_key: SharedString,
+}
+
+impl ExistingAccountSyncConfig {
+    fn load() -> Result<Self, &'static str> {
+        if std::env::var("NIVALIS_STRESS_ALLOW_LIVE_SYNC").as_deref() != Ok("1") {
+            return Err("live_sync_not_confirmed");
+        }
+        let value = std::env::var("NIVALIS_STRESS_EXISTING_ACCOUNT_ID")
+            .map_err(|_| "existing_account_id_missing")?;
+        let key = EntityKey::parse(&value).ok_or("existing_account_id_invalid")?;
+        Ok(Self {
+            account_id: key.get(),
+            account_key: key.encode(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExistingAccountSyncSnapshot {
+    uid_validity: Option<i64>,
+    change_cursor: Option<String>,
+    last_sync_at_ms: Option<i64>,
+    inbox_total: i64,
+    content_total: i64,
+    visible_message_ids: Vec<i64>,
+}
+
+fn read_existing_account_sync_snapshot(
+    database_path: &std::path::Path,
+    account_id: i64,
+) -> Result<ExistingAccountSyncSnapshot, &'static str> {
+    let mut connection = Connection::open_with_flags(
+        database_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|_| "database_evidence_unavailable")?;
+    connection
+        .busy_timeout(Duration::from_millis(50))
+        .map_err(|_| "database_evidence_unavailable")?;
+    connection
+        .pragma_update(None, "query_only", true)
+        .map_err(|_| "database_evidence_unavailable")?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Deferred)
+        .map_err(|_| "database_evidence_unavailable")?;
+
+    let row = transaction
+        .query_row(
+            "SELECT inbox.id,
+                    state.uid_validity,
+                    state.change_cursor,
+                    state.last_sync_at_ms,
+                    (
+                        SELECT count(*)
+                        FROM message_folders AS membership
+                        WHERE membership.folder_id = inbox.id
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM message_folders AS trash_membership
+                              JOIN folders AS trash
+                                ON trash.id = trash_membership.folder_id
+                              WHERE trash_membership.message_id = membership.message_id
+                                AND trash.role = 'trash'
+                          )
+                    ),
+                    (
+                        SELECT count(*)
+                        FROM message_folders AS membership
+                        JOIN message_content AS content
+                          ON content.message_id = membership.message_id
+                        WHERE membership.folder_id = inbox.id
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM message_folders AS trash_membership
+                              JOIN folders AS trash
+                                ON trash.id = trash_membership.folder_id
+                              WHERE trash_membership.message_id = membership.message_id
+                                AND trash.role = 'trash'
+                          )
+                    )
+             FROM folders AS inbox
+             LEFT JOIN sync_state AS state ON state.folder_id = inbox.id
+             WHERE inbox.account_id = ?1 AND inbox.role = 'inbox'",
+            [account_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|_| "database_evidence_unavailable")?
+        .ok_or("database_inbox_missing")?;
+    let (folder_id, uid_validity, change_cursor, last_sync_at_ms, inbox_total, content_total) = row;
+    if inbox_total < 0
+        || content_total < 0
+        || content_total > inbox_total
+        || inbox_total > i64::from(i32::MAX)
+    {
+        return Err("database_count_invalid");
+    }
+
+    let visible_message_ids = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT message.id
+                 FROM messages AS message
+                 JOIN message_folders AS membership
+                   ON membership.message_id = message.id
+                 WHERE membership.folder_id = ?1
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM message_folders AS trash_membership
+                       JOIN folders AS trash ON trash.id = trash_membership.folder_id
+                       WHERE trash_membership.message_id = message.id
+                         AND trash.role = 'trash'
+                   )
+                 ORDER BY message.received_at_ms DESC, message.id DESC
+                 LIMIT 50",
+            )
+            .map_err(|_| "database_evidence_unavailable")?;
+        let rows = statement
+            .query_map([folder_id], |row| row.get::<_, i64>(0))
+            .map_err(|_| "database_evidence_unavailable")?;
+        let mut visible_message_ids = Vec::with_capacity(EXISTING_ACCOUNT_SYNC_PAGE_LIMIT);
+        for row in rows {
+            let id = row.map_err(|_| "database_evidence_unavailable")?;
+            if id <= 0 || visible_message_ids.len() >= EXISTING_ACCOUNT_SYNC_PAGE_LIMIT {
+                return Err("database_message_identity_invalid");
+            }
+            visible_message_ids.push(id);
+        }
+        visible_message_ids
+    };
+    transaction
+        .commit()
+        .map_err(|_| "database_evidence_unavailable")?;
+
+    Ok(ExistingAccountSyncSnapshot {
+        uid_validity,
+        change_cursor,
+        last_sync_at_ms,
+        inbox_total,
+        content_total,
+        visible_message_ids,
+    })
+}
+
+fn canonical_sync_cursor(value: Option<&str>) -> Result<Option<u32>, &'static str> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let cursor = value
+        .parse::<u32>()
+        .map_err(|_| "database_cursor_invalid")?;
+    if cursor == 0 || cursor.to_string() != value {
+        return Err("database_cursor_invalid");
+    }
+    Ok(Some(cursor))
+}
+
+fn canonical_uid_validity(value: Option<i64>) -> Result<Option<u32>, &'static str> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = u32::try_from(value).map_err(|_| "database_uid_validity_invalid")?;
+    if value == 0 {
+        return Err("database_uid_validity_invalid");
+    }
+    Ok(Some(value))
+}
+
+fn canonical_sync_identity(
+    snapshot: &ExistingAccountSyncSnapshot,
+) -> Result<(Option<u32>, Option<u32>), &'static str> {
+    let uid_validity = canonical_uid_validity(snapshot.uid_validity)?;
+    let cursor = canonical_sync_cursor(snapshot.change_cursor.as_deref())?;
+    if cursor.is_some() && uid_validity.is_none() {
+        return Err("database_cursor_without_uid_validity");
+    }
+    Ok((uid_validity, cursor))
+}
+
+fn existing_account_sync_transition_gate(
+    before: &ExistingAccountSyncSnapshot,
+    after: &ExistingAccountSyncSnapshot,
+) -> AccountReceiveGate {
+    if before.content_total != before.inbox_total || after.content_total != after.inbox_total {
+        return AccountReceiveGate::Failed("database_content_incomplete");
+    }
+    let Some(after_sync_at) = after.last_sync_at_ms else {
+        return AccountReceiveGate::Failed("sync_timestamp_missing");
+    };
+    if before
+        .last_sync_at_ms
+        .is_some_and(|before_sync_at| after_sync_at <= before_sync_at)
+    {
+        return AccountReceiveGate::Failed("sync_timestamp_not_advanced");
+    }
+    let (before_uid_validity, before_cursor) = match canonical_sync_identity(before) {
+        Ok(identity) => identity,
+        Err(reason) => return AccountReceiveGate::Failed(reason),
+    };
+    let (after_uid_validity, after_cursor) = match canonical_sync_identity(after) {
+        Ok(identity) => identity,
+        Err(reason) => return AccountReceiveGate::Failed(reason),
+    };
+    match (before_uid_validity, after_uid_validity) {
+        (None, Some(_)) => {}
+        (Some(before), Some(after)) if before == after => {}
+        (None, None) | (Some(_), None) | (Some(_), Some(_)) => {
+            return AccountReceiveGate::Failed("sync_uid_validity_changed");
+        }
+    }
+    if before_cursor.is_some() && after_cursor < before_cursor {
+        return AccountReceiveGate::Failed("sync_cursor_regressed");
+    }
+    if after.inbox_total < before.inbox_total {
+        return AccountReceiveGate::Failed("sync_message_count_regressed");
+    }
+    AccountReceiveGate::Ready
+}
+
+fn existing_account_sync_ui_gate(
+    ui: &AppWindow,
+    account_key: &str,
+    snapshot: &ExistingAccountSyncSnapshot,
+) -> AccountReceiveGate {
+    if ui.get_active_account_id().as_str() != account_key
+        || ui.get_initial_loading()
+        || ui.get_mailbox_loading()
+        || ui.get_mailbox_navigation_loading()
+    {
+        return AccountReceiveGate::Waiting;
+    }
+    if ui.get_mailbox_error() {
+        return AccountReceiveGate::Failed("mailbox_error");
+    }
+    if !ui.get_total_known()
+        || i64::from(ui.get_message_total()) != snapshot.inbox_total
+        || ui.get_mails().row_count() != snapshot.visible_message_ids.len()
+    {
+        return AccountReceiveGate::Failed("ui_database_count_mismatch");
+    }
+    if snapshot.content_total != snapshot.inbox_total {
+        return AccountReceiveGate::Failed("database_content_incomplete");
+    }
+    for (index, expected_id) in snapshot.visible_message_ids.iter().enumerate() {
+        let Some(message) = ui.get_mails().row_data(index) else {
+            return AccountReceiveGate::Failed("ui_message_missing");
+        };
+        if message.account_id.as_str() != account_key
+            || EntityKey::parse(message.id.as_str()).map(EntityKey::get) != Some(*expected_id)
+        {
+            return AccountReceiveGate::Failed("ui_database_identity_mismatch");
+        }
+    }
+    AccountReceiveGate::Ready
+}
+
+fn existing_account_ready(ui: &AppWindow, account_key: &str) -> Result<bool, &'static str> {
+    let accounts = ui.get_accounts();
+    let mut match_count = 0;
+    let mut ready = false;
+    for index in 0..accounts.row_count() {
+        let Some(account) = accounts.row_data(index) else {
+            return Err("account_model_invalid");
+        };
+        if account.id.as_str() == account_key {
+            match_count += 1;
+            ready = !account.has_error && account.status.as_str() == "Ready";
+        }
+    }
+    match match_count {
+        0 => Err("existing_account_missing"),
+        1 => Ok(ready),
+        _ => Err("existing_account_ambiguous"),
+    }
+}
+
+#[derive(Debug)]
+enum ExistingAccountSyncPhase {
+    WaitingForInitialState,
+    WaitingForMailbox,
+    Syncing { before: ExistingAccountSyncSnapshot },
+    WaitingForFinalState { before: ExistingAccountSyncSnapshot },
+    Complete,
+}
+
+struct ExistingAccountSyncStress {
+    phase: ExistingAccountSyncPhase,
+    started: Instant,
+    deadline: Instant,
+    transition_timeout: Duration,
+}
+
+impl ExistingAccountSyncStress {
+    fn advance(&mut self, phase: ExistingAccountSyncPhase) {
+        self.phase = phase;
+        self.deadline = Instant::now() + self.transition_timeout;
+    }
+}
+
+fn install_existing_account_sync(
+    ui: &AppWindow,
+    database_path: PathBuf,
+    steps: usize,
+    delay: u64,
+    interval: u64,
+) -> Option<Rc<Timer>> {
+    if steps != 1 {
+        eprintln!(
+            "NIVALIS_STRESS_ERROR scenario=existing-account-sync reason=steps_must_equal_one"
+        );
+        return None;
+    }
+    let timeout = std::env::var("NIVALIS_STRESS_TRANSITION_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(ACCOUNT_DIAGNOSTIC_DEFAULT_TIMEOUT_MS)
+        .max(1);
+    let transition_timeout = Duration::from_millis(timeout);
+    let timer = Rc::new(Timer::default());
+    let timer_weak = Rc::downgrade(&timer);
+    let ui_weak = ui.as_weak();
+
+    Timer::single_shot(Duration::from_millis(delay), move || {
+        let Some(timer) = timer_weak.upgrade() else {
+            return;
+        };
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let config = match ExistingAccountSyncConfig::load() {
+            Ok(config) => config,
+            Err(reason) => {
+                fail_existing_account_sync(&ui, &timer, reason);
+                return;
+            }
+        };
+        let started = Instant::now();
+        let state = Rc::new(RefCell::new(ExistingAccountSyncStress {
+            phase: ExistingAccountSyncPhase::WaitingForInitialState,
+            started,
+            deadline: started + transition_timeout,
+            transition_timeout,
+        }));
+        let state_for_timer = state.clone();
+        let timer_for_callback = Rc::downgrade(&timer);
+        let ui_for_timer = ui.as_weak();
+        timer.start(
+            TimerMode::Repeated,
+            Duration::from_millis(interval.max(25)),
+            move || {
+                let Some(timer) = timer_for_callback.upgrade() else {
+                    return;
+                };
+                let Some(ui) = ui_for_timer.upgrade() else {
+                    return;
+                };
+                let mut state = state_for_timer.borrow_mut();
+                if Instant::now() >= state.deadline {
+                    fail_existing_account_sync(&ui, &timer, "transition_timeout");
+                    state.phase = ExistingAccountSyncPhase::Complete;
+                    return;
+                }
+
+                match &state.phase {
+                    ExistingAccountSyncPhase::WaitingForInitialState => {
+                        if ui.get_initial_loading() || ui.get_mailbox_loading() {
+                            return;
+                        }
+                        if ui.get_mailbox_error() {
+                            fail_existing_account_sync(&ui, &timer, "initial_mailbox_error");
+                            state.phase = ExistingAccountSyncPhase::Complete;
+                            return;
+                        }
+                        match existing_account_ready(&ui, config.account_key.as_str()) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                fail_existing_account_sync(&ui, &timer, "existing_account_not_ready");
+                                state.phase = ExistingAccountSyncPhase::Complete;
+                                return;
+                            }
+                            Err(reason) => {
+                                fail_existing_account_sync(&ui, &timer, reason);
+                                state.phase = ExistingAccountSyncPhase::Complete;
+                                return;
+                            }
+                        }
+                        if ui.get_active_account_id().as_str() != config.account_key.as_str() {
+                            ui.invoke_switch_account(config.account_key.clone());
+                        }
+                        state.advance(ExistingAccountSyncPhase::WaitingForMailbox);
+                    }
+                    ExistingAccountSyncPhase::WaitingForMailbox => {
+                        if ui.get_active_account_id().as_str() != config.account_key.as_str()
+                            || ui.get_mailbox_loading()
+                            || ui.get_mailbox_navigation_loading()
+                        {
+                            return;
+                        }
+                        let before = match read_existing_account_sync_snapshot(
+                            &database_path,
+                            config.account_id,
+                        ) {
+                            Ok(snapshot) => snapshot,
+                            Err(reason) => {
+                                fail_existing_account_sync(&ui, &timer, reason);
+                                state.phase = ExistingAccountSyncPhase::Complete;
+                                return;
+                            }
+                        };
+                        match existing_account_sync_ui_gate(
+                            &ui,
+                            config.account_key.as_str(),
+                            &before,
+                        ) {
+                            AccountReceiveGate::Waiting => return,
+                            AccountReceiveGate::Failed(reason) => {
+                                fail_existing_account_sync(&ui, &timer, reason);
+                                state.phase = ExistingAccountSyncPhase::Complete;
+                                return;
+                            }
+                            AccountReceiveGate::Ready => {}
+                        }
+                        ui.invoke_sync_account(config.account_key.clone());
+                        if !ui.get_sync_loading() || !ui.get_account_operation_loading() {
+                            fail_existing_account_sync(&ui, &timer, "manual_sync_not_started");
+                            state.phase = ExistingAccountSyncPhase::Complete;
+                            return;
+                        }
+                        state.advance(ExistingAccountSyncPhase::Syncing { before });
+                    }
+                    ExistingAccountSyncPhase::Syncing { before } => {
+                        if ui.get_sync_loading() || ui.get_account_operation_loading() {
+                            return;
+                        }
+                        if !ui.get_account_operation_error().is_empty() {
+                            fail_existing_account_sync(&ui, &timer, "manual_sync_failed");
+                            state.phase = ExistingAccountSyncPhase::Complete;
+                            return;
+                        }
+                        let before = before.clone();
+                        state.advance(ExistingAccountSyncPhase::WaitingForFinalState { before });
+                    }
+                    ExistingAccountSyncPhase::WaitingForFinalState { before } => {
+                        if ui.get_mailbox_loading() || ui.get_mailbox_navigation_loading() {
+                            return;
+                        }
+                        let after = match read_existing_account_sync_snapshot(
+                            &database_path,
+                            config.account_id,
+                        ) {
+                            Ok(snapshot) => snapshot,
+                            Err(reason) => {
+                                fail_existing_account_sync(&ui, &timer, reason);
+                                state.phase = ExistingAccountSyncPhase::Complete;
+                                return;
+                            }
+                        };
+                        match existing_account_sync_transition_gate(before, &after) {
+                            AccountReceiveGate::Waiting => return,
+                            AccountReceiveGate::Failed(reason) => {
+                                fail_existing_account_sync(&ui, &timer, reason);
+                                state.phase = ExistingAccountSyncPhase::Complete;
+                                return;
+                            }
+                            AccountReceiveGate::Ready => {}
+                        }
+                        match existing_account_sync_ui_gate(
+                            &ui,
+                            config.account_key.as_str(),
+                            &after,
+                        ) {
+                            AccountReceiveGate::Waiting => return,
+                            AccountReceiveGate::Failed(reason) => {
+                                fail_existing_account_sync(&ui, &timer, reason);
+                                state.phase = ExistingAccountSyncPhase::Complete;
+                                return;
+                            }
+                            AccountReceiveGate::Ready => {}
+                        }
+                        ui.set_status_text("Existing account sync verification complete".into());
+                        eprintln!(
+                            "NIVALIS_STRESS_RESULT scenario=existing-account-sync steps=1 manual_sync=1 timestamp=1 database=1 ui=1 elapsed_ms={}",
+                            state.started.elapsed().as_millis()
+                        );
+                        stop_stress(&ui, &timer);
+                        state.phase = ExistingAccountSyncPhase::Complete;
+                    }
+                    ExistingAccountSyncPhase::Complete => {}
+                }
+            },
+        );
+    });
+
+    Some(timer)
+}
+
+fn fail_existing_account_sync(ui: &AppWindow, timer: &Timer, reason: &str) {
+    ui.set_status_text("Existing account sync verification failed".into());
+    eprintln!("NIVALIS_STRESS_ERROR scenario=existing-account-sync reason={reason}");
     stop_stress(ui, timer);
 }
 
@@ -2696,6 +3216,9 @@ mod tests {
             "account-receive"
         )));
         assert!(!automatic_sync_enabled_for_scenario(Some("account-send")));
+        assert!(!automatic_sync_enabled_for_scenario(Some(
+            "existing-account-sync"
+        )));
     }
 
     #[test]
@@ -2977,6 +3500,172 @@ mod tests {
         }
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn existing_sync_snapshot(
+        uid_validity: Option<i64>,
+        change_cursor: Option<&str>,
+        last_sync_at_ms: Option<i64>,
+        inbox_total: i64,
+    ) -> ExistingAccountSyncSnapshot {
+        ExistingAccountSyncSnapshot {
+            uid_validity,
+            change_cursor: change_cursor.map(str::to_owned),
+            last_sync_at_ms,
+            inbox_total,
+            content_total: inbox_total,
+            visible_message_ids: (1..=inbox_total.min(50)).rev().collect(),
+        }
+    }
+
+    #[test]
+    fn existing_account_sync_snapshot_uses_actual_schema_and_mailbox_order() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let database = std::env::temp_dir().join(format!(
+            "nivalis-existing-account-sync-{}-{timestamp}.db",
+            std::process::id()
+        ));
+        let (client, replies, runtime, _) = crate::store::sqlite::spawn(database.clone()).unwrap();
+        drop(client);
+        drop(replies);
+        runtime.shutdown().unwrap();
+
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 PRAGMA recursive_triggers = ON;
+                 BEGIN IMMEDIATE;
+                 INSERT INTO accounts (
+                     id, provider, remote_key, name, address, sort_order, state, accent_rgb
+                 ) VALUES (3, 'imap', 'account-3', 'Account 3', 'account-3@example.test',
+                           3, 'active', 0);
+                 INSERT INTO folders (id, account_id, remote_key, name, role) VALUES
+                     (11, 3, 'inbox', 'Inbox', 'inbox'),
+                     (12, 3, 'trash', 'Trash', 'trash');
+                 INSERT INTO messages (
+                     id, account_id, remote_key, subject, received_at_ms
+                 ) VALUES
+                     (7, 3, 'message-7', 'Seven', 1000),
+                     (8, 3, 'message-8', 'Eight', 1000),
+                     (9, 3, 'message-9', 'Nine', 2000);
+                 INSERT INTO message_folders (message_id, folder_id, account_id) VALUES
+                     (7, 11, 3),
+                     (8, 11, 3),
+                     (9, 11, 3),
+                     (9, 12, 3);
+                 INSERT INTO message_content (message_id) VALUES (7), (8), (9);
+                 INSERT INTO sync_state (
+                     folder_id, uid_validity, change_cursor, last_sync_at_ms
+                 ) VALUES (11, 19, '42', 2000);
+                 COMMIT;",
+            )
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(
+            read_existing_account_sync_snapshot(&database, 3).unwrap(),
+            ExistingAccountSyncSnapshot {
+                uid_validity: Some(19),
+                change_cursor: Some("42".to_owned()),
+                last_sync_at_ms: Some(2000),
+                inbox_total: 2,
+                content_total: 2,
+                visible_message_ids: vec![8, 7],
+            }
+        );
+
+        let _ = std::fs::remove_file(&database);
+        let _ = std::fs::remove_file(format!("{}-wal", database.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", database.display()));
+    }
+
+    #[test]
+    fn existing_account_sync_transition_requires_fresh_monotonic_database_state() {
+        let before = existing_sync_snapshot(Some(7), Some("41"), Some(1_000), 2);
+        let after = existing_sync_snapshot(Some(7), Some("42"), Some(2_000), 3);
+        assert_eq!(
+            existing_account_sync_transition_gate(&before, &after),
+            AccountReceiveGate::Ready
+        );
+
+        assert_eq!(
+            existing_account_sync_transition_gate(
+                &before,
+                &existing_sync_snapshot(Some(7), Some("42"), Some(1_000), 3),
+            ),
+            AccountReceiveGate::Failed("sync_timestamp_not_advanced")
+        );
+        assert_eq!(
+            existing_account_sync_transition_gate(
+                &before,
+                &existing_sync_snapshot(Some(7), Some("40"), Some(2_000), 2),
+            ),
+            AccountReceiveGate::Failed("sync_cursor_regressed")
+        );
+        assert_eq!(
+            existing_account_sync_transition_gate(
+                &before,
+                &existing_sync_snapshot(Some(7), Some("42"), Some(2_000), 1),
+            ),
+            AccountReceiveGate::Failed("sync_message_count_regressed")
+        );
+
+        let initialized_before = existing_sync_snapshot(None, None, Some(1_000), 0);
+        let initialized_after = existing_sync_snapshot(Some(8), Some("1"), Some(2_000), 1);
+        assert_eq!(
+            existing_account_sync_transition_gate(&initialized_before, &initialized_after),
+            AccountReceiveGate::Ready
+        );
+        assert_eq!(
+            existing_account_sync_transition_gate(
+                &initialized_before,
+                &existing_sync_snapshot(None, None, Some(2_000), 0),
+            ),
+            AccountReceiveGate::Failed("sync_uid_validity_changed")
+        );
+        assert_eq!(
+            existing_account_sync_transition_gate(
+                &before,
+                &existing_sync_snapshot(Some(8), Some("43"), Some(2_000), 3),
+            ),
+            AccountReceiveGate::Failed("sync_uid_validity_changed")
+        );
+        assert_eq!(
+            existing_account_sync_transition_gate(
+                &before,
+                &existing_sync_snapshot(None, None, Some(2_000), 3),
+            ),
+            AccountReceiveGate::Failed("sync_uid_validity_changed")
+        );
+        let mut incomplete = after.clone();
+        incomplete.content_total -= 1;
+        assert_eq!(
+            existing_account_sync_transition_gate(&before, &incomplete),
+            AccountReceiveGate::Failed("database_content_incomplete")
+        );
+        let invalid_cursor = existing_sync_snapshot(Some(7), Some("042"), Some(2_000), 3);
+        assert_eq!(
+            existing_account_sync_transition_gate(&before, &invalid_cursor),
+            AccountReceiveGate::Failed("database_cursor_invalid")
+        );
+        assert_eq!(
+            existing_account_sync_transition_gate(
+                &existing_sync_snapshot(None, Some("1"), Some(1_000), 0),
+                &initialized_after,
+            ),
+            AccountReceiveGate::Failed("database_cursor_without_uid_validity")
+        );
+        assert_eq!(
+            existing_account_sync_transition_gate(
+                &existing_sync_snapshot(Some(0), None, Some(1_000), 0),
+                &initialized_after,
+            ),
+            AccountReceiveGate::Failed("database_uid_validity_invalid")
+        );
     }
 
     #[test]
