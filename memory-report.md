@@ -13,40 +13,24 @@ The harness samples `/proc/<pid>/smaps_rollup` and `/proc/<pid>/stat`, verifies 
 ## Current Checkpoint
 
 - Date and host: 2026-07-20, Linux 7.1.2-zen3-1-zen x86_64, Rust 1.96.1.
-- Release-code revision: `d5a6c43ce7f5096cbb46052d1a477e0cc1db4063`, SQLite schema v11.
+- Release-code revision: `b852f10fffc8bb5352a36e0af0be18a66ff8e13c`, SQLite schema v12.
 - Renderer and viewport: Winit + `skia-software`, X11, 1200x900 physical pixels, scale factor 1.
-- Production build: 21,964,248 bytes, SHA-256 `c428ef05c5c7a343a6912e02e623eafce0cd2193d727610af3e7cf8f24633887`.
-- Benchmark build: 22,026,712 bytes, SHA-256 `68150b801d106f672d945d80842c003c0454175541eecd1afc7cdb7ec73e4943`.
-- Evidence: [`docs/measurements/2026-07-20-d5a6c43.csv`](docs/measurements/2026-07-20-d5a6c43.csv), SHA-256 `e8032093bd66cea2ed689a39119ecfe1d8569e661bd24cc99924634d5ea39864`.
+- Production build: 22,442,328 bytes, SHA-256 `39e1b511bef56c0446ad1776a77b84cf119917368dd9dbea81aabfbc6490ab61`.
+- Evidence: [`docs/measurements/2026-07-20-b852f10.csv`](docs/measurements/2026-07-20-b852f10.csv), SHA-256 `09ddd3a6b69ccfaacdf27a10edbcb8d424dce054fbcc2106b85befe577c32a4c`.
 
-The single 21-row CSV uses `test_case` to hold three production idle runs and one benchmark receive run. No runtime log, certificate, secret, key, or second evidence file is committed for this hash.
+The single 18-row CSV uses `test_case` for three production idle runs. No runtime log, certificate, secret, key, or second evidence file is committed for this hash. Commit `326ee3d` changes only CI policy after the measured code revision and produces the same release source tree.
 
 ## Results
 
 | Test case | Runs | Peak RSS | Worst PSS | Worst USS | Result |
 | --- | ---: | ---: | ---: | ---: | --- |
-| Empty-account production idle | 3 | 32,556KiB (31.79MiB) | 21,588KiB | 18,672KiB | 90MiB gate and 50MiB target pass |
-| One-message receive lifecycle | 1 | 37,024KiB (36.16MiB) | 24,023KiB | 19,812KiB | 90MiB gate, 50MiB target, growth, and CPU pass |
+| M5 empty-account production idle | 3 | 37,864KiB (36.98MiB) | 28,137KiB | 25,092KiB | 90MiB gate and 50MiB target pass |
 
-The receive action starts after the 5- and 10-second baselines. Through the production UI and core it:
+Each run samples 5, 10, 20, 30, and 45 seconds, then uses a separate ten-second CPU window after a five-second grace period for the 60-second settled row. The largest baseline-to-settled change is +0.04% PSS and +0.03% RSS; all RSS/PSS and swap-inclusive values stay far below 2x. Every settled CPU value is 0.00%, and every swap value is zero.
 
-1. Creates and diagnoses one app-password account using the real Linux Secret Service and platform-verified loopback TLS.
-2. Opens a second IMAP session, examines INBOX, fetches one envelope and one 296-byte MIME literal, then stages and imports it through the SQLite generation and UIDVALIDITY fences.
-3. Opens the resulting body stream, closes it by leaving the reader, removes the account and keyring entry, and reports exactly `imported=1 opened=1 closed=1 removed=1` in 559ms.
-4. Holds the process through 120 seconds and records the dedicated settled CPU sample at 135 seconds.
+This proves that the production binary remains below the idle contract after schema v12, the custom outbound MIME writer, Lettre SMTP transport, Rustls, the global outbox drainer, and the compose controller became active. It does not exercise a credential load, SMTP connection, DATA transfer, retry, uncertain result, or terminal-state recovery, so it does not close the M5 post-workload growth gate.
 
-| Measure | 10s baseline | 135s settled | Growth | Gate |
-| --- | ---: | ---: | ---: | --- |
-| RSS | 32,860KiB | 37,024KiB | +12.67% | pass |
-| PSS | 20,503KiB | 24,015KiB | +17.13% | pass |
-| RSS+Swap | 45,964KiB | 50,120KiB | +9.04% | pass |
-| PSS+SwapPss | 20,503KiB | 24,015KiB | +17.13% | pass |
-
-Final CPU is 0.00%. Swap ranged from 12,500 to 13,104KiB in the receive run and was also present during idle, so lower resident values are not claimed as a deallocation or optimization gain. All resident and swap-inclusive measures remain well below the 2x limit.
-
-Account removal deliberately leaves file deletion to the delayed janitor. Immediately after the measured run SQLite contained one queued zero-reference file and no account, connection, message, content, attachment, or staging row. A separate normal production restart drained its one bounded startup batch, reduced `file_gc` to zero, removed the content file, and passed SQLite integrity and foreign-key checks. The committed end-to-end test independently imports, opens, closes, purges, and collects both a body and attachment.
-
-This closes the scoped M4 receive-memory gate. It does not prove real-provider behavior, automatic or sparse-UID paging, folders beyond INBOX, UIDVALIDITY rebuild, repeated reconnect/IDLE, large messages, large mailboxes, multiple accounts, outbound provider writes, SMTP, or multi-hour growth. The retained historical 68.62MiB outlier also prevents an unconditional 50MiB guarantee outside the documented matrix.
+The prior M4 evidence at `d5a6c43` remains the latest measured receive workload: its loopback add/diagnose/receive/import/open/close/remove lifecycle peaked and settled at 37,024KiB RSS, grew 12.67% RSS and 17.13% PSS, and returned to 0.00% CPU. Real providers, automatic paging, multiple accounts, loopback sending, and multi-hour protocol soaks remain outside the combined proven matrix. The retained historical 68.62MiB outlier also prevents an unconditional 50MiB guarantee beyond the documented workloads.
 
 ## Evidence Layout
 
@@ -54,6 +38,7 @@ This closes the scoped M4 receive-memory gate. It does not prove real-provider b
 
 | Revision | Milestone | Evidence |
 | --- | --- | --- |
+| `b852f10` | M5 SMTP-enabled production idle | `2026-07-20-b852f10.csv` |
 | `d5a6c43` | M4 bounded receive | `2026-07-20-d5a6c43.csv` |
 | `528c2b4` | M3 accounts and diagnostic | `2026-07-20-528c2b4.csv` |
 | `8c005c8` | M2 content lifecycle | `2026-07-19-8c005c8.csv` |
@@ -63,12 +48,41 @@ The other CSVs are retained investigation checkpoints, not current gates. Their 
 
 ## Reproduce
 
-Check out the measured revision. The procedure needs `sqlite3`, `openssl`, `xdotool`, and an unlocked Linux Secret Service session.
+The current M5 idle checkpoint needs `xdotool` and an X11 session:
 
 ```bash
 set -euo pipefail
-revision=d5a6c43ce7f5096cbb46052d1a477e0cc1db4063
+revision=b852f10fffc8bb5352a36e0af0be18a66ff8e13c
 [[ $(git rev-parse HEAD) == "$revision" ]]
+work=$(mktemp -d /tmp/nivalis-memory-b852f10.XXXXXX)
+
+cargo build --locked --release
+install -m 755 target/release/nivalis-mail "$work/nivalis-mail-production"
+[[ $(stat -c %s "$work/nivalis-mail-production") == 22442328 ]]
+[[ $(sha256sum "$work/nivalis-mail-production" | cut -d' ' -f1) == \
+  39e1b511bef56c0446ad1776a77b84cf119917368dd9dbea81aabfbc6490ab61 ]]
+
+mkdir -p "$work/idle"
+NIVALIS_MEMORY_DATA_DIR="$work/idle" NIVALIS_MEMORY_TEST_CASE=m5-idle \
+NIVALIS_MEMORY_RUNS=3 NIVALIS_MEMORY_SAMPLES="5 10 20 30 45" \
+NIVALIS_MEMORY_HARD_GATE=1 NIVALIS_MEMORY_HARD_CAP_KIB=92160 \
+NIVALIS_MEMORY_GROWTH_LIMIT_PERCENT=100 \
+NIVALIS_MEMORY_CPU_SETTLE_GATE=1 \
+NIVALIS_MEMORY_CPU_SETTLE_GRACE_SECONDS=5 \
+NIVALIS_MEMORY_CPU_SETTLE_SECONDS=10 \
+NIVALIS_MEMORY_CPU_SETTLE_MAX_PERCENT=0.00 \
+NIVALIS_MEMORY_LOG="$work/idle.log" \
+  scripts/measure-memory.sh "$work/nivalis-mail-production" > "$work/idle.csv"
+[[ $(sha256sum "$work/idle.csv" | cut -d' ' -f1) == \
+  09ddd3a6b69ccfaacdf27a10edbcb8d424dce054fbcc2106b85befe577c32a4c ]]
+```
+
+### Prior M4 Receive Gate
+
+The retained receive procedure belongs to `d5a6c43`; it additionally needs `sqlite3`, `openssl`, and an unlocked Linux Secret Service session:
+
+```bash
+git checkout d5a6c43ce7f5096cbb46052d1a477e0cc1db4063
 work=$(mktemp -d /tmp/nivalis-memory-d5a6c43.XXXXXX)
 
 cargo build --locked --release
@@ -82,11 +96,7 @@ install -m 755 target/release/nivalis-mail "$work/nivalis-mail-bench"
 [[ $(stat -c %s "$work/nivalis-mail-bench") == 22026712 ]]
 [[ $(sha256sum "$work/nivalis-mail-bench" | cut -d' ' -f1) == \
   68150b801d106f672d945d80842c003c0454175541eecd1afc7cdb7ec73e4943 ]]
-```
 
-Measure three fresh production idle processes:
-
-```bash
 mkdir -p "$work/idle"
 NIVALIS_MEMORY_DATA_DIR="$work/idle" NIVALIS_MEMORY_TEST_CASE=m4-idle \
 NIVALIS_MEMORY_RUNS=3 NIVALIS_MEMORY_SAMPLES="5 10 20 30" \

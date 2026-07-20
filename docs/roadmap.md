@@ -101,15 +101,23 @@ Recorded follow-ups that do not block M4: automatic paging and sparse-UID/ESEARC
 
 ## M5: drafts, outbox, and SMTP
 
-Status: pending.
+Status: in progress; the first production send slice is implemented, while the send-memory and recovery-management gates remain open.
+
+Implementation checkpoint: one selected app-password account can load its latest durable plain-text draft after restart, save it behind account-generation and draft-revision fences, and queue it through the production UI. The core streams the 1MiB-bounded body and deterministic MIME into private files, persists a 15-minute reservation before publication, and finalizes the artifact atomically into a schema-v12 outbox. One global drainer on the existing current-thread runtime claims at most one message, loads its credential only for the attempt, records a durable DATA fence before SMTP transfer, retries safe pre-DATA failures with bounded 30-second-to-one-hour backoff, and marks ambiguous post-DATA outcomes `uncertain` instead of sending a possible duplicate. Accepted compose work drains on shutdown, restart recovery rebuilds or rejects an incomplete reservation, and visible feedback covers busy, validation, queued, retry, uncertain, permanent failure, and delivered states. A file-backed vertical test saves, shuts down, restarts, reloads, queues, crosses the DATA fence with an injected SMTP 250 response, observes delivery, and verifies bounded file collection.
+
+Release-code revision `b852f10fffc8bb5352a36e0af0be18a66ff8e13c` passes the immediate idle gate after activating SMTP: three production runs peak at 37,864KiB RSS (36.98MiB), 28,137KiB PSS, and 25,092KiB USS with zero swap, and each dedicated 60-second sample reports 0.00% CPU. This proves the 90MiB hard limit and preferred 50MiB idle target, but it does not prove post-send growth; M5 remains open until one bounded loopback send/retry workload passes the below-2x contract.
 
 Acceptance criteria:
 
 - Drafts persist locally and survive restart. Compose validation never reports success before durable acceptance.
 - MIME output streams to a private file and a bounded SQLite outbox is the source of truth for delivery attempts.
-- SMTP submission supports cancellation, bounded retry/backoff, authentication recovery, permanent failure, and user-visible delivery state.
+- SMTP submission supports bounded retry/backoff, authentication recovery, permanent failure, and user-visible delivery state; explicit production cancellation remains a closing gate.
 - A successful UI result means the message was durably queued or explicitly delivered; no simulated send path remains.
 - Irreplaceable outbound data uses a strict reservation and commit-recovery protocol so an ambiguous result cannot silently lose or duplicate a delivery attempt.
+
+Remaining M5 gates: add a persistent outbox view that survives lost status hints and exposes retry/release/review actions for permanent and uncertain outcomes; add production cancellation; prevent legacy-generation or exhausted-attempt records from delaying later queued mail; cap compose text before Slint can materialize input beyond the core limit; cover restart after safe pre-DATA failure, ambiguous post-DATA disconnect, authentication failure recovery, and shutdown during active SMTP; and run the corresponding release send-memory workload. Delivered-artifact pruning must also prevent indefinite disk growth without weakening the durable report fence.
+
+Recorded follow-ups that do not block the first send slice: CC/BCC, attachments, HTML or rich-text composition, signatures, reply/forward, SMTP auto-discovery and provider presets, account reconfiguration, and OAuth2. M6 owns fair multi-account scheduling and receive/send convergence. Directory-relative `openat`/`unlinkat`, cross-platform ACL and reparse-point handling, deep fuzzing/Miri, real-provider breadth, repeated reconnects, and multi-hour send/retry soaks remain M7 hardening rather than reasons to redesign the working slice.
 
 ## M6: multi-account scheduling and optional JMAP
 
