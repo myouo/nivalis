@@ -65,12 +65,14 @@ pub(crate) use draft::{
 pub(crate) use file_gc::FileGcOutcome;
 #[allow(unused_imports)]
 pub(crate) use outbox::{
-    ArtifactObservation, OutboxClaim, OutboxClaimOutcome, OutboxErrorClass, OutboxLease,
-    OutboxRecipient, OutboxRecoveryOutcome, OutboxReport, OutboxReportOutcome, OutboxReservation,
-    OutboxReservationToken, OutboxReserveRequest, OutboxState, RecipientKind, ReservationRecovery,
-    claim_next_outbox, claim_outbox, finalize_outbox, load_outbox_state, mark_outbox_data_started,
-    recover_outbox, recover_reservation, release_failed_outbox, report_outbox, reserve_outbox,
-    retry_outbox,
+    ArtifactObservation, MAX_OUTBOX_SUMMARIES, OutboxActionFence, OutboxClaim, OutboxClaimOutcome,
+    OutboxErrorClass, OutboxLease, OutboxRecipient, OutboxRecipientSummary, OutboxRecoveryOutcome,
+    OutboxReport, OutboxReportOutcome, OutboxReservation, OutboxReservationToken,
+    OutboxReserveRequest, OutboxState, OutboxSummary, OutboxSummaryPage, RecipientKind,
+    ReservationRecovery, UncertainResolution, claim_next_outbox, claim_outbox, finalize_outbox,
+    load_outbox_state, load_outbox_summaries, mark_outbox_data_started, recover_outbox,
+    recover_reservation, release_failed_outbox, report_outbox, reserve_outbox,
+    resolve_uncertain_outbox, retry_outbox,
 };
 #[allow(unused_imports)]
 pub(crate) use sync::{

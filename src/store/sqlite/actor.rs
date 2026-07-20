@@ -41,10 +41,12 @@ use super::{
     migrations::migrate,
     mutation::mutate_message,
     outbox::{
-        ArtifactObservation, OutboxClaimOutcome, OutboxLease, OutboxRecoveryOutcome, OutboxReport,
-        OutboxReportOutcome, OutboxReservation, OutboxReserveRequest, ReservationRecovery,
-        claim_next_outbox, finalize_outbox, mark_outbox_data_started, recover_outbox,
-        recover_reservation, release_failed_outbox, report_outbox, reserve_outbox, retry_outbox,
+        ArtifactObservation, OutboxActionFence, OutboxClaimOutcome, OutboxLease,
+        OutboxRecoveryOutcome, OutboxReport, OutboxReportOutcome, OutboxReservation,
+        OutboxReserveRequest, OutboxSummaryPage, ReservationRecovery, UncertainResolution,
+        claim_next_outbox, finalize_outbox, load_outbox_summaries, mark_outbox_data_started,
+        recover_outbox, recover_reservation, release_failed_outbox, report_outbox, reserve_outbox,
+        resolve_uncertain_outbox, retry_outbox,
     },
     query::{open_message, query_account_directory, query_mailbox},
     remote::{
@@ -678,6 +680,9 @@ pub(crate) enum ComposeDbOperation {
     LoadLatestDraft {
         account_id: AccountId,
     },
+    LoadOutboxSummaries {
+        limit: u8,
+    },
     CreateDraft(NewDraft),
     UpdateDraft(DraftUpdate),
     ReserveOutbox(OutboxReserveRequest),
@@ -707,21 +712,28 @@ pub(crate) enum ComposeDbOperation {
         now_ms: i64,
     },
     RetryOutbox {
-        message_id: MessageId,
-        artifact_generation: u64,
-        expected_generation: AccountGeneration,
+        fence: OutboxActionFence,
         now_ms: i64,
     },
     ReleaseFailedOutbox {
-        message_id: MessageId,
-        artifact_generation: u64,
+        fence: OutboxActionFence,
+        now_ms: i64,
+    },
+    ResolveUncertainOutbox {
+        fence: OutboxActionFence,
+        resolution: UncertainResolution,
         now_ms: i64,
     },
 }
 
 impl ComposeDbOperation {
     fn is_write(&self) -> bool {
-        !matches!(self, Self::LoadDraft { .. } | Self::LoadLatestDraft { .. })
+        !matches!(
+            self,
+            Self::LoadDraft { .. }
+                | Self::LoadLatestDraft { .. }
+                | Self::LoadOutboxSummaries { .. }
+        )
     }
 }
 
@@ -729,6 +741,7 @@ impl ComposeDbOperation {
 pub(crate) enum ComposeDbOutcome {
     Draft(Option<DraftSnapshot>),
     LatestDraft(Option<DraftSnapshot>),
+    OutboxSummaries(OutboxSummaryPage),
     DraftSaved(DraftSnapshot),
     OutboxReserved(OutboxReservation),
     OutboxFinalized(OutboxReportOutcome),
@@ -739,6 +752,7 @@ pub(crate) enum ComposeDbOutcome {
     OutboxReported(OutboxReportOutcome),
     OutboxRetried(OutboxReportOutcome),
     FailedOutboxReleased(OutboxReportOutcome),
+    UncertainOutboxResolved(OutboxReportOutcome),
 }
 
 pub(crate) type ComposeDbReply = Result<ComposeDbOutcome, ComposeDbExecutionFailure>;
@@ -1648,6 +1662,9 @@ fn execute_compose_db(
         ComposeDbOperation::LoadLatestDraft { account_id } => {
             load_latest_draft(connection, *account_id).map(ComposeDbOutcome::LatestDraft)
         }
+        ComposeDbOperation::LoadOutboxSummaries { limit } => {
+            load_outbox_summaries(connection, *limit).map(ComposeDbOutcome::OutboxSummaries)
+        }
         ComposeDbOperation::CreateDraft(draft) => {
             create_draft(connection, draft).map(ComposeDbOutcome::DraftSaved)
         }
@@ -1685,25 +1702,19 @@ fn execute_compose_db(
         } => {
             report_outbox(connection, *lease, report, *now_ms).map(ComposeDbOutcome::OutboxReported)
         }
-        ComposeDbOperation::RetryOutbox {
-            message_id,
-            artifact_generation,
-            expected_generation,
+        ComposeDbOperation::RetryOutbox { fence, now_ms } => {
+            retry_outbox(connection, *fence, *now_ms).map(ComposeDbOutcome::OutboxRetried)
+        }
+        ComposeDbOperation::ReleaseFailedOutbox { fence, now_ms } => {
+            release_failed_outbox(connection, *fence, *now_ms)
+                .map(ComposeDbOutcome::FailedOutboxReleased)
+        }
+        ComposeDbOperation::ResolveUncertainOutbox {
+            fence,
+            resolution,
             now_ms,
-        } => retry_outbox(
-            connection,
-            *message_id,
-            *artifact_generation,
-            *expected_generation,
-            *now_ms,
-        )
-        .map(ComposeDbOutcome::OutboxRetried),
-        ComposeDbOperation::ReleaseFailedOutbox {
-            message_id,
-            artifact_generation,
-            now_ms,
-        } => release_failed_outbox(connection, *message_id, *artifact_generation, *now_ms)
-            .map(ComposeDbOutcome::FailedOutboxReleased),
+        } => resolve_uncertain_outbox(connection, *fence, *resolution, *now_ms)
+            .map(ComposeDbOutcome::UncertainOutboxResolved),
     };
     result.map_err(|failure| ComposeDbExecutionFailure { failure, operation })
 }
@@ -2503,6 +2514,176 @@ mod tests {
             )
             .unwrap();
         assert_eq!(subject, "shutdown drain");
+        drop(connection);
+        remove_database_files(&path);
+    }
+
+    #[test]
+    fn outbox_management_round_trips_through_actor() {
+        let path = temporary_database_path();
+        remove_database_files(&path);
+        let mut connection = Connection::open(&path).unwrap();
+        configure(&mut connection).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO accounts
+                     (id, provider, remote_key, name, address, state, accent_rgb)
+                 VALUES (1, 'imap', 'outbox-actor', 'Outbox',
+                         'sender@example.test', 'active', 0);
+                 INSERT INTO account_connections
+                     (account_id, credential_key, auth_kind, login_name, imap_host, imap_port,
+                      smtp_host, smtp_port, smtp_security, smtp_state)
+                 VALUES (1, '0123456789abcdef0123456789abcdef', 'app_password',
+                         'sender@example.test', 'imap.example.test', 993,
+                         'smtp.example.test', 465, 'implicit_tls', 'configured');",
+            )
+            .unwrap();
+        let account_id = AccountId::new(1).unwrap();
+        let generation = AccountGeneration::new(1).unwrap();
+        let draft = create_draft(
+            &mut connection,
+            &NewDraft::new(
+                account_id,
+                generation,
+                "actor-outbox-draft",
+                "Actor outbox",
+                "Actor preview",
+                "Actor body",
+                crate::content::FileKey::parse("body/11111111111111111111111111111111.txt")
+                    .unwrap(),
+                10,
+                Vec::new(),
+                100,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let reservation = reserve_outbox(
+            &mut connection,
+            &OutboxReserveRequest::new(
+                draft.message_id,
+                account_id,
+                generation,
+                draft.revision,
+                super::super::outbox::OutboxReservationToken::new([0x5a; 16]),
+                "<actor-outbox@example.test>",
+                vec![
+                    super::super::outbox::OutboxRecipient::new(
+                        super::super::outbox::RecipientKind::To,
+                        "recipient@example.test",
+                        "Recipient",
+                    )
+                    .unwrap(),
+                ],
+                200,
+                1_200,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        finalize_outbox(&mut connection, &reservation, 128, 300).unwrap();
+        let OutboxClaimOutcome::Claimed(claim) = claim_next_outbox(&mut connection, 400).unwrap()
+        else {
+            panic!("expected actor outbox claim");
+        };
+        mark_outbox_data_started(&mut connection, claim.lease, 450).unwrap();
+        report_outbox(
+            &mut connection,
+            claim.lease,
+            &OutboxReport::uncertain("connection_lost").unwrap(),
+            500,
+        )
+        .unwrap();
+        drop(connection);
+
+        let (client, _replies, runtime, _info) =
+            spawn_target(Target::File(path.clone()), REQUEST_CAPACITY, REPLY_CAPACITY).unwrap();
+        let invalid = receive_oneshot(
+            client
+                .try_compose_db(Box::new(ComposeDbOperation::LoadOutboxSummaries {
+                    limit: 0,
+                }))
+                .unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            invalid.failure().kind,
+            super::super::domain::FailureKind::ResourceLimit
+        );
+        assert!(matches!(
+            invalid.operation(),
+            ComposeDbOperation::LoadOutboxSummaries { limit: 0 }
+        ));
+
+        let summaries = receive_oneshot(
+            client
+                .try_compose_db(Box::new(ComposeDbOperation::LoadOutboxSummaries {
+                    limit: 8,
+                }))
+                .unwrap(),
+        )
+        .unwrap();
+        let ComposeDbOutcome::OutboxSummaries(page) = summaries else {
+            panic!("expected outbox summary page");
+        };
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(
+            page.items[0].state,
+            super::super::outbox::OutboxState::Uncertain
+        );
+        let fence = page.items[0].action_fence();
+
+        let resolved = receive_oneshot(
+            client
+                .try_compose_db(Box::new(ComposeDbOperation::ResolveUncertainOutbox {
+                    fence,
+                    resolution: UncertainResolution::Release,
+                    now_ms: 600,
+                }))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved,
+            ComposeDbOutcome::UncertainOutboxResolved(OutboxReportOutcome::Applied(
+                super::super::outbox::OutboxState::Uncertain,
+            ))
+        );
+        let draft = receive_oneshot(
+            client
+                .try_compose_db(Box::new(ComposeDbOperation::LoadDraft {
+                    message_id: draft.message_id,
+                }))
+                .unwrap(),
+        )
+        .unwrap();
+        let ComposeDbOutcome::Draft(Some(draft)) = draft else {
+            panic!("expected released draft");
+        };
+        assert_eq!(draft.locked_artifact_generation, None);
+        let summaries = receive_oneshot(
+            client
+                .try_compose_db(Box::new(ComposeDbOperation::LoadOutboxSummaries {
+                    limit: 8,
+                }))
+                .unwrap(),
+        )
+        .unwrap();
+        let ComposeDbOutcome::OutboxSummaries(page) = summaries else {
+            panic!("expected empty outbox summary page");
+        };
+        assert!(page.items.is_empty());
+        runtime.shutdown().unwrap();
+
+        let connection = Connection::open(&path).unwrap();
+        let queued: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM file_gc WHERE file_key = ?1",
+                [reservation.file_key.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(queued, 1);
         drop(connection);
         remove_database_files(&path);
     }

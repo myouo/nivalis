@@ -5,6 +5,7 @@ use crate::content::FileKey;
 use super::{
     account::{AccountGeneration, SmtpSecurity},
     domain::{AccountId, DbFailure, MessageId},
+    stats::{apply_transition, load_message_snapshot},
 };
 
 pub(crate) const MAX_OUTBOUND_MIME_BYTES: u64 = 8 * 1024 * 1024;
@@ -13,6 +14,9 @@ const MAX_ADDRESS_BYTES: usize = 320;
 const MAX_DISPLAY_NAME_BYTES: usize = 320;
 const MAX_MESSAGE_ID_BYTES: usize = 998;
 const MAX_ERROR_CODE_BYTES: usize = 64;
+pub(crate) const MAX_OUTBOX_SUMMARIES: u8 = 64;
+const MAX_CLAIM_SCAN: usize = 32;
+const MAX_DELIVERY_ATTEMPTS: i64 = 1_000;
 const MIN_TIMESTAMP_MS: i64 = -62_135_596_800_000;
 const MAX_TIMESTAMP_MS: i64 = 253_402_300_799_999;
 const MAX_RESERVATION_TTL_MS: i64 = 15 * 60 * 1_000;
@@ -290,6 +294,92 @@ impl OutboxErrorClass {
             Self::Ambiguous => "ambiguous",
         }
     }
+
+    fn from_database(value: &str) -> Result<Self, DbFailure> {
+        match value {
+            "network" => Ok(Self::Network),
+            "rate_limit" => Ok(Self::RateLimit),
+            "authentication" => Ok(Self::Authentication),
+            "configuration" => Ok(Self::Configuration),
+            "protocol" => Ok(Self::Protocol),
+            "permanent" => Ok(Self::Permanent),
+            "ambiguous" => Ok(Self::Ambiguous),
+            _ => Err(DbFailure::database("invalid outbox error class")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OutboxActionFence {
+    pub(crate) message_id: MessageId,
+    pub(crate) account_id: AccountId,
+    pub(crate) configuration_generation: AccountGeneration,
+    pub(crate) artifact_generation: u64,
+}
+
+impl OutboxActionFence {
+    pub(crate) fn new(
+        message_id: MessageId,
+        account_id: AccountId,
+        configuration_generation: AccountGeneration,
+        artifact_generation: u64,
+    ) -> Result<Self, DbFailure> {
+        validate_artifact_generation(artifact_generation)?;
+        Ok(Self {
+            message_id,
+            account_id,
+            configuration_generation,
+            artifact_generation,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OutboxRecipientSummary {
+    pub(crate) first_to_address: Option<Box<str>>,
+    pub(crate) to_count: u32,
+    pub(crate) cc_count: u32,
+    pub(crate) bcc_count: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OutboxSummary {
+    pub(crate) message_id: MessageId,
+    pub(crate) account_id: AccountId,
+    pub(crate) configuration_generation: AccountGeneration,
+    pub(crate) artifact_generation: u64,
+    pub(crate) state: OutboxState,
+    pub(crate) subject: Box<str>,
+    pub(crate) recipients: OutboxRecipientSummary,
+    pub(crate) created_at_ms: i64,
+    pub(crate) updated_at_ms: i64,
+    pub(crate) not_before_ms: Option<i64>,
+    pub(crate) attempt_count: u16,
+    pub(crate) error_class: Option<OutboxErrorClass>,
+    pub(crate) error_code: Option<Box<str>>,
+}
+
+impl OutboxSummary {
+    pub(crate) fn action_fence(&self) -> OutboxActionFence {
+        OutboxActionFence {
+            message_id: self.message_id,
+            account_id: self.account_id,
+            configuration_generation: self.configuration_generation,
+            artifact_generation: self.artifact_generation,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OutboxSummaryPage {
+    pub(crate) items: Box<[OutboxSummary]>,
+    pub(crate) has_more: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UncertainResolution {
+    AssumeDelivered,
+    Release,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -364,6 +454,106 @@ pub(crate) enum OutboxRecoveryOutcome {
         state: OutboxState,
     },
     Idle,
+}
+
+pub(crate) fn load_outbox_summaries(
+    connection: &Connection,
+    limit: u8,
+) -> Result<OutboxSummaryPage, DbFailure> {
+    if !(1..=MAX_OUTBOX_SUMMARIES).contains(&limit) {
+        return Err(DbFailure::resource_limit(format!(
+            "outbox summary limit must be between 1 and {MAX_OUTBOX_SUMMARIES}"
+        )));
+    }
+    let query_limit = i64::from(limit) + 1;
+    let mut statement = connection
+        .prepare(
+            "SELECT outbox.message_id, outbox.account_id,
+                    outbox.configuration_generation, outbox.artifact_generation,
+                    outbox.state, message.subject,
+                    (SELECT recipient.address FROM outbox_recipients AS recipient
+                     WHERE recipient.message_id = outbox.message_id AND recipient.kind = 'to'
+                     ORDER BY recipient.ordinal LIMIT 1),
+                    (SELECT count(*) FROM outbox_recipients AS recipient
+                     WHERE recipient.message_id = outbox.message_id AND recipient.kind = 'to'),
+                    (SELECT count(*) FROM outbox_recipients AS recipient
+                     WHERE recipient.message_id = outbox.message_id AND recipient.kind = 'cc'),
+                    (SELECT count(*) FROM outbox_recipients AS recipient
+                     WHERE recipient.message_id = outbox.message_id AND recipient.kind = 'bcc'),
+                    outbox.created_at_ms, outbox.updated_at_ms, outbox.not_before_ms,
+                    outbox.attempt_count, outbox.error_class, outbox.error_code
+             FROM outbox
+             JOIN messages AS message ON message.id = outbox.message_id
+             WHERE outbox.state <> 'delivered'
+             ORDER BY outbox.updated_at_ms DESC, outbox.message_id DESC
+             LIMIT ?1",
+        )
+        .map_err(DbFailure::database)?;
+    let mut rows = statement
+        .query([query_limit])
+        .map_err(DbFailure::database)?;
+    let mut items = Vec::with_capacity(usize::from(limit) + 1);
+    while let Some(row) = rows.next().map_err(DbFailure::database)? {
+        let raw_message_id = row.get::<_, i64>(0).map_err(DbFailure::database)?;
+        let raw_account_id = row.get::<_, i64>(1).map_err(DbFailure::database)?;
+        let raw_configuration_generation = row.get::<_, i64>(2).map_err(DbFailure::database)?;
+        let raw_artifact_generation = row.get::<_, i64>(3).map_err(DbFailure::database)?;
+        let raw_state = row.get::<_, String>(4).map_err(DbFailure::database)?;
+        let subject = row.get::<_, String>(5).map_err(DbFailure::database)?;
+        let first_to_address = row
+            .get::<_, Option<String>>(6)
+            .map_err(DbFailure::database)?;
+        let to_count = row.get::<_, i64>(7).map_err(DbFailure::database)?;
+        let cc_count = row.get::<_, i64>(8).map_err(DbFailure::database)?;
+        let bcc_count = row.get::<_, i64>(9).map_err(DbFailure::database)?;
+        let created_at_ms = row.get::<_, i64>(10).map_err(DbFailure::database)?;
+        let updated_at_ms = row.get::<_, i64>(11).map_err(DbFailure::database)?;
+        let not_before_ms = row.get::<_, Option<i64>>(12).map_err(DbFailure::database)?;
+        let raw_attempt_count = row.get::<_, i64>(13).map_err(DbFailure::database)?;
+        let raw_error_class = row
+            .get::<_, Option<String>>(14)
+            .map_err(DbFailure::database)?;
+        let error_code = row
+            .get::<_, Option<String>>(15)
+            .map_err(DbFailure::database)?;
+
+        items.push(OutboxSummary {
+            message_id: MessageId::new(raw_message_id)
+                .map_err(|error| DbFailure::database(error.to_string()))?,
+            account_id: AccountId::new(raw_account_id)
+                .map_err(|error| DbFailure::database(error.to_string()))?,
+            configuration_generation: AccountGeneration::new(raw_configuration_generation)
+                .map_err(|error| DbFailure::database(error.to_string()))?,
+            artifact_generation: u64::try_from(raw_artifact_generation)
+                .ok()
+                .filter(|generation| *generation > 0)
+                .ok_or_else(|| DbFailure::database("invalid outbox artifact generation"))?,
+            state: OutboxState::from_database(&raw_state)?,
+            subject: subject.into_boxed_str(),
+            recipients: OutboxRecipientSummary {
+                first_to_address: first_to_address.map(String::into_boxed_str),
+                to_count: stored_recipient_count(to_count)?,
+                cc_count: stored_recipient_count(cc_count)?,
+                bcc_count: stored_recipient_count(bcc_count)?,
+            },
+            created_at_ms,
+            updated_at_ms,
+            not_before_ms,
+            attempt_count: u16::try_from(raw_attempt_count)
+                .map_err(|_| DbFailure::database("invalid outbox attempt count"))?,
+            error_class: raw_error_class
+                .as_deref()
+                .map(OutboxErrorClass::from_database)
+                .transpose()?,
+            error_code: error_code.map(String::into_boxed_str),
+        });
+    }
+    let has_more = items.len() > usize::from(limit);
+    items.truncate(usize::from(limit));
+    Ok(OutboxSummaryPage {
+        items: items.into_boxed_slice(),
+        has_more,
+    })
 }
 
 pub(crate) fn reserve_outbox(
@@ -715,105 +905,159 @@ fn claim_outbox_inner(
             wake_at_ms: Some(wake_at_ms),
         });
     }
-    let candidate: Option<(i64, i64, i64, i64)> = if let Some(account_id) = account_scope {
-        transaction
-            .query_row(
-                "SELECT message_id, account_id, artifact_generation, configuration_generation
-                 FROM outbox
-                 WHERE account_id = ?1
-                   AND (state = 'ready' OR (state = 'retry_wait' AND not_before_ms <= ?2))
-                 ORDER BY coalesce(not_before_ms, created_at_ms), message_id
-                 LIMIT 1",
-                params![account_id.get(), now_ms],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()
-            .map_err(DbFailure::database)?
-    } else {
-        transaction
-            .query_row(
-                "SELECT message_id, account_id, artifact_generation, configuration_generation
-                 FROM outbox
-                 WHERE state = 'ready' OR (state = 'retry_wait' AND not_before_ms <= ?1)
-                 ORDER BY coalesce(not_before_ms, created_at_ms), message_id
-                 LIMIT 1",
-                [now_ms],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()
-            .map_err(DbFailure::database)?
-    };
-    let Some((raw_message_id, raw_account_id, artifact_generation, configuration_generation)) =
-        candidate
-    else {
-        let wake_at_ms = if let Some(account_id) = account_scope {
-            transaction
-                .query_row(
-                    "SELECT min(not_before_ms) FROM outbox
-                     WHERE account_id = ?1 AND state = 'retry_wait'",
-                    [account_id.get()],
-                    |row| row.get::<_, Option<i64>>(0),
-                )
-                .map_err(DbFailure::database)?
-        } else {
-            transaction
-                .query_row(
-                    "SELECT min(not_before_ms) FROM outbox WHERE state = 'retry_wait'",
-                    [],
-                    |row| row.get::<_, Option<i64>>(0),
-                )
-                .map_err(DbFailure::database)?
+    for _ in 0..MAX_CLAIM_SCAN {
+        let candidate: Option<(i64, i64, i64, i64, i64, i64)> =
+            if let Some(account_id) = account_scope {
+                transaction
+                    .query_row(
+                        "SELECT message_id, account_id, artifact_generation,
+                                configuration_generation, attempt_count, claim_epoch
+                         FROM outbox
+                         WHERE account_id = ?1
+                           AND (state = 'ready' OR
+                                (state = 'retry_wait' AND not_before_ms <= ?2))
+                         ORDER BY coalesce(not_before_ms, created_at_ms), message_id
+                         LIMIT 1",
+                        params![account_id.get(), now_ms],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(DbFailure::database)?
+            } else {
+                transaction
+                    .query_row(
+                        "SELECT message_id, account_id, artifact_generation,
+                                configuration_generation, attempt_count, claim_epoch
+                         FROM outbox
+                         WHERE state = 'ready' OR
+                               (state = 'retry_wait' AND not_before_ms <= ?1)
+                         ORDER BY coalesce(not_before_ms, created_at_ms), message_id
+                         LIMIT 1",
+                        [now_ms],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(DbFailure::database)?
+            };
+        let Some((
+            raw_message_id,
+            raw_account_id,
+            artifact_generation,
+            configuration_generation,
+            attempt_count,
+            claim_epoch,
+        )) = candidate
+        else {
+            let wake_at_ms = next_outbox_wake(&transaction, account_scope)?;
+            transaction.commit().map_err(DbFailure::database)?;
+            return Ok(OutboxClaimOutcome::Idle { wake_at_ms });
         };
-        transaction.commit().map_err(DbFailure::database)?;
-        return Ok(OutboxClaimOutcome::Idle { wake_at_ms });
-    };
-    let account_id =
-        AccountId::new(raw_account_id).map_err(|error| DbFailure::database(error.to_string()))?;
-    let account_generation: Option<i64> = transaction
-        .query_row(
-            "SELECT account.configuration_generation
-             FROM accounts AS account
-             JOIN account_connections AS connection ON connection.account_id = account.id
-             WHERE account.id = ?1 AND account.state = 'active'
-               AND connection.smtp_state = 'configured'",
-            [account_id.get()],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(DbFailure::database)?;
-    if account_generation != Some(configuration_generation) {
-        transaction
+        let account_id = AccountId::new(raw_account_id)
+            .map_err(|error| DbFailure::database(error.to_string()))?;
+        let account_generation: Option<i64> = transaction
+            .query_row(
+                "SELECT account.configuration_generation
+                 FROM accounts AS account
+                 JOIN account_connections AS connection ON connection.account_id = account.id
+                 WHERE account.id = ?1 AND account.state = 'active'
+                   AND connection.smtp_state = 'configured'",
+                [account_id.get()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(DbFailure::database)?;
+        if account_generation != Some(configuration_generation) {
+            terminalize_claim_candidate(
+                &transaction,
+                raw_message_id,
+                raw_account_id,
+                artifact_generation,
+                configuration_generation,
+                attempt_count,
+                claim_epoch,
+                now_ms,
+                OutboxErrorClass::Configuration,
+                "configuration_changed",
+            )?;
+            continue;
+        }
+        let exhausted = if attempt_count >= MAX_DELIVERY_ATTEMPTS {
+            Some("attempt_limit_exhausted")
+        } else if claim_epoch == i64::MAX {
+            Some("claim_epoch_exhausted")
+        } else {
+            None
+        };
+        if let Some(error_code) = exhausted {
+            terminalize_claim_candidate(
+                &transaction,
+                raw_message_id,
+                raw_account_id,
+                artifact_generation,
+                configuration_generation,
+                attempt_count,
+                claim_epoch,
+                now_ms,
+                OutboxErrorClass::Permanent,
+                error_code,
+            )?;
+            continue;
+        }
+        let updated = transaction
             .execute(
                 "UPDATE outbox
-                 SET state = 'permanent_failure', error_class = 'configuration',
-                     error_code = 'configuration_changed', not_before_ms = NULL,
-                     updated_at_ms = ?2
-                 WHERE message_id = ?1 AND state IN ('ready', 'retry_wait')",
-                params![raw_message_id, now_ms],
+                 SET state = 'in_flight', claim_epoch = ?7,
+                     attempt_count = ?8, lease_expires_at_ms = ?9,
+                     delivery_started = 0, error_class = NULL, error_code = NULL,
+                     updated_at_ms = ?10
+                 WHERE message_id = ?1 AND account_id = ?2
+                   AND artifact_generation = ?3 AND configuration_generation = ?4
+                   AND attempt_count = ?5 AND claim_epoch = ?6
+                   AND (state = 'ready' OR
+                        (state = 'retry_wait' AND not_before_ms <= ?10))",
+                params![
+                    raw_message_id,
+                    raw_account_id,
+                    artifact_generation,
+                    configuration_generation,
+                    attempt_count,
+                    claim_epoch,
+                    claim_epoch + 1,
+                    attempt_count + 1,
+                    expires_at_ms,
+                    now_ms,
+                ],
             )
             .map_err(map_write_error)?;
+        if updated != 1 {
+            return Err(DbFailure::conflict("outbox claim changed"));
+        }
+        let claim = load_claim(&transaction, MessageId::from_database(raw_message_id))?;
         transaction.commit().map_err(DbFailure::database)?;
-        return Ok(OutboxClaimOutcome::Idle { wake_at_ms: None });
+        return Ok(OutboxClaimOutcome::Claimed(Box::new(claim)));
     }
-    let updated = transaction
-        .execute(
-            "UPDATE outbox
-             SET state = 'in_flight', claim_epoch = claim_epoch + 1,
-                 attempt_count = attempt_count + 1, lease_expires_at_ms = ?2,
-                 delivery_started = 0, error_class = NULL, error_code = NULL,
-                 updated_at_ms = ?3
-             WHERE message_id = ?1 AND artifact_generation = ?4
-               AND claim_epoch < 9223372036854775807 AND attempt_count < 1000
-               AND (state = 'ready' OR (state = 'retry_wait' AND not_before_ms <= ?3))",
-            params![raw_message_id, expires_at_ms, now_ms, artifact_generation],
-        )
-        .map_err(map_write_error)?;
-    if updated != 1 {
-        return Err(DbFailure::conflict("outbox claim changed"));
-    }
-    let claim = load_claim(&transaction, MessageId::from_database(raw_message_id))?;
     transaction.commit().map_err(DbFailure::database)?;
-    Ok(OutboxClaimOutcome::Claimed(Box::new(claim)))
+    Ok(OutboxClaimOutcome::Idle {
+        wake_at_ms: Some(now_ms),
+    })
 }
 
 pub(crate) fn mark_outbox_data_started(
@@ -970,38 +1214,35 @@ pub(crate) fn load_outbox_state(
 
 pub(crate) fn retry_outbox(
     connection: &mut Connection,
-    message_id: MessageId,
-    artifact_generation: u64,
-    expected_generation: AccountGeneration,
+    fence: OutboxActionFence,
     now_ms: i64,
 ) -> Result<OutboxReportOutcome, DbFailure> {
     validate_timestamp(now_ms)?;
-    if artifact_generation == 0 || artifact_generation > i64::MAX as u64 {
-        return Err(DbFailure::resource_limit(
-            "outbox artifact generation is outside SQLite bounds",
-        ));
-    }
+    validate_artifact_generation(fence.artifact_generation)?;
     let updated = connection
         .execute(
             "UPDATE outbox
-             SET state = 'ready', not_before_ms = ?4,
-                 error_class = NULL, error_code = NULL, updated_at_ms = ?4
-             WHERE message_id = ?1 AND artifact_generation = ?2
-               AND configuration_generation = ?3 AND state = 'permanent_failure'
+             SET state = 'ready', not_before_ms = ?5,
+                 attempt_count = 0, error_class = NULL, error_code = NULL,
+                 updated_at_ms = ?5
+             WHERE message_id = ?1 AND account_id = ?2
+               AND configuration_generation = ?3 AND artifact_generation = ?4
+               AND state = 'permanent_failure' AND claim_epoch < 9223372036854775807
                AND wire_byte_count IS NOT NULL AND rfc_message_id IS NOT NULL
                AND EXISTS (
                    SELECT 1 FROM accounts AS account
                    JOIN account_connections AS connection
                      ON connection.account_id = account.id
                    WHERE account.id = outbox.account_id
-                     AND account.configuration_generation = ?3
+                     AND account.configuration_generation = outbox.configuration_generation
                      AND account.state = 'active'
                      AND connection.smtp_state = 'configured'
                )",
             params![
-                message_id.get(),
-                artifact_generation as i64,
-                expected_generation.get(),
+                fence.message_id.get(),
+                fence.account_id.get(),
+                fence.configuration_generation.get(),
+                fence.artifact_generation as i64,
                 now_ms,
             ],
         )
@@ -1015,61 +1256,75 @@ pub(crate) fn retry_outbox(
 
 pub(crate) fn release_failed_outbox(
     connection: &mut Connection,
-    message_id: MessageId,
-    artifact_generation: u64,
+    fence: OutboxActionFence,
     now_ms: i64,
 ) -> Result<OutboxReportOutcome, DbFailure> {
     validate_timestamp(now_ms)?;
-    if artifact_generation == 0 || artifact_generation > i64::MAX as u64 {
-        return Err(DbFailure::resource_limit(
-            "outbox artifact generation is outside SQLite bounds",
-        ));
-    }
+    validate_artifact_generation(fence.artifact_generation)?;
     let transaction = immediate_transaction(connection)?;
-    let file_key: Option<String> = transaction
-        .query_row(
-            "SELECT mime_file_key FROM outbox
-             WHERE message_id = ?1 AND artifact_generation = ?2
-               AND state = 'permanent_failure'",
-            params![message_id.get(), artifact_generation as i64],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(DbFailure::database)?;
-    let Some(file_key) = file_key else {
-        transaction.commit().map_err(DbFailure::database)?;
-        return Ok(OutboxReportOutcome::Stale);
-    };
-    transaction
-        .execute(
-            "INSERT OR IGNORE INTO file_gc (file_key, queued_at_ms) VALUES (?1, ?2)",
-            params![file_key, now_ms],
-        )
-        .map_err(map_write_error)?;
-    let unlocked = transaction
-        .execute(
-            "UPDATE local_drafts
-             SET locked_artifact_generation = NULL
-             WHERE message_id = ?1 AND locked_artifact_generation = ?2",
-            params![message_id.get(), artifact_generation as i64],
-        )
-        .map_err(map_write_error)?;
-    if unlocked != 1 {
-        return Err(DbFailure::conflict("outbox draft lock changed"));
-    }
-    let deleted = transaction
-        .execute(
-            "DELETE FROM outbox
-             WHERE message_id = ?1 AND artifact_generation = ?2
-               AND state = 'permanent_failure'",
-            params![message_id.get(), artifact_generation as i64],
-        )
-        .map_err(map_write_error)?;
-    if deleted != 1 {
-        return Err(DbFailure::conflict("failed outbox changed during release"));
-    }
+    let released =
+        release_outbox_to_draft(&transaction, fence, OutboxState::PermanentFailure, now_ms)?;
     transaction.commit().map_err(DbFailure::database)?;
-    Ok(OutboxReportOutcome::Applied(OutboxState::PermanentFailure))
+    Ok(if released {
+        OutboxReportOutcome::Applied(OutboxState::PermanentFailure)
+    } else {
+        OutboxReportOutcome::Stale
+    })
+}
+
+pub(crate) fn resolve_uncertain_outbox(
+    connection: &mut Connection,
+    fence: OutboxActionFence,
+    resolution: UncertainResolution,
+    now_ms: i64,
+) -> Result<OutboxReportOutcome, DbFailure> {
+    validate_timestamp(now_ms)?;
+    validate_artifact_generation(fence.artifact_generation)?;
+    let transaction = immediate_transaction(connection)?;
+    let outcome = match resolution {
+        UncertainResolution::AssumeDelivered => {
+            let updated = transaction
+                .execute(
+                    "UPDATE outbox
+                     SET state = 'delivered', lease_expires_at_ms = NULL,
+                         delivery_started = 0, not_before_ms = NULL,
+                         error_class = NULL, error_code = NULL,
+                         delivered_at_ms = ?5, updated_at_ms = ?5
+                     WHERE message_id = ?1 AND account_id = ?2
+                       AND configuration_generation = ?3 AND artifact_generation = ?4
+                       AND state = 'uncertain'",
+                    params![
+                        fence.message_id.get(),
+                        fence.account_id.get(),
+                        fence.configuration_generation.get(),
+                        fence.artifact_generation as i64,
+                        now_ms,
+                    ],
+                )
+                .map_err(map_write_error)?;
+            if updated == 0 {
+                OutboxReportOutcome::Stale
+            } else {
+                complete_delivered_message(
+                    &transaction,
+                    fence.message_id,
+                    fence.artifact_generation,
+                    fence.configuration_generation,
+                    now_ms,
+                )?;
+                OutboxReportOutcome::Applied(OutboxState::Delivered)
+            }
+        }
+        UncertainResolution::Release => {
+            if release_outbox_to_draft(&transaction, fence, OutboxState::Uncertain, now_ms)? {
+                OutboxReportOutcome::Applied(OutboxState::Uncertain)
+            } else {
+                OutboxReportOutcome::Stale
+            }
+        }
+    };
+    transaction.commit().map_err(DbFailure::database)?;
+    Ok(outcome)
 }
 
 fn load_expired_reservation(
@@ -1381,17 +1636,44 @@ fn apply_delivered(
     if updated != 1 {
         return Err(DbFailure::conflict("outbox delivery fence changed"));
     }
-    let account_id: i64 = transaction
+    complete_delivered_message(
+        transaction,
+        lease.message_id,
+        lease.artifact_generation,
+        lease.configuration_generation,
+        now_ms,
+    )
+}
+
+fn complete_delivered_message(
+    transaction: &Transaction<'_>,
+    message_id: MessageId,
+    artifact_generation: u64,
+    configuration_generation: AccountGeneration,
+    now_ms: i64,
+) -> Result<(), DbFailure> {
+    let stored: Option<(i64, String)> = transaction
         .query_row(
-            "SELECT account_id FROM messages WHERE id = ?1",
-            [lease.message_id.get()],
-            |row| row.get(0),
+            "SELECT account_id, mime_file_key FROM outbox
+             WHERE message_id = ?1 AND artifact_generation = ?2
+               AND configuration_generation = ?3 AND state = 'delivered'",
+            params![
+                message_id.get(),
+                artifact_generation as i64,
+                configuration_generation.get(),
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
+        .optional()
         .map_err(DbFailure::database)?;
+    let Some((account_id, mime_file_key)) = stored else {
+        return Err(DbFailure::conflict("delivered outbox fence changed"));
+    };
+    let before = load_message_snapshot(transaction, message_id)?;
     transaction
         .execute(
             "DELETE FROM local_drafts WHERE message_id = ?1",
-            [lease.message_id.get()],
+            [message_id.get()],
         )
         .map_err(map_write_error)?;
     transaction
@@ -1400,7 +1682,7 @@ fn apply_delivered(
              WHERE message_id = ?1 AND folder_id IN (
                  SELECT id FROM folders WHERE account_id = ?2 AND role = 'drafts'
              )",
-            params![lease.message_id.get(), account_id],
+            params![message_id.get(), account_id],
         )
         .map_err(map_write_error)?;
     let sent_folder = ensure_sent_folder(transaction, account_id)?;
@@ -1408,16 +1690,122 @@ fn apply_delivered(
         .execute(
             "INSERT OR IGNORE INTO message_folders (message_id, folder_id, account_id)
              VALUES (?1, ?2, ?3)",
-            params![lease.message_id.get(), sent_folder, account_id],
+            params![message_id.get(), sent_folder, account_id],
         )
         .map_err(map_write_error)?;
+    let after = load_message_snapshot(transaction, message_id)?;
+    apply_transition(transaction, before, Some(after))?;
     transaction
         .execute(
-            "UPDATE account_mailbox_stats SET dirty = 1 WHERE account_id = ?1",
-            [account_id],
+            "INSERT OR IGNORE INTO file_gc (file_key, queued_at_ms) VALUES (?1, ?2)",
+            params![mime_file_key, now_ms],
         )
         .map_err(map_write_error)?;
+    let deleted = transaction
+        .execute(
+            "DELETE FROM outbox
+             WHERE message_id = ?1 AND account_id = ?2
+               AND artifact_generation = ?3 AND configuration_generation = ?4
+               AND state = 'delivered'",
+            params![
+                message_id.get(),
+                account_id,
+                artifact_generation as i64,
+                configuration_generation.get(),
+            ],
+        )
+        .map_err(map_write_error)?;
+    if deleted != 1 {
+        return Err(DbFailure::conflict(
+            "delivered outbox changed during artifact release",
+        ));
+    }
     Ok(())
+}
+
+fn release_outbox_to_draft(
+    transaction: &Transaction<'_>,
+    fence: OutboxActionFence,
+    expected_state: OutboxState,
+    now_ms: i64,
+) -> Result<bool, DbFailure> {
+    debug_assert!(matches!(
+        expected_state,
+        OutboxState::PermanentFailure | OutboxState::Uncertain
+    ));
+    let stored: Option<(String, Option<String>, Option<String>)> = transaction
+        .query_row(
+            "SELECT mime_file_key, rfc_message_id, error_code FROM outbox
+             WHERE message_id = ?1 AND account_id = ?2
+               AND configuration_generation = ?3 AND artifact_generation = ?4
+               AND state = ?5",
+            params![
+                fence.message_id.get(),
+                fence.account_id.get(),
+                fence.configuration_generation.get(),
+                fence.artifact_generation as i64,
+                expected_state.database_value(),
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(DbFailure::database)?;
+    let Some((file_key, rfc_message_id, error_code)) = stored else {
+        return Ok(false);
+    };
+    let stored_lock: Option<Option<i64>> = transaction
+        .query_row(
+            "SELECT locked_artifact_generation FROM local_drafts WHERE message_id = ?1",
+            [fence.message_id.get()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(DbFailure::database)?;
+    match stored_lock {
+        Some(Some(generation)) if generation == fence.artifact_generation as i64 => {}
+        None if rfc_message_id.is_none() && error_code.as_deref() == Some("legacy_unverified") => {}
+        _ => return Err(DbFailure::conflict("outbox draft lock changed")),
+    }
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO file_gc (file_key, queued_at_ms) VALUES (?1, ?2)",
+            params![file_key, now_ms],
+        )
+        .map_err(map_write_error)?;
+    if stored_lock.is_some() {
+        let unlocked = transaction
+            .execute(
+                "UPDATE local_drafts
+                 SET locked_artifact_generation = NULL
+                 WHERE message_id = ?1 AND locked_artifact_generation = ?2",
+                params![fence.message_id.get(), fence.artifact_generation as i64],
+            )
+            .map_err(map_write_error)?;
+        if unlocked != 1 {
+            return Err(DbFailure::conflict("outbox draft lock changed"));
+        }
+    }
+    let deleted = transaction
+        .execute(
+            "DELETE FROM outbox
+             WHERE message_id = ?1 AND account_id = ?2
+               AND configuration_generation = ?3 AND artifact_generation = ?4
+               AND state = ?5",
+            params![
+                fence.message_id.get(),
+                fence.account_id.get(),
+                fence.configuration_generation.get(),
+                fence.artifact_generation as i64,
+                expected_state.database_value(),
+            ],
+        )
+        .map_err(map_write_error)?;
+    if deleted != 1 {
+        return Err(DbFailure::conflict(
+            "terminal outbox changed during release",
+        ));
+    }
+    Ok(true)
 }
 
 fn ensure_sent_folder(transaction: &Transaction<'_>, account_id: i64) -> Result<i64, DbFailure> {
@@ -1442,10 +1830,92 @@ fn ensure_sent_folder(transaction: &Transaction<'_>, account_id: i64) -> Result<
     Ok(transaction.last_insert_rowid())
 }
 
+fn next_outbox_wake(
+    transaction: &Transaction<'_>,
+    account_scope: Option<AccountId>,
+) -> Result<Option<i64>, DbFailure> {
+    if let Some(account_id) = account_scope {
+        transaction
+            .query_row(
+                "SELECT min(not_before_ms) FROM outbox
+                 WHERE account_id = ?1 AND state = 'retry_wait'",
+                [account_id.get()],
+                |row| row.get(0),
+            )
+            .map_err(DbFailure::database)
+    } else {
+        transaction
+            .query_row(
+                "SELECT min(not_before_ms) FROM outbox WHERE state = 'retry_wait'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(DbFailure::database)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn terminalize_claim_candidate(
+    transaction: &Transaction<'_>,
+    message_id: i64,
+    account_id: i64,
+    artifact_generation: i64,
+    configuration_generation: i64,
+    attempt_count: i64,
+    claim_epoch: i64,
+    now_ms: i64,
+    error_class: OutboxErrorClass,
+    error_code: &str,
+) -> Result<(), DbFailure> {
+    let updated = transaction
+        .execute(
+            "UPDATE outbox
+             SET state = 'permanent_failure', lease_expires_at_ms = NULL,
+                 delivery_started = 0, not_before_ms = NULL,
+                 error_class = ?7, error_code = ?8, updated_at_ms = ?9
+             WHERE message_id = ?1 AND account_id = ?2
+               AND artifact_generation = ?3 AND configuration_generation = ?4
+               AND attempt_count = ?5 AND claim_epoch = ?6
+               AND (state = 'ready' OR
+                    (state = 'retry_wait' AND not_before_ms <= ?9))",
+            params![
+                message_id,
+                account_id,
+                artifact_generation,
+                configuration_generation,
+                attempt_count,
+                claim_epoch,
+                error_class.database_value(),
+                error_code,
+                now_ms,
+            ],
+        )
+        .map_err(map_write_error)?;
+    if updated != 1 {
+        return Err(DbFailure::conflict(
+            "outbox candidate changed while being terminalized",
+        ));
+    }
+    Ok(())
+}
+
 fn immediate_transaction(connection: &mut Connection) -> Result<Transaction<'_>, DbFailure> {
     connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(DbFailure::database)
+}
+
+fn validate_artifact_generation(artifact_generation: u64) -> Result<(), DbFailure> {
+    if artifact_generation == 0 || artifact_generation > i64::MAX as u64 {
+        return Err(DbFailure::resource_limit(
+            "outbox artifact generation is outside SQLite bounds",
+        ));
+    }
+    Ok(())
+}
+
+fn stored_recipient_count(value: i64) -> Result<u32, DbFailure> {
+    u32::try_from(value).map_err(|_| DbFailure::database("invalid outbox recipient count"))
 }
 
 fn validate_recipients(recipients: &[OutboxRecipient]) -> Result<(), DbFailure> {
@@ -1612,12 +2082,22 @@ mod tests {
         token_byte: u8,
         now_ms: i64,
     ) -> OutboxReservation {
+        reserve_with_generation(connection, message_id, token_byte, now_ms, 1)
+    }
+
+    fn reserve_with_generation(
+        connection: &mut Connection,
+        message_id: MessageId,
+        token_byte: u8,
+        now_ms: i64,
+        generation: i64,
+    ) -> OutboxReservation {
         reserve_outbox(
             connection,
             &OutboxReserveRequest::new(
                 message_id,
                 AccountId::new(1).unwrap(),
-                AccountGeneration::new(1).unwrap(),
+                AccountGeneration::new(generation).unwrap(),
                 0,
                 OutboxReservationToken::new([token_byte; 16]),
                 &format!("<message-{token_byte}@example.test>"),
@@ -1629,6 +2109,16 @@ mod tests {
                 now_ms + 1_000,
             )
             .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn action_fence(message_id: MessageId) -> OutboxActionFence {
+        OutboxActionFence::new(
+            message_id,
+            AccountId::new(1).unwrap(),
+            AccountGeneration::new(1).unwrap(),
+            1,
         )
         .unwrap()
     }
@@ -1766,18 +2256,11 @@ mod tests {
             OutboxReportOutcome::Applied(OutboxState::Uncertain)
         );
         assert_eq!(
-            retry_outbox(
-                &mut connection,
-                message_id,
-                1,
-                AccountGeneration::new(1).unwrap(),
-                600,
-            )
-            .unwrap(),
+            retry_outbox(&mut connection, action_fence(message_id), 600).unwrap(),
             OutboxReportOutcome::Stale
         );
         assert_eq!(
-            release_failed_outbox(&mut connection, message_id, 1, 600).unwrap(),
+            release_failed_outbox(&mut connection, action_fence(message_id), 600).unwrap(),
             OutboxReportOutcome::Stale
         );
     }
@@ -1830,18 +2313,27 @@ mod tests {
         assert_eq!(
             retry_outbox(
                 &mut connection,
-                message_id,
-                1,
-                AccountGeneration::new(1).unwrap(),
-                1_000,
+                OutboxActionFence::new(
+                    message_id,
+                    AccountId::new(1).unwrap(),
+                    AccountGeneration::new(2).unwrap(),
+                    1,
+                )
+                .unwrap(),
+                999,
             )
             .unwrap(),
+            OutboxReportOutcome::Stale
+        );
+        assert_eq!(
+            retry_outbox(&mut connection, action_fence(message_id), 1_000).unwrap(),
             OutboxReportOutcome::Applied(OutboxState::Ready)
         );
         let OutboxClaimOutcome::Claimed(third) = claim_next_outbox(&mut connection, 1_001).unwrap()
         else {
             panic!("expected retried claim");
         };
+        assert_eq!(third.attempt_count, 1);
         report_outbox(
             &mut connection,
             third.lease,
@@ -1850,7 +2342,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            release_failed_outbox(&mut connection, message_id, 1, 1_200).unwrap(),
+            release_failed_outbox(
+                &mut connection,
+                OutboxActionFence::new(
+                    message_id,
+                    AccountId::new(1).unwrap(),
+                    AccountGeneration::new(1).unwrap(),
+                    2,
+                )
+                .unwrap(),
+                1_199,
+            )
+            .unwrap(),
+            OutboxReportOutcome::Stale
+        );
+        assert_eq!(
+            release_failed_outbox(&mut connection, action_fence(message_id), 1_200).unwrap(),
             OutboxReportOutcome::Applied(OutboxState::PermanentFailure)
         );
         assert_eq!(load_outbox_state(&connection, message_id).unwrap(), None);
@@ -1869,6 +2376,66 @@ mod tests {
             )
             .unwrap();
         assert_eq!(queued, 1);
+    }
+
+    #[test]
+    fn releases_migrated_terminal_rows_without_accepting_a_missing_current_draft() {
+        let mut connection = database();
+        let legacy_message = create_test_draft(&mut connection, 63, 100);
+        let legacy_reservation = reserve(&mut connection, legacy_message, 0x72, 200);
+        finalize_outbox(&mut connection, &legacy_reservation, 128, 300).unwrap();
+        connection
+            .execute(
+                "UPDATE outbox
+                 SET state = 'permanent_failure', rfc_message_id = NULL,
+                     error_class = 'configuration', error_code = 'legacy_unverified'
+                 WHERE message_id = ?1",
+                [legacy_message.get()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM local_drafts WHERE message_id = ?1",
+                [legacy_message.get()],
+            )
+            .unwrap();
+        assert_eq!(
+            release_failed_outbox(&mut connection, action_fence(legacy_message), 400).unwrap(),
+            OutboxReportOutcome::Applied(OutboxState::PermanentFailure)
+        );
+        assert_eq!(
+            load_outbox_state(&connection, legacy_message).unwrap(),
+            None
+        );
+
+        let current_message = create_test_draft(&mut connection, 64, 500);
+        let current_reservation = reserve(&mut connection, current_message, 0x73, 600);
+        finalize_outbox(&mut connection, &current_reservation, 128, 700).unwrap();
+        connection
+            .execute(
+                "UPDATE outbox
+                 SET state = 'permanent_failure', error_class = 'permanent',
+                     error_code = 'rejected'
+                 WHERE message_id = ?1",
+                [current_message.get()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM local_drafts WHERE message_id = ?1",
+                [current_message.get()],
+            )
+            .unwrap();
+        assert_eq!(
+            release_failed_outbox(&mut connection, action_fence(current_message), 800)
+                .unwrap_err()
+                .kind,
+            FailureKind::Conflict
+        );
+        assert_eq!(
+            load_outbox_state(&connection, current_message).unwrap(),
+            Some(OutboxState::PermanentFailure)
+        );
     }
 
     #[test]
@@ -1906,5 +2473,350 @@ mod tests {
                 state: OutboxState::Uncertain,
             }
         );
+    }
+
+    #[test]
+    fn summary_query_is_bounded_and_carries_terminal_action_fences() {
+        let mut connection = database();
+        let failed_message = create_test_draft(&mut connection, 6, 100);
+        let queued_message = create_test_draft(&mut connection, 7, 101);
+        let failed_reservation = reserve(&mut connection, failed_message, 0x51, 200);
+        let queued_reservation = reserve(&mut connection, queued_message, 0x52, 201);
+        finalize_outbox(&mut connection, &failed_reservation, 128, 300).unwrap();
+        finalize_outbox(&mut connection, &queued_reservation, 128, 301).unwrap();
+        let OutboxClaimOutcome::Claimed(claim) = claim_next_outbox(&mut connection, 400).unwrap()
+        else {
+            panic!("expected first outbox claim");
+        };
+        report_outbox(
+            &mut connection,
+            claim.lease,
+            &OutboxReport::permanent_failure(
+                OutboxErrorClass::Authentication,
+                "authentication_failed",
+            )
+            .unwrap(),
+            500,
+        )
+        .unwrap();
+
+        let first_page = load_outbox_summaries(&connection, 1).unwrap();
+        assert!(first_page.has_more);
+        assert_eq!(first_page.items.len(), 1);
+        let failed = &first_page.items[0];
+        assert_eq!(failed.message_id, failed_message);
+        assert_eq!(failed.state, OutboxState::PermanentFailure);
+        assert_eq!(&*failed.subject, "Subject");
+        assert_eq!(
+            failed.recipients.first_to_address.as_deref(),
+            Some("recipient@example.test")
+        );
+        assert_eq!(failed.recipients.to_count, 1);
+        assert_eq!(failed.recipients.cc_count, 0);
+        assert_eq!(failed.recipients.bcc_count, 0);
+        assert_eq!(failed.error_class, Some(OutboxErrorClass::Authentication));
+        assert_eq!(failed.error_code.as_deref(), Some("authentication_failed"));
+        assert_eq!(failed.action_fence(), action_fence(failed_message));
+
+        let full_page = load_outbox_summaries(&connection, MAX_OUTBOX_SUMMARIES).unwrap();
+        assert!(!full_page.has_more);
+        assert_eq!(full_page.items.len(), 2);
+        assert_eq!(
+            load_outbox_summaries(&connection, 0).unwrap_err().kind,
+            FailureKind::ResourceLimit
+        );
+        assert_eq!(
+            load_outbox_summaries(&connection, MAX_OUTBOX_SUMMARIES + 1)
+                .unwrap_err()
+                .kind,
+            FailureKind::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn claim_terminalizes_exhausted_heads_and_claims_following_mail() {
+        let mut connection = database();
+        let attempts_exhausted = create_test_draft(&mut connection, 8, 100);
+        let epoch_exhausted = create_test_draft(&mut connection, 9, 101);
+        let deliverable = create_test_draft(&mut connection, 10, 102);
+        for (message_id, token, created_at_ms) in [
+            (attempts_exhausted, 0x61, 200),
+            (epoch_exhausted, 0x62, 201),
+            (deliverable, 0x63, 202),
+        ] {
+            let reservation = reserve(&mut connection, message_id, token, created_at_ms);
+            finalize_outbox(&mut connection, &reservation, 128, created_at_ms + 100).unwrap();
+        }
+        connection
+            .execute(
+                "UPDATE outbox SET attempt_count = ?2 WHERE message_id = ?1",
+                params![attempts_exhausted.get(), MAX_DELIVERY_ATTEMPTS],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE outbox SET claim_epoch = ?2 WHERE message_id = ?1",
+                params![epoch_exhausted.get(), i64::MAX],
+            )
+            .unwrap();
+
+        let OutboxClaimOutcome::Claimed(claim) = claim_next_outbox(&mut connection, 500).unwrap()
+        else {
+            panic!("expected claim after exhausted queue heads");
+        };
+        assert_eq!(claim.lease.message_id, deliverable);
+        let exhausted: Vec<(i64, String, String)> = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT message_id, state, error_code FROM outbox
+                     WHERE message_id IN (?1, ?2) ORDER BY message_id",
+                )
+                .unwrap();
+            statement
+                .query_map(
+                    params![attempts_exhausted.get(), epoch_exhausted.get()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            exhausted,
+            vec![
+                (
+                    attempts_exhausted.get(),
+                    "permanent_failure".to_owned(),
+                    "attempt_limit_exhausted".to_owned(),
+                ),
+                (
+                    epoch_exhausted.get(),
+                    "permanent_failure".to_owned(),
+                    "claim_epoch_exhausted".to_owned(),
+                ),
+            ]
+        );
+        assert_eq!(
+            retry_outbox(&mut connection, action_fence(attempts_exhausted), 501).unwrap(),
+            OutboxReportOutcome::Applied(OutboxState::Ready)
+        );
+        let reset_attempts: i64 = connection
+            .query_row(
+                "SELECT attempt_count FROM outbox WHERE message_id = ?1",
+                [attempts_exhausted.get()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reset_attempts, 0);
+        assert_eq!(
+            retry_outbox(&mut connection, action_fence(epoch_exhausted), 501).unwrap(),
+            OutboxReportOutcome::Stale
+        );
+        assert_eq!(
+            release_failed_outbox(&mut connection, action_fence(epoch_exhausted), 502).unwrap(),
+            OutboxReportOutcome::Applied(OutboxState::PermanentFailure)
+        );
+    }
+
+    #[test]
+    fn claim_scan_limit_yields_immediately_then_reaches_valid_mail() {
+        let mut connection = database();
+        let mut stale_messages = Vec::with_capacity(MAX_CLAIM_SCAN);
+        for index in 0..=MAX_CLAIM_SCAN {
+            let value = u8::try_from(index + 20).unwrap();
+            let message_id = create_test_draft(&mut connection, value, 100 + index as i64);
+            if index < MAX_CLAIM_SCAN {
+                let reservation = reserve(&mut connection, message_id, value, 1_000 + index as i64);
+                finalize_outbox(&mut connection, &reservation, 128, 2_000 + index as i64).unwrap();
+                stale_messages.push(message_id);
+            } else {
+                connection
+                    .execute(
+                        "UPDATE accounts SET configuration_generation = 2 WHERE id = 1",
+                        [],
+                    )
+                    .unwrap();
+                let reservation =
+                    reserve_with_generation(&mut connection, message_id, value, 10_000, 2);
+                finalize_outbox(&mut connection, &reservation, 128, 10_001).unwrap();
+            }
+        }
+
+        assert_eq!(
+            claim_next_outbox(&mut connection, 20_000).unwrap(),
+            OutboxClaimOutcome::Idle {
+                wake_at_ms: Some(20_000)
+            }
+        );
+        let terminalized: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM outbox
+                 WHERE state = 'permanent_failure'
+                   AND error_code = 'configuration_changed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(terminalized, MAX_CLAIM_SCAN as i64);
+        let OutboxClaimOutcome::Claimed(claim) =
+            claim_next_outbox(&mut connection, 20_000).unwrap()
+        else {
+            panic!("expected valid mail after bounded continuation");
+        };
+        assert!(!stale_messages.contains(&claim.lease.message_id));
+        assert_eq!(claim.lease.configuration_generation.get(), 2);
+    }
+
+    #[test]
+    fn delivered_mail_releases_mime_and_rebuilds_mailbox_statistics() {
+        let mut connection = database();
+        let message_id = create_test_draft(&mut connection, 60, 100);
+        let reservation = reserve(&mut connection, message_id, 0x71, 200);
+        finalize_outbox(&mut connection, &reservation, 128, 300).unwrap();
+        let OutboxClaimOutcome::Claimed(claim) = claim_next_outbox(&mut connection, 400).unwrap()
+        else {
+            panic!("expected delivery claim");
+        };
+        mark_outbox_data_started(&mut connection, claim.lease, 450).unwrap();
+        assert_eq!(
+            report_outbox(
+                &mut connection,
+                claim.lease,
+                &OutboxReport::delivered(500).unwrap(),
+                500,
+            )
+            .unwrap(),
+            OutboxReportOutcome::Applied(OutboxState::Delivered)
+        );
+
+        assert_eq!(load_outbox_state(&connection, message_id).unwrap(), None);
+        assert_eq!(load_draft(&connection, message_id).unwrap(), None);
+        let queued: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM file_gc WHERE file_key = ?1",
+                [reservation.file_key.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(queued, 1);
+        let stats: (i64, i64, bool) = connection
+            .query_row(
+                "SELECT drafts_total, sent_total, dirty FROM account_mailbox_stats
+                 WHERE account_id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stats, (0, 1, false));
+    }
+
+    #[test]
+    fn uncertain_resolution_is_fenced_and_never_requeues() {
+        for (value, resolution) in [
+            (61, UncertainResolution::AssumeDelivered),
+            (62, UncertainResolution::Release),
+        ] {
+            let mut connection = database();
+            let message_id = create_test_draft(&mut connection, value, 100);
+            let reservation = reserve(&mut connection, message_id, value, 200);
+            finalize_outbox(&mut connection, &reservation, 128, 300).unwrap();
+            let OutboxClaimOutcome::Claimed(claim) =
+                claim_next_outbox(&mut connection, 400).unwrap()
+            else {
+                panic!("expected uncertain delivery claim");
+            };
+            mark_outbox_data_started(&mut connection, claim.lease, 450).unwrap();
+            report_outbox(
+                &mut connection,
+                claim.lease,
+                &OutboxReport::uncertain("connection_lost").unwrap(),
+                500,
+            )
+            .unwrap();
+            assert_eq!(
+                claim_next_outbox(&mut connection, 600).unwrap(),
+                OutboxClaimOutcome::Idle { wake_at_ms: None }
+            );
+
+            for stale_fence in [
+                OutboxActionFence::new(
+                    message_id,
+                    AccountId::new(2).unwrap(),
+                    AccountGeneration::new(1).unwrap(),
+                    1,
+                )
+                .unwrap(),
+                OutboxActionFence::new(
+                    message_id,
+                    AccountId::new(1).unwrap(),
+                    AccountGeneration::new(2).unwrap(),
+                    1,
+                )
+                .unwrap(),
+                OutboxActionFence::new(
+                    message_id,
+                    AccountId::new(1).unwrap(),
+                    AccountGeneration::new(1).unwrap(),
+                    2,
+                )
+                .unwrap(),
+            ] {
+                assert_eq!(
+                    resolve_uncertain_outbox(&mut connection, stale_fence, resolution, 601,)
+                        .unwrap(),
+                    OutboxReportOutcome::Stale
+                );
+            }
+            assert_eq!(
+                load_outbox_state(&connection, message_id).unwrap(),
+                Some(OutboxState::Uncertain)
+            );
+            let expected = match resolution {
+                UncertainResolution::AssumeDelivered => OutboxState::Delivered,
+                UncertainResolution::Release => OutboxState::Uncertain,
+            };
+            assert_eq!(
+                resolve_uncertain_outbox(
+                    &mut connection,
+                    action_fence(message_id),
+                    resolution,
+                    700,
+                )
+                .unwrap(),
+                OutboxReportOutcome::Applied(expected)
+            );
+            assert_eq!(load_outbox_state(&connection, message_id).unwrap(), None);
+            assert_eq!(
+                claim_next_outbox(&mut connection, 701).unwrap(),
+                OutboxClaimOutcome::Idle { wake_at_ms: None }
+            );
+            let queued: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM file_gc WHERE file_key = ?1",
+                    [reservation.file_key.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(queued, 1);
+            let draft = load_draft(&connection, message_id).unwrap();
+            let stats: (i64, i64, bool) = connection
+                .query_row(
+                    "SELECT drafts_total, sent_total, dirty FROM account_mailbox_stats
+                     WHERE account_id = 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            match resolution {
+                UncertainResolution::AssumeDelivered => {
+                    assert!(draft.is_none());
+                    assert_eq!(stats, (0, 1, false));
+                }
+                UncertainResolution::Release => {
+                    assert_eq!(draft.unwrap().locked_artifact_generation, None);
+                    assert_eq!(stats, (1, 0, false));
+                }
+            }
+        }
     }
 }
