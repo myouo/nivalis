@@ -25,16 +25,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database_path = store::database_path()?;
     #[cfg(feature = "bench-harness")]
     let content_path = database_path.with_file_name("content");
+    #[cfg(feature = "bench-harness")]
+    let benchmark_database_path = database_path.clone();
     #[cfg(not(feature = "bench-harness"))]
     let (core, core_events, core_runtime) = core::spawn(database_path)?;
     #[cfg(feature = "bench-harness")]
     let (core, core_events, core_runtime, benchmark_database) =
-        core::spawn_with_database(database_path)?;
+        core::spawn_with_database(database_path, benchmark::automatic_sync_enabled())?;
     let _core_event_task = controller::install(&ui, core, core_events)?;
 
     #[cfg(feature = "bench-harness")]
-    let _memory_stress_timer =
-        benchmark::install_memory_stress(&ui, benchmark_database, content_path);
+    let _memory_stress_timer = benchmark::install_memory_stress(
+        &ui,
+        benchmark_database,
+        benchmark_database_path,
+        content_path,
+    );
     #[cfg(feature = "bench-harness")]
     benchmark::install_maximize_stress(&ui);
 

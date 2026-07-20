@@ -50,6 +50,7 @@ pub(crate) fn spawn(
 #[cfg(feature = "bench-harness")]
 pub(crate) fn spawn_with_database(
     database_path: std::path::PathBuf,
+    auto_sync_enabled: bool,
 ) -> Result<
     (
         CoreHandle,
@@ -59,5 +60,5 @@ pub(crate) fn spawn_with_database(
     ),
     StartError,
 > {
-    runtime::spawn_with_database(database_path)
+    runtime::spawn_with_database(database_path, auto_sync_enabled)
 }

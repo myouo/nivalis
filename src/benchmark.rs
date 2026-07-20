@@ -6,6 +6,7 @@ use crate::{
         FileGcOutcome, MailboxQueryCounts, MessageId, mailbox_query_counts,
     },
 };
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use slint::{ComponentHandle, Model, SharedString, Timer, TimerMode};
 use std::cell::{Cell, RefCell};
 use std::fs::File;
@@ -16,9 +17,21 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
+pub(crate) fn automatic_sync_enabled() -> bool {
+    automatic_sync_enabled_for_scenario(std::env::var("NIVALIS_STRESS_SCENARIO").ok().as_deref())
+}
+
+fn automatic_sync_enabled_for_scenario(scenario: Option<&str>) -> bool {
+    !matches!(
+        scenario,
+        Some("account-diagnostic" | "account-receive" | "account-send")
+    )
+}
+
 pub(crate) fn install_memory_stress(
     ui: &AppWindow,
     database: DatabaseClient,
+    database_path: PathBuf,
     content_path: PathBuf,
 ) -> Option<Rc<Timer>> {
     let steps = std::env::var("NIVALIS_STRESS_STEPS")
@@ -41,7 +54,9 @@ pub(crate) fn install_memory_stress(
         Ok("write-search") => install_write_search_stress(ui, steps, delay, interval),
         Ok("content") => install_content_stress(ui, database, content_path, steps, delay),
         Ok("account-diagnostic") => install_account_diagnostic_stress(ui, steps, delay, interval),
-        Ok("account-receive") => install_account_receive_stress(ui, steps, delay, interval),
+        Ok("account-receive") => {
+            install_account_receive_stress(ui, database_path, content_path, steps, delay, interval)
+        }
         Ok("account-send") => install_account_send_stress(ui, steps, delay, interval),
         Ok("mixed") | Err(_) => install_mixed_stress(ui, steps, delay, interval),
         Ok(scenario) => {
@@ -55,6 +70,8 @@ pub(crate) fn install_memory_stress(
 
 const ACCOUNT_DIAGNOSTIC_SECRET_LIMIT: u64 = 16 * 1024;
 const ACCOUNT_DIAGNOSTIC_DEFAULT_TIMEOUT_MS: u64 = 45_000;
+const ACCOUNT_RECEIVE_EXPECTED_SUBJECT: &str = "Received memory fixture";
+const ACCOUNT_RECEIVE_EXPECTED_BODY: &str = "Bounded receive body.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AccountDiagnosticExpectation {
@@ -465,6 +482,7 @@ struct AccountReceiveMailboxObservation {
     has_next: bool,
     first_account_matches: bool,
     first_id_present: bool,
+    first_subject_matches: bool,
 }
 
 fn account_receive_mailbox_gate(
@@ -506,7 +524,10 @@ fn account_receive_mailbox_gate(
                 && !observation.has_previous
                 && !observation.has_next
             {
-                if !observation.first_account_matches || !observation.first_id_present {
+                if !observation.first_account_matches
+                    || !observation.first_id_present
+                    || !observation.first_subject_matches
+                {
                     AccountReceiveGate::Failed("imported_message_invalid")
                 } else {
                     AccountReceiveGate::Ready
@@ -519,13 +540,202 @@ fn account_receive_mailbox_gate(
 }
 
 #[derive(Clone, Copy)]
+struct AccountReceiveDatabaseObservation {
+    account_matches: bool,
+    message_total: i64,
+    body_key_valid: bool,
+    body_byte_count: i64,
+    body_file_regular: bool,
+    body_file_bytes: Option<u64>,
+    reader_excerpt_matches_file: bool,
+    subject_matches_fixture: bool,
+    body_matches_fixture: bool,
+    private_permissions: bool,
+}
+
+#[cfg(unix)]
+fn account_receive_private_permissions(
+    content_metadata: &std::fs::Metadata,
+    body_directory_metadata: &std::fs::Metadata,
+    body_metadata: &std::fs::Metadata,
+) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    content_metadata.file_type().is_dir()
+        && body_directory_metadata.file_type().is_dir()
+        && body_metadata.file_type().is_file()
+        && content_metadata.permissions().mode() & 0o777 == 0o700
+        && body_directory_metadata.permissions().mode() & 0o777 == 0o700
+        && body_metadata.permissions().mode() & 0o777 == 0o600
+}
+
+#[cfg(not(unix))]
+fn account_receive_private_permissions(
+    content_metadata: &std::fs::Metadata,
+    body_directory_metadata: &std::fs::Metadata,
+    body_metadata: &std::fs::Metadata,
+) -> bool {
+    content_metadata.file_type().is_dir()
+        && body_directory_metadata.file_type().is_dir()
+        && body_metadata.file_type().is_file()
+}
+
+fn account_receive_database_gate(
+    database_path: &std::path::Path,
+    content_path: &std::path::Path,
+    expected_account_id: &str,
+    expected_message_id: &str,
+) -> AccountReceiveGate {
+    let Ok(expected_account_id) = expected_account_id.parse::<i64>() else {
+        return AccountReceiveGate::Failed("database_account_identity_invalid");
+    };
+    let Ok(expected_message_id) = expected_message_id.parse::<i64>() else {
+        return AccountReceiveGate::Failed("database_message_identity_invalid");
+    };
+    let connection = match Connection::open_with_flags(
+        database_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(connection) => connection,
+        Err(_) => return AccountReceiveGate::Failed("database_evidence_unavailable"),
+    };
+    if connection.pragma_update(None, "query_only", true).is_err() {
+        return AccountReceiveGate::Failed("database_evidence_unavailable");
+    }
+    let row = match connection
+        .query_row(
+            "SELECT message.account_id,
+                    (SELECT count(*) FROM messages WHERE account_id = message.account_id),
+                    message.subject,
+                    content.body_file_key,
+                    content.body_byte_count,
+                    content.reader_excerpt
+             FROM messages AS message
+             JOIN message_content AS content ON content.message_id = message.id
+             WHERE message.id = ?1
+               AND EXISTS (
+                   SELECT 1
+                   FROM message_folders AS membership
+                   JOIN folders AS folder ON folder.id = membership.folder_id
+                   WHERE membership.message_id = message.id
+                     AND folder.role = 'inbox'
+               )",
+            [expected_message_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()
+    {
+        Ok(Some(row)) => row,
+        Ok(None) => return AccountReceiveGate::Failed("database_message_missing"),
+        Err(_) => return AccountReceiveGate::Failed("database_evidence_unavailable"),
+    };
+    let (account_id, message_total, subject, body_file_key, body_byte_count, reader_excerpt) = row;
+    let body_key = body_file_key
+        .as_deref()
+        .and_then(|value| FileKey::parse(value).ok());
+    let body_path = body_key.as_ref().map(|key| content_path.join(key.as_str()));
+    let body_metadata = body_path
+        .as_ref()
+        .and_then(|path| std::fs::symlink_metadata(path).ok());
+    let body_directory_metadata = body_path
+        .as_ref()
+        .and_then(|path| path.parent())
+        .and_then(|path| std::fs::symlink_metadata(path).ok());
+    let content_metadata = std::fs::symlink_metadata(content_path).ok();
+    let body_bytes = body_path.as_ref().and_then(|path| {
+        if !body_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.file_type().is_file())
+        {
+            return None;
+        }
+        let Ok(file) = File::open(path) else {
+            return None;
+        };
+        let mut bytes = Vec::with_capacity(reader_excerpt.len().saturating_add(2));
+        file.take(1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .ok()
+            .filter(|_| bytes.len() <= 1024 * 1024)
+            .map(|_| bytes)
+    });
+    let reader_excerpt_matches_file = body_bytes.as_ref().is_some_and(|bytes| {
+        bytes
+            .get(..reader_excerpt.len())
+            .is_some_and(|prefix| prefix == reader_excerpt.as_bytes())
+    });
+    let body_matches_fixture = body_bytes
+        .as_ref()
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .is_some_and(|body| body.trim_end_matches(['\r', '\n']) == ACCOUNT_RECEIVE_EXPECTED_BODY);
+    let private_permissions = content_metadata.as_ref().is_some_and(|content| {
+        body_directory_metadata.as_ref().is_some_and(|directory| {
+            body_metadata
+                .as_ref()
+                .is_some_and(|body| account_receive_private_permissions(content, directory, body))
+        })
+    });
+    account_receive_database_observation_gate(AccountReceiveDatabaseObservation {
+        account_matches: account_id == expected_account_id,
+        message_total,
+        body_key_valid: body_key.is_some(),
+        body_byte_count,
+        body_file_regular: body_metadata
+            .as_ref()
+            .is_some_and(std::fs::Metadata::is_file),
+        body_file_bytes: body_metadata.map(|metadata| metadata.len()),
+        reader_excerpt_matches_file,
+        subject_matches_fixture: subject == ACCOUNT_RECEIVE_EXPECTED_SUBJECT,
+        body_matches_fixture,
+        private_permissions,
+    })
+}
+
+fn account_receive_database_observation_gate(
+    observation: AccountReceiveDatabaseObservation,
+) -> AccountReceiveGate {
+    if !observation.account_matches {
+        return AccountReceiveGate::Failed("database_account_mismatch");
+    }
+    if observation.message_total != 1 {
+        return AccountReceiveGate::Failed("database_message_count_mismatch");
+    }
+    if !observation.body_key_valid || observation.body_byte_count <= 0 {
+        return AccountReceiveGate::Failed("database_content_missing");
+    }
+    if !observation.body_file_regular || observation.body_file_bytes == Some(0) {
+        return AccountReceiveGate::Failed("database_body_file_mismatch");
+    }
+    if !observation.reader_excerpt_matches_file {
+        return AccountReceiveGate::Failed("database_body_excerpt_mismatch");
+    }
+    if !observation.subject_matches_fixture || !observation.body_matches_fixture {
+        return AccountReceiveGate::Failed("database_fixture_mismatch");
+    }
+    if !observation.private_permissions {
+        return AccountReceiveGate::Failed("database_body_not_private");
+    }
+    AccountReceiveGate::Ready
+}
+
+#[derive(Clone, Copy)]
 struct AccountReceiveReaderObservation {
     detail_open: bool,
     loading: bool,
     error: bool,
     selected_id_matches: bool,
     detail_id_matches: bool,
-    body_present: bool,
+    subject_matches_fixture: bool,
+    body_matches_fixture: bool,
 }
 
 fn account_receive_reader_gate(observation: AccountReceiveReaderObservation) -> AccountReceiveGate {
@@ -541,8 +751,8 @@ fn account_receive_reader_gate(observation: AccountReceiveReaderObservation) -> 
     if !observation.selected_id_matches || !observation.detail_id_matches {
         return AccountReceiveGate::Failed("opened_message_mismatch");
     }
-    if !observation.body_present {
-        return AccountReceiveGate::Failed("message_body_empty");
+    if !observation.subject_matches_fixture || !observation.body_matches_fixture {
+        return AccountReceiveGate::Failed("reader_fixture_mismatch");
     }
     AccountReceiveGate::Ready
 }
@@ -596,6 +806,8 @@ impl AccountReceiveStress {
 
 fn install_account_receive_stress(
     ui: &AppWindow,
+    database_path: PathBuf,
+    content_path: PathBuf,
     steps: usize,
     delay: u64,
     interval: u64,
@@ -811,6 +1023,20 @@ fn install_account_receive_stress(
                                     return;
                                 };
                                 let message_id = message.id;
+                                match account_receive_database_gate(
+                                    &database_path,
+                                    &content_path,
+                                    account_id.as_str(),
+                                    message_id.as_str(),
+                                ) {
+                                    AccountReceiveGate::Waiting => return,
+                                    AccountReceiveGate::Failed(reason) => {
+                                        fail_account_receive_stress(&ui, &timer, reason, true);
+                                        state.phase = AccountReceivePhase::Complete;
+                                        return;
+                                    }
+                                    AccountReceiveGate::Ready => {}
+                                }
                                 ui.set_detail_open(true);
                                 ui.invoke_select_mail(message_id.clone());
                                 state.advance(AccountReceivePhase::Opening {
@@ -832,7 +1058,13 @@ fn install_account_receive_stress(
                             selected_id_matches: ui.get_selected_id().as_str()
                                 == message_id.as_str(),
                             detail_id_matches: detail.id.as_str() == message_id.as_str(),
-                            body_present: !detail.body.as_str().trim().is_empty(),
+                            subject_matches_fixture: detail.subject.as_str()
+                                == ACCOUNT_RECEIVE_EXPECTED_SUBJECT,
+                            body_matches_fixture: detail
+                                .body
+                                .as_str()
+                                .trim_end_matches(['\r', '\n'])
+                                == ACCOUNT_RECEIVE_EXPECTED_BODY,
                         });
                         match gate {
                             AccountReceiveGate::Waiting => {}
@@ -881,7 +1113,7 @@ fn install_account_receive_stress(
                         state.cleanup_required = false;
                         ui.set_status_text("Account receive memory stress complete".into());
                         eprintln!(
-                            "NIVALIS_STRESS_RESULT scenario=account-receive steps=1 imported=1 opened=1 closed=1 removed=1 elapsed_ms={}",
+                            "NIVALIS_STRESS_RESULT scenario=account-receive steps=1 manual_sync=1 database=1 ui=1 reader=1 imported=1 opened=1 closed=1 removed=1 elapsed_ms={}",
                             state.started.elapsed().as_millis()
                         );
                         stop_stress(&ui, &timer);
@@ -916,7 +1148,9 @@ fn account_receive_mailbox_observation(
         first_account_matches: first
             .as_ref()
             .is_some_and(|mail| mail.account_id.as_str() == expected_account_id),
-        first_id_present: first.is_some_and(|mail| !mail.id.is_empty()),
+        first_id_present: first.as_ref().is_some_and(|mail| !mail.id.is_empty()),
+        first_subject_matches: first
+            .is_some_and(|mail| mail.subject.as_str() == ACCOUNT_RECEIVE_EXPECTED_SUBJECT),
     }
 }
 
@@ -2452,6 +2686,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn account_scenarios_explicitly_isolate_manual_protocol_work() {
+        assert!(automatic_sync_enabled_for_scenario(None));
+        assert!(automatic_sync_enabled_for_scenario(Some("mixed")));
+        assert!(!automatic_sync_enabled_for_scenario(Some(
+            "account-diagnostic"
+        )));
+        assert!(!automatic_sync_enabled_for_scenario(Some(
+            "account-receive"
+        )));
+        assert!(!automatic_sync_enabled_for_scenario(Some("account-send")));
+    }
+
+    #[test]
     fn account_diagnostic_result_classification_is_strict() {
         assert_eq!(
             AccountDiagnosticExpectation::parse("ready"),
@@ -2491,6 +2738,7 @@ mod tests {
             has_next: false,
             first_account_matches: false,
             first_id_present: false,
+            first_subject_matches: false,
         };
         assert_eq!(
             account_receive_mailbox_gate(empty, AccountReceiveMailboxExpectation::Empty),
@@ -2506,6 +2754,7 @@ mod tests {
             rows: 1,
             first_account_matches: true,
             first_id_present: true,
+            first_subject_matches: true,
             ..empty
         };
         assert_eq!(
@@ -2558,7 +2807,8 @@ mod tests {
             error: false,
             selected_id_matches: true,
             detail_id_matches: true,
-            body_present: true,
+            subject_matches_fixture: true,
+            body_matches_fixture: true,
         };
         assert_eq!(
             account_receive_reader_gate(ready),
@@ -2573,10 +2823,10 @@ mod tests {
         );
         assert_eq!(
             account_receive_reader_gate(AccountReceiveReaderObservation {
-                body_present: false,
+                body_matches_fixture: false,
                 ..ready
             }),
-            AccountReceiveGate::Failed("message_body_empty")
+            AccountReceiveGate::Failed("reader_fixture_mismatch")
         );
         assert_eq!(
             account_receive_reader_gate(AccountReceiveReaderObservation {
@@ -2592,6 +2842,141 @@ mod tests {
             }),
             AccountReceiveGate::Failed("detail_error")
         );
+    }
+
+    #[test]
+    fn account_receive_database_gate_requires_one_private_durable_body() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "nivalis-account-receive-database-{}-{timestamp}",
+            std::process::id()
+        ));
+        let content = root.join("content");
+        let body_directory = content.join("body");
+        std::fs::create_dir_all(&body_directory).unwrap();
+        let database = root.join("mail.sqlite3");
+        let body_key = "body/11111111111111111111111111111111.txt";
+        std::fs::write(
+            content.join(body_key),
+            format!("{ACCOUNT_RECEIVE_EXPECTED_BODY}\n"),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&content, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(&body_directory, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            std::fs::set_permissions(
+                content.join(body_key),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE messages (
+                     id INTEGER PRIMARY KEY,
+                     account_id INTEGER NOT NULL,
+                     subject TEXT NOT NULL
+                 );
+                 CREATE TABLE folders (
+                     id INTEGER PRIMARY KEY,
+                     account_id INTEGER NOT NULL,
+                     role TEXT NOT NULL
+                 );
+                 CREATE TABLE message_folders (
+                     message_id INTEGER NOT NULL,
+                     folder_id INTEGER NOT NULL,
+                     account_id INTEGER NOT NULL
+                 );
+                 CREATE TABLE message_content (
+                     message_id INTEGER PRIMARY KEY,
+                     body_file_key TEXT,
+                     body_byte_count INTEGER NOT NULL,
+                     reader_excerpt TEXT NOT NULL
+                 );
+                 INSERT INTO messages VALUES (7, 3, 'Received memory fixture');
+                 INSERT INTO folders VALUES (11, 3, 'inbox');
+                 INSERT INTO message_folders VALUES (7, 11, 3);
+                 INSERT INTO message_content VALUES (
+                     7, 'body/11111111111111111111111111111111.txt',
+                     22, 'Bounded receive body.\n'
+                 );",
+            )
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(
+            account_receive_database_gate(&database, &content, "3", "7"),
+            AccountReceiveGate::Ready
+        );
+        std::fs::write(content.join(body_key), b"").unwrap();
+        assert_eq!(
+            account_receive_database_gate(&database, &content, "3", "7"),
+            AccountReceiveGate::Failed("database_body_file_mismatch")
+        );
+        std::fs::write(content.join(body_key), b"Different body.\n").unwrap();
+        assert_eq!(
+            account_receive_database_gate(&database, &content, "3", "7"),
+            AccountReceiveGate::Failed("database_body_excerpt_mismatch")
+        );
+        std::fs::write(
+            content.join(body_key),
+            format!("{ACCOUNT_RECEIVE_EXPECTED_BODY}\n"),
+        )
+        .unwrap();
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute("UPDATE messages SET subject = 'Different subject'", [])
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            account_receive_database_gate(&database, &content, "3", "7"),
+            AccountReceiveGate::Failed("database_fixture_mismatch")
+        );
+        assert_eq!(
+            account_receive_database_gate(&database, &content, "4", "7"),
+            AccountReceiveGate::Failed("database_account_mismatch")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+
+            let connection = Connection::open(&database).unwrap();
+            connection
+                .execute(
+                    "UPDATE messages SET subject = 'Received memory fixture'",
+                    [],
+                )
+                .unwrap();
+            drop(connection);
+            std::fs::set_permissions(
+                content.join(body_key),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+            assert_eq!(
+                account_receive_database_gate(&database, &content, "3", "7"),
+                AccountReceiveGate::Failed("database_body_not_private")
+            );
+
+            let external = root.join("external-body.txt");
+            std::fs::write(&external, format!("{ACCOUNT_RECEIVE_EXPECTED_BODY}\n")).unwrap();
+            std::fs::remove_file(content.join(body_key)).unwrap();
+            symlink(&external, content.join(body_key)).unwrap();
+            assert_eq!(
+                account_receive_database_gate(&database, &content, "3", "7"),
+                AccountReceiveGate::Failed("database_body_file_mismatch")
+            );
+        }
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

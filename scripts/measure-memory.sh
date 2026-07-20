@@ -558,7 +558,7 @@ for ((run = 1; run <= runs; run++)); do
                 exit 1
             fi
         elif [[ "$stress_scenario" == "account-receive" ]]; then
-            account_receive_pattern='^NIVALIS_STRESS_RESULT scenario=account-receive steps=1 imported=1 opened=1 closed=1 removed=1 elapsed_ms=(0|[1-9][0-9]*)$'
+            account_receive_pattern='^NIVALIS_STRESS_RESULT scenario=account-receive steps=1 manual_sync=1 database=1 ui=1 reader=1 imported=1 opened=1 closed=1 removed=1 elapsed_ms=(0|[1-9][0-9]*)$'
             if [[ ! "$stress_result" =~ $account_receive_pattern ]]; then
                 printf 'Account-receive stress completion marker has an invalid format: %s\n' \
                     "$stress_result" >&2

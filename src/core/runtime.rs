@@ -80,6 +80,7 @@ pub(crate) fn spawn(
 #[cfg(feature = "bench-harness")]
 pub(crate) fn spawn_with_database(
     database_path: PathBuf,
+    auto_sync_enabled: bool,
 ) -> Result<(CoreHandle, EventReceiver, CoreRuntime, DatabaseClient), StartError> {
     let content_root = database_path.with_file_name("content");
     let database = sqlite::spawn(database_path).map_err(StartError::Database)?;
@@ -92,7 +93,7 @@ pub(crate) fn spawn_with_database(
         production_imap_inbox_fetch,
         production_smtp_submit,
         Some(content_root),
-        true,
+        auto_sync_enabled,
     )?;
     Ok((core, events, runtime, benchmark_database))
 }
