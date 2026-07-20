@@ -1,7 +1,9 @@
 mod account;
+mod compose;
 mod message;
 #[allow(dead_code)]
 mod outbound;
+mod outbox_driver;
 mod runtime;
 mod sync;
 
@@ -12,7 +14,13 @@ pub(crate) use account::{
     InboxSyncFailureKind,
 };
 pub(crate) use message::{CoreHandle, Event, EventReceiver};
+pub(crate) use outbox_driver::{OutboxDriverFault, OutboxStatus};
 pub(crate) use runtime::{CoreRuntime, StartError};
+
+pub(crate) use compose::{
+    ComposeDraftIdentity, ComposeDraftInput, ComposeFailure, ComposeFailureKind, ComposeOperation,
+    ComposeSuccess,
+};
 
 #[allow(unused_imports)]
 pub(crate) use crate::store::sqlite::{
@@ -23,8 +31,9 @@ pub(crate) use crate::store::sqlite::{
 pub(crate) use message::{
     AccountDirectoryLoadError, AccountDirectoryQuery, AccountOperationResponse,
     AccountOperationResponseError, AccountOperationSubmitError, AccountOperationSubmitFailure,
-    MailboxLoadError, MailboxQuery, MessageLoadError, MessageQuery, MutationRequest,
-    MutationSubmitError, SubmitError,
+    ComposeOperationResponse, ComposeOperationResponseError, ComposeOperationSubmitError,
+    ComposeOperationSubmitFailure, MailboxLoadError, MailboxQuery, MessageLoadError, MessageQuery,
+    MutationRequest, MutationSubmitError, SubmitError,
 };
 
 #[cfg_attr(feature = "bench-harness", allow(dead_code))]

@@ -142,6 +142,7 @@ export component AppWindow inherits Window {
     callback previous-mailbox-page;
     callback next-mailbox-page;
     callback retry-detail;
+    callback open-composer;
     callback send-message(string, string, string);
     callback save-draft(string, string, string);
     callback switch-account(string);
@@ -166,6 +167,7 @@ export component AppWindow inherits Window {
                 if (root.compose-enabled && !root.blocking-overlay-open) {
                     root.composer-error = "";
                     root.composer-open = true;
+                    root.open-composer();
                 }
             }
         }
@@ -245,6 +247,7 @@ export component AppWindow inherits Window {
                             if (root.compose-enabled) {
                                 root.composer-error = "";
                                 root.composer-open = true;
+                                root.open-composer();
                             }
                         }
                         folder-selected(folder) => { root.filter-folder(folder); root.detail-open = false; }

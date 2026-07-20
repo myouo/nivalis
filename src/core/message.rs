@@ -1,4 +1,8 @@
-use super::account::{AccountOperation, AccountOperationReply};
+use super::{
+    account::{AccountOperation, AccountOperationReply},
+    compose::{ComposeOperation, ComposeReply},
+    outbox_driver::OutboxStatus,
+};
 use crate::store::sqlite::{
     AccountDirectory, Generation, MailboxPage, MessageDetail, MessageId, MessageMutation,
     MutationOutcome, PageSpec, RequestId, Tagged,
@@ -14,12 +18,19 @@ use tokio::sync::{mpsc, oneshot};
 
 pub(crate) const COMMAND_CAPACITY: usize = 64;
 pub(crate) const ACCOUNT_COMMAND_CAPACITY: usize = 4;
+pub(crate) const COMPOSE_COMMAND_CAPACITY: usize = 1;
 pub(crate) const EVENT_CAPACITY: usize = 128;
 
 #[derive(Debug)]
 pub(super) struct AccountCommand {
     pub(super) operation: AccountOperation,
     pub(super) reply: oneshot::Sender<AccountOperationReply>,
+}
+
+#[derive(Debug)]
+pub(super) struct ComposeCommand {
+    pub(super) operation: ComposeOperation,
+    pub(super) reply: oneshot::Sender<ComposeReply>,
 }
 
 #[derive(Debug)]
@@ -62,6 +73,7 @@ pub(crate) enum Event {
         generation: Generation,
         reason: MutationSubmitError,
     },
+    OutboxStatus(OutboxStatus),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -370,16 +382,40 @@ fn lock_latest(slot: &Mutex<LatestEvent>) -> MutexGuard<'_, LatestEvent> {
 pub(crate) struct CoreHandle {
     commands: mpsc::Sender<Command>,
     account_commands: mpsc::Sender<AccountCommand>,
+    compose_commands: mpsc::Sender<ComposeCommand>,
 }
 
 impl CoreHandle {
     pub(super) fn new(
         commands: mpsc::Sender<Command>,
         account_commands: mpsc::Sender<AccountCommand>,
+        compose_commands: mpsc::Sender<ComposeCommand>,
     ) -> Self {
         Self {
             commands,
             account_commands,
+            compose_commands,
+        }
+    }
+
+    pub(crate) fn try_compose_operation(
+        &self,
+        operation: ComposeOperation,
+    ) -> Result<ComposeOperationResponse, ComposeOperationSubmitFailure> {
+        let (reply, receiver) = oneshot::channel();
+        match self
+            .compose_commands
+            .try_send(ComposeCommand { operation, reply })
+        {
+            Ok(()) => Ok(ComposeOperationResponse { receiver }),
+            Err(mpsc::error::TrySendError::Full(command)) => Err(ComposeOperationSubmitFailure {
+                reason: ComposeOperationSubmitError::Busy,
+                operation: Box::new(command.operation),
+            }),
+            Err(mpsc::error::TrySendError::Closed(command)) => Err(ComposeOperationSubmitFailure {
+                reason: ComposeOperationSubmitError::Closed,
+                operation: Box::new(command.operation),
+            }),
         }
     }
 
@@ -444,6 +480,78 @@ impl CoreHandle {
         self.commands
             .try_send(Command::Barrier(reached))
             .map_err(SubmitError::from)
+    }
+}
+
+pub(crate) struct ComposeOperationResponse {
+    receiver: oneshot::Receiver<ComposeReply>,
+}
+
+impl fmt::Debug for ComposeOperationResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ComposeOperationResponse(..)")
+    }
+}
+
+impl Future for ComposeOperationResponse {
+    type Output = Result<ComposeReply, ComposeOperationResponseError>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.receiver).poll(context) {
+            Poll::Ready(Ok(reply)) => Poll::Ready(Ok(reply)),
+            Poll::Ready(Err(_)) => Poll::Ready(Err(ComposeOperationResponseError::CoreClosed)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ComposeOperationResponseError {
+    CoreClosed,
+}
+
+impl fmt::Display for ComposeOperationResponseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("the compose operation stopped before producing a result")
+    }
+}
+
+impl std::error::Error for ComposeOperationResponseError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ComposeOperationSubmitError {
+    Busy,
+    Closed,
+}
+
+pub(crate) struct ComposeOperationSubmitFailure {
+    reason: ComposeOperationSubmitError,
+    operation: Box<ComposeOperation>,
+}
+
+impl ComposeOperationSubmitFailure {
+    pub(crate) fn reason(&self) -> ComposeOperationSubmitError {
+        self.reason
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn into_operation(self) -> ComposeOperation {
+        *self.operation
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn into_parts(self) -> (ComposeOperationSubmitError, ComposeOperation) {
+        (self.reason, *self.operation)
+    }
+}
+
+impl fmt::Debug for ComposeOperationSubmitFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ComposeOperationSubmitFailure")
+            .field("reason", &self.reason)
+            .field("operation", self.operation.as_ref())
+            .finish()
     }
 }
 
@@ -575,21 +683,34 @@ mod tests {
         }
     }
 
+    fn load_compose_operation(account_id: i64) -> ComposeOperation {
+        ComposeOperation::LoadLatest {
+            account_id: AccountId::new(account_id).unwrap(),
+            expected_generation: AccountGeneration::new(1).unwrap(),
+        }
+    }
+
     fn handle_with_account_channel(
         commands: mpsc::Sender<Command>,
         account_capacity: usize,
-    ) -> (CoreHandle, mpsc::Receiver<AccountCommand>) {
+    ) -> (
+        CoreHandle,
+        mpsc::Receiver<AccountCommand>,
+        mpsc::Receiver<ComposeCommand>,
+    ) {
         let (account_commands, account_receiver) = mpsc::channel(account_capacity);
+        let (compose_commands, compose_receiver) = mpsc::channel(COMPOSE_COMMAND_CAPACITY);
         (
-            CoreHandle::new(commands, account_commands),
+            CoreHandle::new(commands, account_commands, compose_commands),
             account_receiver,
+            compose_receiver,
         )
     }
 
     #[test]
     fn full_command_queue_is_reported_as_busy() {
         let (sender, _receiver) = mpsc::channel(1);
-        let (handle, _account_receiver) = handle_with_account_channel(sender, 1);
+        let (handle, _account_receiver, _compose_receiver) = handle_with_account_channel(sender, 1);
 
         assert_eq!(
             handle.try_query_account_directory(account_directory_query(1)),
@@ -604,7 +725,7 @@ mod tests {
     #[test]
     fn closed_command_queue_is_reported() {
         let (sender, receiver) = mpsc::channel(1);
-        let (handle, _account_receiver) = handle_with_account_channel(sender, 1);
+        let (handle, _account_receiver, _compose_receiver) = handle_with_account_channel(sender, 1);
         drop(receiver);
 
         assert_eq!(
@@ -616,7 +737,8 @@ mod tests {
     #[test]
     fn account_commands_use_an_independent_bounded_queue() {
         let (sender, _receiver) = mpsc::channel(1);
-        let (handle, mut account_receiver) = handle_with_account_channel(sender, 1);
+        let (handle, mut account_receiver, _compose_receiver) =
+            handle_with_account_channel(sender, 1);
         handle
             .try_query_account_directory(account_directory_query(1))
             .unwrap();
@@ -632,7 +754,7 @@ mod tests {
     #[test]
     fn full_account_queue_returns_the_original_operation() {
         let (sender, _receiver) = mpsc::channel(1);
-        let (handle, _account_receiver) = handle_with_account_channel(sender, 1);
+        let (handle, _account_receiver, _compose_receiver) = handle_with_account_channel(sender, 1);
         let _first = handle
             .try_account_operation(remove_account_operation(1))
             .unwrap();
@@ -653,7 +775,7 @@ mod tests {
     #[test]
     fn closed_account_queue_returns_the_original_operation() {
         let (sender, _receiver) = mpsc::channel(1);
-        let (handle, account_receiver) = handle_with_account_channel(sender, 1);
+        let (handle, account_receiver, _compose_receiver) = handle_with_account_channel(sender, 1);
         drop(account_receiver);
 
         let failure = handle
@@ -670,7 +792,8 @@ mod tests {
     #[test]
     fn account_operation_response_maps_reply_and_channel_close() {
         let (sender, _receiver) = mpsc::channel(1);
-        let (handle, mut account_receiver) = handle_with_account_channel(sender, 2);
+        let (handle, mut account_receiver, _compose_receiver) =
+            handle_with_account_channel(sender, 2);
         let response = handle
             .try_account_operation(remove_account_operation(8))
             .unwrap();
@@ -695,6 +818,43 @@ mod tests {
             runtime.block_on(closed),
             Err(AccountOperationResponseError::CoreClosed)
         );
+    }
+
+    #[test]
+    fn full_compose_queue_returns_the_original_operation() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let (handle, _account_receiver, _compose_receiver) = handle_with_account_channel(sender, 1);
+        let _first = handle
+            .try_compose_operation(load_compose_operation(1))
+            .unwrap();
+
+        let failure = handle
+            .try_compose_operation(load_compose_operation(2))
+            .unwrap_err();
+
+        assert_eq!(failure.reason(), ComposeOperationSubmitError::Busy);
+        let ComposeOperation::LoadLatest { account_id, .. } = failure.into_operation() else {
+            panic!("expected original load operation");
+        };
+        assert_eq!(account_id, AccountId::new(2).unwrap());
+    }
+
+    #[test]
+    fn closed_compose_queue_returns_the_original_operation() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let (handle, _account_receiver, compose_receiver) = handle_with_account_channel(sender, 1);
+        drop(compose_receiver);
+
+        let failure = handle
+            .try_compose_operation(load_compose_operation(3))
+            .unwrap_err();
+        let (reason, operation) = failure.into_parts();
+
+        assert_eq!(reason, ComposeOperationSubmitError::Closed);
+        let ComposeOperation::LoadLatest { account_id, .. } = operation else {
+            panic!("expected original load operation");
+        };
+        assert_eq!(account_id, AccountId::new(3).unwrap());
     }
 
     #[test]

@@ -2,16 +2,19 @@ use super::{
     account::{
         AccountDriverError, AccountWorkflows, ImapDiagnosticProbe, production_imap_diagnostic,
     },
+    compose::{ComposeSuccess, execute_compose},
     message::{
         ACCOUNT_COMMAND_CAPACITY, AccountCommand, AccountDirectoryLoadError, AccountDirectoryQuery,
-        AccountDirectoryRequestKey, COMMAND_CAPACITY, Command, CoreHandle, EVENT_CAPACITY, Event,
-        EventReceiver, EventSender, MailboxLoadError, MailboxQuery, MailboxRequestKey,
-        MessageLoadError, MessageQuery, MessageRequestKey, MutationRequest, MutationSubmitError,
-        event_channel,
+        AccountDirectoryRequestKey, COMMAND_CAPACITY, COMPOSE_COMMAND_CAPACITY, Command,
+        ComposeCommand, CoreHandle, EVENT_CAPACITY, Event, EventReceiver, EventSender,
+        MailboxLoadError, MailboxQuery, MailboxRequestKey, MessageLoadError, MessageQuery,
+        MessageRequestKey, MutationRequest, MutationSubmitError, event_channel,
     },
+    outbox_driver::{OutboxStatus, SmtpSubmitProbe, production_smtp_submit, run_outbox_driver},
     sync::{ImapInboxFetchProbe, production_imap_inbox_fetch},
 };
 use crate::{
+    content::{ContentStaging, StorageError},
     credentials::{self, CredentialClient, CredentialRuntime},
     store::sqlite::{
         self, DatabaseClient, DatabaseInfo, DatabaseReplies, DatabaseRuntime, DatabaseSubmitError,
@@ -32,6 +35,8 @@ use std::{
 use tokio::{runtime::Builder, sync::mpsc, sync::oneshot, time};
 
 const COMMAND_BURST_LIMIT: u8 = 8;
+const OUTBOX_STATUS_CAPACITY: usize = 16;
+const OUTBOX_WAKE_CAPACITY: usize = 1;
 const SHUTDOWN_QUERY_INTERRUPT_INTERVAL: Duration = Duration::from_millis(10);
 
 type DatabaseParts = (
@@ -55,6 +60,7 @@ pub(crate) fn spawn(
         credentials::spawn(),
         production_imap_diagnostic,
         production_imap_inbox_fetch,
+        production_smtp_submit,
         Some(content_root),
     )
 }
@@ -72,6 +78,7 @@ pub(crate) fn spawn_with_database(
         credentials::spawn(),
         production_imap_diagnostic,
         production_imap_inbox_fetch,
+        production_smtp_submit,
         Some(content_root),
     )?;
     Ok((core, events, runtime, benchmark_database))
@@ -118,6 +125,7 @@ fn spawn_with_components_and_probe(
         credentials,
         diagnostic_probe,
         production_imap_inbox_fetch,
+        production_smtp_submit,
         None,
     )
 }
@@ -128,12 +136,23 @@ fn spawn_with_sync_components(
     credentials: CredentialParts,
     diagnostic_probe: ImapDiagnosticProbe,
     inbox_fetch_probe: ImapInboxFetchProbe,
+    smtp_submit_probe: SmtpSubmitProbe,
     content_root: Option<PathBuf>,
 ) -> Result<(CoreHandle, EventReceiver, CoreRuntime), StartError> {
+    let staging = content_root
+        .as_ref()
+        .map(|root| ContentStaging::open(root.clone()).map(Arc::new))
+        .transpose()
+        .map_err(StartError::Content)?;
     let (database, database_replies, database_runtime, _database_info) = database;
     let (credentials, credential_runtime) = credentials;
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CAPACITY);
     let (account_command_tx, account_command_rx) = mpsc::channel(ACCOUNT_COMMAND_CAPACITY);
+    let (compose_command_tx, compose_command_rx) = mpsc::channel(COMPOSE_COMMAND_CAPACITY);
+    let (outbox_wakeup_tx, outbox_wakeup_rx) = mpsc::channel(OUTBOX_WAKE_CAPACITY);
+    let (outbox_status_tx, outbox_status_rx) = mpsc::channel(OUTBOX_STATUS_CAPACITY);
+    let compose_command_rx = staging.as_ref().map(|_| compose_command_rx);
+    let outbox_status_rx = staging.as_ref().map(|_| outbox_status_rx);
     let (event_tx, event_rx) = event_channel(event_capacity);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let runtime = Builder::new_current_thread()
@@ -145,6 +164,7 @@ fn spawn_with_sync_components(
     let worker = thread::Builder::new()
         .name("nivalis-core".into())
         .spawn(move || {
+            let outbox_credentials = credentials.clone();
             let account_workflows = AccountWorkflows::with_sync(
                 database.clone(),
                 credentials,
@@ -152,6 +172,16 @@ fn spawn_with_sync_components(
                 inbox_fetch_probe,
                 content_root,
             );
+            let outbox_task = staging.as_ref().map(|staging| {
+                runtime.spawn(run_outbox_driver(
+                    database.clone(),
+                    outbox_credentials,
+                    Arc::clone(staging),
+                    outbox_wakeup_rx,
+                    outbox_status_tx,
+                    smtp_submit_probe,
+                ))
+            });
             let core_result = runtime.block_on(run_core(
                 command_rx,
                 event_tx,
@@ -160,7 +190,15 @@ fn spawn_with_sync_components(
                 database_replies,
                 account_command_rx,
                 account_workflows,
+                compose_command_rx,
+                staging,
+                outbox_wakeup_tx,
+                outbox_status_rx,
             ));
+            if let Some(outbox_task) = outbox_task {
+                outbox_task.abort();
+                let _ = runtime.block_on(outbox_task);
+            }
             let credential_result =
                 credential_runtime
                     .shutdown()
@@ -181,7 +219,7 @@ fn spawn_with_sync_components(
         .map_err(StartError::Runtime)?;
 
     Ok((
-        CoreHandle::new(command_tx, account_command_tx),
+        CoreHandle::new(command_tx, account_command_tx, compose_command_tx),
         event_rx,
         CoreRuntime {
             shutdown: Some(shutdown_tx),
@@ -190,6 +228,7 @@ fn spawn_with_sync_components(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_core(
     mut commands: mpsc::Receiver<Command>,
     events: EventSender,
@@ -198,6 +237,10 @@ async fn run_core(
     mut database_replies: DatabaseReplies,
     account_commands: mpsc::Receiver<AccountCommand>,
     mut account_workflows: AccountWorkflows,
+    compose_commands: Option<mpsc::Receiver<ComposeCommand>>,
+    staging: Option<Arc<ContentStaging>>,
+    outbox_wakeups: mpsc::Sender<()>,
+    outbox_statuses: Option<mpsc::Receiver<OutboxStatus>>,
 ) -> Result<(), RuntimeError> {
     let mut shutdown = Box::pin(shutdown);
     let mut accounts = AccountDirectorySchedule::default();
@@ -206,6 +249,8 @@ async fn run_core(
     let mut active_mutations = 0_usize;
     let mut command_streak = 0_u8;
     let mut account_commands = Some(account_commands);
+    let mut compose_commands = compose_commands;
+    let mut outbox_statuses = outbox_statuses;
 
     loop {
         let input = next_input(
@@ -214,6 +259,8 @@ async fn run_core(
             &mut database_replies,
             &mut account_commands,
             &mut account_workflows,
+            &mut compose_commands,
+            &mut outbox_statuses,
             command_streak < COMMAND_BURST_LIMIT,
         )
         .await;
@@ -225,16 +272,22 @@ async fn run_core(
 
         match input {
             CoreInput::Shutdown | CoreInput::CommandsClosed => {
-                return finish_accepted_mutations(
+                return finish_accepted_work(
                     &mut commands,
+                    &mut compose_commands,
+                    staging.as_deref(),
+                    &outbox_wakeups,
                     &database,
                     &mut database_replies,
                     active_mutations,
+                    None,
                 )
                 .await;
             }
             CoreInput::DatabaseClosed => return Err(RuntimeError::DatabaseClosed),
             CoreInput::AccountCommandsClosed => account_commands = None,
+            CoreInput::ComposeCommandsClosed => compose_commands = None,
+            CoreInput::OutboxStatusesClosed => outbox_statuses = None,
             CoreInput::AccountProgress => {}
             CoreInput::AccountFailure(error) => return Err(error.into()),
             CoreInput::AccountCommand(command) => {
@@ -242,16 +295,58 @@ async fn run_core(
                     .start_user_operation(command.operation, command.reply)
                     .map_err(RuntimeError::from)?;
             }
+            CoreInput::ComposeCommand(command) => {
+                let Some(staging) = staging.as_ref() else {
+                    drop(command.reply);
+                    continue;
+                };
+                let reply = execute_compose(
+                    &database,
+                    staging.as_ref(),
+                    &outbox_wakeups,
+                    command.operation,
+                )
+                .await;
+                let collect_files = matches!(
+                    &reply,
+                    Ok(ComposeSuccess::Saved(_)
+                        | ComposeSuccess::Queued { .. }
+                        | ComposeSuccess::Recovering)
+                );
+                let _ = command.reply.send(reply);
+                if collect_files {
+                    run_compose_file_gc(&database, staging).await;
+                }
+            }
+            CoreInput::OutboxStatus(status) => {
+                if !send_event(&events, &mut shutdown, Event::OutboxStatus(status)).await {
+                    return finish_accepted_work(
+                        &mut commands,
+                        &mut compose_commands,
+                        staging.as_deref(),
+                        &outbox_wakeups,
+                        &database,
+                        &mut database_replies,
+                        active_mutations,
+                        None,
+                    )
+                    .await;
+                }
+            }
             CoreInput::Command(Command::QueryAccountDirectory(query)) => {
                 if let Some(query) = accounts.enqueue(query)
                     && let Some(event) = submit_account_directory(&database, &mut accounts, query)
                     && !send_event(&events, &mut shutdown, event).await
                 {
-                    return finish_accepted_mutations(
+                    return finish_accepted_work(
                         &mut commands,
+                        &mut compose_commands,
+                        staging.as_deref(),
+                        &outbox_wakeups,
                         &database,
                         &mut database_replies,
                         active_mutations,
+                        None,
                     )
                     .await;
                 }
@@ -268,11 +363,15 @@ async fn run_core(
                     && let Some(event) = submit_mailbox(&database, &mut mailbox, query)
                     && !send_event(&events, &mut shutdown, event).await
                 {
-                    return finish_accepted_mutations(
+                    return finish_accepted_work(
                         &mut commands,
+                        &mut compose_commands,
+                        staging.as_deref(),
+                        &outbox_wakeups,
                         &database,
                         &mut database_replies,
                         active_mutations,
+                        None,
                     )
                     .await;
                 }
@@ -282,11 +381,15 @@ async fn run_core(
                     && let Some(event) = submit_message(&database, &mut message, query)
                     && !send_event(&events, &mut shutdown, event).await
                 {
-                    return finish_accepted_mutations(
+                    return finish_accepted_work(
                         &mut commands,
+                        &mut compose_commands,
+                        staging.as_deref(),
+                        &outbox_wakeups,
                         &database,
                         &mut database_replies,
                         active_mutations,
+                        None,
                     )
                     .await;
                 }
@@ -300,8 +403,11 @@ async fn run_core(
                     }
                     MutationSubmission::Rejected { event, request } => {
                         if !send_event(&events, &mut shutdown, event).await {
-                            return finish_accepted_mutations_with(
+                            return finish_accepted_work(
                                 &mut commands,
+                                &mut compose_commands,
+                                staging.as_deref(),
+                                &outbox_wakeups,
                                 &database,
                                 &mut database_replies,
                                 active_mutations,
@@ -325,11 +431,15 @@ async fn run_core(
                     AccountDirectoryCompletion::Ignore => {}
                     AccountDirectoryCompletion::Publish => {
                         if !send_event(&events, &mut shutdown, Event::AccountsLoaded(reply)).await {
-                            return finish_accepted_mutations(
+                            return finish_accepted_work(
                                 &mut commands,
+                                &mut compose_commands,
+                                staging.as_deref(),
+                                &outbox_wakeups,
                                 &database,
                                 &mut database_replies,
                                 active_mutations,
+                                None,
                             )
                             .await;
                         }
@@ -339,11 +449,15 @@ async fn run_core(
                             submit_account_directory(&database, &mut accounts, query)
                             && !send_event(&events, &mut shutdown, event).await
                         {
-                            return finish_accepted_mutations(
+                            return finish_accepted_work(
                                 &mut commands,
+                                &mut compose_commands,
+                                staging.as_deref(),
+                                &outbox_wakeups,
                                 &database,
                                 &mut database_replies,
                                 active_mutations,
+                                None,
                             )
                             .await;
                         }
@@ -359,11 +473,15 @@ async fn run_core(
                     MailboxCompletion::Ignore => {}
                     MailboxCompletion::Publish => {
                         if !send_event(&events, &mut shutdown, Event::MailboxLoaded(reply)).await {
-                            return finish_accepted_mutations(
+                            return finish_accepted_work(
                                 &mut commands,
+                                &mut compose_commands,
+                                staging.as_deref(),
+                                &outbox_wakeups,
                                 &database,
                                 &mut database_replies,
                                 active_mutations,
+                                None,
                             )
                             .await;
                         }
@@ -372,11 +490,15 @@ async fn run_core(
                         if let Some(event) = submit_mailbox(&database, &mut mailbox, query)
                             && !send_event(&events, &mut shutdown, event).await
                         {
-                            return finish_accepted_mutations(
+                            return finish_accepted_work(
                                 &mut commands,
+                                &mut compose_commands,
+                                staging.as_deref(),
+                                &outbox_wakeups,
                                 &database,
                                 &mut database_replies,
                                 active_mutations,
+                                None,
                             )
                             .await;
                         }
@@ -395,11 +517,15 @@ async fn run_core(
                     && let Some(event) = submit_mailbox(&database, &mut mailbox, query)
                     && !send_event(&events, &mut shutdown, event).await
                 {
-                    return finish_accepted_mutations(
+                    return finish_accepted_work(
                         &mut commands,
+                        &mut compose_commands,
+                        staging.as_deref(),
+                        &outbox_wakeups,
                         &database,
                         &mut database_replies,
                         active_mutations,
+                        None,
                     )
                     .await;
                 }
@@ -413,11 +539,15 @@ async fn run_core(
                     MessageCompletion::Ignore => {}
                     MessageCompletion::Publish => {
                         if !send_event(&events, &mut shutdown, Event::MessageLoaded(reply)).await {
-                            return finish_accepted_mutations(
+                            return finish_accepted_work(
                                 &mut commands,
+                                &mut compose_commands,
+                                staging.as_deref(),
+                                &outbox_wakeups,
                                 &database,
                                 &mut database_replies,
                                 active_mutations,
+                                None,
                             )
                             .await;
                         }
@@ -426,11 +556,15 @@ async fn run_core(
                         if let Some(event) = submit_message(&database, &mut message, query)
                             && !send_event(&events, &mut shutdown, event).await
                         {
-                            return finish_accepted_mutations(
+                            return finish_accepted_work(
                                 &mut commands,
+                                &mut compose_commands,
+                                staging.as_deref(),
+                                &outbox_wakeups,
                                 &database,
                                 &mut database_replies,
                                 active_mutations,
+                                None,
                             )
                             .await;
                         }
@@ -447,11 +581,15 @@ async fn run_core(
                     .err()
                     .map(|failure| Arc::from(failure.to_string()));
                 if !send_event(&events, &mut shutdown, Event::MutationFinished(reply)).await {
-                    let finish = finish_accepted_mutations(
+                    let finish = finish_accepted_work(
                         &mut commands,
+                        &mut compose_commands,
+                        staging.as_deref(),
+                        &outbox_wakeups,
                         &database,
                         &mut database_replies,
                         active_mutations,
+                        None,
                     )
                     .await;
                     return match (finish, undelivered_failure) {
@@ -497,14 +635,56 @@ fn submit_mutation(database: &DatabaseClient, mut request: MutationRequest) -> M
     }
 }
 
-async fn finish_accepted_mutations(
+#[allow(clippy::too_many_arguments)]
+async fn finish_accepted_work(
     commands: &mut mpsc::Receiver<Command>,
+    compose_commands: &mut Option<mpsc::Receiver<ComposeCommand>>,
+    staging: Option<&ContentStaging>,
+    outbox_wakeups: &mpsc::Sender<()>,
     database: &DatabaseClient,
     database_replies: &mut DatabaseReplies,
     active_mutations: usize,
+    initial_request: Option<MutationRequest>,
 ) -> Result<(), RuntimeError> {
-    finish_accepted_mutations_with(commands, database, database_replies, active_mutations, None)
-        .await
+    let mutation_result = finish_accepted_mutations_with(
+        commands,
+        database,
+        database_replies,
+        active_mutations,
+        initial_request,
+    )
+    .await;
+    finish_accepted_compose(compose_commands, staging, database, outbox_wakeups).await;
+    mutation_result
+}
+
+async fn finish_accepted_compose(
+    compose_commands: &mut Option<mpsc::Receiver<ComposeCommand>>,
+    staging: Option<&ContentStaging>,
+    database: &DatabaseClient,
+    outbox_wakeups: &mpsc::Sender<()>,
+) {
+    let (Some(compose_commands), Some(staging)) = (compose_commands.as_mut(), staging) else {
+        return;
+    };
+    compose_commands.close();
+    while let Ok(command) = compose_commands.try_recv() {
+        let reply = execute_compose(database, staging, outbox_wakeups, command.operation).await;
+        let _ = command.reply.send(reply);
+    }
+}
+
+async fn run_compose_file_gc(database: &DatabaseClient, staging: &Arc<ContentStaging>) {
+    for _ in 0..3 {
+        match database.try_run_file_gc(staging, 16) {
+            Ok(reply) => {
+                let _ = reply.await;
+                return;
+            }
+            Err(DatabaseSubmitError::Busy) => time::sleep(Duration::from_millis(10)).await,
+            Err(DatabaseSubmitError::Closed) => return,
+        }
+    }
 }
 
 async fn finish_accepted_mutations_with(
@@ -582,20 +762,27 @@ enum CoreInput {
     Shutdown,
     CommandsClosed,
     AccountCommandsClosed,
+    ComposeCommandsClosed,
+    OutboxStatusesClosed,
     DatabaseClosed,
     Command(Command),
     AccountCommand(AccountCommand),
+    ComposeCommand(ComposeCommand),
+    OutboxStatus(OutboxStatus),
     AccountProgress,
     AccountFailure(AccountDriverError),
     Database(DbReply),
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn next_input(
     shutdown: &mut Pin<Box<oneshot::Receiver<()>>>,
     commands: &mut mpsc::Receiver<Command>,
     database_replies: &mut DatabaseReplies,
     account_commands: &mut Option<mpsc::Receiver<AccountCommand>>,
     account_workflows: &mut AccountWorkflows,
+    compose_commands: &mut Option<mpsc::Receiver<ComposeCommand>>,
+    outbox_statuses: &mut Option<mpsc::Receiver<OutboxStatus>>,
     commands_first: bool,
 ) -> CoreInput {
     poll_fn(|context| {
@@ -623,6 +810,14 @@ async fn next_input(
             Poll::Pending => {}
         }
 
+        if let Some(outbox_statuses) = outbox_statuses.as_mut() {
+            match outbox_statuses.poll_recv(context) {
+                Poll::Ready(Some(status)) => return Poll::Ready(CoreInput::OutboxStatus(status)),
+                Poll::Ready(None) => return Poll::Ready(CoreInput::OutboxStatusesClosed),
+                Poll::Pending => {}
+            }
+        }
+
         if account_workflows.can_start_user_operation()
             && let Some(account_commands) = account_commands.as_mut()
         {
@@ -631,6 +826,16 @@ async fn next_input(
                     return Poll::Ready(CoreInput::AccountCommand(command));
                 }
                 Poll::Ready(None) => return Poll::Ready(CoreInput::AccountCommandsClosed),
+                Poll::Pending => {}
+            }
+        }
+
+        if let Some(compose_commands) = compose_commands.as_mut() {
+            match compose_commands.poll_recv(context) {
+                Poll::Ready(Some(command)) => {
+                    return Poll::Ready(CoreInput::ComposeCommand(command));
+                }
+                Poll::Ready(None) => return Poll::Ready(CoreInput::ComposeCommandsClosed),
                 Poll::Pending => {}
             }
         }
@@ -961,6 +1166,7 @@ impl From<AccountDriverError> for RuntimeError {
 #[derive(Debug)]
 pub(crate) enum StartError {
     Database(sqlite::StartError),
+    Content(StorageError),
     Runtime(std::io::Error),
 }
 
@@ -968,6 +1174,9 @@ impl fmt::Display for StartError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Database(error) => write!(formatter, "could not start mail database: {error}"),
+            Self::Content(error) => {
+                write!(formatter, "could not open private mail storage: {error}")
+            }
             Self::Runtime(error) => write!(formatter, "could not start core runtime: {error}"),
         }
     }
@@ -977,6 +1186,7 @@ impl std::error::Error for StartError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Database(error) => Some(error),
+            Self::Content(error) => Some(error),
             Self::Runtime(error) => Some(error),
         }
     }
@@ -998,17 +1208,25 @@ mod tests {
     use crate::{
         core::{
             AccountConfigDraft, AccountDirectoryQuery, AccountOperation, AccountOperationSuccess,
-            AccountScope, AccountSetupMode, FolderScope, Generation, MailboxQuery, MessageId,
-            MessageQuery, PageBoundary, PageSpec, RequestId, account::ImapDiagnosticFuture,
+            AccountScope, AccountSetupMode, ComposeDraftInput, ComposeOperation, ComposeSuccess,
+            FolderScope, Generation, MailboxQuery, MessageId, MessageQuery, PageBoundary, PageSpec,
+            RequestId, account::ImapDiagnosticFuture,
         },
         credentials::{
             CredentialDeleteOutcome, CredentialFailure, CredentialFailureKind, CredentialLocator,
             CredentialOperation, CredentialOutcome, Secret,
         },
-        network::imap::{ImapDiagnosticFailure, ImapDiagnosticRequest},
+        network::{
+            imap::{ImapDiagnosticFailure, ImapDiagnosticRequest},
+            smtp::{
+                SmtpDataFence, SmtpSubmissionFailure, SmtpSubmissionFailureKind,
+                SmtpSubmissionReceipt, SmtpSubmissionRequest, SmtpSubmissionStage,
+            },
+        },
         store::sqlite::{
             AccountAuthKind, AccountConfigInput, AccountConfiguration, AccountDiagnostic,
             AccountLifecycle, AccountWrite, AccountWriteOutcome, DatabaseClient, FailureKind,
+            OutboxState, SmtpSecurity,
         },
     };
     use keyring_core::CredentialStore;
@@ -1097,6 +1315,8 @@ mod tests {
 
     static PENDING_DIAGNOSTIC_POLLS: AtomicUsize = AtomicUsize::new(0);
     static PENDING_DIAGNOSTIC_DROPS: AtomicUsize = AtomicUsize::new(0);
+    static FENCED_SMTP_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static COMPLETED_DATA_FENCES: AtomicUsize = AtomicUsize::new(0);
 
     struct PendingDiagnostic;
 
@@ -1117,6 +1337,56 @@ mod tests {
 
     fn pending_diagnostic(_: ImapDiagnosticRequest) -> ImapDiagnosticFuture {
         Box::pin(PendingDiagnostic)
+    }
+
+    fn fenced_successful_smtp(
+        _request: SmtpSubmissionRequest,
+        data_fence: SmtpDataFence,
+    ) -> crate::core::outbox_driver::SmtpSubmitFuture {
+        Box::pin(async move {
+            FENCED_SMTP_CALLS.fetch_add(1, Ordering::AcqRel);
+            data_fence.await.map_err(|_| SmtpSubmissionFailure {
+                stage: SmtpSubmissionStage::DataFence,
+                kind: SmtpSubmissionFailureKind::LocalState,
+            })?;
+            COMPLETED_DATA_FENCES.fetch_add(1, Ordering::AcqRel);
+            Ok(SmtpSubmissionReceipt {
+                response_code: 250,
+                wire_byte_count: 1,
+            })
+        })
+    }
+
+    fn create_outbound_account(
+        database: &DatabaseClient,
+        credential_key: &str,
+    ) -> AccountConfiguration {
+        let input = AccountConfigInput::new_with_smtp(
+            credential_key,
+            "Alice",
+            "alice@example.test",
+            AccountAuthKind::AppPassword,
+            "alice@example.test",
+            "imap.example.test",
+            993,
+            "smtp.example.test",
+            465,
+            SmtpSecurity::ImplicitTls,
+            true,
+            0x335577,
+        )
+        .unwrap();
+        let outcome = wait_for(
+            database
+                .try_write_account(Box::new(AccountWrite::Create(input)))
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let AccountWriteOutcome::Saved(configuration) = outcome else {
+            panic!("account creation must return configuration")
+        };
+        configuration
     }
 
     fn diagnostic_fixture(
@@ -1199,6 +1469,216 @@ mod tests {
             )
             .unwrap();
         sqlite::rebuild_account_stats_for_test(&connection, 1).unwrap();
+    }
+
+    #[test]
+    fn compose_restart_queue_and_fenced_delivery_form_a_vertical_slice() {
+        const CREDENTIAL_KEY: &str = "89abcdef0123456789abcdef01234567";
+
+        FENCED_SMTP_CALLS.store(0, Ordering::Release);
+        COMPLETED_DATA_FENCES.store(0, Ordering::Release);
+        let path = temporary_database_path();
+        let content_root = path.with_extension("content");
+        remove_database_files(&path);
+        let _ = fs::remove_dir_all(&content_root);
+
+        let store: Arc<CredentialStore> =
+            keyring_core::mock::Store::new().expect("create shared credential store");
+        let first_store = Arc::clone(&store);
+        let credential_parts =
+            credentials::spawn_with_test_factory(move || Ok(Arc::clone(&first_store)));
+        let credential_client = credential_parts.0.clone();
+        let database = sqlite::spawn(path.clone()).unwrap();
+        let account = create_outbound_account(&database.0, CREDENTIAL_KEY);
+        let stored = wait_for(
+            credential_client
+                .try_submit(CredentialOperation::Store {
+                    locator: CredentialLocator::parse(CREDENTIAL_KEY).unwrap(),
+                    secret: Secret::new(b"outbound-secret".to_vec()).unwrap(),
+                })
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(stored, CredentialOutcome::Stored));
+
+        let (core, _events, runtime) = spawn_with_sync_components(
+            EVENT_CAPACITY,
+            database,
+            credential_parts,
+            successful_diagnostic,
+            production_imap_inbox_fetch,
+            fenced_successful_smtp,
+            Some(content_root.clone()),
+        )
+        .unwrap();
+        let saved = wait_for(
+            core.try_compose_operation(ComposeOperation::SaveAndClose(
+                ComposeDraftInput::new(
+                    account.account_id,
+                    account.generation,
+                    None,
+                    "bob@example.test",
+                    "Restart-safe subject",
+                    "Body persisted before restart.",
+                )
+                .unwrap(),
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let ComposeSuccess::Saved(saved_identity) = saved else {
+            panic!("compose save must persist a draft")
+        };
+        runtime.shutdown().unwrap();
+        drop(core);
+
+        let restarted_store = Arc::clone(&store);
+        let credential_parts =
+            credentials::spawn_with_test_factory(move || Ok(Arc::clone(&restarted_store)));
+        let database = sqlite::spawn(path.clone()).unwrap();
+        let (core, mut events, runtime) = spawn_with_sync_components(
+            EVENT_CAPACITY,
+            database,
+            credential_parts,
+            successful_diagnostic,
+            production_imap_inbox_fetch,
+            fenced_successful_smtp,
+            Some(content_root.clone()),
+        )
+        .unwrap();
+        let loaded = wait_for(
+            core.try_compose_operation(ComposeOperation::LoadLatest {
+                account_id: account.account_id,
+                expected_generation: account.generation,
+            })
+            .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let ComposeSuccess::Loaded(Some(loaded)) = loaded else {
+            panic!("restart must load the saved draft")
+        };
+        assert_eq!(loaded.identity, saved_identity);
+        assert_eq!(loaded.to.as_ref(), "bob@example.test");
+        assert_eq!(loaded.subject.as_ref(), "Restart-safe subject");
+        assert_eq!(loaded.body.as_ref(), "Body persisted before restart.");
+
+        let queued = wait_for(
+            core.try_compose_operation(ComposeOperation::Queue(
+                ComposeDraftInput::new(
+                    account.account_id,
+                    account.generation,
+                    Some(loaded.identity),
+                    &loaded.to,
+                    &loaded.subject,
+                    &loaded.body,
+                )
+                .unwrap(),
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let ComposeSuccess::Queued { draft, .. } = queued else {
+            panic!("compose queue must commit a ready outbox item")
+        };
+
+        wait_for(async {
+            loop {
+                match events.recv().await {
+                    Some(Event::OutboxStatus(OutboxStatus::StateChanged {
+                        message_id,
+                        state: OutboxState::Delivered,
+                        ..
+                    })) if message_id == draft.message_id => break,
+                    Some(Event::OutboxStatus(OutboxStatus::Fault { kind, .. })) => {
+                        panic!("outbox driver faulted before delivery: {kind:?}")
+                    }
+                    Some(_) => {}
+                    None => panic!("core event channel closed before delivery"),
+                }
+            }
+        });
+        assert_eq!(FENCED_SMTP_CALLS.load(Ordering::Acquire), 1);
+        assert_eq!(COMPLETED_DATA_FENCES.load(Ordering::Acquire), 1);
+
+        runtime.shutdown().unwrap();
+        drop(core);
+        let connection = Connection::open(&path).unwrap();
+        let pending_gc = connection
+            .query_row("SELECT count(*) FROM file_gc", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(pending_gc, 0);
+        drop(connection);
+        let body_files = fs::read_dir(content_root.join("body"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .count();
+        assert_eq!(body_files, 1);
+        remove_database_files(&path);
+        fs::remove_dir_all(content_root).unwrap();
+    }
+
+    #[test]
+    fn shutdown_finishes_a_compose_save_already_accepted_by_core() {
+        const CREDENTIAL_KEY: &str = "fedcba9876543210fedcba9876543210";
+
+        let path = temporary_database_path();
+        let content_root = path.with_extension("shutdown-content");
+        remove_database_files(&path);
+        let _ = fs::remove_dir_all(&content_root);
+        let database = sqlite::spawn(path.clone()).unwrap();
+        let account = create_outbound_account(&database.0, CREDENTIAL_KEY);
+        let (core, _events, runtime) = spawn_with_sync_components(
+            EVENT_CAPACITY,
+            database,
+            credentials::spawn(),
+            successful_diagnostic,
+            production_imap_inbox_fetch,
+            fenced_successful_smtp,
+            Some(content_root.clone()),
+        )
+        .unwrap();
+        let response = core
+            .try_compose_operation(ComposeOperation::SaveAndClose(
+                ComposeDraftInput::new(
+                    account.account_id,
+                    account.generation,
+                    None,
+                    "bob@example.test",
+                    "Shutdown-safe subject",
+                    "Accepted body must reach durable storage.",
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+
+        runtime.shutdown().unwrap();
+        let saved = wait_for(response).unwrap().unwrap();
+        assert!(matches!(saved, ComposeSuccess::Saved(_)));
+        drop(core);
+
+        let connection = Connection::open(&path).unwrap();
+        let (subject, body_key) = connection
+            .query_row(
+                "SELECT message.subject, content.body_file_key
+                   FROM local_drafts AS draft
+                   JOIN messages AS message ON message.id = draft.message_id
+                   JOIN message_content AS content ON content.message_id = message.id",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(subject, "Shutdown-safe subject");
+        assert!(content_root.join(body_key).is_file());
+        drop(connection);
+        remove_database_files(&path);
+        fs::remove_dir_all(content_root).unwrap();
     }
 
     #[test]
@@ -2064,6 +2544,8 @@ mod tests {
         let mut shutdown = Box::pin(shutdown_rx);
         let (_account_tx, account_rx) = mpsc::channel(1);
         let mut account_commands = Some(account_rx);
+        let mut compose_commands = None;
+        let mut outbox_statuses = None;
         let (credential_client, credential_runtime) = credentials::spawn();
         let mut account_workflows = AccountWorkflows::new(
             database.clone(),
@@ -2079,6 +2561,8 @@ mod tests {
                 &mut database_replies,
                 &mut account_commands,
                 &mut account_workflows,
+                &mut compose_commands,
+                &mut outbox_statuses,
                 false,
             ));
 

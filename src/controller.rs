@@ -7,9 +7,11 @@ use self::session::{
 use crate::core::{
     AccountConfigDraft, AccountDirectoryLoadError, AccountOperation, AccountOperationFailure,
     AccountOperationResponseError, AccountOperationSubmitError, AccountOperationSuccess,
-    AccountSetupMode, AccountWorkflowFailureKind, CoreHandle, Event, EventReceiver,
-    InboxSyncFailureKind, MailboxLoadError, MessageLoadError, MutationSubmitError, RequestId,
-    SubmitError,
+    AccountSetupMode, AccountWorkflowFailureKind, ComposeDraftIdentity, ComposeDraftInput,
+    ComposeFailure, ComposeFailureKind, ComposeOperation, ComposeOperationResponseError,
+    ComposeOperationSubmitError, ComposeSuccess, CoreHandle, Event, EventReceiver,
+    InboxSyncFailureKind, MailboxLoadError, MessageLoadError, MutationSubmitError,
+    OutboxDriverFault, OutboxStatus, RequestId, SubmitError,
 };
 use crate::credentials::Secret;
 use crate::presentation::sqlite::{
@@ -19,7 +21,7 @@ use crate::presentation::sqlite::{
 use crate::presentation::{show_snackbar, show_snackbar_for};
 use crate::store::sqlite::{
     AccountDiagnosticKind, AccountDirectory, AccountValidationError, DbFailure, FailureKind,
-    MailboxPage, MessageDetail, Tagged,
+    MailboxPage, MessageDetail, OutboxState, Tagged,
 };
 use crate::ui_identity::{AccountKey, EntityKey};
 use crate::{AccountItem, AppWindow, MailDetail, MailSummary};
@@ -60,6 +62,9 @@ struct Controller {
     mail_model: Rc<VecModel<MailSummary>>,
     account_model: Rc<VecModel<AccountItem>>,
     account_task: RefCell<Option<slint::JoinHandle<()>>>,
+    compose_task: RefCell<Option<slint::JoinHandle<()>>>,
+    compose_identity: Cell<Option<ComposeDraftIdentity>>,
+    compose_target: Cell<Option<AccountOperationTarget>>,
     account_request_id: Cell<u64>,
     account_cancelable: Cell<bool>,
     pending_account_selection: Cell<Option<i64>>,
@@ -98,6 +103,10 @@ impl Controller {
         ui.set_sync_loading(false);
         ui.set_account_operation_stage(SharedString::default());
         ui.set_account_operation_error(SharedString::default());
+        ui.set_compose_enabled(false);
+        ui.set_composer_loading(false);
+        ui.set_composer_status(SharedString::default());
+        ui.set_composer_error(SharedString::default());
         ui.set_selected_id(SharedString::default());
         ui.set_selected_mail(MailDetail::default());
 
@@ -110,6 +119,9 @@ impl Controller {
             mail_model,
             account_model,
             account_task: RefCell::new(None),
+            compose_task: RefCell::new(None),
+            compose_identity: Cell::new(None),
+            compose_target: Cell::new(None),
             account_request_id: Cell::new(1),
             account_cancelable: Cell::new(false),
             pending_account_selection: Cell::new(None),
@@ -193,6 +205,19 @@ impl Controller {
 
         let controller = self.clone();
         ui.on_undo_delete(move || controller.undo_delete());
+
+        let controller = self.clone();
+        ui.on_open_composer(move || controller.open_composer());
+
+        let controller = self.clone();
+        ui.on_save_draft(move |to, subject, body| {
+            controller.save_compose_draft(to, subject, body);
+        });
+
+        let controller = self.clone();
+        ui.on_send_message(move |to, subject, body| {
+            controller.queue_composed_message(to, subject, body);
+        });
     }
 
     fn start(&self) {
@@ -292,6 +317,7 @@ impl Controller {
                 generation,
                 reason,
             } => self.handle_mutation_rejection(request_id, generation, reason),
+            Event::OutboxStatus(status) => self.handle_outbox_status(status),
         }
     }
 
@@ -992,6 +1018,337 @@ impl Controller {
         }
     }
 
+    fn open_composer(self: &Rc<Self>) {
+        let Some(target) = self.active_compose_target() else {
+            self.close_composer();
+            self.notify_error(UserError::compose_account());
+            return;
+        };
+        if !self.begin_compose_task("Loading saved draft") {
+            return;
+        }
+        self.compose_target.set(Some(target));
+        self.compose_identity.set(None);
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_compose_to(SharedString::default());
+            ui.set_compose_subject(SharedString::default());
+            ui.set_compose_body(SharedString::default());
+        }
+        let response = match self
+            .core
+            .try_compose_operation(ComposeOperation::LoadLatest {
+                account_id: target.account_id,
+                expected_generation: target.expected_generation,
+            }) {
+            Ok(response) => response,
+            Err(failure) => {
+                self.finish_compose_task_with_error(compose_submit_error(failure.reason()));
+                return;
+            }
+        };
+        let weak = Rc::downgrade(self);
+        let task = slint::spawn_local(async move {
+            let result = response.await;
+            let Some(controller) = weak.upgrade() else {
+                return;
+            };
+            match result {
+                Ok(Ok(ComposeSuccess::Loaded(Some(draft)))) if draft.locked_for_delivery => {
+                    controller.finish_compose_task();
+                    controller.compose_identity.set(None);
+                    if let Some(ui) = controller.ui.upgrade() {
+                        ui.set_composer_status("Previous message is already queued".into());
+                        show_snackbar(
+                            &ui,
+                            "The previous message is already queued; this is a new draft",
+                            false,
+                            &controller.snackbar_timer,
+                        );
+                    }
+                }
+                Ok(Ok(ComposeSuccess::Loaded(Some(draft)))) => {
+                    controller.finish_compose_task();
+                    controller.compose_identity.set(Some(draft.identity));
+                    if let Some(ui) = controller.ui.upgrade() {
+                        ui.set_compose_to(draft.to.as_ref().into());
+                        ui.set_compose_subject(draft.subject.as_ref().into());
+                        ui.set_compose_body(draft.body.as_ref().into());
+                        ui.set_composer_status("Saved draft loaded".into());
+                    }
+                }
+                Ok(Ok(ComposeSuccess::Loaded(None))) => {
+                    controller.finish_compose_task();
+                    if let Some(ui) = controller.ui.upgrade() {
+                        ui.set_composer_status("New draft".into());
+                    }
+                }
+                Ok(Err(failure)) => controller.finish_compose_failure(failure),
+                Ok(Ok(_)) => controller.finish_compose_task_with_error(UserError::compose_result()),
+                Err(error) => {
+                    controller.finish_compose_task_with_error(compose_response_error(error))
+                }
+            }
+        });
+        self.store_compose_task(task);
+    }
+
+    fn save_compose_draft(
+        self: &Rc<Self>,
+        to: SharedString,
+        subject: SharedString,
+        body: SharedString,
+    ) {
+        let Some(target) = self.compose_target.get() else {
+            self.finish_compose_task_with_error(UserError::compose_account());
+            return;
+        };
+        let input = match ComposeDraftInput::new(
+            target.account_id,
+            target.expected_generation,
+            self.compose_identity.get(),
+            to.as_str(),
+            subject.as_str(),
+            body.as_str(),
+        ) {
+            Ok(input) => input,
+            Err(failure) => {
+                self.finish_compose_failure(failure);
+                return;
+            }
+        };
+        if !self.begin_compose_task("Saving draft") {
+            return;
+        }
+        let response = match self
+            .core
+            .try_compose_operation(ComposeOperation::SaveAndClose(input))
+        {
+            Ok(response) => response,
+            Err(failure) => {
+                self.finish_compose_task_with_error(compose_submit_error(failure.reason()));
+                return;
+            }
+        };
+        let weak = Rc::downgrade(self);
+        let task = slint::spawn_local(async move {
+            let result = response.await;
+            let Some(controller) = weak.upgrade() else {
+                return;
+            };
+            match result {
+                Ok(Ok(ComposeSuccess::Saved(_))) => {
+                    controller.finish_compose_success("Draft saved");
+                }
+                Ok(Ok(ComposeSuccess::Discarded)) => {
+                    controller.finish_compose_success("Empty draft discarded");
+                }
+                Ok(Err(failure)) => controller.finish_compose_failure(failure),
+                Ok(Ok(_)) => controller.finish_compose_task_with_error(UserError::compose_result()),
+                Err(error) => {
+                    controller.finish_compose_task_with_error(compose_response_error(error))
+                }
+            }
+        });
+        self.store_compose_task(task);
+    }
+
+    fn queue_composed_message(
+        self: &Rc<Self>,
+        to: SharedString,
+        subject: SharedString,
+        body: SharedString,
+    ) {
+        let Some(target) = self.compose_target.get() else {
+            self.finish_compose_task_with_error(UserError::compose_account());
+            return;
+        };
+        let input = match ComposeDraftInput::new(
+            target.account_id,
+            target.expected_generation,
+            self.compose_identity.get(),
+            to.as_str(),
+            subject.as_str(),
+            body.as_str(),
+        ) {
+            Ok(input) => input,
+            Err(failure) => {
+                self.finish_compose_failure(failure);
+                return;
+            }
+        };
+        if !self.begin_compose_task("Queueing message") {
+            return;
+        }
+        let response = match self
+            .core
+            .try_compose_operation(ComposeOperation::Queue(input))
+        {
+            Ok(response) => response,
+            Err(failure) => {
+                self.finish_compose_task_with_error(compose_submit_error(failure.reason()));
+                return;
+            }
+        };
+        let weak = Rc::downgrade(self);
+        let task = slint::spawn_local(async move {
+            let result = response.await;
+            let Some(controller) = weak.upgrade() else {
+                return;
+            };
+            match result {
+                Ok(Ok(ComposeSuccess::Queued { .. })) => {
+                    controller.finish_compose_success("Message queued");
+                    controller.reload_mailbox();
+                }
+                Ok(Ok(ComposeSuccess::Recovering)) => {
+                    controller.finish_compose_success("Message queued for recovery");
+                    controller.reload_mailbox();
+                }
+                Ok(Err(failure)) => controller.finish_compose_failure(failure),
+                Ok(Ok(_)) => controller.finish_compose_task_with_error(UserError::compose_result()),
+                Err(error) => {
+                    controller.finish_compose_task_with_error(compose_response_error(error))
+                }
+            }
+        });
+        self.store_compose_task(task);
+    }
+
+    fn active_compose_target(&self) -> Option<AccountOperationTarget> {
+        let account = self.state.borrow().account();
+        self.catalog.borrow().as_ref()?.operation_target(account)
+    }
+
+    fn begin_compose_task(&self, status: &'static str) -> bool {
+        let mut task = self.compose_task.borrow_mut();
+        if task.as_ref().is_some_and(|task| !task.is_finished()) {
+            drop(task);
+            self.show_compose_error(UserError::compose_busy());
+            return false;
+        }
+        task.take();
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_composer_loading(true);
+            ui.set_composer_status(status.into());
+            ui.set_composer_error(SharedString::default());
+        }
+        true
+    }
+
+    fn store_compose_task(&self, task: Result<slint::JoinHandle<()>, slint::EventLoopError>) {
+        match task {
+            Ok(task) => *self.compose_task.borrow_mut() = Some(task),
+            Err(_) => self.finish_compose_task_with_error(UserError::compose_runtime()),
+        }
+    }
+
+    fn finish_compose_task(&self) {
+        self.compose_task.borrow_mut().take();
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_composer_loading(false);
+        }
+    }
+
+    fn finish_compose_success(&self, feedback: &'static str) {
+        self.finish_compose_task();
+        self.close_composer();
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_status_text(feedback.into());
+            show_snackbar(&ui, feedback, false, &self.snackbar_timer);
+        }
+    }
+
+    fn finish_compose_failure(&self, failure: ComposeFailure) {
+        self.compose_identity.set(failure.draft);
+        self.finish_compose_task_with_error(compose_failure_error(failure.kind));
+    }
+
+    fn finish_compose_task_with_error(&self, error: UserError) {
+        self.finish_compose_task();
+        self.show_compose_error(error);
+    }
+
+    fn show_compose_error(&self, error: UserError) {
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_composer_loading(false);
+            ui.set_composer_status(error.title.into());
+            ui.set_composer_error(error.detail.into());
+            ui.set_status_text(error.title.into());
+        }
+    }
+
+    fn close_composer(&self) {
+        self.compose_identity.set(None);
+        self.compose_target.set(None);
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_composer_open(false);
+            ui.set_composer_loading(false);
+            ui.set_compose_to(SharedString::default());
+            ui.set_compose_subject(SharedString::default());
+            ui.set_compose_body(SharedString::default());
+            ui.set_composer_error(SharedString::default());
+            ui.set_composer_status(SharedString::default());
+        }
+    }
+
+    fn handle_outbox_status(&self, status: OutboxStatus) {
+        let Some(ui) = self.ui.upgrade() else {
+            return;
+        };
+        match status {
+            OutboxStatus::AttemptStarted { .. } => {
+                ui.set_status_text("Sending queued message".into());
+            }
+            OutboxStatus::StateChanged { state, .. } => match state {
+                OutboxState::Reserved | OutboxState::Ready => {}
+                OutboxState::InFlight => ui.set_status_text("Sending queued message".into()),
+                OutboxState::RetryWait => {
+                    ui.set_status_text("Message will retry automatically".into());
+                    show_snackbar(
+                        &ui,
+                        "Message was not sent; Nivalis will retry automatically",
+                        false,
+                        &self.snackbar_timer,
+                    );
+                }
+                OutboxState::Uncertain => {
+                    ui.set_status_text("Message delivery needs review".into());
+                    show_snackbar(
+                        &ui,
+                        "The server response was unclear; Nivalis will not send a duplicate",
+                        false,
+                        &self.snackbar_timer,
+                    );
+                }
+                OutboxState::PermanentFailure => {
+                    ui.set_status_text("Message could not be sent".into());
+                    show_snackbar(
+                        &ui,
+                        "Message could not be sent; check the account settings before retrying",
+                        false,
+                        &self.snackbar_timer,
+                    );
+                }
+                OutboxState::Delivered => {
+                    ui.set_status_text("Message sent".into());
+                    show_snackbar(&ui, "Message sent", false, &self.snackbar_timer);
+                    self.issue_accounts();
+                    self.reload_mailbox();
+                }
+            },
+            OutboxStatus::Fault { kind, .. } => {
+                let error = match kind {
+                    OutboxDriverFault::Database => UserError::compose_database(),
+                    OutboxDriverFault::ContentStorage => UserError::compose_storage(),
+                    OutboxDriverFault::Credential => UserError::compose_credentials(),
+                    OutboxDriverFault::InvalidSubmission => UserError::compose_input(),
+                };
+                ui.set_status_text(error.title.into());
+                show_snackbar(&ui, error.detail, false, &self.snackbar_timer);
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn add_account(
         self: &Rc<Self>,
@@ -1343,6 +1700,9 @@ impl Controller {
         if let Some(task) = self.account_task.borrow_mut().take() {
             task.abort();
         }
+        if let Some(task) = self.compose_task.borrow_mut().take() {
+            task.abort();
+        }
         if let Some(ui) = self.ui.upgrade() {
             ui.set_account_operation_loading(false);
             ui.set_account_operation_stage(SharedString::default());
@@ -1482,16 +1842,26 @@ impl Controller {
 
     fn refresh_active_account(&self) {
         let account_key = self.state.borrow().account();
+        let compose_enabled = self
+            .catalog
+            .borrow()
+            .as_ref()
+            .and_then(|catalog| catalog.operation_target(account_key))
+            .is_some();
         let item = self
             .catalog
             .borrow()
             .as_ref()
             .and_then(|catalog| catalog.active_item(account_key));
         let Some(item) = item else {
+            if let Some(ui) = self.ui.upgrade() {
+                ui.set_compose_enabled(false);
+            }
             self.notify_error(UserError::selection());
             return;
         };
         if let Some(ui) = self.ui.upgrade() {
+            ui.set_compose_enabled(compose_enabled);
             ui.set_active_account_id(item.id);
             ui.set_active_account_name(item.name);
             ui.set_active_account_detail(item.address);
@@ -1586,6 +1956,7 @@ impl Controller {
         self.pending_mailbox.borrow_mut().take();
         if let Some(ui) = self.ui.upgrade() {
             ui.set_has_accounts(false);
+            ui.set_compose_enabled(false);
             ui.set_initial_loading(false);
             ui.set_mail_actions_enabled(false);
         }
@@ -1640,6 +2011,14 @@ impl Controller {
             ui.set_account_operation_error(
                 "The account service stopped. Restart Nivalis and try again.".into(),
             );
+            ui.set_compose_enabled(false);
+            ui.set_composer_loading(false);
+            if ui.get_composer_open() {
+                ui.set_composer_status("Draft service stopped".into());
+                ui.set_composer_error(
+                    "Restart Nivalis to reopen the last durably saved draft.".into(),
+                );
+            }
             ui.get_detail_loading() || !ui.get_selected_id().is_empty()
         });
         let error = submit_error(SubmitError::Closed);
@@ -1877,6 +2256,98 @@ impl UserError {
             detail: "The interface event loop is unavailable. Restart Nivalis and try again.",
         }
     }
+
+    const fn compose_account() -> Self {
+        Self {
+            title: "Choose one account to send from",
+            detail: "Select a configured account instead of All inboxes, then write the message.",
+        }
+    }
+
+    const fn compose_busy() -> Self {
+        Self {
+            title: "A draft action is already running",
+            detail: "Wait for the current save or queue operation to finish, then try again.",
+        }
+    }
+
+    const fn compose_result() -> Self {
+        Self {
+            title: "Draft result could not be verified",
+            detail: "Keep this window open and try again. Nivalis will not report the message as queued without durable confirmation.",
+        }
+    }
+
+    const fn compose_runtime() -> Self {
+        Self {
+            title: "Draft action could not start",
+            detail: "The interface event loop is unavailable. Restart Nivalis and reopen the draft.",
+        }
+    }
+
+    const fn compose_input() -> Self {
+        Self {
+            title: "Check the message fields",
+            detail: "Enter valid comma-separated recipient addresses and remove control characters from the subject.",
+        }
+    }
+
+    const fn compose_storage() -> Self {
+        Self {
+            title: "Draft file could not be stored",
+            detail: "Check available disk space and access to the Nivalis data directory, then try again.",
+        }
+    }
+
+    const fn compose_database() -> Self {
+        Self {
+            title: "Draft database is unavailable",
+            detail: "Keep the message open and try again. Restart Nivalis if the problem continues.",
+        }
+    }
+
+    const fn compose_credentials() -> Self {
+        Self {
+            title: "Mail password is unavailable",
+            detail: "Unlock the system credential store or update the account, then retry the message.",
+        }
+    }
+}
+
+fn compose_failure_error(kind: ComposeFailureKind) -> UserError {
+    match kind {
+        ComposeFailureKind::InvalidInput => UserError::compose_input(),
+        ComposeFailureKind::ResourceLimit => UserError {
+            title: "Message exceeds a safety limit",
+            detail: "Shorten the body, subject, or recipient list, then try again.",
+        },
+        ComposeFailureKind::Conflict => UserError {
+            title: "Draft changed before it was saved",
+            detail: "Close and reopen the composer to load the latest durable draft before editing again.",
+        },
+        ComposeFailureKind::Configuration => UserError {
+            title: "Outgoing mail is not configured",
+            detail: "Remove and add this account with its SMTP server settings before sending. The current draft can still be saved locally.",
+        },
+        ComposeFailureKind::NotFound => UserError {
+            title: "Draft is no longer available",
+            detail: "Close and reopen the composer to start from the current mailbox state.",
+        },
+        ComposeFailureKind::Storage => UserError::compose_storage(),
+        ComposeFailureKind::Database => UserError::compose_database(),
+        ComposeFailureKind::Unavailable => UserError::compose_result(),
+    }
+}
+
+fn compose_submit_error(error: ComposeOperationSubmitError) -> UserError {
+    match error {
+        ComposeOperationSubmitError::Busy => UserError::compose_busy(),
+        ComposeOperationSubmitError::Closed => UserError::compose_result(),
+    }
+}
+
+fn compose_response_error(_error: ComposeOperationResponseError) -> UserError {
+    UserError::compose_result()
 }
 
 fn parse_mail_port(value: &str) -> Option<u16> {
@@ -2386,6 +2857,34 @@ mod tests {
     }
 
     #[test]
+    fn compose_failures_are_actionable_and_do_not_disclose_internal_messages() {
+        for kind in [
+            ComposeFailureKind::InvalidInput,
+            ComposeFailureKind::ResourceLimit,
+            ComposeFailureKind::Conflict,
+            ComposeFailureKind::Configuration,
+            ComposeFailureKind::NotFound,
+            ComposeFailureKind::Storage,
+            ComposeFailureKind::Database,
+            ComposeFailureKind::Unavailable,
+        ] {
+            let error = compose_failure_error(kind);
+            assert!(!error.title.is_empty());
+            assert!(!error.detail.is_empty());
+            assert!(!error.detail.contains("secret database message"));
+        }
+
+        let failure = ComposeFailure {
+            kind: ComposeFailureKind::Database,
+            message: "secret database message".into(),
+            draft: None,
+        };
+        let error = compose_failure_error(failure.kind);
+        assert!(!error.title.contains(failure.message.as_ref()));
+        assert!(!error.detail.contains(failure.message.as_ref()));
+    }
+
+    #[test]
     fn visible_summary_drives_desired_absolute_state() {
         let model = VecModel::from(vec![summary(1, false, false), summary(2, true, true)]);
 
@@ -2600,6 +3099,7 @@ mod tests {
 
         assert!(harness.ui.get_has_accounts());
         assert!(harness.ui.get_mail_actions_enabled());
+        assert!(!harness.ui.get_compose_enabled());
         assert_eq!(harness.ui.get_accounts().row_count(), 65);
 
         harness.ui.invoke_manage_account("1".into());
@@ -2659,11 +3159,13 @@ mod tests {
         harness.ui.invoke_switch_account("1".into());
         harness.drive_until("single-account mailbox", |ui| mailbox_ready(ui, 1, 1));
         assert_eq!(harness.ui.get_active_account_id().as_str(), "1");
+        assert!(harness.ui.get_compose_enabled());
         assert!(model_contains(&harness.ui, "1"));
 
         harness.ui.invoke_switch_account("".into());
         harness.drive_until("all-account mailbox", |ui| mailbox_ready(ui, 50, 1));
         assert!(harness.ui.get_active_account_id().is_empty());
+        assert!(!harness.ui.get_compose_enabled());
 
         harness.ui.set_search_query("message 49".into());
         harness.ui.invoke_query_mail("message 49".into());
