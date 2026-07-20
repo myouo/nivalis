@@ -104,6 +104,11 @@ impl SmtpSubmissionRequest {
             wire_byte_count,
         })
     }
+
+    #[cfg(test)]
+    pub(crate) fn secret_for_test(&self) -> &[u8] {
+        self.secret.expose()
+    }
 }
 
 impl fmt::Debug for SmtpSubmissionRequest {
@@ -780,7 +785,9 @@ fn map_lettre_error(
     if error.is_permanent() {
         return failure(
             stage,
-            if stage == SmtpSubmissionStage::Authenticate {
+            if stage == SmtpSubmissionStage::Authenticate
+                && error.status().is_some_and(|code| u16::from(code) == 535)
+            {
                 SmtpSubmissionFailureKind::Authentication
             } else {
                 SmtpSubmissionFailureKind::Permanent
@@ -880,6 +887,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum MailBehavior {
         Success,
+        Authentication534,
         Authentication535,
         Data451,
         Data550,
@@ -1051,8 +1059,16 @@ mod tests {
 
         let auth = read_command(stream).await?;
         assert!(auth.starts_with("AUTH PLAIN "));
-        if matches!(behavior, MailBehavior::Authentication535) {
-            write_reply(stream, b"535 5.7.8 credentials rejected\r\n").await?;
+        if matches!(
+            behavior,
+            MailBehavior::Authentication534 | MailBehavior::Authentication535
+        ) {
+            let reply = if matches!(behavior, MailBehavior::Authentication535) {
+                b"535 5.7.8 credentials rejected\r\n".as_slice()
+            } else {
+                b"534 5.7.9 authentication mechanism rejected\r\n".as_slice()
+            };
+            write_reply(stream, reply).await?;
             return Ok(());
         }
         write_reply(stream, b"235 2.7.0 authenticated\r\n").await?;
@@ -1078,7 +1094,7 @@ mod tests {
                 return Ok(());
             }
             MailBehavior::Success | MailBehavior::Body451 | MailBehavior::ExpectNoBody => {}
-            MailBehavior::Authentication535 => unreachable!(),
+            MailBehavior::Authentication534 | MailBehavior::Authentication535 => unreachable!(),
         }
 
         write_reply(stream, b"354 continue\r\n").await?;
@@ -1256,6 +1272,30 @@ mod tests {
             .unwrap_err();
             assert_eq!(failure.stage, SmtpSubmissionStage::Authenticate);
             assert_eq!(failure.kind, SmtpSubmissionFailureKind::Authentication);
+            server.task.await.unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn does_not_map_other_permanent_auth_responses_to_rejected_credentials() {
+        run_async(async {
+            let server = spawn_server(
+                TestSecurity::ImplicitTls,
+                ServerScript::Mail(MailBehavior::Authentication534),
+                None,
+            )
+            .await;
+            let failure = submit_to_server(
+                &server,
+                b"Subject: unsupported auth\r\n\r\nbody",
+                None,
+                no_op_data_fence(),
+                TEST_TIMEOUT,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(failure.stage, SmtpSubmissionStage::Authenticate);
+            assert_eq!(failure.kind, SmtpSubmissionFailureKind::Permanent);
             server.task.await.unwrap().unwrap();
         });
     }

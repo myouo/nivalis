@@ -9,9 +9,9 @@ import {
     NavigationPane, TitleBar
 } from "shell.slint";
 import {
-    AccountMenuOverlay, AccountRemoveDialog, AccountSetupOverlay, AccountStatusOverlay,
-    DeleteDialog, FilterMenuOverlay, InboxMoreMenuOverlay, MessageMenuOverlay,
-    SettingsOverlay, Snackbar
+    AccountCredentialDialog, AccountMenuOverlay, AccountRemoveDialog, AccountSetupOverlay,
+    AccountStatusOverlay, DeleteDialog, FilterMenuOverlay, InboxMoreMenuOverlay,
+    MessageMenuOverlay, SettingsOverlay, Snackbar
 } from "overlays.slint";
 import { MaterialIcon } from "components.slint";
 import { EmptyState } from "states.slint";
@@ -88,6 +88,7 @@ export component AppWindow inherits Window {
     in-out property <bool> account-menu-open: false;
     in-out property <bool> account-setup-open: false;
     in-out property <bool> account-status-open: false;
+    in-out property <bool> account-credential-open: false;
     in-out property <bool> account-remove-open: false;
     in property <bool> account-operation-loading: false;
     in property <bool> sync-loading: false;
@@ -120,6 +121,7 @@ export component AppWindow inherits Window {
     private property <bool> blocking-overlay-open: root.account-menu-open
         || root.account-setup-open
         || root.account-status-open
+        || root.account-credential-open
         || root.account-remove-open
         || root.settings-open
         || root.more-menu-open
@@ -164,10 +166,12 @@ export component AppWindow inherits Window {
     callback assume-delivered-outbox(string);
     callback release-uncertain-outbox(string);
     callback cancel-active-outbox(string);
+    callback repair-outbox-credential(string);
     callback switch-account(string);
     callback add-account(string, string, string, string, string, string, string, string);
     callback manage-account(string);
     callback diagnose-account(string);
+    callback update-account-credential(string, string);
     callback sync-account(string);
     callback remove-account(string);
     callback cancel-account-operation;
@@ -194,7 +198,10 @@ export component AppWindow inherits Window {
 
         key-pressed(event) => {
             if (event.text == Key.Escape) {
-                if (root.account-remove-open) {
+                if (root.account-credential-open) {
+                    if (!root.account-operation-loading) { root.account-credential-open = false; }
+                }
+                else if (root.account-remove-open) {
                     if (!root.account-operation-loading) { root.account-remove-open = false; }
                 }
                 else if (root.account-setup-open) {
@@ -473,6 +480,7 @@ export component AppWindow inherits Window {
         width: parent.width;
         height: parent.height;
         account-status-open <=> root.account-status-open;
+        account-credential-open <=> root.account-credential-open;
         account-remove-open <=> root.account-remove-open;
         operation-loading: root.account-operation-loading;
         operation-stage: root.account-operation-stage;
@@ -484,6 +492,19 @@ export component AppWindow inherits Window {
         account-has-error: root.managed-account-has-error;
         diagnose-account(id) => { root.diagnose-account(id); }
         cancel-operation => { root.cancel-account-operation(); }
+    }
+
+    if root.account-credential-open: AccountCredentialDialog {
+        width: parent.width;
+        height: parent.height;
+        account-credential-open <=> root.account-credential-open;
+        operation-loading: root.account-operation-loading;
+        operation-stage: root.account-operation-stage;
+        operation-error <=> root.account-operation-error;
+        account-id: root.managed-account-id;
+        account-name: root.managed-account-name;
+        account-address: root.managed-account-address;
+        update-credential(id, password) => { root.update-account-credential(id, password); }
     }
 
     if root.account-remove-open: AccountRemoveDialog {
@@ -547,6 +568,7 @@ export component AppWindow inherits Window {
             }
         }
         retry(id) => { root.retry-outbox(id); }
+        repair-credential(id) => { root.repair-outbox-credential(id); }
         release-failed(id) => { root.release-failed-outbox(id); }
         assume-delivered(id) => { root.assume-delivered-outbox(id); }
         release-uncertain(id) => { root.release-uncertain-outbox(id); }

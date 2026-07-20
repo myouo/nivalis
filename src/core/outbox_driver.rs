@@ -1184,6 +1184,8 @@ mod tests {
     const TEST_TIMEOUT: Duration = Duration::from_secs(3);
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
     static RETRY_DATA_FENCES: AtomicUsize = AtomicUsize::new(0);
+    static CREDENTIAL_RECOVERY_SUBMISSIONS: AtomicUsize = AtomicUsize::new(0);
+    static CREDENTIAL_RECOVERY_DATA_FENCES: AtomicUsize = AtomicUsize::new(0);
     static DISCONNECT_DATA_FENCES: AtomicUsize = AtomicUsize::new(0);
     static UNEXPECTED_SUBMISSIONS: AtomicUsize = AtomicUsize::new(0);
     static PRE_DATA_CANCEL_READY: AtomicBool = AtomicBool::new(false);
@@ -1417,6 +1419,45 @@ mod tests {
                 stage: smtp::SmtpSubmissionStage::Authenticate,
                 kind: SmtpSubmissionFailureKind::Authentication,
             })
+        })
+    }
+
+    fn credential_recovery_submission(
+        request: SmtpSubmissionRequest,
+        _cancellation: SmtpSubmissionCancellation,
+        data_fence: SmtpDataFence,
+    ) -> SmtpSubmitFuture {
+        let attempt = CREDENTIAL_RECOVERY_SUBMISSIONS.fetch_add(1, Ordering::AcqRel);
+        let expected_secret: &[u8] = match attempt {
+            0 => b"smtp-secret",
+            1 => b"replacement-smtp-secret",
+            _ => b"",
+        };
+        let secret_matched = request.secret_for_test() == expected_secret;
+        Box::pin(async move {
+            assert!(
+                secret_matched,
+                "SMTP attempt {} did not load the expected keyring secret",
+                attempt + 1
+            );
+            match attempt {
+                0 => Err(SmtpSubmissionFailure {
+                    stage: smtp::SmtpSubmissionStage::Authenticate,
+                    kind: SmtpSubmissionFailureKind::Authentication,
+                }),
+                1 => {
+                    data_fence.await.map_err(|_| SmtpSubmissionFailure {
+                        stage: smtp::SmtpSubmissionStage::DataFence,
+                        kind: SmtpSubmissionFailureKind::LocalState,
+                    })?;
+                    CREDENTIAL_RECOVERY_DATA_FENCES.fetch_add(1, Ordering::AcqRel);
+                    Ok(SmtpSubmissionReceipt {
+                        response_code: 250,
+                        wire_byte_count: 1,
+                    })
+                }
+                _ => panic!("credential recovery submitted the message more than twice"),
+            }
         })
     }
 
@@ -1954,6 +1995,117 @@ mod tests {
                 stored_outbox_state(&fixture.database_path, fixture.message_id),
                 None
             );
+        });
+    }
+
+    #[test]
+    fn authentication_failure_delivers_after_same_locator_credential_replacement() {
+        CREDENTIAL_RECOVERY_SUBMISSIONS.store(0, Ordering::Release);
+        CREDENTIAL_RECOVERY_DATA_FENCES.store(0, Ordering::Release);
+        block_on(async {
+            let fixture = DriverFixture::new().await;
+            let (status_tx, mut status_rx) = mpsc::channel(16);
+            let first = claim(&fixture.database, now_ms()).await;
+            assert_eq!(first.lease.message_id, fixture.message_id);
+            let action_fence = OutboxActionFence::new(
+                first.lease.message_id,
+                fixture.account.account_id,
+                fixture.account.generation,
+                first.lease.artifact_generation,
+            )
+            .unwrap();
+
+            submit_claim(
+                &fixture.database,
+                &fixture.credentials,
+                &fixture.staging,
+                &status_tx,
+                &SmtpCancellationTracker::default(),
+                credential_recovery_submission,
+                first,
+            )
+            .await
+            .unwrap();
+            let (failed_message_id, failed_wake) =
+                expect_state(&mut status_rx, OutboxState::PermanentFailure).await;
+            assert_eq!(failed_message_id, fixture.message_id);
+            assert_eq!(failed_wake, None);
+            assert_eq!(CREDENTIAL_RECOVERY_SUBMISSIONS.load(Ordering::Acquire), 1);
+            assert_eq!(CREDENTIAL_RECOVERY_DATA_FENCES.load(Ordering::Acquire), 0);
+
+            let stored = fixture
+                .credentials
+                .try_submit(CredentialOperation::Store {
+                    locator: CredentialLocator::parse(CREDENTIAL_KEY).unwrap(),
+                    secret: Secret::new(b"replacement-smtp-secret".to_vec()).unwrap(),
+                })
+                .unwrap()
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(stored, CredentialOutcome::Stored));
+
+            let retried = database_call(
+                &fixture.database,
+                ComposeDbOperation::RetryOutbox {
+                    fence: action_fence,
+                    now_ms: now_ms(),
+                },
+            )
+            .await;
+            assert_eq!(
+                retried,
+                ComposeDbOutcome::OutboxRetried(OutboxReportOutcome::Applied(OutboxState::Ready))
+            );
+
+            let second = claim(&fixture.database, now_ms()).await;
+            assert_eq!(second.lease.message_id, fixture.message_id);
+            assert_eq!(
+                second.lease.artifact_generation,
+                action_fence.artifact_generation
+            );
+            assert_eq!(
+                second.lease.configuration_generation,
+                action_fence.configuration_generation
+            );
+            submit_claim(
+                &fixture.database,
+                &fixture.credentials,
+                &fixture.staging,
+                &status_tx,
+                &SmtpCancellationTracker::default(),
+                credential_recovery_submission,
+                second,
+            )
+            .await
+            .unwrap();
+            let (delivered_message_id, delivered_wake) =
+                expect_state(&mut status_rx, OutboxState::Delivered).await;
+            assert_eq!(delivered_message_id, fixture.message_id);
+            assert_eq!(delivered_wake, None);
+            assert_eq!(CREDENTIAL_RECOVERY_SUBMISSIONS.load(Ordering::Acquire), 2);
+            assert_eq!(CREDENTIAL_RECOVERY_DATA_FENCES.load(Ordering::Acquire), 1);
+            assert_eq!(
+                stored_outbox_state(&fixture.database_path, fixture.message_id),
+                None
+            );
+            let persisted = Connection::open(&fixture.database_path)
+                .unwrap()
+                .query_row(
+                    "SELECT
+                         EXISTS (
+                             SELECT 1 FROM messages AS message
+                             JOIN message_folders AS membership
+                               ON membership.message_id = message.id
+                             JOIN folders AS folder ON folder.id = membership.folder_id
+                             WHERE message.id = ?1 AND folder.role = 'sent'
+                         ),
+                         EXISTS (SELECT 1 FROM local_drafts WHERE message_id = ?1)",
+                    [fixture.message_id.get()],
+                    |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
+                )
+                .unwrap();
+            assert_eq!(persisted, (true, false));
         });
     }
 }

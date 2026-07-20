@@ -206,6 +206,11 @@ impl Controller {
         ui.on_diagnose_account(move |key| controller.diagnose_account(key.as_str()));
 
         let controller = self.clone();
+        ui.on_update_account_credential(move |key, password| {
+            controller.update_account_credential(key.as_str(), password);
+        });
+
+        let controller = self.clone();
         ui.on_sync_account(move |key| controller.sync_account(key.as_str()));
 
         let controller = self.clone();
@@ -293,6 +298,11 @@ impl Controller {
 
         let controller = self.clone();
         ui.on_cancel_active_outbox(move |key| controller.cancel_outbox_attempt(key.as_str()));
+
+        let controller = self.clone();
+        ui.on_repair_outbox_credential(move |key| {
+            controller.open_outbox_credential_repair(key.as_str());
+        });
     }
 
     fn start(self: &Rc<Self>) {
@@ -1489,6 +1499,55 @@ impl Controller {
         }
     }
 
+    fn open_outbox_credential_repair(&self, key: &str) {
+        let Some(message_key) = EntityKey::parse(key) else {
+            self.show_outbox_error(UserError::outbox_changed());
+            return;
+        };
+        let Some((account_id, configuration_generation)) = self
+            .outbox_snapshots
+            .borrow()
+            .iter()
+            .find(|summary| {
+                summary.message_id.get() == message_key.get()
+                    && can_offer_credential_update(
+                        summary.state,
+                        summary.error_class,
+                        summary.error_code.as_deref(),
+                        true,
+                    )
+            })
+            .map(|summary| (summary.account_id, summary.configuration_generation))
+        else {
+            self.show_outbox_error(UserError::outbox_changed());
+            return;
+        };
+        let account_key = AccountKey::Account(
+            EntityKey::new(account_id.get()).expect("persisted account IDs are positive"),
+        );
+        let matches_current_generation = self
+            .catalog
+            .borrow()
+            .as_ref()
+            .and_then(|catalog| catalog.operation_target(account_key))
+            .is_some_and(|target| {
+                target.account_id == account_id
+                    && target.expected_generation == configuration_generation
+            });
+        if !matches_current_generation {
+            self.show_outbox_error(UserError::outbox_changed());
+            return;
+        }
+
+        let account_key = account_id.get().to_string();
+        self.manage_account(&account_key);
+        if let Some(ui) = self.ui.upgrade()
+            && ui.get_managed_account_id().as_str() == account_key
+        {
+            ui.set_account_credential_open(true);
+        }
+    }
+
     fn outbox_fence(&self, key: &str) -> Option<(crate::core::OutboxActionFence, OutboxState)> {
         let key = EntityKey::parse(key)?;
         self.outbox_snapshots
@@ -1949,6 +2008,88 @@ impl Controller {
             let result = diagnostic.await;
             if let Some(controller) = weak.upgrade() {
                 controller.finish_diagnostic(result, diagnostic_request_id, target);
+            }
+        });
+        self.store_account_task(task);
+    }
+
+    fn update_account_credential(self: &Rc<Self>, key: &str, password: SharedString) {
+        let Some(target) = self.account_operation_target(key) else {
+            self.show_account_error(UserError::selection());
+            return;
+        };
+        let secret = match Secret::new(password.as_bytes().to_vec()) {
+            Ok(secret) => secret,
+            Err(_) => {
+                self.show_account_error(UserError::account_password());
+                return;
+            }
+        };
+        let Some(request_id) = self.next_account_request_id() else {
+            self.show_account_error(UserError::account_session_limit());
+            return;
+        };
+        if !self.begin_account_task("Saving app password", false) {
+            return;
+        }
+        let response = match self
+            .core
+            .try_account_operation(AccountOperation::RetryCredential {
+                request_id,
+                account_id: target.account_id,
+                expected_generation: target.expected_generation,
+                secret,
+            }) {
+            Ok(response) => response,
+            Err(failure) => {
+                self.finish_account_task_with_error(account_submit_error(failure.reason()));
+                return;
+            }
+        };
+        let weak = Rc::downgrade(self);
+        let task = slint::spawn_local(async move {
+            let result = response.await;
+            let Some(controller) = weak.upgrade() else {
+                return;
+            };
+            match result {
+                Ok(reply)
+                    if reply.request_id == request_id
+                        && matches!(
+                            reply.result,
+                            Ok(AccountOperationSuccess::Configured {
+                                account_id,
+                                generation,
+                            }) if account_id == target.account_id
+                                && generation == target.expected_generation
+                        ) =>
+                {
+                    controller.finish_account_task();
+                    if let Some(ui) = controller.ui.upgrade() {
+                        ui.set_account_credential_open(false);
+                        ui.set_account_status_open(false);
+                        ui.set_account_operation_error(SharedString::default());
+                        ui.set_status_text("App password updated".into());
+                        show_snackbar(
+                            &ui,
+                            "App password updated; retry the message from Outbox",
+                            false,
+                            &controller.snackbar_timer,
+                        );
+                    }
+                    controller.issue_accounts();
+                    controller.request_outbox_refresh();
+                }
+                Ok(reply) if reply.request_id == request_id => match reply.result {
+                    Err(failure) => {
+                        controller.finish_account_task_with_error(account_operation_error(failure))
+                    }
+                    Ok(_) => controller.finish_account_task_with_error(UserError::account_result()),
+                },
+                Ok(_) => controller.finish_account_task_with_error(UserError::account_result()),
+                Err(error) => {
+                    controller.finish_account_task_with_error(account_response_error(error))
+                }
             }
         });
         self.store_account_task(task);
@@ -2852,10 +2993,14 @@ async fn request_outbox_page(core: CoreHandle) -> Result<OutboxSummaryPage, User
 }
 
 fn project_outbox_item(summary: &OutboxSummary, catalog: Option<&AccountCatalog>) -> OutboxItem {
-    let account_label = EntityKey::new(summary.account_id.get())
-        .and_then(|key| catalog?.active_item(AccountKey::Account(key)))
+    let account_key = EntityKey::new(summary.account_id.get()).map(AccountKey::Account);
+    let account_label = account_key
+        .and_then(|key| catalog?.active_item(key))
         .map(|item| item.name)
         .unwrap_or_else(|| format!("Mail account {}", summary.account_id.get()).into());
+    let account_generation_matches = account_key
+        .and_then(|key| catalog?.operation_target(key))
+        .is_some_and(|target| target.expected_generation == summary.configuration_generation);
     let recipient_count = summary
         .recipients
         .to_count
@@ -2923,7 +3068,25 @@ fn project_outbox_item(summary: &OutboxSummary, catalog: Option<&AccountCatalog>
         state: state.into(),
         status: status.into(),
         attempt_detail,
+        can_update_credential: can_offer_credential_update(
+            summary.state,
+            summary.error_class,
+            summary.error_code.as_deref(),
+            account_generation_matches,
+        ),
     }
+}
+
+fn can_offer_credential_update(
+    state: OutboxState,
+    error_class: Option<OutboxErrorClass>,
+    error_code: Option<&str>,
+    account_generation_matches: bool,
+) -> bool {
+    state == OutboxState::PermanentFailure
+        && error_class == Some(OutboxErrorClass::Authentication)
+        && error_code == Some("smtp_authentication_rejected")
+        && account_generation_matches
 }
 
 fn permanent_outbox_detail(error_class: Option<OutboxErrorClass>) -> &'static str {
@@ -3264,6 +3427,34 @@ mod tests {
         assert_eq!(bounded_utf8_prefix("a雪b", 4), "a雪");
         assert_eq!(bounded_utf8_prefix("雪", 2), "");
         assert_eq!(bounded_utf8_prefix("body", 0), "");
+    }
+
+    #[test]
+    fn credential_update_is_offered_only_for_current_smtp_rejection() {
+        assert!(can_offer_credential_update(
+            OutboxState::PermanentFailure,
+            Some(OutboxErrorClass::Authentication),
+            Some("smtp_authentication_rejected"),
+            true,
+        ));
+        assert!(!can_offer_credential_update(
+            OutboxState::PermanentFailure,
+            Some(OutboxErrorClass::Authentication),
+            Some("credential_unavailable"),
+            true,
+        ));
+        assert!(!can_offer_credential_update(
+            OutboxState::PermanentFailure,
+            Some(OutboxErrorClass::Authentication),
+            Some("smtp_authentication_rejected"),
+            false,
+        ));
+        assert!(!can_offer_credential_update(
+            OutboxState::RetryWait,
+            Some(OutboxErrorClass::Authentication),
+            Some("smtp_authentication_rejected"),
+            true,
+        ));
     }
 
     struct TestDatabase {
@@ -4160,11 +4351,28 @@ mod tests {
                     assert_eq!(item.status.as_str(), "Not sent");
                     assert!(item.attempt_detail.contains("credentials"));
                     assert!(!item.attempt_detail.contains("smtp_authentication_rejected"));
+                    assert!(item.can_update_credential);
 
                     ui.invoke_open_outbox();
                     poll_phase.set(1);
                 }
                 1 if ui.get_outbox_open() && !ui.get_outbox_loading() => {
+                    ui.invoke_repair_outbox_credential(message_id.to_string().into());
+                    assert!(ui.get_outbox_open());
+                    assert!(ui.get_account_status_open());
+                    assert!(ui.get_account_credential_open());
+                    assert_eq!(ui.get_managed_account_id().as_str(), "1");
+
+                    ui.invoke_update_account_credential("1".into(), SharedString::default());
+                    assert!(ui.get_account_credential_open());
+                    assert!(!ui.get_account_operation_loading());
+                    assert!(
+                        ui.get_account_operation_error()
+                            .contains("non-empty app password")
+                    );
+                    ui.set_account_credential_open(false);
+                    ui.set_account_status_open(false);
+                    ui.set_account_operation_error(SharedString::default());
                     ui.invoke_close_outbox();
                     assert!(!ui.get_outbox_open());
                     ui.invoke_open_outbox();

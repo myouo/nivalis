@@ -289,6 +289,7 @@ export component AccountSetupOverlay inherits Rectangle {
 
 export component AccountStatusOverlay inherits Rectangle {
     in-out property <bool> account-status-open: false;
+    in-out property <bool> account-credential-open: false;
     in-out property <bool> account-remove-open: false;
     in property <bool> operation-loading: false;
     in property <string> operation-stage: "";
@@ -403,6 +404,15 @@ export component AccountStatusOverlay inherits Rectangle {
                     enabled: !root.operation-loading && root.account-id != "";
                     clicked => { root.operation-error = ""; root.account-remove-open = true; }
                 }
+                MButton {
+                    label: "Update app password";
+                    icon: "edit";
+                    enabled: !root.operation-loading && root.account-id != "";
+                    clicked => {
+                        root.operation-error = "";
+                        root.account-credential-open = true;
+                    }
+                }
                 Rectangle { horizontal-stretch: 1; }
                 if root.operation-loading: MButton { label: "Cancel check"; clicked => { root.cancel-operation(); } }
                 MButton {
@@ -415,6 +425,154 @@ export component AccountStatusOverlay inherits Rectangle {
                 }
             }
         }
+    }
+}
+
+export component AccountCredentialDialog inherits FocusScope {
+    in-out property <bool> account-credential-open: false;
+    in property <bool> operation-loading: false;
+    in property <string> operation-stage: "";
+    in-out property <string> operation-error: "";
+    in property <string> account-id: "";
+    in property <string> account-name: "";
+    in property <string> account-address: "";
+    callback update-credential(string, string);
+
+    private property <string> replacement-password: "";
+    private property <bool> validation-visible: false;
+
+    z: 48;
+    init => { self.focus(); }
+    focus-on-tab-navigation: false;
+    forward-focus: password-field;
+    key-pressed(event) => {
+        if (event.text == Key.Escape && !root.operation-loading) {
+            root.replacement-password = "";
+            root.account-credential-open = false;
+            return accept;
+        }
+        return reject;
+    }
+
+    start-focus-guard := FocusScope {
+        width: 0px;
+        height: 0px;
+        focus-on-click: false;
+        focus-gained => { root.focus(); }
+    }
+
+    Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: Theme.scrim;
+        TouchArea { }
+    }
+    dialog := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: parent.width < 484px ? parent.width - 24px : 460px;
+        height: 330px;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.outline;
+        background: Theme.surface;
+        accessible-role: form;
+        accessible-label: "Update the app password for " + root.account-name;
+        VerticalLayout {
+            padding: 20px;
+            spacing: 10px;
+            HorizontalLayout {
+                height: 48px;
+                VerticalLayout {
+                    alignment: center;
+                    Text {
+                        text: "Update app password";
+                        color: Theme.on-surface;
+                        font-family: Theme.body-font;
+                        font-size: 18px;
+                        font-weight: 600;
+                    }
+                    Text {
+                        text: root.account-address;
+                        color: Theme.on-surface-variant;
+                        font-family: Theme.body-font;
+                        font-size: 10px;
+                        overflow: elide;
+                    }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                MIconButton {
+                    icon: "close";
+                    label: "Cancel password update";
+                    busy: root.operation-loading;
+                    clicked => {
+                        root.replacement-password = "";
+                        root.account-credential-open = false;
+                    }
+                }
+            }
+            Text {
+                text: "Use a current app password from your mail provider. Existing queued mail stays in the Outbox until you retry it.";
+                color: Theme.on-surface-variant;
+                font-family: Theme.body-font;
+                font-size: 11px;
+                wrap: word-wrap;
+            }
+            password-field := LabeledTextField {
+                label: "New app password";
+                placeholder: "Password from your email provider";
+                helper: "Stored in your system credential service, not the mailbox database.";
+                value <=> root.replacement-password;
+                enabled: !root.operation-loading;
+                input-type: InputType.password;
+                error: root.validation-visible && root.replacement-password == ""
+                    ? "Enter the new app password" : "";
+            }
+            if root.operation-loading || root.operation-error != "": Text {
+                text: root.operation-loading
+                    ? (root.operation-stage == "" ? "Saving app password" : root.operation-stage)
+                    : root.operation-error;
+                color: root.operation-error != "" ? Theme.error : Theme.primary;
+                font-family: Theme.body-font;
+                font-size: 10px;
+                wrap: word-wrap;
+                accessible-role: region;
+                accessible-live-region: root.operation-error != "" ? assertive : polite;
+            }
+            Rectangle { vertical-stretch: 1; }
+            HorizontalLayout {
+                spacing: 8px;
+                Rectangle { horizontal-stretch: 1; }
+                MButton {
+                    label: "Cancel";
+                    enabled: !root.operation-loading;
+                    clicked => {
+                        root.replacement-password = "";
+                        root.account-credential-open = false;
+                    }
+                }
+                MButton {
+                    label: "Save app password";
+                    icon: "edit";
+                    variant: "filled";
+                    loading: root.operation-loading;
+                    clicked => {
+                        root.validation-visible = true;
+                        if (root.replacement-password != "" && root.account-id != "") {
+                            root.update-credential(root.account-id, root.replacement-password);
+                            root.replacement-password = "";
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    end-focus-guard := FocusScope {
+        width: 0px;
+        height: 0px;
+        focus-on-click: false;
+        focus-gained => { root.focus(); }
     }
 }
 

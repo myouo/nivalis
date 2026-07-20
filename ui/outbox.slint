@@ -47,6 +47,7 @@ component OutboxRow inherits Rectangle {
     in property <bool> actions-enabled: true;
     in property <bool> action-loading: false;
     callback retry(string);
+    callback repair-credential(string);
     callback release-failed(string);
     callback request-assume-delivered(string, string);
     callback request-release-uncertain(string, string);
@@ -55,6 +56,7 @@ component OutboxRow inherits Rectangle {
     private property <bool> failed: root.item.state == "permanent_failure";
     private property <bool> uncertain: root.item.state == "uncertain";
     private property <bool> active: root.item.state == "in_flight";
+    private property <bool> credential-failure: root.failed && root.item.can-update-credential;
     private property <bool> actionable: root.failed || root.uncertain || root.active;
 
     height: root.active ? 228px : root.failed || root.uncertain ? 218px : 148px;
@@ -129,7 +131,9 @@ component OutboxRow inherits Rectangle {
                     ? "Stop closes the current connection. If the server has not accepted the message, it stays queued; if delivery already started, it moves to review."
                     : root.uncertain
                         ? "The server may already have accepted this message. Nivalis will never resend it automatically."
-                        : "Delivery stopped. Retry after fixing the issue, or return the message to Drafts.";
+                        : root.credential-failure
+                            ? "The mail server rejected this account password. Update it, then retry delivery; the message remains safely queued."
+                            : "Delivery stopped. Retry after fixing the issue, or return the message to Drafts.";
                 color: root.failed ? Theme.on-error-container : root.uncertain ? Theme.on-tertiary-container : Theme.on-surface-variant;
                 font-family: Theme.body-font;
                 font-size: 10px;
@@ -140,6 +144,12 @@ component OutboxRow inherits Rectangle {
             if root.actionable: HorizontalLayout {
                 height: 48px;
                 spacing: 8px;
+                if root.credential-failure: MButton {
+                    label: "Update password";
+                    variant: "outlined";
+                    enabled: root.actions-enabled;
+                    clicked => { root.repair-credential(root.item.message-id); }
+                }
                 if root.failed: MButton {
                     label: "Retry delivery";
                     variant: "tonal";
@@ -476,6 +486,7 @@ export component OutboxOverlay inherits FocusScope {
     callback reload;
     callback close;
     callback retry(string);
+    callback repair-credential(string);
     callback release-failed(string);
     callback assume-delivered(string);
     callback release-uncertain(string);
@@ -638,6 +649,7 @@ export component OutboxOverlay inherits FocusScope {
                         && !root.release-confirmation-open;
                     action-loading: root.operation-loading && root.operation-message-id == item.message-id;
                     retry(id) => { root.retry(id); }
+                    repair-credential(id) => { root.repair-credential(id); }
                     release-failed(id) => { root.release-failed(id); }
                     request-assume-delivered(id, subject) => {
                         root.delivery-confirmation-message-id = id;
