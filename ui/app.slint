@@ -145,6 +145,7 @@ export component AppWindow inherits Window {
     callback open-composer;
     callback send-message(string, string, string);
     callback save-draft(string, string, string);
+    callback compose-input-edited(string, string);
     callback switch-account(string);
     callback add-account(string, string, string, string, string, string, string, string);
     callback manage-account(string);
@@ -469,6 +470,9 @@ export component AppWindow inherits Window {
         }
         save-draft(to, subject, body) => {
             root.save-draft(to, subject, body);
+        }
+        input-edited(field, value) => {
+            root.compose-input-edited(field, value);
         }
     }
 

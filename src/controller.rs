@@ -7,10 +7,11 @@ use self::session::{
 use crate::core::{
     AccountConfigDraft, AccountDirectoryLoadError, AccountOperation, AccountOperationFailure,
     AccountOperationResponseError, AccountOperationSubmitError, AccountOperationSuccess,
-    AccountSetupMode, AccountWorkflowFailureKind, ComposeDraftIdentity, ComposeDraftInput,
-    ComposeFailure, ComposeFailureKind, ComposeOperation, ComposeOperationResponseError,
-    ComposeOperationSubmitError, ComposeSuccess, CoreHandle, Event, EventReceiver,
-    InboxSyncFailureKind, MailboxLoadError, MessageLoadError, MutationSubmitError,
+    AccountSetupMode, AccountWorkflowFailureKind, COMPOSE_BODY_BYTE_LIMIT,
+    COMPOSE_SUBJECT_BYTE_LIMIT, COMPOSE_TO_FIELD_BYTE_LIMIT, ComposeDraftIdentity,
+    ComposeDraftInput, ComposeFailure, ComposeFailureKind, ComposeOperation,
+    ComposeOperationResponseError, ComposeOperationSubmitError, ComposeSuccess, CoreHandle, Event,
+    EventReceiver, InboxSyncFailureKind, MailboxLoadError, MessageLoadError, MutationSubmitError,
     OutboxDriverFault, OutboxStatus, RequestId, SubmitError,
 };
 use crate::credentials::Secret;
@@ -217,6 +218,11 @@ impl Controller {
         let controller = self.clone();
         ui.on_send_message(move |to, subject, body| {
             controller.queue_composed_message(to, subject, body);
+        });
+
+        let controller = self.clone();
+        ui.on_compose_input_edited(move |field, value| {
+            controller.bound_compose_input(field.as_str(), value);
         });
     }
 
@@ -1217,6 +1223,37 @@ impl Controller {
     fn active_compose_target(&self) -> Option<AccountOperationTarget> {
         let account = self.state.borrow().account();
         self.catalog.borrow().as_ref()?.operation_target(account)
+    }
+
+    fn bound_compose_input(&self, field: &str, value: SharedString) {
+        let (limit, error) = match field {
+            "to" => (
+                COMPOSE_TO_FIELD_BYTE_LIMIT,
+                "Recipient input reached its safety limit. Remove an address before adding another.",
+            ),
+            "subject" => (
+                COMPOSE_SUBJECT_BYTE_LIMIT,
+                "Subject input reached its safety limit. Shorten it before sending.",
+            ),
+            "body" => (
+                COMPOSE_BODY_BYTE_LIMIT,
+                "Message input reached the 1 MiB safety limit. Shorten it before adding more text.",
+            ),
+            _ => return,
+        };
+        if value.as_str().len() <= limit {
+            return;
+        }
+        let bounded = bounded_utf8_prefix(value.as_str(), limit);
+        if let Some(ui) = self.ui.upgrade() {
+            match field {
+                "to" => ui.set_compose_to(bounded.into()),
+                "subject" => ui.set_compose_subject(bounded.into()),
+                "body" => ui.set_compose_body(bounded.into()),
+                _ => unreachable!("compose field was validated above"),
+            }
+            ui.set_composer_error(error.into());
+        }
     }
 
     fn begin_compose_task(&self, status: &'static str) -> bool {
@@ -2350,6 +2387,17 @@ fn compose_response_error(_error: ComposeOperationResponseError) -> UserError {
     UserError::compose_result()
 }
 
+fn bounded_utf8_prefix(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
 fn parse_mail_port(value: &str) -> Option<u16> {
     if value.is_empty() || value.trim() != value || !value.bytes().all(|byte| byte.is_ascii_digit())
     {
@@ -2650,6 +2698,14 @@ mod tests {
 
     const CONTROLLER_TIMEOUT: Duration = Duration::from_secs(5);
     static NEXT_DATABASE_ID: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn compose_input_bound_preserves_utf8_boundaries() {
+        assert_eq!(bounded_utf8_prefix("plain", 5), "plain");
+        assert_eq!(bounded_utf8_prefix("a雪b", 4), "a雪");
+        assert_eq!(bounded_utf8_prefix("雪", 2), "");
+        assert_eq!(bounded_utf8_prefix("body", 0), "");
+    }
 
     struct TestDatabase {
         directory: PathBuf,

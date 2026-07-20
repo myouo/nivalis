@@ -19,14 +19,17 @@ use crate::{
 use super::outbound::{OutboundMailbox, PlainTextMessage};
 
 const DATABASE_RETRY_DELAY: Duration = Duration::from_millis(10);
-const MAX_BODY_BYTES: usize = 1024 * 1024;
+pub(crate) const COMPOSE_BODY_BYTE_LIMIT: usize = 1024 * 1024;
+pub(crate) const COMPOSE_SUBJECT_BYTE_LIMIT: usize = 998;
 const MAX_RECIPIENTS: usize = 64;
 const MAX_ADDRESS_BYTES: usize = 320;
-const MAX_SUBJECT_BYTES: usize = 998;
+pub(crate) const COMPOSE_TO_FIELD_BYTE_LIMIT: usize = MAX_RECIPIENTS * (MAX_ADDRESS_BYTES + 2);
+const MAX_BODY_BYTES: usize = COMPOSE_BODY_BYTE_LIMIT;
+const MAX_SUBJECT_BYTES: usize = COMPOSE_SUBJECT_BYTE_LIMIT;
 const MAX_PREVIEW_BYTES: usize = 2 * 1024;
 const MAX_READER_EXCERPT_BYTES: usize = 64 * 1024;
 const MAX_OUTBOUND_MIME_BYTES: usize = 8 * 1024 * 1024;
-const MAX_TO_FIELD_BYTES: usize = MAX_RECIPIENTS * (MAX_ADDRESS_BYTES + 2);
+const MAX_TO_FIELD_BYTES: usize = COMPOSE_TO_FIELD_BYTE_LIMIT;
 const MAX_FAILURE_MESSAGE_BYTES: usize = 512;
 const RESERVATION_TTL_MS: i64 = 15 * 60 * 1_000;
 

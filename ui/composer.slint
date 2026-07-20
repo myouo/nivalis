@@ -15,6 +15,7 @@ export component ComposerOverlay inherits FocusScope {
     in property <string> composer-status: "";
     callback send-message(string, string, string);
     callback save-draft(string, string, string);
+    callback input-edited(string, string);
 
     z: 30;
     init => { self.focus(); }
@@ -106,6 +107,7 @@ export component ComposerOverlay inherits FocusScope {
                     placeholder: "name@example.com";
                     helper: "Separate multiple addresses with commas";
                     enabled: !root.composer-loading;
+                    edited(value) => { root.input-edited("to", value); }
                 }
                 LabeledTextField {
                     label: "Subject";
@@ -113,6 +115,7 @@ export component ComposerOverlay inherits FocusScope {
                     placeholder: "What is this message about?";
                     helper: "Use a concise subject that identifies the conversation";
                     enabled: !root.composer-loading;
+                    edited(value) => { root.input-edited("subject", value); }
                 }
                 LabeledTextField {
                     label: "Message";
@@ -122,6 +125,7 @@ export component ComposerOverlay inherits FocusScope {
                     multiline: true;
                     enabled: !root.composer-loading;
                     vertical-stretch: 1;
+                    edited(value) => { root.input-edited("body", value); }
                 }
 
                 if root.composer-error != "": Rectangle {

@@ -18,6 +18,7 @@ pub(crate) use outbox_driver::{OutboxDriverFault, OutboxStatus};
 pub(crate) use runtime::{CoreRuntime, StartError};
 
 pub(crate) use compose::{
+    COMPOSE_BODY_BYTE_LIMIT, COMPOSE_SUBJECT_BYTE_LIMIT, COMPOSE_TO_FIELD_BYTE_LIMIT,
     ComposeDraftIdentity, ComposeDraftInput, ComposeFailure, ComposeFailureKind, ComposeOperation,
     ComposeSuccess,
 };
