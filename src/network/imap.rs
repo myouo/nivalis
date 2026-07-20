@@ -594,10 +594,31 @@ async fn fetch_canonical_inbox_inner(
         });
     }
 
-    let span = u32::try_from(limits.max_messages.saturating_sub(1)).unwrap_or(u32::MAX);
-    let mut last_uid = first_uid.saturating_add(span);
-    last_uid = last_uid.min(uid_next.get().saturating_sub(1));
-    let mut metadata = fetch_metadata(&mut session, first_uid, last_uid, deadline, limits).await?;
+    // A missing cursor always maps to UID 1, including retries after metadata
+    // staging has persisted UIDVALIDITY but content publication did not finish.
+    let initial_snapshot = first_uid == 1;
+    let selection = search_uids(
+        &mut session,
+        first_uid,
+        uid_next,
+        initial_snapshot,
+        deadline,
+        limits,
+    )
+    .await?;
+    if selection.uids.is_empty() {
+        let scanned_through_uid = NonZeroU32::new(uid_next.get().saturating_sub(1));
+        let _ = tokio::time::timeout(LOGOUT_TIMEOUT, session.logout()).await;
+        return Ok(ImapInboxPage {
+            uid_validity,
+            uid_next,
+            scanned_through_uid,
+            next_uid: None,
+            messages: Box::new([]),
+        });
+    }
+
+    let mut metadata = fetch_metadata(&mut session, &selection.uids, deadline, limits).await?;
     metadata.sort_unstable_by_key(|message| message.uid);
 
     let mut messages = Vec::with_capacity(metadata.len());
@@ -618,14 +639,7 @@ async fn fetch_canonical_inbox_inner(
                 deferred_uid = Some(metadata.uid);
                 break;
             }
-            let raw = fetch_body(
-                &mut session,
-                metadata.uid,
-                metadata.declared_bytes,
-                deadline,
-                limits,
-            )
-            .await?;
+            let raw = fetch_body(&mut session, metadata.uid, deadline, limits).await?;
             literal_bytes = literal_bytes
                 .checked_add(raw.len())
                 .ok_or(ImapInboxFetchFailure::ResourceLimit)?;
@@ -646,13 +660,8 @@ async fn fetch_canonical_inbox_inner(
     let scanned_through_uid = deferred_uid
         .and_then(|uid| uid.get().checked_sub(1))
         .and_then(NonZeroU32::new)
-        .or_else(|| NonZeroU32::new(last_uid));
-    let next_uid = deferred_uid.or_else(|| {
-        last_uid
-            .checked_add(1)
-            .filter(|next| *next < uid_next.get())
-            .and_then(NonZeroU32::new)
-    });
+        .or(selection.scanned_through_uid);
+    let next_uid = deferred_uid.or(selection.next_uid);
     let _ = tokio::time::timeout(LOGOUT_TIMEOUT, session.logout()).await;
     Ok(ImapInboxPage {
         uid_validity,
@@ -694,15 +703,64 @@ struct InboxMetadata {
     declared_bytes: u32,
 }
 
-async fn fetch_metadata(
+struct UidSelection {
+    uids: Vec<NonZeroU32>,
+    scanned_through_uid: Option<NonZeroU32>,
+    next_uid: Option<NonZeroU32>,
+}
+
+async fn search_uids(
     session: &mut AuthenticatedSession,
     first_uid: u32,
-    last_uid: u32,
+    uid_next: NonZeroU32,
+    initial_snapshot: bool,
+    deadline: Instant,
+    limits: InboxFetchLimits,
+) -> Result<UidSelection, ImapInboxFetchFailure> {
+    if limits.max_messages == 0 {
+        return Err(ImapInboxFetchFailure::ResourceLimit);
+    }
+    let found = match timeout_at(deadline, session.uid_search(format!("UID {first_uid}:*"))).await {
+        Ok(Ok(found)) => found,
+        Ok(Err(error)) => return Err(map_receive_imap_error(&error, false)),
+        Err(_) => return Err(ImapInboxFetchFailure::Timeout),
+    };
+    let mut found = found
+        .into_iter()
+        .filter(|uid| (first_uid..uid_next.get()).contains(uid))
+        .filter_map(NonZeroU32::new)
+        .collect::<Vec<_>>();
+    found.sort_unstable();
+
+    if initial_snapshot && found.len() > limits.max_messages {
+        found.drain(..found.len() - limits.max_messages);
+    }
+    let next_uid = (!initial_snapshot && found.len() > limits.max_messages)
+        .then(|| found[limits.max_messages]);
+    found.truncate(limits.max_messages);
+    let scanned_through_uid = next_uid
+        .and_then(|_| found.last().copied())
+        .or_else(|| NonZeroU32::new(uid_next.get().saturating_sub(1)));
+    Ok(UidSelection {
+        uids: found,
+        scanned_through_uid,
+        next_uid,
+    })
+}
+
+async fn fetch_metadata(
+    session: &mut AuthenticatedSession,
+    uids: &[NonZeroU32],
     deadline: Instant,
     limits: InboxFetchLimits,
 ) -> Result<Vec<InboxMetadata>, ImapInboxFetchFailure> {
-    let command =
-        format!("UID FETCH {first_uid}:{last_uid} (UID FLAGS INTERNALDATE RFC822.SIZE ENVELOPE)");
+    let uid_set = uids
+        .iter()
+        .map(|uid| uid.get())
+        .map(|uid| uid.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let command = format!("UID FETCH {uid_set} (UID FLAGS INTERNALDATE RFC822.SIZE ENVELOPE)");
     let id = match timeout_at(deadline, session.run_command(command)).await {
         Ok(Ok(id)) => id,
         Ok(Err(error)) => return Err(map_receive_imap_error(&error, false)),
@@ -722,7 +780,7 @@ async fn fetch_metadata(
                     return Err(ImapInboxFetchFailure::ResourceLimit);
                 }
                 let message = parse_metadata(fetch)?;
-                if !(first_uid..=last_uid).contains(&message.uid.get())
+                if !uids.contains(&message.uid)
                     || messages
                         .iter()
                         .any(|existing: &InboxMetadata| existing.uid == message.uid)
@@ -741,7 +799,6 @@ async fn fetch_metadata(
 async fn fetch_body(
     session: &mut AuthenticatedSession,
     uid: NonZeroU32,
-    declared_bytes: u32,
     deadline: Instant,
     limits: InboxFetchLimits,
 ) -> Result<Box<[u8]>, ImapInboxFetchFailure> {
@@ -765,7 +822,7 @@ async fn fetch_body(
             }
             ReceiveResponse::Done { .. } => return Err(ImapInboxFetchFailure::Protocol),
             ReceiveResponse::Fetch(fetch) => {
-                let Some(body_response) = parse_body(fetch)? else {
+                let Some(body_response) = parse_body(fetch, uid)? else {
                     continue;
                 };
                 if body_response.uid != uid || body.is_some() {
@@ -780,11 +837,7 @@ async fn fetch_body(
             ReceiveResponse::Other => {}
         }
     }
-    let body = body.ok_or(ImapInboxFetchFailure::Protocol)?;
-    if body.len() != declared_bytes as usize {
-        return Err(ImapInboxFetchFailure::Protocol);
-    }
-    Ok(body)
+    body.ok_or(ImapInboxFetchFailure::Protocol)
 }
 
 async fn read_receive_response(
@@ -923,14 +976,22 @@ struct ProjectedBody {
     bytes: Box<[u8]>,
 }
 
-fn parse_body(fetch: ProjectedFetch) -> Result<Option<ProjectedBody>, ImapInboxFetchFailure> {
+fn parse_body(
+    fetch: ProjectedFetch,
+    requested_uid: NonZeroU32,
+) -> Result<Option<ProjectedBody>, ImapInboxFetchFailure> {
     let Some(body) = fetch.body else {
         return Ok(None);
     };
-    let uid = fetch
-        .uid
-        .and_then(NonZeroU32::new)
-        .ok_or(ImapInboxFetchFailure::Protocol)?;
+    // Some IMAP4rev1 servers omit the implicit UID item on a single-UID
+    // UID FETCH. The command still identifies the body unambiguously.
+    let uid = match fetch.uid {
+        Some(uid) => NonZeroU32::new(uid).ok_or(ImapInboxFetchFailure::Protocol)?,
+        None => requested_uid,
+    };
+    if uid != requested_uid {
+        return Err(ImapInboxFetchFailure::Protocol);
+    }
     Ok(Some(ProjectedBody { uid, bytes: body }))
 }
 
@@ -2012,6 +2073,7 @@ mod inbox_fetch_tests {
         messages: Vec<FixtureMessage>,
         metadata_status: Option<&'static str>,
         extra_metadata: usize,
+        omit_body_uid: bool,
         stall_body: Option<oneshot::Sender<()>>,
     }
 
@@ -2024,6 +2086,7 @@ mod inbox_fetch_tests {
                 messages,
                 metadata_status: None,
                 extra_metadata: 0,
+                omit_body_uid: false,
                 stall_body: None,
             }
         }
@@ -2221,6 +2284,36 @@ mod inbox_fetch_tests {
         tagged(&mut stream, &examine, "OK [READ-ONLY] selected").await;
         let mut commands = vec![login, examine];
 
+        if !plan.messages.is_empty() {
+            let Some(search) = read_command(&mut stream).await else {
+                return commands;
+            };
+            assert!(search.contains("UID SEARCH UID "));
+            commands.push(search.clone());
+            let first_uid = search
+                .split_whitespace()
+                .nth(4)
+                .unwrap()
+                .split(':')
+                .next()
+                .unwrap()
+                .parse::<u32>()
+                .unwrap();
+            let uids = plan
+                .messages
+                .iter()
+                .filter(|message| message.uid >= first_uid)
+                .map(|message| message.uid.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            stream
+                .get_mut()
+                .write_all(format!("* SEARCH {uids}\r\n").as_bytes())
+                .await
+                .unwrap();
+            tagged(&mut stream, &search, "OK search complete").await;
+        }
+
         let Some(metadata) = read_command(&mut stream).await else {
             return commands;
         };
@@ -2229,14 +2322,31 @@ mod inbox_fetch_tests {
             tagged(&mut stream, &metadata, "OK logout complete").await;
             return commands;
         }
-        assert!(metadata.contains("UID FETCH 1:"));
+        assert!(metadata.contains("UID FETCH "));
         if let Some(status) = plan.metadata_status {
             tagged(&mut stream, &metadata, status).await;
             let _ = read_command(&mut stream).await;
             return commands;
         }
-        for (index, message) in plan.messages.iter().enumerate() {
-            write_metadata(&mut stream, index + 1, message).await;
+        let requested_uids = metadata
+            .split_whitespace()
+            .nth(3)
+            .unwrap()
+            .split(',')
+            .map(|uid| uid.parse::<u32>().unwrap())
+            .collect::<Vec<_>>();
+        for message in plan
+            .messages
+            .iter()
+            .filter(|message| requested_uids.contains(&message.uid))
+        {
+            let sequence = plan
+                .messages
+                .iter()
+                .position(|candidate| candidate.uid == message.uid)
+                .unwrap()
+                + 1;
+            write_metadata(&mut stream, sequence, message).await;
         }
         for extra in 0..plan.extra_metadata {
             write_metadata(
@@ -2269,8 +2379,19 @@ mod inbox_fetch_tests {
                 .iter()
                 .find(|message| message.uid == uid)
                 .unwrap();
+            let sequence = plan
+                .messages
+                .iter()
+                .position(|message| message.uid == uid)
+                .unwrap()
+                + 1;
+            let uid_attribute = if plan.omit_body_uid {
+                String::new()
+            } else {
+                format!("UID {uid} ")
+            };
             let response = format!(
-                "* {uid} FETCH (UID {uid} BODY[] {{{}}}\r\n",
+                "* {sequence} FETCH ({uid_attribute}BODY[] {{{}}}\r\n",
                 message.raw.len()
             );
             stream
@@ -2327,7 +2448,7 @@ mod inbox_fetch_tests {
                     .iter()
                     .filter_map(|command| command_name(command))
                     .collect::<Vec<_>>(),
-                ["LOGIN", "EXAMINE", "UID", "UID", "UID", "LOGOUT"]
+                ["LOGIN", "EXAMINE", "UID", "UID", "UID", "UID", "LOGOUT"]
             );
 
             let empty = spawn_server(ServerPlan::messages(Vec::new())).await;
@@ -2359,6 +2480,117 @@ mod inbox_fetch_tests {
             assert_eq!(page.scanned_through_uid.unwrap().get(), 999);
             assert_eq!(page.next_uid, None);
             assert_eq!(finish(historical_empty).await.len(), 3);
+        });
+    }
+
+    #[test]
+    fn accepts_single_uid_body_without_uid_and_with_a_canonical_size_difference() {
+        run_async(async {
+            let mut message = fixture(1, RAW_ONE);
+            message.declared_bytes = message.declared_bytes.saturating_add(12);
+            let mut plan = ServerPlan::messages(vec![message]);
+            plan.omit_body_uid = true;
+            let server = spawn_server(plan).await;
+
+            let page = fetch_canonical_inbox_with_connector(
+                request(server.address.port(), None),
+                server.connector.clone(),
+                limits(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(page.messages.len(), 1);
+            assert_eq!(page.messages[0].uid.get(), 1);
+            assert_eq!(page.messages[0].declared_bytes, RAW_ONE.len() as u32 + 12);
+            assert_eq!(
+                page.messages[0].content,
+                ImapInboxContent::Fetched(RAW_ONE.into())
+            );
+            finish(server).await;
+
+            let wrong_uid = ProjectedFetch {
+                uid: Some(2),
+                body: Some(RAW_ONE.into()),
+                ..ProjectedFetch::default()
+            };
+            assert!(matches!(
+                parse_body(wrong_uid, NonZeroU32::new(1).unwrap()),
+                Err(ImapInboxFetchFailure::Protocol)
+            ));
+        });
+    }
+
+    #[test]
+    fn discovers_sparse_uids_and_starts_a_new_account_from_recent_mail() {
+        run_async(async {
+            let messages = || {
+                vec![
+                    fixture(21, RAW_ONE),
+                    fixture(105, RAW_TWO),
+                    fixture(400, RAW_ONE),
+                    fixture(900, RAW_TWO),
+                ]
+            };
+            let initial = spawn_server(ServerPlan::messages(messages())).await;
+            let page = fetch_canonical_inbox_with_connector(
+                request(initial.address.port(), None),
+                initial.connector.clone(),
+                limits(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                page.messages
+                    .iter()
+                    .map(|message| message.uid.get())
+                    .collect::<Vec<_>>(),
+                [400, 900]
+            );
+            assert_eq!(page.scanned_through_uid.unwrap().get(), 900);
+            assert_eq!(page.next_uid, None);
+            finish(initial).await;
+
+            let staged_retry = spawn_server(ServerPlan::messages(messages())).await;
+            let page = fetch_canonical_inbox_with_connector(
+                request(staged_retry.address.port(), Some(UID_VALIDITY)),
+                staged_retry.connector.clone(),
+                limits(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                page.messages
+                    .iter()
+                    .map(|message| message.uid.get())
+                    .collect::<Vec<_>>(),
+                [400, 900]
+            );
+            assert_eq!(page.scanned_through_uid.unwrap().get(), 900);
+            finish(staged_retry).await;
+
+            let incremental = spawn_server(ServerPlan::messages(messages())).await;
+            let page = fetch_canonical_inbox_with_connector(
+                request_from(incremental.address.port(), 105, Some(UID_VALIDITY)),
+                incremental.connector.clone(),
+                limits(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                page.messages
+                    .iter()
+                    .map(|message| message.uid.get())
+                    .collect::<Vec<_>>(),
+                [105, 400]
+            );
+            assert_eq!(page.scanned_through_uid.unwrap().get(), 400);
+            assert_eq!(page.next_uid.unwrap().get(), 900);
+            finish(incremental).await;
         });
     }
 
@@ -2475,7 +2707,23 @@ mod inbox_fetch_tests {
             );
             assert_eq!(page.scanned_through_uid.unwrap().get(), 1);
             assert_eq!(page.next_uid, None);
-            assert_eq!(finish(oversized).await.len(), 4);
+            assert_eq!(finish(oversized).await.len(), 5);
+
+            let raw = vec![b'x'; 1025];
+            let mut understated_message = fixture(1, &raw);
+            understated_message.declared_bytes = 1;
+            let understated = spawn_server(ServerPlan::messages(vec![understated_message])).await;
+            assert_eq!(
+                fetch_canonical_inbox_with_connector(
+                    request(understated.address.port(), None),
+                    understated.connector.clone(),
+                    limits(),
+                    None,
+                )
+                .await,
+                Err(ImapInboxFetchFailure::ResourceLimit)
+            );
+            finish(understated).await;
 
             let server = spawn_server(ServerPlan::messages(vec![
                 fixture(1, RAW_ONE),
