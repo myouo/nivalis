@@ -57,6 +57,28 @@ jobs:
           fi
           cargo tree --locked -e features -i async-imap | grep -F 'async-imap feature "runtime-tokio"'
 
+          lettre_features=$(cargo tree --locked -e features -i lettre --prefix none)
+          for feature in smtp-transport tokio1 tokio1-rustls ring rustls-platform-verifier; do
+            if ! grep -Fq "lettre feature \"$feature\"" <<<"$lettre_features"; then
+              printf 'Required Lettre feature is missing: %s\n' "$feature" >&2
+              exit 1
+            fi
+          done
+
+          # tokio1-rustls enables Lettre's internal rustls feature. Everything
+          # else, including default, builder, pool, and native TLS, is opt-in.
+          unexpected_lettre_features=$(
+            sed -n 's/^lettre feature "\([^"]*\)".*/\1/p' <<<"$lettre_features" \
+              | sort -u \
+              | grep -Ev '^(ring|rustls|rustls-platform-verifier|smtp-transport|tokio1|tokio1-rustls)$' \
+              || true
+          )
+          if [[ -n "$unexpected_lettre_features" ]]; then
+            printf 'Unexpected Lettre feature(s) entered the release graph:\n%s\n' \
+              "$unexpected_lettre_features" >&2
+            exit 1
+          fi
+
       - name: Validate memory evidence layout
         shell: bash
         run: |
