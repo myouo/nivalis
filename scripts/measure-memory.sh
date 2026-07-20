@@ -28,6 +28,7 @@ stress_steps=${NIVALIS_STRESS_STEPS:-}
 test_case=${NIVALIS_MEMORY_TEST_CASE:-}
 account_diagnostic_delay_ms=${NIVALIS_STRESS_DELAY_MS:-5000}
 account_receive_delay_ms=${NIVALIS_STRESS_DELAY_MS:-5000}
+account_send_delay_ms=${NIVALIS_STRESS_DELAY_MS:-5000}
 
 is_bounded_positive_decimal() {
     local value=$1
@@ -88,7 +89,7 @@ stress_scenario=${NIVALIS_STRESS_SCENARIO:-mixed}
 if [[ -n "$stress_steps" && "$stress_scenario" != "mixed" &&
     "$stress_scenario" != "pagination" && "$stress_scenario" != "write-search" &&
     "$stress_scenario" != "content" && "$stress_scenario" != "account-diagnostic" &&
-    "$stress_scenario" != "account-receive" ]]; then
+    "$stress_scenario" != "account-receive" && "$stress_scenario" != "account-send" ]]; then
     printf 'Unsupported NIVALIS_STRESS_SCENARIO: %s\n' "$stress_scenario" >&2
     exit 1
 fi
@@ -100,6 +101,10 @@ if [[ "$stress_scenario" == "account-receive" && "$stress_steps" != "1" ]]; then
     printf 'account-receive stress requires NIVALIS_STRESS_STEPS=1\n' >&2
     exit 1
 fi
+if [[ "$stress_scenario" == "account-send" && "$stress_steps" != "1" ]]; then
+    printf 'account-send stress requires NIVALIS_STRESS_STEPS=1\n' >&2
+    exit 1
+fi
 if [[ "$stress_scenario" == "account-diagnostic" && -z "$data_dir" ]]; then
     printf 'account-diagnostic stress requires an explicit persistent NIVALIS_MEMORY_DATA_DIR or NIVALIS_DATA_DIR\n' >&2
     exit 1
@@ -108,12 +113,20 @@ if [[ "$stress_scenario" == "account-receive" && -z "$data_dir" ]]; then
     printf 'account-receive stress requires an explicit persistent NIVALIS_MEMORY_DATA_DIR or NIVALIS_DATA_DIR\n' >&2
     exit 1
 fi
+if [[ "$stress_scenario" == "account-send" && -z "$data_dir" ]]; then
+    printf 'account-send stress requires an explicit persistent NIVALIS_MEMORY_DATA_DIR or NIVALIS_DATA_DIR\n' >&2
+    exit 1
+fi
 if [[ "$stress_scenario" == "account-diagnostic" && "$cpu_settle_gate" != "1" ]]; then
     printf 'account-diagnostic stress requires NIVALIS_MEMORY_CPU_SETTLE_GATE=1\n' >&2
     exit 1
 fi
 if [[ "$stress_scenario" == "account-receive" && "$cpu_settle_gate" != "1" ]]; then
     printf 'account-receive stress requires NIVALIS_MEMORY_CPU_SETTLE_GATE=1\n' >&2
+    exit 1
+fi
+if [[ "$stress_scenario" == "account-send" && "$cpu_settle_gate" != "1" ]]; then
+    printf 'account-send stress requires NIVALIS_MEMORY_CPU_SETTLE_GATE=1\n' >&2
     exit 1
 fi
 if [[ "$stress_scenario" == "account-diagnostic" ]] &&
@@ -125,6 +138,70 @@ if [[ "$stress_scenario" == "account-receive" ]] &&
     ! is_bounded_positive_decimal "$account_receive_delay_ms" 2147483647; then
     printf 'account-receive stress requires a positive bounded NIVALIS_STRESS_DELAY_MS\n' >&2
     exit 1
+fi
+if [[ "$stress_scenario" == "account-send" ]] &&
+    ! is_bounded_positive_decimal "$account_send_delay_ms" 2147483647; then
+    printf 'account-send stress requires a positive bounded NIVALIS_STRESS_DELAY_MS\n' >&2
+    exit 1
+fi
+if [[ "$stress_scenario" == "account-send" ]]; then
+    account_send_address=${NIVALIS_STRESS_ACCOUNT_ADDRESS:-}
+    account_send_login=${NIVALIS_STRESS_ACCOUNT_LOGIN:-}
+    account_send_imap_host=${NIVALIS_STRESS_ACCOUNT_IMAP_HOST:-}
+    account_send_imap_port=${NIVALIS_STRESS_ACCOUNT_IMAP_PORT:-}
+    account_send_smtp_host=${NIVALIS_STRESS_ACCOUNT_SMTP_HOST:-}
+    account_send_smtp_port=${NIVALIS_STRESS_ACCOUNT_SMTP_PORT:-}
+    account_send_secret_file=${NIVALIS_STRESS_ACCOUNT_SECRET_FILE:-}
+    account_send_expected=${NIVALIS_STRESS_ACCOUNT_EXPECTED_RESULT:-}
+    if [[ -z "$account_send_address" || -z "$account_send_login" ]]; then
+        printf 'account-send stress requires explicit account address and login values\n' >&2
+        exit 1
+    fi
+    if [[ "$account_send_imap_host" != "localhost" &&
+        "$account_send_imap_host" != "127.0.0.1" &&
+        "$account_send_imap_host" != "::1" ]]; then
+        printf 'account-send stress requires an explicit loopback NIVALIS_STRESS_ACCOUNT_IMAP_HOST\n' >&2
+        exit 1
+    fi
+    if ! is_bounded_positive_decimal "$account_send_imap_port" 65535; then
+        printf 'account-send stress requires NIVALIS_STRESS_ACCOUNT_IMAP_PORT between 1 and 65535\n' >&2
+        exit 1
+    fi
+    if [[ "$account_send_smtp_host" != "localhost" &&
+        "$account_send_smtp_host" != "127.0.0.1" &&
+        "$account_send_smtp_host" != "::1" ]]; then
+        printf 'account-send stress requires an explicit loopback NIVALIS_STRESS_ACCOUNT_SMTP_HOST\n' >&2
+        exit 1
+    fi
+    if ! is_bounded_positive_decimal "$account_send_smtp_port" 65535; then
+        printf 'account-send stress requires NIVALIS_STRESS_ACCOUNT_SMTP_PORT between 1 and 65535\n' >&2
+        exit 1
+    fi
+    if [[ "$account_send_secret_file" != /* || -L "$account_send_secret_file" ||
+        ! -f "$account_send_secret_file" || ! -r "$account_send_secret_file" ]]; then
+        printf 'account-send stress requires an absolute, readable, regular NIVALIS_STRESS_ACCOUNT_SECRET_FILE\n' >&2
+        exit 1
+    fi
+    account_send_secret_mode=$(stat -c '%a' -- "$account_send_secret_file")
+    if [[ ! "$account_send_secret_mode" =~ ^[0-7]+$ ]] ||
+        ((8#$account_send_secret_mode & 077)); then
+        printf 'account-send stress requires a secret file inaccessible to group and other users\n' >&2
+        exit 1
+    fi
+    account_send_secret_bytes=$(wc -c <"$account_send_secret_file")
+    if ! is_bounded_positive_decimal "$account_send_secret_bytes" 16384; then
+        printf 'account-send stress requires a non-empty secret file no larger than 16384 bytes\n' >&2
+        exit 1
+    fi
+    if [[ "$account_send_expected" != "ready" ]]; then
+        printf 'account-send stress requires NIVALIS_STRESS_ACCOUNT_EXPECTED_RESULT=ready\n' >&2
+        exit 1
+    fi
+    account_send_transition_timeout_ms=${NIVALIS_STRESS_TRANSITION_TIMEOUT_MS:-45000}
+    if ! is_bounded_positive_decimal "$account_send_transition_timeout_ms" 2147483647; then
+        printf 'account-send stress requires a positive bounded NIVALIS_STRESS_TRANSITION_TIMEOUT_MS\n' >&2
+        exit 1
+    fi
 fi
 if [[ -n "$stress_steps" &&
     ("$stress_scenario" == "pagination" || "$stress_scenario" == "write-search") ]] &&
@@ -169,6 +246,11 @@ fi
 if [[ "$stress_scenario" == "account-receive" ]] &&
     ((account_receive_delay_ms <= sample_points[0] * 1000)); then
     printf 'account-receive stress must start after the first memory baseline sample\n' >&2
+    exit 1
+fi
+if [[ "$stress_scenario" == "account-send" ]] &&
+    ((account_send_delay_ms <= sample_points[0] * 1000)); then
+    printf 'account-send stress must start after the first memory baseline sample\n' >&2
     exit 1
 fi
 if ((hard_gate)) && ((${#sample_points[@]} < 2)); then
@@ -448,6 +530,9 @@ for ((run = 1; run <= runs; run++)); do
             if [[ "$stress_scenario" == "account-receive" ]]; then
                 printf 'Account receive recovery data retained at %s\n' "$data_dir" >&2
             fi
+            if [[ "$stress_scenario" == "account-send" ]]; then
+                printf 'Account send recovery data retained at %s\n' "$data_dir" >&2
+            fi
             exit 1
         fi
         mapfile -t stress_results < <(grep -E '^NIVALIS_STRESS_RESULT ' "$run_log_file" || true)
@@ -458,10 +543,21 @@ for ((run = 1; run <= runs; run++)); do
             if [[ "$stress_scenario" == "account-receive" ]]; then
                 printf 'Account receive recovery data retained at %s\n' "$data_dir" >&2
             fi
+            if [[ "$stress_scenario" == "account-send" ]]; then
+                printf 'Account send recovery data retained at %s\n' "$data_dir" >&2
+            fi
             exit 1
         fi
         stress_result=${stress_results[0]}
-        if [[ "$stress_scenario" == "account-receive" ]]; then
+        if [[ "$stress_scenario" == "account-send" ]]; then
+            account_send_pattern='^NIVALIS_STRESS_RESULT scenario=account-send steps=1 queued=1 delivered=1 sent_visible=1 drafts=0 removed=1 elapsed_ms=(0|[1-9][0-9]*)$'
+            if [[ ! "$stress_result" =~ $account_send_pattern ]]; then
+                printf 'Account-send stress completion marker has an invalid format: %s\n' \
+                    "$stress_result" >&2
+                printf 'Account send recovery data retained at %s\n' "$data_dir" >&2
+                exit 1
+            fi
+        elif [[ "$stress_scenario" == "account-receive" ]]; then
             account_receive_pattern='^NIVALIS_STRESS_RESULT scenario=account-receive steps=1 imported=1 opened=1 closed=1 removed=1 elapsed_ms=(0|[1-9][0-9]*)$'
             if [[ ! "$stress_result" =~ $account_receive_pattern ]]; then
                 printf 'Account-receive stress completion marker has an invalid format: %s\n' \

@@ -42,6 +42,7 @@ pub(crate) fn install_memory_stress(
         Ok("content") => install_content_stress(ui, database, content_path, steps, delay),
         Ok("account-diagnostic") => install_account_diagnostic_stress(ui, steps, delay, interval),
         Ok("account-receive") => install_account_receive_stress(ui, steps, delay, interval),
+        Ok("account-send") => install_account_send_stress(ui, steps, delay, interval),
         Ok("mixed") | Err(_) => install_mixed_stress(ui, steps, delay, interval),
         Ok(scenario) => {
             eprintln!(
@@ -91,21 +92,27 @@ impl AccountDiagnosticConfig {
     fn load() -> Result<Self, &'static str> {
         let secret_path = required_account_diagnostic_env("NIVALIS_STRESS_ACCOUNT_SECRET_FILE")?;
         let imap_host = required_account_diagnostic_env("NIVALIS_STRESS_ACCOUNT_IMAP_HOST")?;
+        let smtp_host =
+            std::env::var("NIVALIS_STRESS_ACCOUNT_SMTP_HOST").unwrap_or_else(|_| imap_host.clone());
         // The harness copies through Slint to exercise production UI, so it only accepts fake
         // credentials for a loopback fixture rather than a real provider secret.
-        if !is_loopback_imap_host(&imap_host) {
+        if !is_loopback_host(&imap_host) {
             return Err("nonlocal_host_rejected");
+        }
+        if !is_loopback_host(&smtp_host) {
+            return Err("nonlocal_smtp_host_rejected");
         }
         Ok(Self {
             name: std::env::var("NIVALIS_STRESS_ACCOUNT_NAME")
                 .unwrap_or_else(|_| "Memory diagnostic".into()),
             address: required_account_diagnostic_env("NIVALIS_STRESS_ACCOUNT_ADDRESS")?,
             login: required_account_diagnostic_env("NIVALIS_STRESS_ACCOUNT_LOGIN")?,
-            smtp_host: imap_host.clone(),
+            smtp_host,
             imap_host,
             imap_port: std::env::var("NIVALIS_STRESS_ACCOUNT_IMAP_PORT")
                 .unwrap_or_else(|_| "993".into()),
-            smtp_port: "465".into(),
+            smtp_port: std::env::var("NIVALIS_STRESS_ACCOUNT_SMTP_PORT")
+                .unwrap_or_else(|_| "465".into()),
             secret: read_account_diagnostic_secret(&PathBuf::from(secret_path))?,
             expected: std::env::var("NIVALIS_STRESS_ACCOUNT_EXPECTED_RESULT")
                 .ok()
@@ -116,7 +123,7 @@ impl AccountDiagnosticConfig {
     }
 }
 
-fn is_loopback_imap_host(host: &str) -> bool {
+fn is_loopback_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
@@ -922,6 +929,483 @@ fn fail_account_receive_stress(
     ui.set_status_text("Account receive memory stress failed".into());
     eprintln!(
         "NIVALIS_STRESS_ERROR scenario=account-receive reason={reason} cleanup_required={}",
+        u8::from(cleanup_required)
+    );
+    stop_stress(ui, timer);
+}
+
+const ACCOUNT_SEND_MAX_TO_BYTES: usize = 64 * 322;
+const ACCOUNT_SEND_MAX_SUBJECT_BYTES: usize = 998;
+const ACCOUNT_SEND_MAX_BODY_BYTES: usize = 1024 * 1024;
+
+struct AccountSendMessage {
+    to: String,
+    subject: String,
+    body: String,
+}
+
+impl AccountSendMessage {
+    fn load() -> Result<Self, &'static str> {
+        let to = std::env::var("NIVALIS_STRESS_SEND_TO")
+            .unwrap_or_else(|_| "recipient@localhost".into());
+        let subject = std::env::var("NIVALIS_STRESS_SEND_SUBJECT")
+            .unwrap_or_else(|_| "Nivalis bounded send fixture".into());
+        let body = std::env::var("NIVALIS_STRESS_SEND_BODY")
+            .unwrap_or_else(|_| "Bounded loopback SMTP body.".into());
+        if to.is_empty()
+            || to.len() > ACCOUNT_SEND_MAX_TO_BYTES
+            || to.bytes().any(|byte| byte < b' ' || byte == 0x7f)
+        {
+            return Err("send_recipient_invalid");
+        }
+        if subject.len() > ACCOUNT_SEND_MAX_SUBJECT_BYTES
+            || subject.bytes().any(|byte| byte < b' ' || byte == 0x7f)
+        {
+            return Err("send_subject_invalid");
+        }
+        if body.len() > ACCOUNT_SEND_MAX_BODY_BYTES {
+            return Err("send_body_too_large");
+        }
+        Ok(Self { to, subject, body })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccountSendDeliveryGate {
+    Waiting,
+    Delivered,
+    Failed(&'static str),
+}
+
+fn account_send_delivery_gate(
+    composer_open: bool,
+    composer_loading: bool,
+    composer_error: &str,
+    status: &str,
+    snackbar_visible: bool,
+    snackbar: &str,
+) -> AccountSendDeliveryGate {
+    if !composer_error.is_empty() {
+        return AccountSendDeliveryGate::Failed("queue_failed");
+    }
+    if composer_open || composer_loading {
+        return AccountSendDeliveryGate::Waiting;
+    }
+    if status == "Message sent" || (snackbar_visible && snackbar == "Message sent") {
+        return AccountSendDeliveryGate::Delivered;
+    }
+    match status {
+        "Message delivery needs review" => AccountSendDeliveryGate::Failed("delivery_uncertain"),
+        "Message could not be sent" => {
+            AccountSendDeliveryGate::Failed("delivery_permanent_failure")
+        }
+        _ => AccountSendDeliveryGate::Waiting,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AccountSendSentObservation {
+    account_selected: bool,
+    sent_selected: bool,
+    loading: bool,
+    error: bool,
+    total_known: bool,
+    message_total: i32,
+    rows: usize,
+    drafts: i32,
+    has_previous: bool,
+    has_next: bool,
+    first_account_matches: bool,
+    first_subject_matches: bool,
+    first_id_present: bool,
+}
+
+fn account_send_sent_gate(observation: AccountSendSentObservation) -> AccountReceiveGate {
+    if !observation.account_selected || !observation.sent_selected || observation.loading {
+        return AccountReceiveGate::Waiting;
+    }
+    if observation.error {
+        return AccountReceiveGate::Failed("sent_mailbox_error");
+    }
+    if observation.message_total < 0 || observation.drafts < 0 {
+        return AccountReceiveGate::Failed("sent_mailbox_count_invalid");
+    }
+    if observation.message_total > 1 || observation.rows > 1 {
+        return AccountReceiveGate::Failed("sent_fixture_not_empty");
+    }
+    if observation.total_known
+        && observation.message_total == 1
+        && observation.rows == 1
+        && observation.drafts == 0
+        && !observation.has_previous
+        && !observation.has_next
+    {
+        if observation.first_account_matches
+            && observation.first_subject_matches
+            && observation.first_id_present
+        {
+            AccountReceiveGate::Ready
+        } else {
+            AccountReceiveGate::Failed("sent_message_invalid")
+        }
+    } else {
+        AccountReceiveGate::Waiting
+    }
+}
+
+#[derive(Debug)]
+enum AccountSendPhase {
+    WaitingForInitialState,
+    Diagnosing,
+    WaitingForCatalog { account_id: SharedString },
+    WaitingForAccountMailbox { account_id: SharedString },
+    LoadingComposer { account_id: SharedString },
+    Queueing { account_id: SharedString },
+    WaitingForSent { account_id: SharedString },
+    ClosingSent { account_id: SharedString },
+    Removing { account_id: SharedString },
+    WaitingForRemoval { account_id: SharedString },
+    Complete,
+}
+
+struct AccountSendStress {
+    phase: AccountSendPhase,
+    message: Option<AccountSendMessage>,
+    started: Instant,
+    deadline: Instant,
+    transition_timeout: Duration,
+    cleanup_required: bool,
+}
+
+impl AccountSendStress {
+    fn advance(&mut self, phase: AccountSendPhase) {
+        self.phase = phase;
+        self.deadline = Instant::now() + self.transition_timeout;
+    }
+}
+
+fn install_account_send_stress(
+    ui: &AppWindow,
+    steps: usize,
+    delay: u64,
+    interval: u64,
+) -> Option<Rc<Timer>> {
+    if steps != 1 {
+        eprintln!(
+            "NIVALIS_STRESS_ERROR scenario=account-send reason=steps_must_equal_one steps={steps} cleanup_required=0"
+        );
+        return None;
+    }
+    let timeout = std::env::var("NIVALIS_STRESS_TRANSITION_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(ACCOUNT_DIAGNOSTIC_DEFAULT_TIMEOUT_MS)
+        .max(1);
+    let transition_timeout = Duration::from_millis(timeout);
+    let timer = Rc::new(Timer::default());
+    let timer_weak = Rc::downgrade(&timer);
+    let ui_weak = ui.as_weak();
+
+    Timer::single_shot(Duration::from_millis(delay), move || {
+        let Some(timer) = timer_weak.upgrade() else {
+            return;
+        };
+        let started = Instant::now();
+        let state = Rc::new(RefCell::new(AccountSendStress {
+            phase: AccountSendPhase::WaitingForInitialState,
+            message: None,
+            started,
+            deadline: started + transition_timeout,
+            transition_timeout,
+            cleanup_required: false,
+        }));
+        let state_for_timer = state.clone();
+        let timer_for_callback = Rc::downgrade(&timer);
+        timer.start(
+            TimerMode::Repeated,
+            Duration::from_millis(interval.max(25)),
+            move || {
+                let Some(timer) = timer_for_callback.upgrade() else {
+                    return;
+                };
+                let Some(ui) = ui_weak.upgrade() else {
+                    return;
+                };
+                let mut state = state_for_timer.borrow_mut();
+                if Instant::now() >= state.deadline {
+                    fail_account_send_stress(
+                        &ui,
+                        &timer,
+                        "transition_timeout",
+                        state.cleanup_required,
+                    );
+                    state.phase = AccountSendPhase::Complete;
+                    return;
+                }
+
+                match &state.phase {
+                    AccountSendPhase::WaitingForInitialState => {
+                        if ui.get_initial_loading() || ui.get_mailbox_loading() {
+                            return;
+                        }
+                        if ui.get_mailbox_error() {
+                            fail_account_send_stress(&ui, &timer, "initial_mailbox_error", false);
+                            state.phase = AccountSendPhase::Complete;
+                            return;
+                        }
+                        if ui.get_has_accounts() {
+                            fail_account_send_stress(&ui, &timer, "fixture_not_empty", false);
+                            state.phase = AccountSendPhase::Complete;
+                            return;
+                        }
+                        let message = match AccountSendMessage::load() {
+                            Ok(message) => message,
+                            Err(reason) => {
+                                fail_account_send_stress(&ui, &timer, reason, false);
+                                state.phase = AccountSendPhase::Complete;
+                                return;
+                            }
+                        };
+                        let config = match AccountDiagnosticConfig::load() {
+                            Ok(config) => config,
+                            Err(reason) => {
+                                fail_account_send_stress(&ui, &timer, reason, false);
+                                state.phase = AccountSendPhase::Complete;
+                                return;
+                            }
+                        };
+                        let secret = match std::str::from_utf8(&config.secret) {
+                            Ok(secret) => SharedString::from(secret),
+                            Err(_) => {
+                                fail_account_send_stress(&ui, &timer, "secret_file_invalid", false);
+                                state.phase = AccountSendPhase::Complete;
+                                return;
+                            }
+                        };
+                        state.message = Some(message);
+                        ui.invoke_add_account(
+                            config.name.into(),
+                            config.address.into(),
+                            config.login.into(),
+                            config.imap_host.into(),
+                            config.imap_port.into(),
+                            config.smtp_host.into(),
+                            config.smtp_port.into(),
+                            secret,
+                        );
+                        state.cleanup_required = true;
+                        state.advance(AccountSendPhase::Diagnosing);
+                    }
+                    AccountSendPhase::Diagnosing => {
+                        if ui.get_account_operation_loading() {
+                            return;
+                        }
+                        if !ui.get_account_operation_error().is_empty() {
+                            fail_account_send_stress(&ui, &timer, "diagnostic_failed", true);
+                            state.phase = AccountSendPhase::Complete;
+                            return;
+                        }
+                        let account_id = ui.get_managed_account_id();
+                        if account_id.is_empty() {
+                            fail_account_send_stress(&ui, &timer, "account_identity_missing", true);
+                            state.phase = AccountSendPhase::Complete;
+                            return;
+                        }
+                        if classify_account_diagnostic(
+                            ui.get_managed_account_status().as_str(),
+                            ui.get_managed_account_has_error(),
+                        ) != Some(AccountDiagnosticExpectation::Ready)
+                        {
+                            fail_account_send_stress(&ui, &timer, "diagnostic_mismatch", true);
+                            state.phase = AccountSendPhase::Complete;
+                            return;
+                        }
+                        state.advance(AccountSendPhase::WaitingForCatalog { account_id });
+                    }
+                    AccountSendPhase::WaitingForCatalog { account_id } => {
+                        if !account_model_contains(&ui, account_id.as_str()) {
+                            return;
+                        }
+                        let account_id = account_id.clone();
+                        if ui.get_active_account_id().as_str() != account_id.as_str() {
+                            ui.invoke_switch_account(account_id.clone());
+                        }
+                        state.advance(AccountSendPhase::WaitingForAccountMailbox { account_id });
+                    }
+                    AccountSendPhase::WaitingForAccountMailbox { account_id } => {
+                        match account_receive_mailbox_gate(
+                            account_receive_mailbox_observation(&ui, account_id.as_str()),
+                            AccountReceiveMailboxExpectation::Empty,
+                        ) {
+                            AccountReceiveGate::Waiting => {}
+                            AccountReceiveGate::Failed(reason) => {
+                                fail_account_send_stress(&ui, &timer, reason, true);
+                                state.phase = AccountSendPhase::Complete;
+                            }
+                            AccountReceiveGate::Ready => {
+                                if !ui.get_compose_enabled() {
+                                    fail_account_send_stress(
+                                        &ui,
+                                        &timer,
+                                        "compose_not_enabled",
+                                        true,
+                                    );
+                                    state.phase = AccountSendPhase::Complete;
+                                    return;
+                                }
+                                let account_id = account_id.clone();
+                                ui.set_composer_open(true);
+                                ui.invoke_open_composer();
+                                state.advance(AccountSendPhase::LoadingComposer { account_id });
+                            }
+                        }
+                    }
+                    AccountSendPhase::LoadingComposer { account_id } => {
+                        if ui.get_composer_loading() {
+                            return;
+                        }
+                        if !ui.get_composer_error().is_empty() || !ui.get_composer_open() {
+                            fail_account_send_stress(&ui, &timer, "composer_load_failed", true);
+                            state.phase = AccountSendPhase::Complete;
+                            return;
+                        }
+                        let Some(message) = state.message.as_ref() else {
+                            fail_account_send_stress(&ui, &timer, "send_message_missing", true);
+                            state.phase = AccountSendPhase::Complete;
+                            return;
+                        };
+                        let account_id = account_id.clone();
+                        ui.invoke_send_message(
+                            message.to.clone().into(),
+                            message.subject.clone().into(),
+                            message.body.clone().into(),
+                        );
+                        state.advance(AccountSendPhase::Queueing { account_id });
+                    }
+                    AccountSendPhase::Queueing { account_id } => {
+                        if ui.get_composer_loading() {
+                            return;
+                        }
+                        if !ui.get_composer_error().is_empty() {
+                            fail_account_send_stress(&ui, &timer, "queue_failed", true);
+                            state.phase = AccountSendPhase::Complete;
+                            return;
+                        }
+                        if ui.get_composer_open() {
+                            return;
+                        }
+                        let account_id = account_id.clone();
+                        ui.invoke_filter_folder("Sent".into());
+                        state.advance(AccountSendPhase::WaitingForSent { account_id });
+                    }
+                    AccountSendPhase::WaitingForSent { account_id } => {
+                        if let AccountSendDeliveryGate::Failed(reason) = account_send_delivery_gate(
+                            ui.get_composer_open(),
+                            ui.get_composer_loading(),
+                            ui.get_composer_error().as_str(),
+                            ui.get_status_text().as_str(),
+                            ui.get_snackbar_visible(),
+                            ui.get_snackbar_text().as_str(),
+                        ) {
+                            fail_account_send_stress(&ui, &timer, reason, true);
+                            state.phase = AccountSendPhase::Complete;
+                            return;
+                        }
+                        let mails = ui.get_mails();
+                        let first = mails.row_data(0);
+                        let subject = state
+                            .message
+                            .as_ref()
+                            .map(|message| message.subject.as_str())
+                            .unwrap_or_default();
+                        let gate = account_send_sent_gate(AccountSendSentObservation {
+                            account_selected: ui.get_active_account_id().as_str()
+                                == account_id.as_str(),
+                            sent_selected: ui.get_active_folder().as_str() == "Sent",
+                            loading: ui.get_initial_loading()
+                                || ui.get_mailbox_loading()
+                                || ui.get_mailbox_navigation_loading(),
+                            error: ui.get_mailbox_error(),
+                            total_known: ui.get_total_known(),
+                            message_total: ui.get_message_total(),
+                            rows: mails.row_count(),
+                            drafts: ui.get_draft_count(),
+                            has_previous: ui.get_has_previous_mailbox_page(),
+                            has_next: ui.get_has_next_mailbox_page(),
+                            first_account_matches: first.as_ref().is_some_and(|mail| {
+                                mail.account_id.as_str() == account_id.as_str()
+                            }),
+                            first_subject_matches: first
+                                .as_ref()
+                                .is_some_and(|mail| mail.subject.as_str() == subject),
+                            first_id_present: first.is_some_and(|mail| !mail.id.is_empty()),
+                        });
+                        match gate {
+                            AccountReceiveGate::Waiting => {}
+                            AccountReceiveGate::Failed(reason) => {
+                                fail_account_send_stress(&ui, &timer, reason, true);
+                                state.phase = AccountSendPhase::Complete;
+                            }
+                            AccountReceiveGate::Ready => {
+                                let account_id = account_id.clone();
+                                ui.invoke_switch_account(SharedString::default());
+                                state.advance(AccountSendPhase::ClosingSent { account_id });
+                            }
+                        }
+                    }
+                    AccountSendPhase::ClosingSent { account_id } => {
+                        if !ui.get_active_account_id().is_empty()
+                            || ui.get_mailbox_loading()
+                            || ui.get_mailbox_navigation_loading()
+                        {
+                            return;
+                        }
+                        let account_id = account_id.clone();
+                        ui.invoke_remove_account(account_id.clone());
+                        state.advance(AccountSendPhase::Removing { account_id });
+                    }
+                    AccountSendPhase::Removing { account_id } => {
+                        if ui.get_account_operation_loading() {
+                            return;
+                        }
+                        if !ui.get_account_operation_error().is_empty() {
+                            fail_account_send_stress(&ui, &timer, "removal_failed", true);
+                            state.phase = AccountSendPhase::Complete;
+                            return;
+                        }
+                        let account_id = account_id.clone();
+                        state.advance(AccountSendPhase::WaitingForRemoval { account_id });
+                    }
+                    AccountSendPhase::WaitingForRemoval { account_id } => {
+                        if account_model_contains(&ui, account_id.as_str()) {
+                            return;
+                        }
+                        state.cleanup_required = false;
+                        ui.set_status_text("Account send memory stress complete".into());
+                        eprintln!("{}", account_send_result_marker(state.started.elapsed()));
+                        stop_stress(&ui, &timer);
+                        state.phase = AccountSendPhase::Complete;
+                    }
+                    AccountSendPhase::Complete => {}
+                }
+            },
+        );
+    });
+
+    Some(timer)
+}
+
+fn account_send_result_marker(elapsed: Duration) -> String {
+    format!(
+        "NIVALIS_STRESS_RESULT scenario=account-send steps=1 queued=1 delivered=1 sent_visible=1 drafts=0 removed=1 elapsed_ms={}",
+        elapsed.as_millis()
+    )
+}
+
+fn fail_account_send_stress(ui: &AppWindow, timer: &Timer, reason: &str, cleanup_required: bool) {
+    ui.set_status_text("Account send memory stress failed".into());
+    eprintln!(
+        "NIVALIS_STRESS_ERROR scenario=account-send reason={reason} cleanup_required={}",
         u8::from(cleanup_required)
     );
     stop_stress(ui, timer);
@@ -1988,10 +2472,10 @@ mod tests {
             None
         );
         assert_eq!(classify_account_diagnostic("Connected", true), None);
-        assert!(is_loopback_imap_host("localhost"));
-        assert!(is_loopback_imap_host("127.0.0.1"));
-        assert!(is_loopback_imap_host("::1"));
-        assert!(!is_loopback_imap_host("imap.example.test"));
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("::1"));
+        assert!(!is_loopback_host("imap.example.test"));
     }
 
     #[test]
@@ -2107,6 +2591,90 @@ mod tests {
                 ..ready
             }),
             AccountReceiveGate::Failed("detail_error")
+        );
+    }
+
+    #[test]
+    fn account_send_delivery_gate_accepts_only_fenced_delivered_feedback() {
+        assert_eq!(
+            account_send_delivery_gate(false, false, "", "Message sent", false, ""),
+            AccountSendDeliveryGate::Delivered
+        );
+        assert_eq!(
+            account_send_delivery_gate(false, false, "", "Inbox ready", true, "Message sent"),
+            AccountSendDeliveryGate::Delivered
+        );
+        assert_eq!(
+            account_send_delivery_gate(false, false, "", "Message queued", false, ""),
+            AccountSendDeliveryGate::Waiting
+        );
+        assert_eq!(
+            account_send_delivery_gate(
+                false,
+                false,
+                "",
+                "Message delivery needs review",
+                false,
+                "",
+            ),
+            AccountSendDeliveryGate::Failed("delivery_uncertain")
+        );
+        assert_eq!(
+            account_send_delivery_gate(false, false, "invalid", "Message sent", false, ""),
+            AccountSendDeliveryGate::Failed("queue_failed")
+        );
+    }
+
+    #[test]
+    fn account_send_sent_gate_requires_one_sent_row_and_no_draft() {
+        let delivered = AccountSendSentObservation {
+            account_selected: true,
+            sent_selected: true,
+            loading: false,
+            error: false,
+            total_known: true,
+            message_total: 1,
+            rows: 1,
+            drafts: 0,
+            has_previous: false,
+            has_next: false,
+            first_account_matches: true,
+            first_subject_matches: true,
+            first_id_present: true,
+        };
+        assert_eq!(account_send_sent_gate(delivered), AccountReceiveGate::Ready);
+        assert_eq!(
+            account_send_sent_gate(AccountSendSentObservation {
+                loading: true,
+                ..delivered
+            }),
+            AccountReceiveGate::Waiting
+        );
+        assert_eq!(
+            account_send_sent_gate(AccountSendSentObservation {
+                drafts: 1,
+                ..delivered
+            }),
+            AccountReceiveGate::Waiting
+        );
+        assert_eq!(
+            account_send_sent_gate(AccountSendSentObservation {
+                first_subject_matches: false,
+                ..delivered
+            }),
+            AccountReceiveGate::Failed("sent_message_invalid")
+        );
+        assert_eq!(
+            account_send_sent_gate(AccountSendSentObservation {
+                message_total: 2,
+                rows: 2,
+                ..delivered
+            }),
+            AccountReceiveGate::Failed("sent_fixture_not_empty")
+        );
+        assert_eq!(
+            account_send_result_marker(Duration::from_millis(17)),
+            "NIVALIS_STRESS_RESULT scenario=account-send steps=1 queued=1 delivered=1 sent_visible=1 drafts=0 removed=1 elapsed_ms=17"
         );
     }
 
