@@ -14,6 +14,7 @@ pub(crate) struct FileGcOutcome {
     pub(crate) missing: u8,
     pub(crate) invalid_keys: u8,
     pub(crate) io_errors: u8,
+    pub(crate) has_pending: bool,
 }
 
 pub(super) fn run_file_gc(
@@ -65,6 +66,13 @@ pub(super) fn run_file_gc(
             }
         }
     }
+
+    outcome.has_pending = transaction
+        .query_row("SELECT EXISTS (SELECT 1 FROM file_gc)", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(DbFailure::database)?
+        != 0;
 
     transaction.commit().map_err(DbFailure::database)?;
     Ok(outcome)
@@ -402,6 +410,7 @@ mod tests {
         let first = run_file_gc(&mut connection, &staging, 2).expect("run bounded file GC");
         assert_eq!(first.examined, 2);
         assert_eq!(first.missing, 2);
+        assert!(first.has_pending);
         assert_eq!(queue_count(&connection), 1);
         let remaining: String = connection
             .query_row("SELECT file_key FROM file_gc", [], |row| row.get(0))
@@ -418,6 +427,7 @@ mod tests {
         let second = run_file_gc(&mut connection, &staging, 1).expect("drain remaining file");
         assert_eq!(second.examined, 1);
         assert_eq!(second.missing, 1);
+        assert!(!second.has_pending);
         assert_eq!(queue_count(&connection), 0);
     }
 
@@ -442,6 +452,7 @@ mod tests {
                 missing: 1,
                 invalid_keys: 1,
                 io_errors: 1,
+                has_pending: true,
                 ..FileGcOutcome::default()
             }
         );

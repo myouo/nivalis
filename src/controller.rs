@@ -12,7 +12,8 @@ use crate::core::{
     ComposeDraftInput, ComposeFailure, ComposeFailureKind, ComposeOperation,
     ComposeOperationResponseError, ComposeOperationSubmitError, ComposeSuccess, CoreHandle, Event,
     EventReceiver, InboxSyncFailureKind, MailboxLoadError, MessageLoadError, MutationSubmitError,
-    OutboxDriverFault, OutboxStatus, RequestId, SubmitError,
+    OutboxCancelOutcome, OutboxDriverFault, OutboxErrorClass, OutboxState, OutboxStatus,
+    OutboxSummary, OutboxSummaryPage, RequestId, SubmitError, UncertainResolution,
 };
 use crate::credentials::Secret;
 use crate::presentation::sqlite::{
@@ -22,10 +23,10 @@ use crate::presentation::sqlite::{
 use crate::presentation::{show_snackbar, show_snackbar_for};
 use crate::store::sqlite::{
     AccountDiagnosticKind, AccountDirectory, AccountValidationError, DbFailure, FailureKind,
-    MailboxPage, MessageDetail, OutboxState, Tagged,
+    MailboxPage, MessageDetail, Tagged,
 };
 use crate::ui_identity::{AccountKey, EntityKey};
-use crate::{AccountItem, AppWindow, MailDetail, MailSummary};
+use crate::{AccountItem, AppWindow, MailDetail, MailSummary, OutboxItem};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
 use std::{
     cell::{Cell, RefCell},
@@ -62,8 +63,14 @@ struct Controller {
     pending_mailbox: RefCell<Option<PendingMailboxProjection>>,
     mail_model: Rc<VecModel<MailSummary>>,
     account_model: Rc<VecModel<AccountItem>>,
+    outbox_model: Rc<VecModel<OutboxItem>>,
+    outbox_snapshots: RefCell<Box<[OutboxSummary]>>,
     account_task: RefCell<Option<slint::JoinHandle<()>>>,
     compose_task: RefCell<Option<slint::JoinHandle<()>>>,
+    outbox_task: RefCell<Option<slint::JoinHandle<()>>>,
+    outbox_busy: Cell<bool>,
+    outbox_refresh_pending: Cell<bool>,
+    outbox_cancel_pending: Cell<bool>,
     compose_identity: Cell<Option<ComposeDraftIdentity>>,
     compose_target: Cell<Option<AccountOperationTarget>>,
     account_request_id: Cell<u64>,
@@ -78,12 +85,22 @@ struct PendingMailboxProjection {
     page: MailboxPage,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutboxUiAction {
+    Retry,
+    ReleaseFailed,
+    AssumeDelivered,
+    ReleaseUncertain,
+}
+
 impl Controller {
     fn new(ui: &AppWindow, core: CoreHandle) -> Self {
         let mail_model = Rc::new(VecModel::from(Vec::<MailSummary>::new()));
         let account_model = Rc::new(VecModel::from(Vec::<AccountItem>::new()));
+        let outbox_model = Rc::new(VecModel::from(Vec::<OutboxItem>::new()));
         ui.set_mails(ModelRc::from(mail_model.clone()));
         ui.set_accounts(ModelRc::from(account_model.clone()));
+        ui.set_outbox_items(ModelRc::from(outbox_model.clone()));
         ui.set_has_accounts(false);
         ui.set_mail_actions_enabled(false);
         ui.set_mutation_loading(false);
@@ -108,6 +125,13 @@ impl Controller {
         ui.set_composer_loading(false);
         ui.set_composer_status(SharedString::default());
         ui.set_composer_error(SharedString::default());
+        ui.set_outbox_open(false);
+        ui.set_outbox_loading(false);
+        ui.set_outbox_error(SharedString::default());
+        ui.set_outbox_has_more(false);
+        ui.set_outbox_count(0);
+        ui.set_outbox_action_loading(false);
+        ui.set_outbox_action_message_id(SharedString::default());
         ui.set_selected_id(SharedString::default());
         ui.set_selected_mail(MailDetail::default());
 
@@ -119,8 +143,14 @@ impl Controller {
             pending_mailbox: RefCell::new(None),
             mail_model,
             account_model,
+            outbox_model,
+            outbox_snapshots: RefCell::new(Box::new([])),
             account_task: RefCell::new(None),
             compose_task: RefCell::new(None),
+            outbox_task: RefCell::new(None),
+            outbox_busy: Cell::new(false),
+            outbox_refresh_pending: Cell::new(false),
+            outbox_cancel_pending: Cell::new(false),
             compose_identity: Cell::new(None),
             compose_target: Cell::new(None),
             account_request_id: Cell::new(1),
@@ -224,11 +254,44 @@ impl Controller {
         ui.on_compose_input_edited(move |field, value| {
             controller.bound_compose_input(field.as_str(), value);
         });
+
+        let controller = self.clone();
+        ui.on_open_outbox(move || controller.load_outbox(true));
+
+        let controller = self.clone();
+        ui.on_reload_outbox(move || controller.load_outbox(true));
+
+        let controller = self.clone();
+        ui.on_close_outbox(move || controller.close_outbox());
+
+        let controller = self.clone();
+        ui.on_retry_outbox(move |key| {
+            controller.change_outbox(key.as_str(), OutboxUiAction::Retry);
+        });
+
+        let controller = self.clone();
+        ui.on_release_failed_outbox(move |key| {
+            controller.change_outbox(key.as_str(), OutboxUiAction::ReleaseFailed);
+        });
+
+        let controller = self.clone();
+        ui.on_assume_delivered_outbox(move |key| {
+            controller.change_outbox(key.as_str(), OutboxUiAction::AssumeDelivered);
+        });
+
+        let controller = self.clone();
+        ui.on_release_uncertain_outbox(move |key| {
+            controller.change_outbox(key.as_str(), OutboxUiAction::ReleaseUncertain);
+        });
+
+        let controller = self.clone();
+        ui.on_cancel_active_outbox(move |key| controller.cancel_outbox_attempt(key.as_str()));
     }
 
-    fn start(&self) {
+    fn start(self: &Rc<Self>) {
         self.reload_mailbox();
         self.issue_accounts();
+        self.load_outbox(false);
     }
 
     fn issue_accounts(&self) {
@@ -273,7 +336,7 @@ impl Controller {
         }
     }
 
-    fn handle_event(&self, event: Event) {
+    fn handle_event(self: &Rc<Self>, event: Event) {
         match event {
             Event::AccountsLoaded(reply) => self.handle_accounts(reply),
             Event::AccountsLoadRejected {
@@ -382,6 +445,7 @@ impl Controller {
         self.account_model.set_vec(catalog.account_items());
         let has_accounts = catalog.len() > 0;
         *self.catalog.borrow_mut() = Some(catalog);
+        self.refresh_outbox_projection();
         if let Some(ui) = self.ui.upgrade() {
             ui.set_has_accounts(has_accounts);
             ui.set_initial_loading(false);
@@ -1205,10 +1269,12 @@ impl Controller {
                 Ok(Ok(ComposeSuccess::Queued { .. })) => {
                     controller.finish_compose_success("Message queued");
                     controller.reload_mailbox();
+                    controller.load_outbox(false);
                 }
                 Ok(Ok(ComposeSuccess::Recovering)) => {
                     controller.finish_compose_success("Message queued for recovery");
                     controller.reload_mailbox();
+                    controller.load_outbox(false);
                 }
                 Ok(Err(failure)) => controller.finish_compose_failure(failure),
                 Ok(Ok(_)) => controller.finish_compose_task_with_error(UserError::compose_result()),
@@ -1218,6 +1284,302 @@ impl Controller {
             }
         });
         self.store_compose_task(task);
+    }
+
+    fn load_outbox(self: &Rc<Self>, open: bool) {
+        if let Some(ui) = self.ui.upgrade()
+            && open
+        {
+            ui.set_outbox_open(true);
+        }
+        if !self.begin_outbox_task(true, None) {
+            return;
+        }
+        let response = match self
+            .core
+            .try_compose_operation(ComposeOperation::LoadOutbox)
+        {
+            Ok(response) => response,
+            Err(failure) => {
+                self.finish_outbox_task_with_error(compose_submit_error(failure.reason()));
+                return;
+            }
+        };
+        let weak = Rc::downgrade(self);
+        let task = slint::spawn_local(async move {
+            let result = response.await;
+            let Some(controller) = weak.upgrade() else {
+                return;
+            };
+            match result {
+                Ok(Ok(ComposeSuccess::OutboxLoaded(page))) => {
+                    controller.apply_outbox_page(page);
+                    controller.finish_outbox_task();
+                }
+                Ok(Err(failure)) => {
+                    controller.finish_outbox_task_with_error(compose_failure_error(failure.kind))
+                }
+                Ok(Ok(_)) => controller.finish_outbox_task_with_error(UserError::compose_result()),
+                Err(error) => {
+                    controller.finish_outbox_task_with_error(compose_response_error(error))
+                }
+            }
+        });
+        self.store_outbox_task(task);
+    }
+
+    fn change_outbox(self: &Rc<Self>, key: &str, action: OutboxUiAction) {
+        let Some((fence, state)) = self.outbox_fence(key) else {
+            self.show_outbox_error(UserError::outbox_changed());
+            return;
+        };
+        let valid = match action {
+            OutboxUiAction::Retry | OutboxUiAction::ReleaseFailed => {
+                state == OutboxState::PermanentFailure
+            }
+            OutboxUiAction::AssumeDelivered | OutboxUiAction::ReleaseUncertain => {
+                state == OutboxState::Uncertain
+            }
+        };
+        if !valid {
+            self.show_outbox_error(UserError::outbox_changed());
+            return;
+        }
+        let operation = match action {
+            OutboxUiAction::Retry => ComposeOperation::RetryOutbox(fence),
+            OutboxUiAction::ReleaseFailed => ComposeOperation::ReleaseFailedOutbox(fence),
+            OutboxUiAction::AssumeDelivered => ComposeOperation::ResolveUncertainOutbox {
+                fence,
+                resolution: UncertainResolution::AssumeDelivered,
+            },
+            OutboxUiAction::ReleaseUncertain => ComposeOperation::ResolveUncertainOutbox {
+                fence,
+                resolution: UncertainResolution::Release,
+            },
+        };
+        if !self.begin_outbox_task(false, Some(key)) {
+            return;
+        }
+        let response = match self.core.try_compose_operation(operation) {
+            Ok(response) => response,
+            Err(failure) => {
+                self.finish_outbox_task_with_error(compose_submit_error(failure.reason()));
+                return;
+            }
+        };
+        let core = self.core.clone();
+        let weak = Rc::downgrade(self);
+        let task = slint::spawn_local(async move {
+            let result = response.await;
+            let Some(controller) = weak.upgrade() else {
+                return;
+            };
+            let applied = match (action, result) {
+                (OutboxUiAction::Retry, Ok(Ok(ComposeSuccess::OutboxRetried { message_id })))
+                    if message_id == fence.message_id =>
+                {
+                    true
+                }
+                (
+                    OutboxUiAction::ReleaseFailed,
+                    Ok(Ok(ComposeSuccess::OutboxReleased { message_id })),
+                ) if message_id == fence.message_id => true,
+                (
+                    OutboxUiAction::AssumeDelivered,
+                    Ok(Ok(ComposeSuccess::UncertainOutboxResolved {
+                        message_id,
+                        resolution: UncertainResolution::AssumeDelivered,
+                    })),
+                ) if message_id == fence.message_id => true,
+                (
+                    OutboxUiAction::ReleaseUncertain,
+                    Ok(Ok(ComposeSuccess::UncertainOutboxResolved {
+                        message_id,
+                        resolution: UncertainResolution::Release,
+                    })),
+                ) if message_id == fence.message_id => true,
+                (_, Ok(Err(failure))) => {
+                    controller.finish_outbox_task_with_error(compose_failure_error(failure.kind));
+                    return;
+                }
+                (_, Err(error)) => {
+                    controller.finish_outbox_task_with_error(compose_response_error(error));
+                    return;
+                }
+                _ => {
+                    controller.finish_outbox_task_with_error(UserError::compose_result());
+                    return;
+                }
+            };
+            debug_assert!(applied);
+            match request_outbox_page(core).await {
+                Ok(page) => controller.apply_outbox_page(page),
+                Err(error) => {
+                    controller.finish_outbox_task_with_error(error);
+                    return;
+                }
+            }
+            controller.finish_outbox_task();
+            if let Some(ui) = controller.ui.upgrade() {
+                let message = match action {
+                    OutboxUiAction::Retry => "Message queued to retry",
+                    OutboxUiAction::ReleaseFailed | OutboxUiAction::ReleaseUncertain => {
+                        "Message returned to Drafts"
+                    }
+                    OutboxUiAction::AssumeDelivered => "Message marked delivered",
+                };
+                ui.set_status_text(message.into());
+                show_snackbar(&ui, message, false, &controller.snackbar_timer);
+            }
+            if action == OutboxUiAction::AssumeDelivered {
+                controller.issue_accounts();
+                controller.reload_mailbox();
+            }
+        });
+        self.store_outbox_task(task);
+    }
+
+    fn cancel_outbox_attempt(self: &Rc<Self>, key: &str) {
+        let Some((fence, OutboxState::InFlight)) = self.outbox_fence(key) else {
+            self.show_outbox_error(UserError::outbox_changed());
+            return;
+        };
+        let Some(ui) = self.ui.upgrade() else {
+            return;
+        };
+        match self.core.cancel_outbox_attempt(fence.message_id) {
+            OutboxCancelOutcome::Applied => {
+                self.outbox_cancel_pending.set(true);
+                ui.set_outbox_action_loading(true);
+                ui.set_outbox_action_message_id(key.into());
+                ui.set_outbox_error(SharedString::default());
+                ui.set_status_text("Stopping the current SMTP attempt".into());
+                show_snackbar(
+                    &ui,
+                    "Stopping this connection; durable delivery state will be preserved",
+                    false,
+                    &self.snackbar_timer,
+                );
+                let weak = Rc::downgrade(self);
+                Timer::single_shot(Duration::from_millis(500), move || {
+                    let Some(controller) = weak.upgrade() else {
+                        return;
+                    };
+                    if controller.outbox_cancel_pending.get() {
+                        controller.request_outbox_refresh();
+                    }
+                });
+            }
+            OutboxCancelOutcome::NotActive => {
+                self.show_outbox_error(UserError::outbox_not_active());
+                self.load_outbox(false);
+            }
+        }
+    }
+
+    fn outbox_fence(&self, key: &str) -> Option<(crate::core::OutboxActionFence, OutboxState)> {
+        let key = EntityKey::parse(key)?;
+        self.outbox_snapshots
+            .borrow()
+            .iter()
+            .find(|summary| summary.message_id.get() == key.get())
+            .map(|summary| (summary.action_fence(), summary.state))
+    }
+
+    fn begin_outbox_task(&self, loading: bool, key: Option<&str>) -> bool {
+        if self.outbox_cancel_pending.get() || self.outbox_busy.replace(true) {
+            self.show_outbox_error(UserError::outbox_busy());
+            return false;
+        }
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_outbox_loading(loading);
+            ui.set_outbox_action_loading(!loading);
+            ui.set_outbox_action_message_id(key.unwrap_or_default().into());
+            ui.set_outbox_error(SharedString::default());
+        }
+        true
+    }
+
+    fn finish_outbox_task(self: &Rc<Self>) {
+        self.outbox_busy.set(false);
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_outbox_loading(false);
+            ui.set_outbox_action_loading(false);
+            ui.set_outbox_action_message_id(SharedString::default());
+        }
+        if self.outbox_refresh_pending.replace(false) {
+            self.load_outbox(false);
+        }
+    }
+
+    fn finish_outbox_task_with_error(self: &Rc<Self>, error: UserError) {
+        self.finish_outbox_task();
+        self.show_outbox_error(error);
+    }
+
+    fn show_outbox_error(&self, error: UserError) {
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_outbox_error(error.detail.into());
+            ui.set_status_text(error.title.into());
+        }
+    }
+
+    fn store_outbox_task(
+        self: &Rc<Self>,
+        task: Result<slint::JoinHandle<()>, slint::EventLoopError>,
+    ) {
+        match task {
+            Ok(task) => *self.outbox_task.borrow_mut() = Some(task),
+            Err(_) => self.finish_outbox_task_with_error(UserError::compose_runtime()),
+        }
+    }
+
+    fn request_outbox_refresh(self: &Rc<Self>) {
+        if self.outbox_cancel_pending.replace(false)
+            && let Some(ui) = self.ui.upgrade()
+        {
+            ui.set_outbox_action_loading(false);
+            ui.set_outbox_action_message_id(SharedString::default());
+        }
+        if self.outbox_busy.get() {
+            self.outbox_refresh_pending.set(true);
+        } else {
+            self.load_outbox(false);
+        }
+    }
+
+    fn apply_outbox_page(&self, page: OutboxSummaryPage) {
+        let has_more = page.has_more;
+        *self.outbox_snapshots.borrow_mut() = page.items;
+        self.refresh_outbox_projection();
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_outbox_has_more(has_more);
+            ui.set_outbox_error(SharedString::default());
+        }
+    }
+
+    fn refresh_outbox_projection(&self) {
+        let catalog = self.catalog.borrow();
+        let items = self
+            .outbox_snapshots
+            .borrow()
+            .iter()
+            .map(|summary| project_outbox_item(summary, catalog.as_ref()))
+            .collect::<Vec<_>>();
+        let count = i32::try_from(items.len()).unwrap_or(i32::MAX);
+        self.outbox_model.set_vec(items);
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_outbox_count(count);
+        }
+    }
+
+    fn close_outbox(&self) {
+        if self.outbox_busy.get() {
+            return;
+        }
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_outbox_open(false);
+        }
     }
 
     fn active_compose_target(&self) -> Option<AccountOperationTarget> {
@@ -1328,10 +1690,14 @@ impl Controller {
         }
     }
 
-    fn handle_outbox_status(&self, status: OutboxStatus) {
+    fn handle_outbox_status(self: &Rc<Self>, status: OutboxStatus) {
         let Some(ui) = self.ui.upgrade() else {
             return;
         };
+        let refresh = matches!(
+            status,
+            OutboxStatus::AttemptStarted { .. } | OutboxStatus::StateChanged { .. }
+        );
         match status {
             OutboxStatus::AttemptStarted { .. } => {
                 ui.set_status_text("Sending queued message".into());
@@ -1383,6 +1749,9 @@ impl Controller {
                 ui.set_status_text(error.title.into());
                 show_snackbar(&ui, error.detail, false, &self.snackbar_timer);
             }
+        }
+        if refresh {
+            self.request_outbox_refresh();
         }
     }
 
@@ -2349,6 +2718,27 @@ impl UserError {
             detail: "Unlock the system credential store or update the account, then retry the message.",
         }
     }
+
+    const fn outbox_busy() -> Self {
+        Self {
+            title: "An Outbox action is already running",
+            detail: "Wait for the current Outbox action to finish, then try again.",
+        }
+    }
+
+    const fn outbox_changed() -> Self {
+        Self {
+            title: "Outbox state changed",
+            detail: "Reload the Outbox and use the actions shown for the current delivery state.",
+        }
+    }
+
+    const fn outbox_not_active() -> Self {
+        Self {
+            title: "No SMTP connection is active",
+            detail: "The attempt finished or has not opened its connection yet. Reload the Outbox to see its durable state.",
+        }
+    }
 }
 
 fn compose_failure_error(kind: ComposeFailureKind) -> UserError {
@@ -2385,6 +2775,113 @@ fn compose_submit_error(error: ComposeOperationSubmitError) -> UserError {
 
 fn compose_response_error(_error: ComposeOperationResponseError) -> UserError {
     UserError::compose_result()
+}
+
+async fn request_outbox_page(core: CoreHandle) -> Result<OutboxSummaryPage, UserError> {
+    let response = core
+        .try_compose_operation(ComposeOperation::LoadOutbox)
+        .map_err(|failure| compose_submit_error(failure.reason()))?;
+    match response.await {
+        Ok(Ok(ComposeSuccess::OutboxLoaded(page))) => Ok(page),
+        Ok(Err(failure)) => Err(compose_failure_error(failure.kind)),
+        Ok(Ok(_)) => Err(UserError::compose_result()),
+        Err(error) => Err(compose_response_error(error)),
+    }
+}
+
+fn project_outbox_item(summary: &OutboxSummary, catalog: Option<&AccountCatalog>) -> OutboxItem {
+    let account_label = EntityKey::new(summary.account_id.get())
+        .and_then(|key| catalog?.active_item(AccountKey::Account(key)))
+        .map(|item| item.name)
+        .unwrap_or_else(|| format!("Mail account {}", summary.account_id.get()).into());
+    let recipient_count = summary
+        .recipients
+        .to_count
+        .saturating_add(summary.recipients.cc_count)
+        .saturating_add(summary.recipients.bcc_count);
+    let recipients = match (
+        summary.recipients.first_to_address.as_deref(),
+        recipient_count,
+    ) {
+        (Some(first), 0 | 1) => SharedString::from(first),
+        (Some(first), count) => format!("{first} and {} more", count - 1).into(),
+        (None, 1) => "1 recipient".into(),
+        (None, count) => format!("{count} recipients").into(),
+    };
+    let (state, status, attempt_detail) = match summary.state {
+        OutboxState::Reserved => (
+            "reserved",
+            "Preparing",
+            "Building the private outbound message file.",
+        ),
+        OutboxState::Ready => (
+            "ready",
+            "Queued",
+            "Waiting for the bounded sender; no idle SMTP connection is retained.",
+        ),
+        OutboxState::InFlight => (
+            "in_flight",
+            "Sending",
+            "The current SMTP connection is active.",
+        ),
+        OutboxState::RetryWait => (
+            "retry_wait",
+            "Retry scheduled",
+            "The previous attempt ended before confirmed delivery; Nivalis will retry automatically.",
+        ),
+        OutboxState::Uncertain => (
+            "uncertain",
+            "Review needed",
+            "Server acceptance could not be confirmed; automatic resend is disabled.",
+        ),
+        OutboxState::PermanentFailure => (
+            "permanent_failure",
+            "Not sent",
+            permanent_outbox_detail(summary.error_class),
+        ),
+        OutboxState::Delivered => (
+            "delivered",
+            "Delivered",
+            "Delivery was confirmed and local cleanup is pending.",
+        ),
+    };
+    let attempt_detail = if matches!(
+        summary.state,
+        OutboxState::InFlight | OutboxState::RetryWait
+    ) {
+        format!("{attempt_detail} Attempt {}.", summary.attempt_count).into()
+    } else {
+        attempt_detail.into()
+    };
+    OutboxItem {
+        message_id: summary.message_id.get().to_string().into(),
+        account_label,
+        recipients,
+        subject: summary.subject.as_ref().into(),
+        state: state.into(),
+        status: status.into(),
+        attempt_detail,
+    }
+}
+
+fn permanent_outbox_detail(error_class: Option<OutboxErrorClass>) -> &'static str {
+    match error_class {
+        Some(OutboxErrorClass::Authentication) => {
+            "The server rejected the account credentials. Check the account before retrying."
+        }
+        Some(OutboxErrorClass::Configuration) => {
+            "Outgoing server settings changed or could not be verified. Return to Drafts after fixing the account."
+        }
+        Some(OutboxErrorClass::Protocol) => {
+            "The server did not complete a supported SMTP exchange. Check the account before retrying."
+        }
+        Some(OutboxErrorClass::Network | OutboxErrorClass::RateLimit) => {
+            "Automatic retries reached a safety limit. Check connectivity before retrying."
+        }
+        Some(OutboxErrorClass::Permanent | OutboxErrorClass::Ambiguous) | None => {
+            "Delivery stopped safely. Retry it or return the message to Drafts."
+        }
+    }
 }
 
 fn bounded_utf8_prefix(value: &str, max_bytes: usize) -> &str {
@@ -2771,6 +3268,121 @@ mod tests {
                 )
                 .expect("seed dirty controller fixture");
         }
+
+        fn seed_failed_outbox(&self) -> (i64, PathBuf) {
+            let mut connection = Connection::open(&self.path).expect("open outbox fixture");
+            connection
+                .execute_batch(
+                    "PRAGMA foreign_keys = ON;
+                     INSERT INTO accounts
+                         (id, provider, remote_key, name, address, state, accent_rgb)
+                     VALUES
+                         (1, 'imap', 'outbox-account', 'Send account',
+                          'sender@example.test', 'active', 0);
+                     INSERT INTO account_connections
+                         (account_id, credential_key, auth_kind, login_name,
+                          imap_host, imap_port, smtp_host, smtp_port,
+                          smtp_security, smtp_state)
+                     VALUES
+                         (1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'app_password',
+                          'sender@example.test', 'imap.example.test', 993,
+                          'smtp.example.test', 465, 'implicit_tls', 'configured');",
+                )
+                .expect("seed outbox account");
+
+            let account_id = sqlite::AccountId::new(1).expect("valid outbox account id");
+            let generation = sqlite::AccountGeneration::new(1).expect("valid outbox generation");
+            let draft = sqlite::create_draft(
+                &mut connection,
+                &sqlite::NewDraft::new(
+                    account_id,
+                    generation,
+                    "local:controller-outbox",
+                    "Persistent send failure",
+                    "Draft body",
+                    "Draft body",
+                    crate::content::FileKey::parse("body/11111111111111111111111111111111.txt")
+                        .expect("valid body key"),
+                    10,
+                    vec![
+                        sqlite::DraftRecipient::new("recipient@example.test", "Recipient")
+                            .expect("valid draft recipient"),
+                    ],
+                    1_700_000_000_000,
+                )
+                .expect("valid outbox draft"),
+            )
+            .expect("create outbox draft");
+            let reservation = sqlite::reserve_outbox(
+                &mut connection,
+                &sqlite::OutboxReserveRequest::new(
+                    draft.message_id,
+                    account_id,
+                    generation,
+                    draft.revision,
+                    sqlite::OutboxReservationToken::new([0x5a; 16]),
+                    "<controller-outbox@example.test>",
+                    vec![
+                        sqlite::OutboxRecipient::new(
+                            sqlite::RecipientKind::To,
+                            "recipient@example.test",
+                            "Recipient",
+                        )
+                        .expect("valid outbox recipient"),
+                    ],
+                    1_700_000_000_001,
+                    1_700_000_001_001,
+                )
+                .expect("valid outbox reservation"),
+            )
+            .expect("reserve outbox draft");
+
+            let staging = crate::content::ContentStaging::open(self.path.with_file_name("content"))
+                .expect("open controller content root");
+            let wire = b"From: sender@example.test\r\nTo: recipient@example.test\r\n\r\nbody\r\n";
+            let staged = staging
+                .stage_reader_at(&reservation.file_key, wire.as_slice(), 8 * 1024 * 1024)
+                .expect("stage controller outbound MIME");
+            let wire_byte_count = staged.byte_count();
+            let mut published = staged.publish().expect("publish controller outbound MIME");
+            published.retain();
+            let mime_path = self
+                .path
+                .with_file_name("content")
+                .join(reservation.file_key.as_str());
+
+            assert_eq!(
+                sqlite::finalize_outbox(
+                    &mut connection,
+                    &reservation,
+                    wire_byte_count,
+                    1_700_000_000_002,
+                )
+                .expect("finalize outbox fixture"),
+                sqlite::OutboxReportOutcome::Applied(sqlite::OutboxState::Ready)
+            );
+            let sqlite::OutboxClaimOutcome::Claimed(claim) =
+                sqlite::claim_next_outbox(&mut connection, 1_700_000_000_003)
+                    .expect("claim outbox fixture")
+            else {
+                panic!("expected controller outbox claim");
+            };
+            assert_eq!(
+                sqlite::report_outbox(
+                    &mut connection,
+                    claim.lease,
+                    &sqlite::OutboxReport::permanent_failure(
+                        sqlite::OutboxErrorClass::Authentication,
+                        "smtp_authentication_rejected",
+                    )
+                    .expect("valid permanent failure"),
+                    1_700_000_000_004,
+                )
+                .expect("terminalize outbox fixture"),
+                sqlite::OutboxReportOutcome::Applied(sqlite::OutboxState::PermanentFailure)
+            );
+            (draft.message_id.get(), mime_path)
+        }
     }
 
     impl Drop for TestDatabase {
@@ -3146,7 +3758,7 @@ mod tests {
 
     #[test]
     fn production_controller_drives_sqlite_success_empty_and_error_states() {
-        i_slint_backend_testing::init_no_event_loop();
+        i_slint_backend_testing::init_integration_test_with_system_time();
 
         let database = TestDatabase::new("mailbox");
         database.seed_bounded_mailbox();
@@ -3225,13 +3837,15 @@ mod tests {
 
         harness.ui.set_search_query("message 49".into());
         harness.ui.invoke_query_mail("message 49".into());
-        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(200));
+        slint::platform::update_timers_and_animations();
         harness.drive_until("FTS mailbox result", |ui| mailbox_ready(ui, 1, 1));
         assert!(model_contains(&harness.ui, "49"));
 
         harness.ui.set_search_query("".into());
         harness.ui.invoke_query_mail("".into());
-        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(200));
+        slint::platform::update_timers_and_animations();
         harness.drive_until("cleared FTS mailbox", |ui| mailbox_ready(ui, 50, 1));
 
         harness.ui.set_detail_open(true);
@@ -3349,5 +3963,95 @@ mod tests {
         assert!(dirty.ui.get_has_accounts());
         assert!(dirty.ui.get_mail_actions_enabled());
         dirty.shutdown();
+
+        let outbox_database = TestDatabase::new("outbox");
+        let (message_id, mime_path) = outbox_database.seed_failed_outbox();
+        assert!(mime_path.is_file());
+        let (core, core_events, runtime) =
+            core::spawn(outbox_database.path.clone()).expect("start outbox controller core");
+        let outbox_ui = AppWindow::new().expect("create outbox AppWindow");
+        let controller_task =
+            install(&outbox_ui, core, core_events).expect("install production outbox controller");
+
+        let phase = Rc::new(Cell::new(0_u8));
+        let completed = Rc::new(Cell::new(false));
+        let poll_timer = Timer::default();
+        let poll_ui = outbox_ui.as_weak();
+        let poll_phase = phase.clone();
+        let poll_completed = completed.clone();
+        let poll_database = outbox_database.path.clone();
+        let poll_mime = mime_path.clone();
+        poll_timer.start(TimerMode::Repeated, Duration::from_millis(10), move || {
+            let Some(ui) = poll_ui.upgrade() else {
+                return;
+            };
+            match poll_phase.get() {
+                0 if !ui.get_outbox_loading() && ui.get_outbox_count() == 1 => {
+                    let item = ui
+                        .get_outbox_items()
+                        .row_data(0)
+                        .expect("persistent outbox row");
+                    assert_eq!(item.message_id.as_str(), message_id.to_string());
+                    assert_eq!(item.account_label.as_str(), "Send account");
+                    assert_eq!(item.recipients.as_str(), "recipient@example.test");
+                    assert_eq!(item.status.as_str(), "Not sent");
+                    assert!(item.attempt_detail.contains("credentials"));
+                    assert!(!item.attempt_detail.contains("smtp_authentication_rejected"));
+
+                    ui.invoke_open_outbox();
+                    poll_phase.set(1);
+                }
+                1 if ui.get_outbox_open() && !ui.get_outbox_loading() => {
+                    ui.invoke_close_outbox();
+                    assert!(!ui.get_outbox_open());
+                    ui.invoke_open_outbox();
+                    poll_phase.set(2);
+                }
+                2 if ui.get_outbox_open() && !ui.get_outbox_loading() => {
+                    ui.invoke_release_failed_outbox(message_id.to_string().into());
+                    poll_phase.set(3);
+                }
+                3 if !ui.get_outbox_action_loading() && ui.get_outbox_count() == 0 => {
+                    let Ok(connection) = Connection::open(&poll_database) else {
+                        return;
+                    };
+                    let Ok(state) = connection.query_row(
+                        "SELECT
+                             (SELECT count(*) FROM outbox),
+                             (SELECT locked_artifact_generation
+                                FROM local_drafts WHERE message_id = ?1),
+                             (SELECT drafts_total FROM account_mailbox_stats WHERE account_id = 1),
+                             (SELECT count(*) FROM file_gc)",
+                        [message_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, Option<i64>>(1)?,
+                                row.get::<_, i64>(2)?,
+                                row.get::<_, i64>(3)?,
+                            ))
+                        },
+                    ) else {
+                        return;
+                    };
+                    if state == (0, None, 1, 0) && !poll_mime.exists() {
+                        assert_eq!(ui.get_status_text().as_str(), "Message returned to Drafts");
+                        poll_completed.set(true);
+                        slint::quit_event_loop().expect("stop outbox controller test loop");
+                    }
+                }
+                _ => {}
+            }
+        });
+        let timed_out = completed.clone();
+        Timer::single_shot(Duration::from_secs(5), move || {
+            if !timed_out.get() {
+                slint::quit_event_loop().expect("stop timed-out outbox controller test loop");
+            }
+        });
+        slint::run_event_loop_until_quit().expect("run outbox controller test loop");
+        assert!(completed.get(), "persistent outbox UI flow timed out");
+        controller_task.abort();
+        runtime.shutdown().expect("stop outbox controller core");
     }
 }

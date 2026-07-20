@@ -13,7 +13,7 @@ pub(crate) use account::{
     AccountOperationSuccess, AccountSetupMode, AccountWorkflowFailureKind, AccountWorkflowStage,
     InboxSyncFailureKind,
 };
-pub(crate) use message::{CoreHandle, Event, EventReceiver};
+pub(crate) use message::{CoreHandle, Event, EventReceiver, OutboxCancelOutcome};
 pub(crate) use outbox_driver::{OutboxDriverFault, OutboxStatus};
 pub(crate) use runtime::{CoreRuntime, StartError};
 
@@ -26,7 +26,9 @@ pub(crate) use compose::{
 #[allow(unused_imports)]
 pub(crate) use crate::store::sqlite::{
     AccountScope, AccountStatsDelta, FolderScope, Generation, MessageId, MessageMutation,
-    MutationOutcome, PageBoundary, PageSpec, RequestId, UndoToken,
+    MutationOutcome, OutboxActionFence, OutboxErrorClass, OutboxRecipientSummary, OutboxState,
+    OutboxSummary, OutboxSummaryPage, PageBoundary, PageSpec, RequestId, UncertainResolution,
+    UndoToken,
 };
 #[allow(unused_imports)]
 pub(crate) use message::{

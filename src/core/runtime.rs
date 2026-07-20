@@ -10,7 +10,10 @@ use super::{
         MailboxLoadError, MailboxQuery, MailboxRequestKey, MessageLoadError, MessageQuery,
         MessageRequestKey, MutationRequest, MutationSubmitError, event_channel,
     },
-    outbox_driver::{OutboxStatus, SmtpSubmitProbe, production_smtp_submit, run_outbox_driver},
+    outbox_driver::{
+        OutboxStatus, SmtpCancellationTracker, SmtpSubmitProbe, production_smtp_submit,
+        run_outbox_driver,
+    },
     sync::{ImapInboxFetchProbe, production_imap_inbox_fetch},
 };
 use crate::{
@@ -37,6 +40,14 @@ use tokio::{runtime::Builder, sync::mpsc, sync::oneshot, time};
 const COMMAND_BURST_LIMIT: u8 = 8;
 const OUTBOX_STATUS_CAPACITY: usize = 16;
 const OUTBOX_WAKE_CAPACITY: usize = 1;
+const FILE_GC_WAKE_CAPACITY: usize = 1;
+const FILE_GC_BATCH_LIMIT: usize = 16;
+const FILE_GC_INITIAL_DELAY: Duration = Duration::from_millis(50);
+const FILE_GC_BATCH_DELAY: Duration = Duration::from_millis(10);
+const FILE_GC_SUBMIT_RETRY_DELAY: Duration = Duration::from_millis(10);
+const FILE_GC_FAILURE_RETRY_DELAY: Duration = Duration::from_secs(300);
+const OUTBOX_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+const FILE_GC_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 const SHUTDOWN_QUERY_INTERRUPT_INTERVAL: Duration = Duration::from_millis(10);
 
 type DatabaseParts = (
@@ -151,6 +162,12 @@ fn spawn_with_sync_components(
     let (compose_command_tx, compose_command_rx) = mpsc::channel(COMPOSE_COMMAND_CAPACITY);
     let (outbox_wakeup_tx, outbox_wakeup_rx) = mpsc::channel(OUTBOX_WAKE_CAPACITY);
     let (outbox_status_tx, outbox_status_rx) = mpsc::channel(OUTBOX_STATUS_CAPACITY);
+    let (file_gc_wakeup_tx, file_gc_wakeup_rx) = mpsc::channel(FILE_GC_WAKE_CAPACITY);
+    let outbox_file_gc_wakeup_tx = file_gc_wakeup_tx.clone();
+    let smtp_cancellations = SmtpCancellationTracker::default();
+    let driver_smtp_cancellations = smtp_cancellations.clone();
+    let worker_smtp_cancellations = smtp_cancellations.clone();
+    let runtime_smtp_cancellations = smtp_cancellations.clone();
     let compose_command_rx = staging.as_ref().map(|_| compose_command_rx);
     let outbox_status_rx = staging.as_ref().map(|_| outbox_status_rx);
     let (event_tx, event_rx) = event_channel(event_capacity);
@@ -165,6 +182,13 @@ fn spawn_with_sync_components(
         .name("nivalis-core".into())
         .spawn(move || {
             let outbox_credentials = credentials.clone();
+            let file_gc_task = staging.as_ref().map(|staging| {
+                runtime.spawn(run_file_janitor(
+                    database.clone(),
+                    Arc::clone(staging),
+                    file_gc_wakeup_rx,
+                ))
+            });
             let account_workflows = AccountWorkflows::with_sync(
                 database.clone(),
                 credentials,
@@ -179,6 +203,8 @@ fn spawn_with_sync_components(
                     Arc::clone(staging),
                     outbox_wakeup_rx,
                     outbox_status_tx,
+                    outbox_file_gc_wakeup_tx,
+                    driver_smtp_cancellations,
                     smtp_submit_probe,
                 ))
             });
@@ -194,10 +220,28 @@ fn spawn_with_sync_components(
                 staging,
                 outbox_wakeup_tx,
                 outbox_status_rx,
+                file_gc_wakeup_tx,
             ));
-            if let Some(outbox_task) = outbox_task {
+            worker_smtp_cancellations.begin_shutdown();
+            if let Some(mut outbox_task) = outbox_task
+                && runtime
+                    .block_on(async {
+                        time::timeout(OUTBOX_SHUTDOWN_GRACE, &mut outbox_task).await
+                    })
+                    .is_err()
+            {
                 outbox_task.abort();
                 let _ = runtime.block_on(outbox_task);
+            }
+            if let Some(mut file_gc_task) = file_gc_task
+                && runtime
+                    .block_on(async {
+                        time::timeout(FILE_GC_SHUTDOWN_GRACE, &mut file_gc_task).await
+                    })
+                    .is_err()
+            {
+                file_gc_task.abort();
+                let _ = runtime.block_on(file_gc_task);
             }
             let credential_result =
                 credential_runtime
@@ -219,11 +263,17 @@ fn spawn_with_sync_components(
         .map_err(StartError::Runtime)?;
 
     Ok((
-        CoreHandle::new(command_tx, account_command_tx, compose_command_tx),
+        CoreHandle::new(
+            command_tx,
+            account_command_tx,
+            compose_command_tx,
+            smtp_cancellations,
+        ),
         event_rx,
         CoreRuntime {
             shutdown: Some(shutdown_tx),
             worker: Some(worker),
+            smtp_cancellations: runtime_smtp_cancellations,
         },
     ))
 }
@@ -241,6 +291,7 @@ async fn run_core(
     staging: Option<Arc<ContentStaging>>,
     outbox_wakeups: mpsc::Sender<()>,
     outbox_statuses: Option<mpsc::Receiver<OutboxStatus>>,
+    file_gc_wakeups: mpsc::Sender<()>,
 ) -> Result<(), RuntimeError> {
     let mut shutdown = Box::pin(shutdown);
     let mut accounts = AccountDirectorySchedule::default();
@@ -311,11 +362,13 @@ async fn run_core(
                     &reply,
                     Ok(ComposeSuccess::Saved(_)
                         | ComposeSuccess::Queued { .. }
-                        | ComposeSuccess::Recovering)
+                        | ComposeSuccess::Recovering
+                        | ComposeSuccess::OutboxReleased { .. }
+                        | ComposeSuccess::UncertainOutboxResolved { .. })
                 );
                 let _ = command.reply.send(reply);
                 if collect_files {
-                    run_compose_file_gc(&database, staging).await;
+                    let _ = file_gc_wakeups.try_send(());
                 }
             }
             CoreInput::OutboxStatus(status) => {
@@ -674,17 +727,90 @@ async fn finish_accepted_compose(
     }
 }
 
-async fn run_compose_file_gc(database: &DatabaseClient, staging: &Arc<ContentStaging>) {
-    for _ in 0..3 {
-        match database.try_run_file_gc(staging, 16) {
-            Ok(reply) => {
-                let _ = reply.await;
-                return;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileJanitorExit {
+    WakeChannel,
+    Database,
+}
+
+async fn run_file_janitor(
+    database: DatabaseClient,
+    staging: Arc<ContentStaging>,
+    mut wakeups: mpsc::Receiver<()>,
+) -> FileJanitorExit {
+    let mut delay = FILE_GC_INITIAL_DELAY;
+    let mut shutting_down = false;
+    loop {
+        if !shutting_down && !wait_for_file_gc_delay(&mut wakeups, delay).await {
+            shutting_down = true;
+        }
+
+        let receiver = match database.try_run_file_gc(&staging, FILE_GC_BATCH_LIMIT) {
+            Ok(receiver) => receiver,
+            Err(DatabaseSubmitError::Busy) => {
+                if shutting_down {
+                    return FileJanitorExit::WakeChannel;
+                }
+                delay = FILE_GC_SUBMIT_RETRY_DELAY;
+                continue;
             }
-            Err(DatabaseSubmitError::Busy) => time::sleep(Duration::from_millis(10)).await,
-            Err(DatabaseSubmitError::Closed) => return,
+            Err(DatabaseSubmitError::Closed) => return FileJanitorExit::Database,
+        };
+        let outcome = match receiver.await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => {
+                if shutting_down {
+                    return FileJanitorExit::WakeChannel;
+                }
+                delay = FILE_GC_FAILURE_RETRY_DELAY;
+                continue;
+            }
+            Err(_) => return FileJanitorExit::Database,
+        };
+
+        if outcome.has_pending {
+            let progress = outcome
+                .referenced
+                .saturating_add(outcome.removed)
+                .saturating_add(outcome.missing);
+            if shutting_down {
+                if progress == 0 {
+                    return FileJanitorExit::WakeChannel;
+                }
+                continue;
+            }
+            delay = if progress == 0 {
+                FILE_GC_FAILURE_RETRY_DELAY
+            } else {
+                FILE_GC_BATCH_DELAY
+            };
+            continue;
+        }
+
+        if shutting_down {
+            return FileJanitorExit::WakeChannel;
+        }
+
+        match wakeups.recv().await {
+            Some(()) => delay = FILE_GC_INITIAL_DELAY,
+            None => return FileJanitorExit::WakeChannel,
         }
     }
+}
+
+async fn wait_for_file_gc_delay(wakeups: &mut mpsc::Receiver<()>, delay: Duration) -> bool {
+    let mut sleep = Box::pin(time::sleep(delay));
+    poll_fn(|context| {
+        loop {
+            match wakeups.poll_recv(context) {
+                Poll::Ready(Some(())) => {}
+                Poll::Ready(None) => return Poll::Ready(false),
+                Poll::Pending => break,
+            }
+        }
+        sleep.as_mut().poll(context).map(|()| true)
+    })
+    .await
 }
 
 async fn finish_accepted_mutations_with(
@@ -1068,6 +1194,7 @@ fn submit_message(
 pub(crate) struct CoreRuntime {
     shutdown: Option<oneshot::Sender<()>>,
     worker: Option<thread::JoinHandle<Result<(), RuntimeError>>>,
+    smtp_cancellations: SmtpCancellationTracker,
 }
 
 impl CoreRuntime {
@@ -1076,6 +1203,7 @@ impl CoreRuntime {
     }
 
     fn stop_and_join(&mut self) -> Result<(), RuntimeError> {
+        self.smtp_cancellations.begin_shutdown();
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
@@ -1219,8 +1347,9 @@ mod tests {
         network::{
             imap::{ImapDiagnosticFailure, ImapDiagnosticRequest},
             smtp::{
-                SmtpDataFence, SmtpSubmissionFailure, SmtpSubmissionFailureKind,
-                SmtpSubmissionReceipt, SmtpSubmissionRequest, SmtpSubmissionStage,
+                SmtpDataFence, SmtpSubmissionCancellation, SmtpSubmissionFailure,
+                SmtpSubmissionFailureKind, SmtpSubmissionReceipt, SmtpSubmissionRequest,
+                SmtpSubmissionStage,
             },
         },
         store::sqlite::{
@@ -1317,6 +1446,13 @@ mod tests {
     static PENDING_DIAGNOSTIC_DROPS: AtomicUsize = AtomicUsize::new(0);
     static FENCED_SMTP_CALLS: AtomicUsize = AtomicUsize::new(0);
     static COMPLETED_DATA_FENCES: AtomicUsize = AtomicUsize::new(0);
+    static SHUTDOWN_SMTP_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static SHUTDOWN_DATA_FENCED: AtomicBool = AtomicBool::new(false);
+    static SHUTDOWN_SMTP_DROPPED: AtomicBool = AtomicBool::new(false);
+    static STUBBORN_SMTP_READY: AtomicBool = AtomicBool::new(false);
+    static STUBBORN_SMTP_DROPPED: AtomicBool = AtomicBool::new(false);
+    static CANCEL_SMTP_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static CANCEL_AFTER_DATA_READY: AtomicBool = AtomicBool::new(false);
 
     struct PendingDiagnostic;
 
@@ -1341,6 +1477,7 @@ mod tests {
 
     fn fenced_successful_smtp(
         _request: SmtpSubmissionRequest,
+        _cancellation: SmtpSubmissionCancellation,
         data_fence: SmtpDataFence,
     ) -> crate::core::outbox_driver::SmtpSubmitFuture {
         Box::pin(async move {
@@ -1353,6 +1490,93 @@ mod tests {
             Ok(SmtpSubmissionReceipt {
                 response_code: 250,
                 wire_byte_count: 1,
+            })
+        })
+    }
+
+    struct PendingSmtpGuard;
+
+    impl Drop for PendingSmtpGuard {
+        fn drop(&mut self) {
+            SHUTDOWN_SMTP_DROPPED.store(true, Ordering::Release);
+        }
+    }
+
+    struct StubbornSmtpGuard;
+
+    impl Drop for StubbornSmtpGuard {
+        fn drop(&mut self) {
+            STUBBORN_SMTP_DROPPED.store(true, Ordering::Release);
+        }
+    }
+
+    fn pending_smtp_after_fence(
+        _request: SmtpSubmissionRequest,
+        cancellation: SmtpSubmissionCancellation,
+        data_fence: SmtpDataFence,
+    ) -> crate::core::outbox_driver::SmtpSubmitFuture {
+        SHUTDOWN_SMTP_CALLS.fetch_add(1, Ordering::AcqRel);
+        Box::pin(async move {
+            data_fence.await.map_err(|_| SmtpSubmissionFailure {
+                stage: SmtpSubmissionStage::DataFence,
+                kind: SmtpSubmissionFailureKind::LocalState,
+            })?;
+            let _drop_guard = PendingSmtpGuard;
+            SHUTDOWN_DATA_FENCED.store(true, Ordering::Release);
+            cancellation.cancelled().await;
+            Err(SmtpSubmissionFailure {
+                stage: SmtpSubmissionStage::Body,
+                kind: SmtpSubmissionFailureKind::Uncertain,
+            })
+        })
+    }
+
+    fn stubborn_smtp_after_fence(
+        _request: SmtpSubmissionRequest,
+        _cancellation: SmtpSubmissionCancellation,
+        data_fence: SmtpDataFence,
+    ) -> crate::core::outbox_driver::SmtpSubmitFuture {
+        Box::pin(async move {
+            data_fence.await.map_err(|_| SmtpSubmissionFailure {
+                stage: SmtpSubmissionStage::DataFence,
+                kind: SmtpSubmissionFailureKind::LocalState,
+            })?;
+            let _drop_guard = StubbornSmtpGuard;
+            STUBBORN_SMTP_READY.store(true, Ordering::Release);
+            std::future::pending().await
+        })
+    }
+
+    fn unexpected_smtp_after_restart(
+        _request: SmtpSubmissionRequest,
+        _cancellation: SmtpSubmissionCancellation,
+        _data_fence: SmtpDataFence,
+    ) -> crate::core::outbox_driver::SmtpSubmitFuture {
+        SHUTDOWN_SMTP_CALLS.fetch_add(1, Ordering::AcqRel);
+        Box::pin(async {
+            Err(SmtpSubmissionFailure {
+                stage: SmtpSubmissionStage::Connect,
+                kind: SmtpSubmissionFailureKind::Retryable,
+            })
+        })
+    }
+
+    fn cancellable_smtp_after_fence(
+        _request: SmtpSubmissionRequest,
+        cancellation: SmtpSubmissionCancellation,
+        data_fence: SmtpDataFence,
+    ) -> crate::core::outbox_driver::SmtpSubmitFuture {
+        CANCEL_SMTP_CALLS.fetch_add(1, Ordering::AcqRel);
+        Box::pin(async move {
+            data_fence.await.map_err(|_| SmtpSubmissionFailure {
+                stage: SmtpSubmissionStage::DataFence,
+                kind: SmtpSubmissionFailureKind::LocalState,
+            })?;
+            CANCEL_AFTER_DATA_READY.store(true, Ordering::Release);
+            cancellation.cancelled().await;
+            Err(SmtpSubmissionFailure {
+                stage: SmtpSubmissionStage::Body,
+                kind: SmtpSubmissionFailureKind::Uncertain,
             })
         })
     }
@@ -1469,6 +1693,64 @@ mod tests {
             )
             .unwrap();
         sqlite::rebuild_account_stats_for_test(&connection, 1).unwrap();
+    }
+
+    #[test]
+    fn startup_file_janitor_drains_more_than_one_bounded_batch() {
+        let path = temporary_database_path();
+        let content_root = path.with_extension("janitor-content");
+        remove_database_files(&path);
+        let _ = fs::remove_dir_all(&content_root);
+
+        let (database, replies, database_runtime, _info) = sqlite::spawn(path.clone()).unwrap();
+        drop(database);
+        drop(replies);
+        database_runtime.shutdown().unwrap();
+        let connection = Connection::open(&path).unwrap();
+        for index in 0..33_i64 {
+            connection
+                .execute(
+                    "INSERT INTO file_gc (file_key, queued_at_ms) VALUES (?1, ?2)",
+                    rusqlite::params![format!("body/{index:032x}.txt"), index],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let database = sqlite::spawn(path.clone()).unwrap();
+        let (core, _events, runtime) = spawn_with_sync_components(
+            EVENT_CAPACITY,
+            database,
+            credentials::spawn(),
+            successful_diagnostic,
+            production_imap_inbox_fetch,
+            fenced_successful_smtp,
+            Some(content_root.clone()),
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let pending = Connection::open(&path)
+                .unwrap()
+                .query_row("SELECT count(*) FROM file_gc", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap();
+            if pending == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "startup janitor left {pending} durable file-GC rows"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        runtime.shutdown().unwrap();
+        drop(core);
+        remove_database_files(&path);
+        fs::remove_dir_all(content_root).unwrap();
     }
 
     #[test]
@@ -1604,6 +1886,41 @@ mod tests {
         assert_eq!(FENCED_SMTP_CALLS.load(Ordering::Acquire), 1);
         assert_eq!(COMPLETED_DATA_FENCES.load(Ordering::Acquire), 1);
 
+        let sent_request = RequestId::new(91).unwrap();
+        core.try_query_mailbox(MailboxQuery::new(
+            sent_request,
+            Generation::new(1),
+            PageSpec::new(
+                AccountScope::Account(account.account_id),
+                FolderScope::Sent,
+                None,
+                PageBoundary::First,
+                50,
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+        let sent = wait_for(async {
+            loop {
+                match events.recv().await {
+                    Some(Event::MailboxLoaded(reply)) if reply.request_id == sent_request => {
+                        break reply
+                            .result
+                            .expect("delivered mailbox stats must remain queryable");
+                    }
+                    Some(Event::MailboxLoadRejected {
+                        request_id, reason, ..
+                    }) if request_id == sent_request => {
+                        panic!("sent mailbox query was rejected: {reason:?}")
+                    }
+                    Some(_) => {}
+                    None => panic!("core event channel closed before Sent projection"),
+                }
+            }
+        });
+        assert_eq!(sent.rows.len(), 1);
+        assert_eq!(sent.rows[0].id, draft.message_id);
+
         runtime.shutdown().unwrap();
         drop(core);
         let connection = Connection::open(&path).unwrap();
@@ -1677,6 +1994,336 @@ mod tests {
         assert_eq!(subject, "Shutdown-safe subject");
         assert!(content_root.join(body_key).is_file());
         drop(connection);
+        remove_database_files(&path);
+        fs::remove_dir_all(content_root).unwrap();
+    }
+
+    #[test]
+    fn shutdown_after_data_fence_persists_uncertain_without_resubmitting() {
+        const CREDENTIAL_KEY: &str = "76543210fedcba9876543210fedcba98";
+
+        SHUTDOWN_SMTP_CALLS.store(0, Ordering::Release);
+        SHUTDOWN_DATA_FENCED.store(false, Ordering::Release);
+        SHUTDOWN_SMTP_DROPPED.store(false, Ordering::Release);
+        let path = temporary_database_path();
+        let content_root = path.with_extension("content");
+        remove_database_files(&path);
+        let _ = fs::remove_dir_all(&content_root);
+
+        let store: Arc<CredentialStore> =
+            keyring_core::mock::Store::new().expect("create shared credential store");
+        let first_store = Arc::clone(&store);
+        let credential_parts =
+            credentials::spawn_with_test_factory(move || Ok(Arc::clone(&first_store)));
+        let credential_client = credential_parts.0.clone();
+        let database = sqlite::spawn(path.clone()).unwrap();
+        let account = create_outbound_account(&database.0, CREDENTIAL_KEY);
+        let stored = wait_for(
+            credential_client
+                .try_submit(CredentialOperation::Store {
+                    locator: CredentialLocator::parse(CREDENTIAL_KEY).unwrap(),
+                    secret: Secret::new(b"shutdown-secret".to_vec()).unwrap(),
+                })
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(stored, CredentialOutcome::Stored));
+
+        let (core, _events, runtime) = spawn_with_sync_components(
+            EVENT_CAPACITY,
+            database,
+            credential_parts,
+            successful_diagnostic,
+            production_imap_inbox_fetch,
+            pending_smtp_after_fence,
+            Some(content_root.clone()),
+        )
+        .unwrap();
+        let queued = wait_for(
+            core.try_compose_operation(ComposeOperation::Queue(
+                ComposeDraftInput::new(
+                    account.account_id,
+                    account.generation,
+                    None,
+                    "bob@example.test",
+                    "Shutdown subject",
+                    "The DATA fence must survive shutdown.",
+                )
+                .unwrap(),
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let ComposeSuccess::Queued { draft, .. } = queued else {
+            panic!("compose queue must create the pending submission")
+        };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !SHUTDOWN_DATA_FENCED.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "SMTP DATA fence did not complete"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(SHUTDOWN_SMTP_CALLS.load(Ordering::Acquire), 1);
+
+        let shutdown_started = Instant::now();
+        runtime.shutdown().unwrap();
+        assert!(shutdown_started.elapsed() < Duration::from_secs(1));
+        assert!(SHUTDOWN_SMTP_DROPPED.load(Ordering::Acquire));
+        drop(core);
+
+        let mut connection = Connection::open(&path).unwrap();
+        let (state, delivery_started, lease_cleared): (String, bool, bool) = connection
+            .query_row(
+                "SELECT state, delivery_started <> 0, lease_expires_at_ms IS NULL
+                 FROM outbox WHERE message_id = ?1",
+                [draft.message_id.get()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "uncertain");
+        assert!(delivery_started);
+        assert!(lease_cleared);
+        assert!(matches!(
+            sqlite::claim_next_outbox(&mut connection, 2_000_000_000_000).unwrap(),
+            crate::store::sqlite::OutboxClaimOutcome::Idle { .. }
+        ));
+        drop(connection);
+
+        let restart_store = Arc::clone(&store);
+        let credential_parts =
+            credentials::spawn_with_test_factory(move || Ok(Arc::clone(&restart_store)));
+        let database = sqlite::spawn(path.clone()).unwrap();
+        let (core, mut events, runtime) = spawn_with_sync_components(
+            EVENT_CAPACITY,
+            database,
+            credential_parts,
+            successful_diagnostic,
+            production_imap_inbox_fetch,
+            unexpected_smtp_after_restart,
+            Some(content_root.clone()),
+        )
+        .unwrap();
+        core.try_query_account_directory(account_directory_query(901, 1))
+            .unwrap();
+        wait_for(async {
+            loop {
+                match events.recv().await {
+                    Some(Event::AccountsLoaded(_)) => break,
+                    Some(Event::OutboxStatus(OutboxStatus::Fault { kind, .. })) => {
+                        panic!("outbox restart faulted: {kind:?}")
+                    }
+                    Some(_) => {}
+                    None => panic!("core event channel closed before restart synchronization"),
+                }
+            }
+        });
+        assert_eq!(SHUTDOWN_SMTP_CALLS.load(Ordering::Acquire), 1);
+        runtime.shutdown().unwrap();
+        drop(core);
+
+        let state: String = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT state FROM outbox WHERE message_id = ?1",
+                [draft.message_id.get()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "uncertain");
+        remove_database_files(&path);
+        fs::remove_dir_all(content_root).unwrap();
+    }
+
+    #[test]
+    fn shutdown_aborts_uncooperative_smtp_after_bounded_grace() {
+        const CREDENTIAL_KEY: &str = "11112222333344445555666677778888";
+
+        STUBBORN_SMTP_READY.store(false, Ordering::Release);
+        STUBBORN_SMTP_DROPPED.store(false, Ordering::Release);
+        let path = temporary_database_path();
+        let content_root = path.with_extension("stubborn-content");
+        remove_database_files(&path);
+        let _ = fs::remove_dir_all(&content_root);
+
+        let store: Arc<CredentialStore> =
+            keyring_core::mock::Store::new().expect("create shared credential store");
+        let credential_parts = credentials::spawn_with_test_factory(move || Ok(Arc::clone(&store)));
+        let credential_client = credential_parts.0.clone();
+        let database = sqlite::spawn(path.clone()).unwrap();
+        let account = create_outbound_account(&database.0, CREDENTIAL_KEY);
+        let stored = wait_for(
+            credential_client
+                .try_submit(CredentialOperation::Store {
+                    locator: CredentialLocator::parse(CREDENTIAL_KEY).unwrap(),
+                    secret: Secret::new(b"stubborn-secret".to_vec()).unwrap(),
+                })
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(stored, CredentialOutcome::Stored));
+
+        let (core, _events, runtime) = spawn_with_sync_components(
+            EVENT_CAPACITY,
+            database,
+            credential_parts,
+            successful_diagnostic,
+            production_imap_inbox_fetch,
+            stubborn_smtp_after_fence,
+            Some(content_root.clone()),
+        )
+        .unwrap();
+        let queued = wait_for(
+            core.try_compose_operation(ComposeOperation::Queue(
+                ComposeDraftInput::new(
+                    account.account_id,
+                    account.generation,
+                    None,
+                    "bob@example.test",
+                    "Bounded shutdown",
+                    "A non-cooperative transport must not block shutdown.",
+                )
+                .unwrap(),
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(queued, ComposeSuccess::Queued { .. }));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !STUBBORN_SMTP_READY.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "SMTP fence did not complete");
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let shutdown_started = Instant::now();
+        runtime.shutdown().unwrap();
+        let shutdown_elapsed = shutdown_started.elapsed();
+        assert!(shutdown_elapsed >= OUTBOX_SHUTDOWN_GRACE);
+        assert!(shutdown_elapsed < OUTBOX_SHUTDOWN_GRACE + Duration::from_secs(1));
+        assert!(STUBBORN_SMTP_DROPPED.load(Ordering::Acquire));
+        drop(core);
+
+        remove_database_files(&path);
+        fs::remove_dir_all(content_root).unwrap();
+    }
+
+    #[test]
+    fn current_attempt_cancel_is_message_fenced_and_uncertain_after_data() {
+        const CREDENTIAL_KEY: &str = "abcdefabcdefabcdefabcdefabcdefab";
+
+        CANCEL_SMTP_CALLS.store(0, Ordering::Release);
+        CANCEL_AFTER_DATA_READY.store(false, Ordering::Release);
+        let path = temporary_database_path();
+        let content_root = path.with_extension("cancel-content");
+        remove_database_files(&path);
+        let _ = fs::remove_dir_all(&content_root);
+
+        let store: Arc<CredentialStore> =
+            keyring_core::mock::Store::new().expect("create shared credential store");
+        let credential_parts = credentials::spawn_with_test_factory(move || Ok(Arc::clone(&store)));
+        let credential_client = credential_parts.0.clone();
+        let database = sqlite::spawn(path.clone()).unwrap();
+        let account = create_outbound_account(&database.0, CREDENTIAL_KEY);
+        let stored = wait_for(
+            credential_client
+                .try_submit(CredentialOperation::Store {
+                    locator: CredentialLocator::parse(CREDENTIAL_KEY).unwrap(),
+                    secret: Secret::new(b"cancel-secret".to_vec()).unwrap(),
+                })
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(stored, CredentialOutcome::Stored));
+
+        let (core, mut events, runtime) = spawn_with_sync_components(
+            EVENT_CAPACITY,
+            database,
+            credential_parts,
+            successful_diagnostic,
+            production_imap_inbox_fetch,
+            cancellable_smtp_after_fence,
+            Some(content_root.clone()),
+        )
+        .unwrap();
+        let queued = wait_for(
+            core.try_compose_operation(ComposeOperation::Queue(
+                ComposeDraftInput::new(
+                    account.account_id,
+                    account.generation,
+                    None,
+                    "bob@example.test",
+                    "Cancel after DATA",
+                    "Acceptance must remain conservative.",
+                )
+                .unwrap(),
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let ComposeSuccess::Queued { draft, .. } = queued else {
+            panic!("compose queue must create a pending submission")
+        };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !CANCEL_AFTER_DATA_READY.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "SMTP DATA fence did not complete"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let wrong_message_id = MessageId::new(draft.message_id.get() + 1).unwrap();
+        assert_eq!(
+            core.cancel_outbox_attempt(wrong_message_id),
+            crate::core::message::OutboxCancelOutcome::NotActive
+        );
+        assert_eq!(
+            core.cancel_outbox_attempt(draft.message_id),
+            crate::core::message::OutboxCancelOutcome::Applied
+        );
+        assert_eq!(
+            core.cancel_outbox_attempt(draft.message_id),
+            crate::core::message::OutboxCancelOutcome::NotActive
+        );
+
+        wait_for(async {
+            loop {
+                match events.recv().await {
+                    Some(Event::OutboxStatus(OutboxStatus::StateChanged {
+                        message_id,
+                        state: OutboxState::Uncertain,
+                        ..
+                    })) if message_id == draft.message_id => break,
+                    Some(Event::OutboxStatus(OutboxStatus::Fault { kind, .. })) => {
+                        panic!("outbox cancellation faulted: {kind:?}")
+                    }
+                    Some(_) => {}
+                    None => panic!("core event channel closed before uncertain cancellation"),
+                }
+            }
+        });
+        assert_eq!(CANCEL_SMTP_CALLS.load(Ordering::Acquire), 1);
+        assert_eq!(
+            Connection::open(&path)
+                .unwrap()
+                .query_row(
+                    "SELECT state FROM outbox WHERE message_id = ?1",
+                    [draft.message_id.get()],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "uncertain"
+        );
+
+        runtime.shutdown().unwrap();
+        drop(core);
         remove_database_files(&path);
         fs::remove_dir_all(content_root).unwrap();
     }

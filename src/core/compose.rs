@@ -10,9 +10,10 @@ use crate::{
     store::sqlite::{
         AccountConfiguration, AccountGeneration, AccountId, AccountLifecycle, AccountRecord,
         ComposeDbOperation, ComposeDbOutcome, DatabaseClient, DatabaseSubmitError, DbFailure,
-        DraftRecipient, DraftSnapshot, DraftUpdate, FailureKind, MessageId, NewDraft,
-        OutboxRecipient, OutboxReportOutcome, OutboxReservation, OutboxReservationToken,
-        OutboxReserveRequest, OutboxState, RecipientKind,
+        DraftRecipient, DraftSnapshot, DraftUpdate, FailureKind, MAX_OUTBOX_SUMMARIES, MessageId,
+        NewDraft, OutboxActionFence, OutboxRecipient, OutboxReportOutcome, OutboxReservation,
+        OutboxReservationToken, OutboxReserveRequest, OutboxState, OutboxSummaryPage,
+        RecipientKind, UncertainResolution,
     },
 };
 
@@ -86,6 +87,13 @@ pub(crate) enum ComposeOperation {
     },
     SaveAndClose(ComposeDraftInput),
     Queue(ComposeDraftInput),
+    LoadOutbox,
+    RetryOutbox(OutboxActionFence),
+    ReleaseFailedOutbox(OutboxActionFence),
+    ResolveUncertainOutbox {
+        fence: OutboxActionFence,
+        resolution: UncertainResolution,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -107,6 +115,17 @@ pub(crate) enum ComposeSuccess {
         rfc_message_id: Box<str>,
     },
     Recovering,
+    OutboxLoaded(OutboxSummaryPage),
+    OutboxRetried {
+        message_id: MessageId,
+    },
+    OutboxReleased {
+        message_id: MessageId,
+    },
+    UncertainOutboxResolved {
+        message_id: MessageId,
+        resolution: UncertainResolution,
+    },
 }
 
 pub(crate) type ComposeReply = Result<ComposeSuccess, ComposeFailure>;
@@ -179,6 +198,98 @@ pub(crate) async fn execute_compose(
         ComposeOperation::Queue(input) => {
             queue_draft(database, staging, outbox_wakeups, input).await
         }
+        ComposeOperation::LoadOutbox => load_outbox(database).await,
+        ComposeOperation::RetryOutbox(fence) => {
+            let success = change_outbox(
+                database,
+                ComposeDbOperation::RetryOutbox {
+                    fence,
+                    now_ms: now_ms(),
+                },
+                OutboxState::Ready,
+                ComposeSuccess::OutboxRetried {
+                    message_id: fence.message_id,
+                },
+            )
+            .await?;
+            let _ = outbox_wakeups.try_send(());
+            Ok(success)
+        }
+        ComposeOperation::ReleaseFailedOutbox(fence) => {
+            change_outbox(
+                database,
+                ComposeDbOperation::ReleaseFailedOutbox {
+                    fence,
+                    now_ms: now_ms(),
+                },
+                OutboxState::PermanentFailure,
+                ComposeSuccess::OutboxReleased {
+                    message_id: fence.message_id,
+                },
+            )
+            .await
+        }
+        ComposeOperation::ResolveUncertainOutbox { fence, resolution } => {
+            let expected = match resolution {
+                UncertainResolution::AssumeDelivered => OutboxState::Delivered,
+                UncertainResolution::Release => OutboxState::Uncertain,
+            };
+            change_outbox(
+                database,
+                ComposeDbOperation::ResolveUncertainOutbox {
+                    fence,
+                    resolution,
+                    now_ms: now_ms(),
+                },
+                expected,
+                ComposeSuccess::UncertainOutboxResolved {
+                    message_id: fence.message_id,
+                    resolution,
+                },
+            )
+            .await
+        }
+    }
+}
+
+async fn load_outbox(database: &DatabaseClient) -> ComposeReply {
+    let outcome = compose_call(
+        database,
+        Box::new(ComposeDbOperation::LoadOutboxSummaries {
+            limit: MAX_OUTBOX_SUMMARIES,
+        }),
+    )
+    .await
+    .map_err(|error| error.into_failure(None))?;
+    let ComposeDbOutcome::OutboxSummaries(page) = outcome else {
+        return Err(unexpected_database_outcome(None));
+    };
+    Ok(ComposeSuccess::OutboxLoaded(page))
+}
+
+async fn change_outbox(
+    database: &DatabaseClient,
+    operation: ComposeDbOperation,
+    expected_state: OutboxState,
+    success: ComposeSuccess,
+) -> ComposeReply {
+    let outcome = compose_call(database, Box::new(operation))
+        .await
+        .map_err(|error| error.into_failure(None))?;
+    let report = match outcome {
+        ComposeDbOutcome::OutboxRetried(report)
+        | ComposeDbOutcome::FailedOutboxReleased(report)
+        | ComposeDbOutcome::UncertainOutboxResolved(report) => report,
+        _ => return Err(unexpected_database_outcome(None)),
+    };
+    match report {
+        OutboxReportOutcome::Applied(state) if state == expected_state => Ok(success),
+        OutboxReportOutcome::Stale => Err(ComposeFailure::new(
+            ComposeFailureKind::Conflict,
+            "outbox item changed; reload the outbox before trying again",
+            None,
+        )),
+        OutboxReportOutcome::Applied(_) => Err(unexpected_database_outcome(None)),
     }
 }
 
@@ -831,7 +942,7 @@ mod tests {
 
     use crate::store::sqlite::{
         AccountAuthKind, AccountConfigInput, AccountWrite, AccountWriteOutcome, ComposeDbOperation,
-        ComposeDbOutcome, OutboxClaimOutcome, SmtpSecurity,
+        ComposeDbOutcome, OutboxClaimOutcome, OutboxErrorClass, OutboxReport, SmtpSecurity,
     };
 
     use super::*;
@@ -986,6 +1097,160 @@ mod tests {
             mime.windows(b"queued=20body".len())
                 .any(|part| part == b"queued=20body")
         );
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn persistent_outbox_management_retries_and_releases_with_loaded_fence() {
+        let paths = TestPaths::new("outbox-management");
+        let staging = ContentStaging::open(paths.content.clone()).unwrap();
+        let (client, _replies, runtime, _) =
+            crate::store::sqlite::spawn(paths.database.clone()).expect("start test database");
+        let account = block_on(create_account(&client));
+        let (wakeups, mut wake_receiver) = mpsc::channel(1);
+        let queued = block_on(execute_compose(
+            &client,
+            &staging,
+            &wakeups,
+            ComposeOperation::Queue(input(&account, None, "managed body")),
+        ))
+        .unwrap();
+        let ComposeSuccess::Queued { draft, .. } = queued else {
+            panic!("expected queued draft");
+        };
+        assert_eq!(wake_receiver.try_recv(), Ok(()));
+
+        let claim = block_on(compose_call(
+            &client,
+            Box::new(ComposeDbOperation::ClaimNextOutbox {
+                now_ms: now_ms().saturating_add(1),
+            }),
+        ))
+        .unwrap();
+        let ComposeDbOutcome::OutboxClaimed(OutboxClaimOutcome::Claimed(claim)) = claim else {
+            panic!("expected first outbox claim");
+        };
+        let reported = block_on(compose_call(
+            &client,
+            Box::new(ComposeDbOperation::ReportOutbox {
+                lease: claim.lease,
+                report: OutboxReport::permanent_failure(
+                    OutboxErrorClass::Authentication,
+                    "test_authentication",
+                )
+                .unwrap(),
+                now_ms: now_ms().saturating_add(2),
+            }),
+        ))
+        .unwrap();
+        assert!(matches!(
+            reported,
+            ComposeDbOutcome::OutboxReported(OutboxReportOutcome::Applied(
+                OutboxState::PermanentFailure
+            ))
+        ));
+
+        let loaded = block_on(execute_compose(
+            &client,
+            &staging,
+            &wakeups,
+            ComposeOperation::LoadOutbox,
+        ))
+        .unwrap();
+        let ComposeSuccess::OutboxLoaded(page) = loaded else {
+            panic!("expected persistent outbox page");
+        };
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].message_id, draft.message_id);
+        assert_eq!(page.items[0].state, OutboxState::PermanentFailure);
+        let fence = page.items[0].action_fence();
+
+        let retried = block_on(execute_compose(
+            &client,
+            &staging,
+            &wakeups,
+            ComposeOperation::RetryOutbox(fence),
+        ))
+        .unwrap();
+        assert_eq!(
+            retried,
+            ComposeSuccess::OutboxRetried {
+                message_id: draft.message_id
+            }
+        );
+        assert_eq!(wake_receiver.try_recv(), Ok(()));
+
+        let claim = block_on(compose_call(
+            &client,
+            Box::new(ComposeDbOperation::ClaimNextOutbox {
+                now_ms: now_ms().saturating_add(3),
+            }),
+        ))
+        .unwrap();
+        let ComposeDbOutcome::OutboxClaimed(OutboxClaimOutcome::Claimed(claim)) = claim else {
+            panic!("expected retried outbox claim");
+        };
+        block_on(compose_call(
+            &client,
+            Box::new(ComposeDbOperation::ReportOutbox {
+                lease: claim.lease,
+                report: OutboxReport::permanent_failure(
+                    OutboxErrorClass::Permanent,
+                    "test_permanent",
+                )
+                .unwrap(),
+                now_ms: now_ms().saturating_add(4),
+            }),
+        ))
+        .unwrap();
+        let loaded = block_on(execute_compose(
+            &client,
+            &staging,
+            &wakeups,
+            ComposeOperation::LoadOutbox,
+        ))
+        .unwrap();
+        let ComposeSuccess::OutboxLoaded(page) = loaded else {
+            panic!("expected refreshed outbox page");
+        };
+        let released = block_on(execute_compose(
+            &client,
+            &staging,
+            &wakeups,
+            ComposeOperation::ReleaseFailedOutbox(page.items[0].action_fence()),
+        ))
+        .unwrap();
+        assert_eq!(
+            released,
+            ComposeSuccess::OutboxReleased {
+                message_id: draft.message_id
+            }
+        );
+        let loaded = block_on(execute_compose(
+            &client,
+            &staging,
+            &wakeups,
+            ComposeOperation::LoadOutbox,
+        ))
+        .unwrap();
+        let ComposeSuccess::OutboxLoaded(page) = loaded else {
+            panic!("expected empty outbox page");
+        };
+        assert!(page.items.is_empty());
+        let draft = block_on(execute_compose(
+            &client,
+            &staging,
+            &wakeups,
+            ComposeOperation::LoadLatest {
+                account_id: account.account_id,
+                expected_generation: account.generation,
+            },
+        ))
+        .unwrap();
+        let ComposeSuccess::Loaded(Some(draft)) = draft else {
+            panic!("expected released draft");
+        };
+        assert!(!draft.locked_for_delivery);
         runtime.shutdown().unwrap();
     }
 

@@ -3,7 +3,6 @@ use std::{
     fmt,
     future::Future,
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -14,7 +13,6 @@ use tokio::{
 };
 
 use crate::{
-    content::ContentStaging,
     credentials::{
         CredentialClient, CredentialDeleteOutcome, CredentialFailureKind, CredentialLocator,
         CredentialOperation, CredentialOutcome, CredentialResponse, CredentialSubmitError, Secret,
@@ -28,8 +26,8 @@ use crate::{
         AccountGeneration, AccountId, AccountLifecycle, AccountPurgeOutcome, AccountRecord,
         AccountRemovalTicket, AccountValidationError, AccountWrite, AccountWriteOutcome,
         AccountWriteReply, DatabaseClient, DatabaseSubmitError, DiagnosticCommit, DiagnosticRecord,
-        DiagnosticTicket, FailureKind, FileGcOutcome, PendingCacheRemoval,
-        PendingCredentialRemoval, RequestId, SmtpSecurity,
+        DiagnosticTicket, FailureKind, PendingCacheRemoval, PendingCredentialRemoval, RequestId,
+        SmtpSecurity,
     },
 };
 
@@ -40,7 +38,6 @@ use super::sync::{ImapInboxFetchProbe, SyncInboxFuture, SyncInboxOutcome, start_
 #[cfg_attr(not(test), allow(dead_code))]
 const PLACEHOLDER_CREDENTIAL_KEY: &str = "00000000000000000000000000000000";
 const RECOVERY_SUBMISSION_RETRY: Duration = Duration::from_millis(10);
-const STARTUP_FILE_GC_LIMIT: usize = 16;
 
 pub(super) type ImapDiagnosticFuture =
     Pin<Box<dyn Future<Output = Result<(), ImapDiagnosticFailure>> + 'static>>;
@@ -1470,16 +1467,7 @@ impl AccountWorkflows {
             }
             RecoveryState::Queued(requests) => {
                 let Some(request) = requests.pop_front() else {
-                    let Some(content_root) = self.content_root.clone() else {
-                        self.recovery = RecoveryState::Complete;
-                        return Poll::Ready(Ok(()));
-                    };
-                    let Ok(staging) = ContentStaging::open(content_root) else {
-                        self.recovery = RecoveryState::Complete;
-                        return Poll::Ready(Ok(()));
-                    };
-                    self.recovery = RecoveryState::SubmitFileGc(Arc::new(staging));
-                    context.waker().wake_by_ref();
+                    self.recovery = RecoveryState::Complete;
                     return Poll::Ready(Ok(()));
                 };
                 let identity = request_identity(&request);
@@ -1497,47 +1485,6 @@ impl AccountWorkflows {
                 context.waker().wake_by_ref();
                 Poll::Ready(Ok(()))
             }
-            RecoveryState::SubmitFileGc(staging) => {
-                match self
-                    .database
-                    .try_run_file_gc(staging, STARTUP_FILE_GC_LIMIT)
-                {
-                    Ok(receiver) => {
-                        self.recovery = RecoveryState::LoadingFileGc(receiver);
-                        context.waker().wake_by_ref();
-                        Poll::Ready(Ok(()))
-                    }
-                    Err(DatabaseSubmitError::Busy) => {
-                        self.recovery = RecoveryState::WaitingFileGcSubmit {
-                            staging: Arc::clone(staging),
-                            delay: Box::pin(time::sleep(RECOVERY_SUBMISSION_RETRY)),
-                        };
-                        Poll::Ready(Ok(()))
-                    }
-                    Err(DatabaseSubmitError::Closed) => {
-                        Poll::Ready(Err(AccountDriverError::DatabaseClosed))
-                    }
-                }
-            }
-            RecoveryState::WaitingFileGcSubmit { staging, delay } => {
-                match delay.as_mut().poll(context) {
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(()) => {
-                        self.recovery = RecoveryState::SubmitFileGc(Arc::clone(staging));
-                        context.waker().wake_by_ref();
-                        Poll::Ready(Ok(()))
-                    }
-                }
-            }
-            RecoveryState::LoadingFileGc(receiver) => match Pin::new(receiver).poll(context) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(Ok(_)) => {
-                    self.recovery = RecoveryState::Complete;
-                    context.waker().wake_by_ref();
-                    Poll::Ready(Ok(()))
-                }
-                Poll::Ready(Err(_)) => Poll::Ready(Err(AccountDriverError::DatabaseClosed)),
-            },
             RecoveryState::Complete => Poll::Pending,
         }
     }
@@ -1570,12 +1517,6 @@ enum RecoveryState {
             oneshot::Receiver<Result<Box<[PendingCacheRemoval]>, crate::store::sqlite::DbFailure>>,
     },
     Queued(VecDeque<AccountWorkflowRequest>),
-    SubmitFileGc(Arc<ContentStaging>),
-    WaitingFileGcSubmit {
-        staging: Arc<ContentStaging>,
-        delay: Pin<Box<Sleep>>,
-    },
-    LoadingFileGc(oneshot::Receiver<Result<FileGcOutcome, crate::store::sqlite::DbFailure>>),
     Complete,
 }
 

@@ -38,3 +38,13 @@ export struct MailDetail {
     has-attachment: bool,
     avatar-color: color,
 }
+
+export struct OutboxItem {
+    message-id: string,
+    account-label: string,
+    recipients: string,
+    subject: string,
+    state: string,
+    status: string,
+    attempt-detail: string,
+}

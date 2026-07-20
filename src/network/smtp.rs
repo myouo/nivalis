@@ -157,6 +157,7 @@ impl SmtpSubmissionStage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SmtpSubmissionFailureKind {
     Retryable,
+    TransientRejection,
     Authentication,
     Permanent,
     Certificate,
@@ -180,6 +181,9 @@ impl fmt::Display for SmtpSubmissionFailure {
         formatter.write_str(match self.kind {
             SmtpSubmissionFailureKind::Retryable => {
                 "the SMTP submission failed before delivery and can be retried"
+            }
+            SmtpSubmissionFailureKind::TransientRejection => {
+                "the SMTP server temporarily rejected the message and it can be retried"
             }
             SmtpSubmissionFailureKind::Authentication => {
                 "the SMTP server rejected the account credentials"
@@ -234,14 +238,19 @@ pub(crate) type SmtpDataFence =
 pub(crate) struct SmtpSubmissionCancelHandle(Option<oneshot::Sender<()>>);
 
 impl SmtpSubmissionCancelHandle {
-    pub(crate) fn cancel(mut self) {
-        if let Some(sender) = self.0.take() {
-            let _ = sender.send(());
-        }
+    pub(crate) fn cancel(mut self) -> bool {
+        self.0.take().is_some_and(|sender| sender.send(()).is_ok())
     }
 }
 
 pub(crate) struct SmtpSubmissionCancellation(oneshot::Receiver<()>);
+
+#[cfg(test)]
+impl SmtpSubmissionCancellation {
+    pub(crate) async fn cancelled(self) {
+        let _ = self.0.await;
+    }
+}
 
 pub(crate) fn smtp_submission_cancellation_pair()
 -> (SmtpSubmissionCancelHandle, SmtpSubmissionCancellation) {
@@ -523,16 +532,6 @@ async fn submit_inner(
         }
     }
 
-    progress.mark(SmtpSubmissionStage::DataFence);
-    data_fence.await.map_err(|_| {
-        failure(
-            SmtpSubmissionStage::DataFence,
-            SmtpSubmissionFailureKind::LocalState,
-        )
-    })?;
-
-    // The durable state is conservative from this point, even if DATA is not yet observed.
-    progress.mark_data_started();
     progress.mark(SmtpSubmissionStage::Data);
     let data_response = connection
         .command(Data)
@@ -545,6 +544,16 @@ async fn submit_inner(
         ));
     }
 
+    progress.mark(SmtpSubmissionStage::DataFence);
+    data_fence.await.map_err(|_| {
+        failure(
+            SmtpSubmissionStage::DataFence,
+            SmtpSubmissionFailureKind::LocalState,
+        )
+    })?;
+
+    // No message bytes are sent until the durable attempt fence is visible.
+    progress.mark_data_started();
     progress.mark(SmtpSubmissionStage::Body);
     let read_state = Arc::new(AtomicU8::new(FileReadState::Reading as u8));
     let chunks = FileChunkIterator::new(mime_file, wire_byte_count, read_state.clone());
@@ -759,7 +768,14 @@ fn map_lettre_error(
     data_started: bool,
 ) -> SmtpSubmissionFailure {
     if error.is_transient() {
-        return failure(stage, SmtpSubmissionFailureKind::Retryable);
+        return failure(
+            stage,
+            if data_started {
+                SmtpSubmissionFailureKind::TransientRejection
+            } else {
+                SmtpSubmissionFailureKind::Retryable
+            },
+        );
     }
     if error.is_permanent() {
         return failure(
@@ -867,8 +883,9 @@ mod tests {
         Authentication535,
         Data451,
         Data550,
+        Body451,
         DisconnectAfterData,
-        ExpectNoData,
+        ExpectNoBody,
     }
 
     enum ServerScript {
@@ -1045,20 +1062,7 @@ mod tests {
         assert!(read_command(stream).await?.starts_with("RCPT TO:<"));
         write_reply(stream, b"250 2.1.5 recipient accepted\r\n").await?;
 
-        match read_command(stream).await {
-            Ok(command) if matches!(behavior, MailBehavior::ExpectNoData) => {
-                panic!("DATA must not be sent after a failed fence: {command}")
-            }
-            Err(_) if matches!(behavior, MailBehavior::ExpectNoData) => return Ok(()),
-            Ok(command) => assert_eq!(command, "DATA"),
-            Err(error) => return Err(error),
-        }
-        if let Some(data_fenced) = data_fenced {
-            assert!(
-                data_fenced.load(Ordering::Acquire),
-                "the durable fence must complete before DATA"
-            );
-        }
+        assert_eq!(read_command(stream).await?, "DATA");
 
         match behavior {
             MailBehavior::Data451 => {
@@ -1073,12 +1077,33 @@ mod tests {
                 write_reply(stream, b"354 continue\r\n").await?;
                 return Ok(());
             }
-            MailBehavior::Success => {}
-            MailBehavior::Authentication535 | MailBehavior::ExpectNoData => unreachable!(),
+            MailBehavior::Success | MailBehavior::Body451 | MailBehavior::ExpectNoBody => {}
+            MailBehavior::Authentication535 => unreachable!(),
         }
 
         write_reply(stream, b"354 continue\r\n").await?;
+        if matches!(behavior, MailBehavior::ExpectNoBody) {
+            return match read_command(stream).await {
+                Err(_) => Ok(()),
+                Ok(command) => {
+                    panic!("message body must not be sent after a failed fence: {command}")
+                }
+            };
+        }
+        if let Some(data_fenced) = data_fenced {
+            tokio::time::timeout(TEST_TIMEOUT, async {
+                while !data_fenced.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the durable fence must complete before the message body");
+        }
         read_data_terminator(stream).await?;
+        if matches!(behavior, MailBehavior::Body451) {
+            write_reply(stream, b"451 4.3.0 try later\r\n").await?;
+            return Ok(());
+        }
         write_reply(stream, b"250 2.0.0 queued\r\n").await?;
         assert_eq!(read_command(stream).await?, "QUIT");
         write_reply(stream, b"221 2.0.0 bye\r\n").await
@@ -1265,6 +1290,61 @@ mod tests {
     }
 
     #[test]
+    fn data_rejection_does_not_run_durable_fence() {
+        run_async(async {
+            let data_fenced = Arc::new(AtomicBool::new(false));
+            let server = spawn_server(
+                TestSecurity::ImplicitTls,
+                ServerScript::Mail(MailBehavior::Data451),
+                Some(data_fenced.clone()),
+            )
+            .await;
+            let fence_flag = data_fenced.clone();
+            let fence = Box::pin(async move {
+                fence_flag.store(true, Ordering::Release);
+                Ok(())
+            });
+            let failure = submit_to_server(
+                &server,
+                b"Subject: rejected before fence\r\n\r\nbody",
+                None,
+                fence,
+                TEST_TIMEOUT,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(failure.stage, SmtpSubmissionStage::Data);
+            assert_eq!(failure.kind, SmtpSubmissionFailureKind::Retryable);
+            assert!(!data_fenced.load(Ordering::Acquire));
+            server.task.await.unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn transient_rejection_after_body_is_confirmed_retryable() {
+        run_async(async {
+            let server = spawn_server(
+                TestSecurity::ImplicitTls,
+                ServerScript::Mail(MailBehavior::Body451),
+                None,
+            )
+            .await;
+            let failure = submit_to_server(
+                &server,
+                b"Subject: rejected after body\r\n\r\nbody",
+                None,
+                no_op_data_fence(),
+                TEST_TIMEOUT,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(failure.stage, SmtpSubmissionStage::Body);
+            assert_eq!(failure.kind, SmtpSubmissionFailureKind::TransientRejection);
+            server.task.await.unwrap().unwrap();
+        });
+    }
+
+    #[test]
     fn disconnect_after_data_is_uncertain() {
         run_async(async {
             let server = spawn_server(
@@ -1289,11 +1369,11 @@ mod tests {
     }
 
     #[test]
-    fn failed_data_fence_never_sends_data() {
+    fn failed_data_fence_never_sends_message_body() {
         run_async(async {
             let server = spawn_server(
                 TestSecurity::ImplicitTls,
-                ServerScript::Mail(MailBehavior::ExpectNoData),
+                ServerScript::Mail(MailBehavior::ExpectNoBody),
                 None,
             )
             .await;
@@ -1339,6 +1419,36 @@ mod tests {
             assert_eq!(failure.stage, SmtpSubmissionStage::Connect);
             assert_eq!(failure.kind, SmtpSubmissionFailureKind::Cancelled);
             cancel_task.await.unwrap();
+            server.task.abort();
+            let _ = server.task.await;
+        });
+    }
+
+    #[test]
+    fn cancellation_after_data_fence_is_uncertain() {
+        run_async(async {
+            let server = spawn_server(
+                TestSecurity::ImplicitTls,
+                ServerScript::Mail(MailBehavior::Success),
+                None,
+            )
+            .await;
+            let (cancel, cancellation) = smtp_submission_cancellation_pair();
+            let fence = Box::pin(async move {
+                cancel.cancel();
+                Ok(())
+            });
+            let failure = submit_to_server(
+                &server,
+                b"Subject: cancel after fence\r\n\r\nbody",
+                Some(cancellation),
+                fence,
+                TEST_TIMEOUT,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(failure.stage, SmtpSubmissionStage::Body);
+            assert_eq!(failure.kind, SmtpSubmissionFailureKind::Uncertain);
             server.task.abort();
             let _ = server.task.await;
         });

@@ -392,6 +392,11 @@ pub(crate) enum OutboxReport {
         error_class: OutboxErrorClass,
         error_code: Box<str>,
     },
+    RetryAfterRejection {
+        not_before_ms: i64,
+        error_class: OutboxErrorClass,
+        error_code: Box<str>,
+    },
     PermanentFailure {
         error_class: OutboxErrorClass,
         error_code: Box<str>,
@@ -415,6 +420,20 @@ impl OutboxReport {
         validate_timestamp(not_before_ms)?;
         validate_error_code(error_code)?;
         Ok(Self::Retry {
+            not_before_ms,
+            error_class,
+            error_code: error_code.into(),
+        })
+    }
+
+    pub(crate) fn retry_after_rejection(
+        not_before_ms: i64,
+        error_class: OutboxErrorClass,
+        error_code: &str,
+    ) -> Result<Self, DbFailure> {
+        validate_timestamp(not_before_ms)?;
+        validate_error_code(error_code)?;
+        Ok(Self::RetryAfterRejection {
             not_before_ms,
             error_class,
             error_code: error_code.into(),
@@ -1139,6 +1158,11 @@ pub(crate) fn report_outbox(
             OutboxState::Uncertain
         }
         OutboxReport::Retry {
+            not_before_ms,
+            error_class,
+            error_code,
+        }
+        | OutboxReport::RetryAfterRejection {
             not_before_ms,
             error_class,
             error_code,
@@ -2262,6 +2286,72 @@ mod tests {
         assert_eq!(
             release_failed_outbox(&mut connection, action_fence(message_id), 600).unwrap(),
             OutboxReportOutcome::Stale
+        );
+    }
+
+    #[test]
+    fn confirmed_transient_rejection_retries_with_claim_generation_fences() {
+        let mut connection = database();
+        let message_id = create_test_draft(&mut connection, 31, 100);
+        let reservation = reserve(&mut connection, message_id, 0x92, 200);
+        finalize_outbox(&mut connection, &reservation, 128, 300).unwrap();
+        let OutboxClaimOutcome::Claimed(claim) = claim_next_outbox(&mut connection, 400).unwrap()
+        else {
+            panic!("expected global outbox claim");
+        };
+        assert_eq!(
+            mark_outbox_data_started(&mut connection, claim.lease, 450).unwrap(),
+            OutboxReportOutcome::Applied(OutboxState::InFlight)
+        );
+
+        let report = OutboxReport::retry_after_rejection(
+            1_000,
+            OutboxErrorClass::Network,
+            "smtp_transient_rejection",
+        )
+        .unwrap();
+        let mut stale_generation = claim.lease;
+        stale_generation.artifact_generation += 1;
+        assert_eq!(
+            report_outbox(&mut connection, stale_generation, &report, 500).unwrap(),
+            OutboxReportOutcome::Stale
+        );
+        let mut stale_claim = claim.lease;
+        stale_claim.claim_epoch += 1;
+        assert_eq!(
+            report_outbox(&mut connection, stale_claim, &report, 500).unwrap(),
+            OutboxReportOutcome::Stale
+        );
+        assert_eq!(
+            load_outbox_state(&connection, message_id).unwrap(),
+            Some(OutboxState::InFlight)
+        );
+        assert_eq!(
+            report_outbox(&mut connection, claim.lease, &report, 500).unwrap(),
+            OutboxReportOutcome::Applied(OutboxState::RetryWait)
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT state, delivery_started, not_before_ms, error_class, error_code
+                     FROM outbox WHERE message_id = ?1",
+                    [message_id.get()],
+                    |row| Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?
+                    )),
+                )
+                .unwrap(),
+            (
+                "retry_wait".to_owned(),
+                0,
+                1_000,
+                "network".to_owned(),
+                "smtp_transient_rejection".to_owned(),
+            )
         );
     }
 

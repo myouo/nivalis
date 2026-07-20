@@ -4,6 +4,7 @@ import { Theme } from "theme.slint";
 import { MailboxPane } from "mailbox.slint";
 import { ReaderPane } from "reader.slint";
 import { ComposerOverlay } from "composer.slint";
+import { OutboxOverlay } from "outbox.slint";
 import {
     NavigationPane, TitleBar
 } from "shell.slint";
@@ -14,9 +15,9 @@ import {
 } from "overlays.slint";
 import { MaterialIcon } from "components.slint";
 import { EmptyState } from "states.slint";
-import { AccountItem, MailDetail, MailSummary } from "models.slint";
+import { AccountItem, MailDetail, MailSummary, OutboxItem } from "models.slint";
 
-export { AccountItem, MailDetail, MailSummary } from "models.slint";
+export { AccountItem, MailDetail, MailSummary, OutboxItem } from "models.slint";
 
 export component AppWindow inherits Window {
     title: "Nivalis Mail";
@@ -44,6 +45,14 @@ export component AppWindow inherits Window {
     in property <int> inbox-count: 0;
     in property <int> starred-count: 0;
     in property <int> draft-count: 0;
+    in property <[OutboxItem]> outbox-items;
+    in-out property <bool> outbox-open: false;
+    in property <bool> outbox-loading: false;
+    in property <string> outbox-error: "";
+    in property <bool> outbox-has-more: false;
+    in property <int> outbox-count: 0;
+    in property <bool> outbox-action-loading: false;
+    in property <string> outbox-action-message-id: "";
     in property <string> active-account-id: "";
     in property <string> active-account-name: "All inboxes";
     in property <string> data-source-label: "Local cache";
@@ -117,6 +126,7 @@ export component AppWindow inherits Window {
         || root.filter-menu-open
         || root.message-menu-open
         || root.composer-open
+        || root.outbox-open
         || root.delete-dialog-open;
 
     changed width => {
@@ -146,6 +156,14 @@ export component AppWindow inherits Window {
     callback send-message(string, string, string);
     callback save-draft(string, string, string);
     callback compose-input-edited(string, string);
+    callback open-outbox;
+    callback reload-outbox;
+    callback close-outbox;
+    callback retry-outbox(string);
+    callback release-failed-outbox(string);
+    callback assume-delivered-outbox(string);
+    callback release-uncertain-outbox(string);
+    callback cancel-active-outbox(string);
     callback switch-account(string);
     callback add-account(string, string, string, string, string, string, string, string);
     callback manage-account(string);
@@ -188,6 +206,12 @@ export component AppWindow inherits Window {
                 else if (root.delete-dialog-open) {
                     if (!root.mutation-loading) { root.delete-dialog-open = false; }
                 }
+                else if (root.outbox-open) {
+                    if (!root.outbox-action-loading) {
+                        root.outbox-open = false;
+                        root.close-outbox();
+                    }
+                }
                 else if (root.composer-open) {
                     if (!root.composer-loading) {
                         root.save-draft(root.compose-to, root.compose-subject, root.compose-body);
@@ -229,6 +253,7 @@ export component AppWindow inherits Window {
                     vertical-stretch: 1;
 
                     NavigationPane {
+                        accessible-enabled: !root.outbox-open;
                         pane-width: root.navigation-width;
                         wide: root.wide-sidebar;
                         account-name: root.active-account-name;
@@ -239,21 +264,40 @@ export component AppWindow inherits Window {
                         compose-enabled: root.compose-enabled;
                         account-menu-open: root.account-menu-open;
                         settings-open: root.settings-open;
+                        outbox-open: root.outbox-open;
                         active-folder: root.active-folder;
                         inbox-count: root.inbox-count;
                         starred-count: root.starred-count;
                         draft-count: root.draft-count;
-                        collapsed(value) => { root.sidebar-collapsed = value; }
+                        outbox-count: root.outbox-count;
+                        collapsed(value) => {
+                            if (!root.outbox-open) { root.sidebar-collapsed = value; }
+                        }
                         compose => {
-                            if (root.compose-enabled) {
+                            if (!root.outbox-open && root.compose-enabled) {
                                 root.composer-error = "";
                                 root.composer-open = true;
                                 root.open-composer();
                             }
                         }
-                        folder-selected(folder) => { root.filter-folder(folder); root.detail-open = false; }
-                        open-accounts => { root.account-menu-open = true; }
-                        open-settings => { root.settings-open = true; }
+                        folder-selected(folder) => {
+                            if (!root.outbox-open) {
+                                root.filter-folder(folder);
+                                root.detail-open = false;
+                            }
+                        }
+                        open-outbox => {
+                            if (!root.outbox-open) {
+                                root.outbox-open = true;
+                                root.open-outbox();
+                            }
+                        }
+                        open-accounts => {
+                            if (!root.outbox-open) { root.account-menu-open = true; }
+                        }
+                        open-settings => {
+                            if (!root.outbox-open) { root.settings-open = true; }
+                        }
                     }
 
                     workspace := Rectangle {
@@ -263,6 +307,7 @@ export component AppWindow inherits Window {
                         clip: true;
                         accessible-role: main;
                         accessible-label: "Mail workspace";
+                        accessible-enabled: !root.outbox-open;
 
                         if !root.has-accounts && (root.initial-loading || root.mailbox-loading): Rectangle {
                             accessible-role: progress-indicator;
@@ -280,7 +325,9 @@ export component AppWindow inherits Window {
                             detail: root.mailbox-error-detail;
                             icon: "warning";
                             action-label: "Try again";
-                            action => { root.retry-mailbox(); }
+                            action => {
+                                if (!root.outbox-open) { root.retry-mailbox(); }
+                            }
                         }
 
                         if !root.has-accounts && !root.initial-loading && !root.mailbox-loading && !root.mailbox-error: EmptyState {
@@ -289,7 +336,12 @@ export component AppWindow inherits Window {
                             icon: "account_circle";
                             action-label: "Add account";
                             action-variant: "filled";
-                            action => { root.account-operation-error = ""; root.account-setup-open = true; }
+                            action => {
+                                if (!root.outbox-open) {
+                                    root.account-operation-error = "";
+                                    root.account-setup-open = true;
+                                }
+                            }
                         }
 
                         if root.has-accounts: HorizontalLayout {
@@ -327,13 +379,27 @@ export component AppWindow inherits Window {
                                 more-menu-open <=> root.more-menu-open;
                                 filter-menu-open <=> root.filter-menu-open;
                                 error-banner-dismissed <=> root.error-banner-dismissed;
-                                select-mail(id) => { root.select-mail(id); }
-                                query-mail(query) => { root.query-mail(query); }
-                                toggle-star(id) => { root.toggle-star(id); }
-                                sync-account(id) => { root.sync-account(id); }
-                                retry => { root.retry-mailbox(); }
-                                previous-mailbox-page => { root.previous-mailbox-page(); }
-                                next-mailbox-page => { root.next-mailbox-page(); }
+                                select-mail(id) => {
+                                    if (!root.outbox-open) { root.select-mail(id); }
+                                }
+                                query-mail(query) => {
+                                    if (!root.outbox-open) { root.query-mail(query); }
+                                }
+                                toggle-star(id) => {
+                                    if (!root.outbox-open) { root.toggle-star(id); }
+                                }
+                                sync-account(id) => {
+                                    if (!root.outbox-open) { root.sync-account(id); }
+                                }
+                                retry => {
+                                    if (!root.outbox-open) { root.retry-mailbox(); }
+                                }
+                                previous-mailbox-page => {
+                                    if (!root.outbox-open) { root.previous-mailbox-page(); }
+                                }
+                                next-mailbox-page => {
+                                    if (!root.outbox-open) { root.next-mailbox-page(); }
+                                }
                             }
 
                             if !root.compact-layout || root.detail-open: ReaderPane {
@@ -350,11 +416,21 @@ export component AppWindow inherits Window {
                                 detail-open <=> root.detail-open;
                                 delete-dialog-open <=> root.delete-dialog-open;
                                 message-menu-open <=> root.message-menu-open;
-                                filter-folder(folder) => { root.filter-folder(folder); }
-                                toggle-star(id) => { root.toggle-star(id); }
-                                archive(id) => { root.archive(id); }
-                                mark-unread(id) => { root.mark-unread(id); }
-                                retry-detail => { root.retry-detail(); }
+                                filter-folder(folder) => {
+                                    if (!root.outbox-open) { root.filter-folder(folder); }
+                                }
+                                toggle-star(id) => {
+                                    if (!root.outbox-open) { root.toggle-star(id); }
+                                }
+                                archive(id) => {
+                                    if (!root.outbox-open) { root.archive(id); }
+                                }
+                                mark-unread(id) => {
+                                    if (!root.outbox-open) { root.mark-unread(id); }
+                                }
+                                retry-detail => {
+                                    if (!root.outbox-open) { root.retry-detail(); }
+                                }
                             }
                         }
                     }
@@ -451,6 +527,29 @@ export component AppWindow inherits Window {
         dark-mode <=> root.dark-mode;
         high-contrast <=> root.high-contrast;
         reduced-motion <=> root.reduced-motion;
+    }
+
+    if root.outbox-open: OutboxOverlay {
+        width: parent.width;
+        height: parent.height;
+        items: root.outbox-items;
+        loading: root.outbox-loading;
+        error: root.outbox-error;
+        has-more: root.outbox-has-more;
+        operation-loading: root.outbox-action-loading;
+        operation-message-id: root.outbox-action-message-id;
+        reload => { root.reload-outbox(); }
+        close => {
+            if (!root.outbox-action-loading) {
+                root.outbox-open = false;
+                root.close-outbox();
+            }
+        }
+        retry(id) => { root.retry-outbox(id); }
+        release-failed(id) => { root.release-failed-outbox(id); }
+        assume-delivered(id) => { root.assume-delivered-outbox(id); }
+        release-uncertain(id) => { root.release-uncertain-outbox(id); }
+        cancel-active(id) => { root.cancel-active-outbox(id); }
     }
 
     if root.composer-open: ComposerOverlay {

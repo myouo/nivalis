@@ -1,0 +1,716 @@
+import { ListView } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { OutboxItem } from "models.slint";
+import { MButton, MaterialIcon, MIconButton, SkeletonRow } from "components.slint";
+import { EmptyState } from "states.slint";
+
+component OutboxStatusBadge inherits Rectangle {
+    in property <string> state;
+    in property <string> status;
+
+    private property <bool> failed: root.state == "permanent_failure";
+    private property <bool> uncertain: root.state == "uncertain";
+    private property <bool> active: root.state == "in_flight";
+
+    height: 28px;
+    min-width: 96px;
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: root.failed ? Theme.error : root.uncertain ? Theme.tertiary : root.active ? Theme.primary : Theme.outline-variant;
+    background: root.failed ? Theme.error-container : root.uncertain ? Theme.tertiary-container : root.active ? Theme.primary-container : Theme.secondary-container;
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 9px;
+        spacing: 5px;
+        alignment: center;
+        MaterialIcon {
+            width: 17px;
+            name: root.failed || root.uncertain ? "warning" : root.active ? "progress_activity" : root.state == "delivered" ? "check_circle" : "send";
+            size: 14px;
+            icon-color: root.failed ? Theme.error : root.uncertain ? Theme.tertiary : root.active ? Theme.primary : Theme.on-secondary-container;
+        }
+        Text {
+            text: root.status;
+            color: root.failed ? Theme.on-error-container : root.uncertain ? Theme.on-tertiary-container : root.active ? Theme.on-primary-container : Theme.on-secondary-container;
+            font-family: Theme.body-font;
+            font-size: 10px;
+            font-weight: 600;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+}
+
+component OutboxRow inherits Rectangle {
+    in property <OutboxItem> item;
+    in property <bool> actions-enabled: true;
+    in property <bool> action-loading: false;
+    callback retry(string);
+    callback release-failed(string);
+    callback request-assume-delivered(string, string);
+    callback request-release-uncertain(string, string);
+    callback cancel-active(string);
+
+    private property <bool> failed: root.item.state == "permanent_failure";
+    private property <bool> uncertain: root.item.state == "uncertain";
+    private property <bool> active: root.item.state == "in_flight";
+    private property <bool> actionable: root.failed || root.uncertain || root.active;
+
+    height: root.active ? 228px : root.failed || root.uncertain ? 218px : 148px;
+    background: transparent;
+
+    card := Rectangle {
+        width: parent.width;
+        height: parent.height - 8px;
+        border-radius: 7px;
+        border-width: 1px;
+        border-color: root.failed ? Theme.error : root.uncertain ? Theme.tertiary : Theme.outline-variant;
+        background: root.action-loading ? Theme.surface-container-high : Theme.surface-container-low;
+        accessible-role: list-item;
+        accessible-label: (root.item.subject == "" ? "No subject" : root.item.subject)
+            + ". To " + root.item.recipients + ". Account " + root.item.account-label
+            + ". " + root.item.status + ". " + root.item.attempt-detail;
+
+        VerticalLayout {
+            padding-left: 14px;
+            padding-right: 14px;
+            padding-top: 11px;
+            padding-bottom: 10px;
+            spacing: 4px;
+
+            HorizontalLayout {
+                height: 30px;
+                spacing: 10px;
+                Text {
+                    text: root.item.subject == "" ? "(No subject)" : root.item.subject;
+                    color: Theme.on-surface;
+                    font-family: Theme.body-font;
+                    font-size: 13px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+                OutboxStatusBadge { state: root.item.state; status: root.item.status; }
+            }
+
+            Text {
+                height: 18px;
+                text: "To " + root.item.recipients;
+                color: Theme.on-surface;
+                font-family: Theme.body-font;
+                font-size: 11px;
+                font-weight: 500;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            Text {
+                height: 16px;
+                text: root.item.account-label;
+                color: Theme.on-surface-variant;
+                font-family: Theme.body-font;
+                font-size: 10px;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            Text {
+                height: 18px;
+                text: root.item.attempt-detail;
+                color: Theme.on-surface-variant;
+                font-family: Theme.body-font;
+                font-size: 10px;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            if root.actionable: Text {
+                height: root.active ? 40px : 30px;
+                text: root.active
+                    ? "Stop closes the current connection. If the server has not accepted the message, it stays queued; if delivery already started, it moves to review."
+                    : root.uncertain
+                        ? "The server may already have accepted this message. Nivalis will never resend it automatically."
+                        : "Delivery stopped. Retry after fixing the issue, or return the message to Drafts.";
+                color: root.failed ? Theme.on-error-container : root.uncertain ? Theme.on-tertiary-container : Theme.on-surface-variant;
+                font-family: Theme.body-font;
+                font-size: 10px;
+                wrap: word-wrap;
+                vertical-alignment: top;
+            }
+
+            if root.actionable: HorizontalLayout {
+                height: 48px;
+                spacing: 8px;
+                if root.failed: MButton {
+                    label: "Retry delivery";
+                    variant: "tonal";
+                    enabled: root.actions-enabled;
+                    clicked => { root.retry(root.item.message-id); }
+                }
+                if root.failed: MButton {
+                    label: "Return to Drafts";
+                    variant: "outlined";
+                    enabled: root.actions-enabled;
+                    clicked => { root.release-failed(root.item.message-id); }
+                }
+                if root.uncertain: MButton {
+                    label: "Mark delivered";
+                    variant: "tonal";
+                    enabled: root.actions-enabled;
+                    clicked => { root.request-assume-delivered(root.item.message-id, root.item.subject); }
+                }
+                if root.uncertain: MButton {
+                    label: "Return to Drafts";
+                    variant: "outlined";
+                    enabled: root.actions-enabled;
+                    clicked => { root.request-release-uncertain(root.item.message-id, root.item.subject); }
+                }
+                if root.active: MButton {
+                    label: "Stop current attempt";
+                    variant: "danger";
+                    enabled: root.actions-enabled;
+                    clicked => { root.cancel-active(root.item.message-id); }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                if root.action-loading: HorizontalLayout {
+                    width: 122px;
+                    spacing: 5px;
+                    MaterialIcon { name: "progress_activity"; width: 18px; size: 14px; icon-color: Theme.primary; }
+                    Text {
+                        text: "Applying action...";
+                        color: Theme.on-surface-variant;
+                        font-family: Theme.body-font;
+                        font-size: 10px;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+    }
+}
+
+component DeliveryConfirmation inherits FocusScope {
+    in property <string> subject;
+    callback cancel;
+    callback confirm;
+
+    init => { self.focus(); }
+    z: 10;
+    focus-on-tab-navigation: false;
+    forward-focus: cancel-button;
+    key-pressed(event) => {
+        if (event.text == Key.Escape) {
+            root.cancel();
+            return accept;
+        }
+        return reject;
+    }
+
+    start-focus-guard := FocusScope {
+        width: 0px;
+        height: 0px;
+        focus-on-click: false;
+        focus-gained => { root.focus(); }
+    }
+
+    Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: Theme.scrim;
+        TouchArea { }
+    }
+
+    dialog := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: parent.width < 568px ? parent.width - 32px : 520px;
+        height: 306px;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.outline;
+        background: Theme.surface;
+        accessible-role: region;
+        accessible-live-region: assertive;
+        accessible-label: "Confirm marking this message as delivered";
+        accessible-description: "Nivalis will not resend the message and will end its draft.";
+
+        VerticalLayout {
+            padding: 18px;
+            spacing: 9px;
+
+            HorizontalLayout {
+                height: 36px;
+                spacing: 9px;
+                MaterialIcon { name: "warning"; width: 24px; size: 19px; icon-color: Theme.tertiary; }
+                Text {
+                    text: "Mark this message delivered?";
+                    color: Theme.on-surface;
+                    font-family: Theme.body-font;
+                    font-size: 18px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+            }
+
+            Rectangle {
+                height: 44px;
+                border-radius: 5px;
+                border-width: 1px;
+                border-color: Theme.outline-variant;
+                background: Theme.surface-container-low;
+                Text {
+                    x: 11px;
+                    width: parent.width - 22px;
+                    height: parent.height;
+                    text: root.subject == "" ? "(No subject)" : root.subject;
+                    color: Theme.on-surface;
+                    font-family: Theme.body-font;
+                    font-size: 12px;
+                    font-weight: 500;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+
+            Text {
+                height: 58px;
+                text: "Nivalis will not resend this message. Its draft will end and the message will move to Sent. Use this only if you believe the mail server accepted it.";
+                color: Theme.on-surface-variant;
+                font-family: Theme.body-font;
+                font-size: 11px;
+                wrap: word-wrap;
+                vertical-alignment: center;
+            }
+
+            Rectangle {
+                height: 38px;
+                border-radius: 5px;
+                background: Theme.tertiary-container;
+                Text {
+                    x: 10px;
+                    width: parent.width - 20px;
+                    height: parent.height;
+                    text: "This local delivery-state change cannot be undone.";
+                    color: Theme.on-tertiary-container;
+                    font-family: Theme.body-font;
+                    font-size: 10px;
+                    wrap: word-wrap;
+                    vertical-alignment: center;
+                }
+            }
+
+            HorizontalLayout {
+                height: 48px;
+                spacing: 8px;
+                Rectangle { horizontal-stretch: 1; }
+                cancel-button := MButton {
+                    width: 96px;
+                    label: "Cancel";
+                    variant: "outlined";
+                    clicked => { root.cancel(); }
+                }
+                MButton {
+                    width: 164px;
+                    label: "Mark as delivered";
+                    variant: "danger-filled";
+                    clicked => { root.confirm(); }
+                }
+            }
+        }
+    }
+
+    end-focus-guard := FocusScope {
+        width: 0px;
+        height: 0px;
+        focus-on-click: false;
+        focus-gained => { root.focus(); }
+    }
+}
+
+component ReleaseConfirmation inherits FocusScope {
+    in property <string> subject;
+    callback cancel;
+    callback confirm;
+
+    init => { self.focus(); }
+    z: 10;
+    focus-on-tab-navigation: false;
+    forward-focus: cancel-button;
+    key-pressed(event) => {
+        if (event.text == Key.Escape) {
+            root.cancel();
+            return accept;
+        }
+        return reject;
+    }
+
+    start-focus-guard := FocusScope {
+        width: 0px;
+        height: 0px;
+        focus-on-click: false;
+        focus-gained => { root.focus(); }
+    }
+
+    Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: Theme.scrim;
+        TouchArea { }
+    }
+
+    dialog := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: parent.width < 568px ? parent.width - 32px : 520px;
+        height: 326px;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.outline;
+        background: Theme.surface;
+        accessible-role: region;
+        accessible-live-region: assertive;
+        accessible-label: "Confirm returning this uncertain message to Drafts";
+        accessible-description: "The server may already have accepted the message. Sending it again can create a duplicate.";
+
+        VerticalLayout {
+            padding: 18px;
+            spacing: 9px;
+
+            HorizontalLayout {
+                height: 36px;
+                spacing: 9px;
+                MaterialIcon { name: "warning"; width: 24px; size: 19px; icon-color: Theme.error; }
+                Text {
+                    text: "Return this message to Drafts?";
+                    color: Theme.on-surface;
+                    font-family: Theme.body-font;
+                    font-size: 18px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+            }
+
+            Rectangle {
+                height: 44px;
+                border-radius: 5px;
+                border-width: 1px;
+                border-color: Theme.outline-variant;
+                background: Theme.surface-container-low;
+                Text {
+                    x: 11px;
+                    width: parent.width - 22px;
+                    height: parent.height;
+                    text: root.subject == "" ? "(No subject)" : root.subject;
+                    color: Theme.on-surface;
+                    font-family: Theme.body-font;
+                    font-size: 12px;
+                    font-weight: 500;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+
+            Text {
+                height: 68px;
+                text: "The mail server may already have accepted this message. Returning it to Drafts allows another send, which could deliver the same message twice.";
+                color: Theme.on-surface-variant;
+                font-family: Theme.body-font;
+                font-size: 11px;
+                wrap: word-wrap;
+                vertical-alignment: center;
+            }
+
+            Rectangle {
+                height: 48px;
+                border-radius: 5px;
+                background: Theme.error-container;
+                Text {
+                    x: 10px;
+                    width: parent.width - 20px;
+                    height: parent.height;
+                    text: "Continue only if you accept the risk of sending a duplicate.";
+                    color: Theme.on-error-container;
+                    font-family: Theme.body-font;
+                    font-size: 10px;
+                    wrap: word-wrap;
+                    vertical-alignment: center;
+                }
+            }
+
+            HorizontalLayout {
+                height: 48px;
+                spacing: 8px;
+                Rectangle { horizontal-stretch: 1; }
+                cancel-button := MButton {
+                    width: 96px;
+                    label: "Cancel";
+                    variant: "outlined";
+                    clicked => { root.cancel(); }
+                }
+                MButton {
+                    width: 190px;
+                    label: "Accept risk and return";
+                    variant: "danger-filled";
+                    clicked => { root.confirm(); }
+                }
+            }
+        }
+    }
+
+    end-focus-guard := FocusScope {
+        width: 0px;
+        height: 0px;
+        focus-on-click: false;
+        focus-gained => { root.focus(); }
+    }
+}
+
+export component OutboxOverlay inherits FocusScope {
+    in property <[OutboxItem]> items;
+    in property <bool> loading: false;
+    in property <string> error: "";
+    in property <bool> has-more: false;
+    in property <bool> operation-loading: false;
+    in property <string> operation-message-id: "";
+    callback reload;
+    callback close;
+    callback retry(string);
+    callback release-failed(string);
+    callback assume-delivered(string);
+    callback release-uncertain(string);
+    callback cancel-active(string);
+
+    private property <bool> delivery-confirmation-open: false;
+    private property <string> delivery-confirmation-message-id: "";
+    private property <string> delivery-confirmation-subject: "";
+    private property <bool> release-confirmation-open: false;
+    private property <string> release-confirmation-message-id: "";
+    private property <string> release-confirmation-subject: "";
+
+    z: 28;
+    init => { self.focus(); }
+    focus-on-tab-navigation: false;
+    forward-focus: close-button;
+    key-pressed(event) => {
+        if (event.text == Key.Escape) {
+            if (root.delivery-confirmation-open) {
+                root.delivery-confirmation-open = false;
+                root.delivery-confirmation-message-id = "";
+                root.delivery-confirmation-subject = "";
+                root.focus();
+            } else if (root.release-confirmation-open) {
+                root.release-confirmation-open = false;
+                root.release-confirmation-message-id = "";
+                root.release-confirmation-subject = "";
+                root.focus();
+            } else if (!root.operation-loading) {
+                root.close();
+            }
+            return accept;
+        }
+        return reject;
+    }
+
+    start-focus-guard := FocusScope {
+        width: 0px;
+        height: 0px;
+        focus-on-click: false;
+        focus-gained => { root.focus(); }
+    }
+
+    Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: Theme.scrim;
+        TouchArea { }
+    }
+
+    panel := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: parent.width < 924px ? parent.width - 24px : 900px;
+        height: parent.height < 704px ? parent.height - 24px : 680px;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.outline;
+        background: Theme.surface;
+        accessible-role: region;
+        accessible-label: root.loading ? "Outbox, loading" : "Outbox delivery management";
+
+        VerticalLayout {
+            padding: 16px;
+            spacing: 8px;
+
+            HorizontalLayout {
+                height: 52px;
+                spacing: 8px;
+                VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 1;
+                    Text {
+                        text: "Outbox";
+                        color: Theme.on-surface;
+                        font-family: Theme.body-font;
+                        font-size: 20px;
+                        font-weight: 600;
+                    }
+                    Text {
+                        text: "Delivery state is stored locally and survives restart.";
+                        color: Theme.on-surface-variant;
+                        font-family: Theme.body-font;
+                        font-size: 10px;
+                    }
+                }
+                MButton {
+                    width: 88px;
+                    label: "Reload";
+                    enabled: !root.loading && !root.operation-loading;
+                    clicked => { root.reload(); }
+                }
+                close-button := MIconButton {
+                    icon: "close";
+                    label: root.operation-loading ? "Wait for the outbox action to finish" : "Close outbox";
+                    busy: root.operation-loading;
+                    clicked => { root.close(); }
+                }
+            }
+
+            Rectangle {
+                height: 52px;
+                border-radius: 5px;
+                border-width: 1px;
+                border-color: Theme.outline-variant;
+                background: Theme.surface-container-low;
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    spacing: 9px;
+                    MaterialIcon { name: "warning"; width: 20px; size: 16px; icon-color: Theme.tertiary; }
+                    Text {
+                        text: "Review failed or uncertain delivery here. Uncertain messages are never resent automatically.";
+                        color: Theme.on-surface-variant;
+                        font-family: Theme.body-font;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            if root.loading: VerticalLayout {
+                spacing: 8px;
+                accessible-role: progress-indicator;
+                accessible-label: "Loading persisted outbox messages";
+                SkeletonRow { }
+                SkeletonRow { }
+                SkeletonRow { }
+                Rectangle { vertical-stretch: 1; }
+            }
+
+            if !root.loading && root.error != "": EmptyState {
+                title: "Outbox unavailable";
+                detail: root.error;
+                icon: "warning";
+                action-label: "Reload outbox";
+                action => { root.reload(); }
+            }
+
+            if !root.loading && root.error == "" && root.items.length == 0: EmptyState {
+                title: "Outbox is clear";
+                detail: "Queued mail and messages that need delivery review will appear here.";
+                icon: "check_circle";
+                action-label: "Close outbox";
+                action => { root.close(); }
+            }
+
+            if !root.loading && root.error == "" && root.items.length > 0: outbox-list := ListView {
+                horizontal-stretch: 1;
+                vertical-stretch: 1;
+                accessible-role: list;
+                accessible-label: "Persisted outbox messages";
+                accessible-item-count: root.items.length;
+                for item in root.items: OutboxRow {
+                    width: outbox-list.width;
+                    item: item;
+                    actions-enabled: !root.operation-loading
+                        && !root.delivery-confirmation-open
+                        && !root.release-confirmation-open;
+                    action-loading: root.operation-loading && root.operation-message-id == item.message-id;
+                    retry(id) => { root.retry(id); }
+                    release-failed(id) => { root.release-failed(id); }
+                    request-assume-delivered(id, subject) => {
+                        root.delivery-confirmation-message-id = id;
+                        root.delivery-confirmation-subject = subject;
+                        root.delivery-confirmation-open = true;
+                    }
+                    request-release-uncertain(id, subject) => {
+                        root.release-confirmation-message-id = id;
+                        root.release-confirmation-subject = subject;
+                        root.release-confirmation-open = true;
+                    }
+                    cancel-active(id) => { root.cancel-active(id); }
+                }
+            }
+
+            if !root.loading && root.error == "" && root.has-more: Rectangle {
+                height: 34px;
+                border-radius: 4px;
+                background: Theme.secondary-container;
+                Text {
+                    text: "Showing the first 64 messages. Resolve an item, then reload to continue.";
+                    color: Theme.on-secondary-container;
+                    font-family: Theme.body-font;
+                    font-size: 10px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+
+    if root.delivery-confirmation-open: DeliveryConfirmation {
+        width: parent.width;
+        height: parent.height;
+        subject: root.delivery-confirmation-subject;
+        cancel => {
+            root.delivery-confirmation-open = false;
+            root.delivery-confirmation-message-id = "";
+            root.delivery-confirmation-subject = "";
+            root.focus();
+        }
+        confirm => {
+            root.delivery-confirmation-open = false;
+            root.focus();
+            root.assume-delivered(root.delivery-confirmation-message-id);
+            root.delivery-confirmation-message-id = "";
+            root.delivery-confirmation-subject = "";
+        }
+    }
+
+    if root.release-confirmation-open: ReleaseConfirmation {
+        width: parent.width;
+        height: parent.height;
+        subject: root.release-confirmation-subject;
+        cancel => {
+            root.release-confirmation-open = false;
+            root.release-confirmation-message-id = "";
+            root.release-confirmation-subject = "";
+            root.focus();
+        }
+        confirm => {
+            root.release-confirmation-open = false;
+            root.focus();
+            root.release-uncertain(root.release-confirmation-message-id);
+            root.release-confirmation-message-id = "";
+            root.release-confirmation-subject = "";
+        }
+    }
+
+    end-focus-guard := FocusScope {
+        width: 0px;
+        height: 0px;
+        focus-on-click: false;
+        focus-gained => { root.focus(); }
+    }
+}

@@ -1,7 +1,7 @@
 use super::{
     account::{AccountOperation, AccountOperationReply},
     compose::{ComposeOperation, ComposeReply},
-    outbox_driver::OutboxStatus,
+    outbox_driver::{OutboxStatus, SmtpCancellationTracker},
 };
 use crate::store::sqlite::{
     AccountDirectory, Generation, MailboxPage, MessageDetail, MessageId, MessageMutation,
@@ -383,6 +383,13 @@ pub(crate) struct CoreHandle {
     commands: mpsc::Sender<Command>,
     account_commands: mpsc::Sender<AccountCommand>,
     compose_commands: mpsc::Sender<ComposeCommand>,
+    smtp_cancellations: SmtpCancellationTracker,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OutboxCancelOutcome {
+    Applied,
+    NotActive,
 }
 
 impl CoreHandle {
@@ -390,11 +397,21 @@ impl CoreHandle {
         commands: mpsc::Sender<Command>,
         account_commands: mpsc::Sender<AccountCommand>,
         compose_commands: mpsc::Sender<ComposeCommand>,
+        smtp_cancellations: SmtpCancellationTracker,
     ) -> Self {
         Self {
             commands,
             account_commands,
             compose_commands,
+            smtp_cancellations,
+        }
+    }
+
+    pub(crate) fn cancel_outbox_attempt(&self, message_id: MessageId) -> OutboxCancelOutcome {
+        if self.smtp_cancellations.cancel(message_id) {
+            OutboxCancelOutcome::Applied
+        } else {
+            OutboxCancelOutcome::NotActive
         }
     }
 
@@ -701,7 +718,12 @@ mod tests {
         let (account_commands, account_receiver) = mpsc::channel(account_capacity);
         let (compose_commands, compose_receiver) = mpsc::channel(COMPOSE_COMMAND_CAPACITY);
         (
-            CoreHandle::new(commands, account_commands, compose_commands),
+            CoreHandle::new(
+                commands,
+                account_commands,
+                compose_commands,
+                SmtpCancellationTracker::default(),
+            ),
             account_receiver,
             compose_receiver,
         )
