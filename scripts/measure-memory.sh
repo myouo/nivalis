@@ -615,7 +615,7 @@ for ((run = 1; run <= runs; run++)); do
                 exit 1
             fi
         elif [[ "$stress_scenario" == "pagination" ]]; then
-            pagination_pattern='^NIVALIS_STRESS_RESULT scenario=pagination transitions=([1-9][0-9]*) after=([1-9][0-9]*) before=([1-9][0-9]*) final_page=1 elapsed_ms=(0|[1-9][0-9]*)$'
+            pagination_pattern='^NIVALIS_STRESS_RESULT scenario=pagination transitions=([1-9][0-9]*) first=([1-9][0-9]*) after=([1-9][0-9]*) before=0 final_rows=50 elapsed_ms=(0|[1-9][0-9]*)$'
             if [[ ! "$stress_result" =~ $pagination_pattern ]]; then
                 printf 'Pagination stress completion marker has an invalid format: %s\n' \
                     "$stress_result" >&2
@@ -625,7 +625,7 @@ for ((run = 1; run <= runs; run++)); do
             if [[ "${BASH_REMATCH[1]}" != "$stress_steps" ||
                 "${BASH_REMATCH[2]}" != "$half_steps" ||
                 "${BASH_REMATCH[3]}" != "$half_steps" ]]; then
-                printf 'Pagination stress completion counts do not match the requested transitions: %s\n' \
+                printf 'Waterfall stress completion counts do not match the requested transitions: %s\n' \
                     "$stress_result" >&2
                 exit 1
             fi

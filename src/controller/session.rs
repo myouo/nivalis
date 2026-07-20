@@ -46,8 +46,16 @@ struct UndoSlot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MailboxIntent {
     First,
-    Next,
-    Previous,
+    Append,
+    Refresh,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MailboxCommitEffect {
+    Replace,
+    Append,
+    Extend { from: usize },
+    Preserve,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,15 +80,15 @@ impl MailboxAcceptance {
         if page.rows.len() > usize::from(PAGE_SIZE) {
             return Err(SessionError::MailboxPageTooLarge);
         }
-        if self.intent != MailboxIntent::First && page.rows.is_empty() {
+        if self.intent == MailboxIntent::Append && page.rows.is_empty() {
             return Err(SessionError::EmptyNavigationPage);
         }
 
         Ok(MailboxCommit {
             request: self.request,
+            intent: self.intent,
             page_number: self.target_page,
             visible_ids: page.rows.iter().map(|row| row.id).collect(),
-            previous_cursor: page.previous_cursor,
             next_cursor: page.next_cursor,
             mutation_refresh: self.mutation_refresh,
         })
@@ -89,9 +97,9 @@ impl MailboxAcceptance {
 
 pub(crate) struct MailboxCommit {
     request: RequestStamp,
+    intent: MailboxIntent,
     page_number: u64,
     visible_ids: Box<[MessageId]>,
-    previous_cursor: Option<PageCursor>,
     next_cursor: Option<PageCursor>,
     mutation_refresh: Option<RequestStamp>,
 }
@@ -173,7 +181,6 @@ pub(crate) struct ReadSession {
     search: Box<str>,
     visible_ids: Box<[MessageId]>,
     selected: Option<MessageId>,
-    previous_cursor: Option<PageCursor>,
     next_cursor: Option<PageCursor>,
     page_number: u64,
     accounts_request: Option<RequestStamp>,
@@ -195,7 +202,6 @@ impl ReadSession {
             search: Box::default(),
             visible_ids: Box::new([]),
             selected: None,
-            previous_cursor: None,
             next_cursor: None,
             page_number: 0,
             accounts_request: None,
@@ -245,10 +251,7 @@ impl ReadSession {
         self.next_cursor
     }
 
-    pub(crate) fn previous_cursor(&self) -> Option<PageCursor> {
-        self.previous_cursor
-    }
-
+    #[cfg(test)]
     pub(crate) fn page_number(&self) -> u64 {
         self.page_number
     }
@@ -270,7 +273,7 @@ impl ReadSession {
         self.issue_mailbox(MailboxIntent::First, PageBoundary::First, 1)
     }
 
-    pub(crate) fn issue_next_mailbox(&mut self) -> Result<MailboxQuery, SessionError> {
+    pub(crate) fn issue_more_mailbox(&mut self) -> Result<MailboxQuery, SessionError> {
         let cursor = self
             .next_cursor
             .ok_or(SessionError::NavigationUnavailable)?;
@@ -280,26 +283,14 @@ impl ReadSession {
             .filter(|page| *page <= MAX_PAGE_NUMBER)
             .ok_or(SessionError::PageNumberExhausted)?;
         self.issue_mailbox(
-            MailboxIntent::Next,
+            MailboxIntent::Append,
             PageBoundary::After(cursor),
             target_page,
         )
     }
 
-    pub(crate) fn issue_previous_mailbox(&mut self) -> Result<MailboxQuery, SessionError> {
-        let cursor = self
-            .previous_cursor
-            .ok_or(SessionError::NavigationUnavailable)?;
-        let target_page = self
-            .page_number
-            .checked_sub(1)
-            .filter(|page| *page > 0)
-            .ok_or(SessionError::PageNumberExhausted)?;
-        self.issue_mailbox(
-            MailboxIntent::Previous,
-            PageBoundary::Before(cursor),
-            target_page,
-        )
+    pub(crate) fn issue_mailbox_refresh(&mut self) -> Result<MailboxQuery, SessionError> {
+        self.issue_mailbox(MailboxIntent::Refresh, PageBoundary::First, 1)
     }
 
     pub(crate) fn select_message(&mut self, key: EntityKey) -> Result<MessageQuery, SessionError> {
@@ -531,28 +522,70 @@ impl ReadSession {
         })
     }
 
-    pub(crate) fn commit_mailbox(&mut self, commit: MailboxCommit) -> bool {
+    pub(crate) fn commit_mailbox(&mut self, commit: MailboxCommit) -> Option<MailboxCommitEffect> {
         if self.latest_mailbox_request != Some(commit.request)
             || commit.request.generation != Generation::new(self.generation_value)
             || self.mailbox_request.is_some()
         {
-            return false;
+            return None;
         }
 
         self.latest_mailbox_request = None;
-        self.visible_ids = commit.visible_ids;
-        self.previous_cursor = commit.previous_cursor;
-        self.next_cursor = commit.next_cursor;
-        self.page_number = commit.page_number;
-        self.selected = None;
-        self.detail_request = None;
+        let effect = match commit.intent {
+            MailboxIntent::Append => {
+                if commit
+                    .visible_ids
+                    .iter()
+                    .any(|id| self.visible_ids.contains(id))
+                {
+                    return None;
+                }
+                let mut visible_ids = self.visible_ids.to_vec();
+                visible_ids.extend_from_slice(&commit.visible_ids);
+                self.visible_ids = visible_ids.into_boxed_slice();
+                self.next_cursor = commit.next_cursor;
+                self.page_number = commit.page_number;
+                MailboxCommitEffect::Append
+            }
+            MailboxIntent::First => {
+                self.visible_ids = commit.visible_ids;
+                self.next_cursor = commit.next_cursor;
+                self.page_number = commit.page_number;
+                self.selected = None;
+                self.detail_request = None;
+                MailboxCommitEffect::Replace
+            }
+            MailboxIntent::Refresh => {
+                if commit.visible_ids.starts_with(&self.visible_ids) {
+                    let from = self.visible_ids.len();
+                    let extended = commit.visible_ids.len() > from;
+                    self.visible_ids = commit.visible_ids;
+                    self.next_cursor = commit.next_cursor;
+                    self.page_number = commit.page_number;
+                    if extended {
+                        MailboxCommitEffect::Extend { from }
+                    } else {
+                        MailboxCommitEffect::Preserve
+                    }
+                } else if self.visible_ids.starts_with(&commit.visible_ids) {
+                    MailboxCommitEffect::Preserve
+                } else {
+                    self.visible_ids = commit.visible_ids;
+                    self.next_cursor = commit.next_cursor;
+                    self.page_number = commit.page_number;
+                    self.selected = None;
+                    self.detail_request = None;
+                    MailboxCommitEffect::Replace
+                }
+            }
+        };
         if commit.mutation_refresh.is_some()
             && self.mutation_refresh == commit.mutation_refresh
             && commit.page_number == 1
         {
             self.mutation_refresh = None;
         }
-        true
+        Some(effect)
     }
 
     pub(crate) fn reject_mailbox(
@@ -784,7 +817,6 @@ impl ReadSession {
     fn invalidate_mailbox(&mut self) {
         self.visible_ids = Box::new([]);
         self.selected = None;
-        self.previous_cursor = None;
         self.next_cursor = None;
         self.page_number = 0;
         self.mailbox_request = None;
@@ -984,7 +1016,7 @@ mod tests {
         let commit = acceptance
             .stage(reply.result.as_ref().expect("successful mailbox reply"))
             .expect("valid mailbox page");
-        assert!(session.commit_mailbox(commit));
+        assert!(session.commit_mailbox(commit).is_some());
     }
 
     fn detail(message_id: i64) -> MessageDetail {
@@ -1111,18 +1143,17 @@ mod tests {
         let commit = acceptance.stage(reply.result.as_ref().unwrap()).unwrap();
         assert_eq!(session.page_number(), 0);
         assert!(session.visible_ids.is_empty());
-        assert!(session.commit_mailbox(commit));
+        assert!(session.commit_mailbox(commit).is_some());
         assert_eq!(session.page_number(), 1);
         assert_eq!(
             session.visible_ids.as_ref(),
             &[MessageId::new(1).unwrap(), MessageId::new(2).unwrap()]
         );
-        assert_eq!(session.previous_cursor(), None);
         assert_eq!(session.next_cursor(), Some(cursor(2)));
     }
 
     #[test]
-    fn next_and_previous_navigation_keep_only_the_current_page_boundaries() {
+    fn appended_mailbox_batches_extend_the_visible_window_and_preserve_selection() {
         let mut session = ReadSession::new();
         session.issue_first_mailbox().unwrap();
         commit_reply(
@@ -1130,28 +1161,89 @@ mod tests {
             &mailbox_reply_with_cursors(1, 1, &[1, 2], None, Some(2)),
         );
 
-        session.issue_next_mailbox().unwrap();
-        let next = mailbox_reply_with_cursors(2, 1, &[3, 4], Some(3), Some(4));
+        session.select_message(EntityKey::new(1).unwrap()).unwrap();
+        session.issue_more_mailbox().unwrap();
+        let next = mailbox_reply_with_cursors(3, 1, &[3, 4], Some(3), Some(4));
         let acceptance = session.match_mailbox_reply(&next).unwrap();
-        assert_eq!(acceptance.intent(), MailboxIntent::Next);
+        assert_eq!(acceptance.intent(), MailboxIntent::Append);
         assert_eq!(acceptance.target_page(), 2);
         assert_eq!(session.page_number(), 1);
-        assert!(session.commit_mailbox(acceptance.stage(next.result.as_ref().unwrap()).unwrap()));
-        assert_eq!(session.page_number(), 2);
-        assert_eq!(session.previous_cursor(), Some(cursor(3)));
-        assert_eq!(session.next_cursor(), Some(cursor(4)));
-
-        session.issue_previous_mailbox().unwrap();
-        let previous = mailbox_reply_with_cursors(3, 1, &[1, 2], None, Some(2));
-        let acceptance = session.match_mailbox_reply(&previous).unwrap();
-        assert_eq!(acceptance.intent(), MailboxIntent::Previous);
-        assert_eq!(acceptance.target_page(), 1);
         assert!(
-            session.commit_mailbox(acceptance.stage(previous.result.as_ref().unwrap()).unwrap())
+            session
+                .commit_mailbox(acceptance.stage(next.result.as_ref().unwrap()).unwrap())
+                .is_some()
         );
-        assert_eq!(session.page_number(), 1);
-        assert_eq!(session.previous_cursor(), None);
-        assert_eq!(session.next_cursor(), Some(cursor(2)));
+        assert_eq!(session.page_number(), 2);
+        assert_eq!(session.next_cursor(), Some(cursor(4)));
+        assert_eq!(
+            session.visible_ids.as_ref(),
+            &[
+                MessageId::new(1).unwrap(),
+                MessageId::new(2).unwrap(),
+                MessageId::new(3).unwrap(),
+                MessageId::new(4).unwrap(),
+            ]
+        );
+        assert_eq!(session.selected(), MessageId::new(1).ok());
+    }
+
+    #[test]
+    fn historical_refresh_extends_a_short_list_without_losing_selection() {
+        let mut session = ReadSession::new();
+        session.issue_first_mailbox().unwrap();
+        commit_reply(
+            &mut session,
+            &mailbox_reply_with_cursors(1, 1, &[1, 2], None, None),
+        );
+        session.select_message(EntityKey::new(1).unwrap()).unwrap();
+
+        session.issue_mailbox_refresh().unwrap();
+        let refreshed = mailbox_reply_with_cursors(3, 1, &[1, 2, 3], None, Some(3));
+        let acceptance = session.match_mailbox_reply(&refreshed).unwrap();
+        assert_eq!(acceptance.intent(), MailboxIntent::Refresh);
+        assert_eq!(
+            session.commit_mailbox(
+                acceptance
+                    .stage(refreshed.result.as_ref().unwrap())
+                    .unwrap()
+            ),
+            Some(MailboxCommitEffect::Extend { from: 2 })
+        );
+        assert_eq!(session.selected(), MessageId::new(1).ok());
+        assert_eq!(session.next_cursor(), Some(cursor(3)));
+    }
+
+    #[test]
+    fn historical_refresh_preserves_an_appended_window_and_its_cursor() {
+        let first = (1..=50).collect::<Vec<_>>();
+        let mut session = ReadSession::new();
+        session.issue_first_mailbox().unwrap();
+        commit_reply(
+            &mut session,
+            &mailbox_reply_with_cursors(1, 1, &first, None, Some(50)),
+        );
+        session.issue_more_mailbox().unwrap();
+        let appended = mailbox_reply_with_cursors(2, 1, &[51], Some(51), Some(51));
+        let acceptance = session.match_mailbox_reply(&appended).unwrap();
+        assert_eq!(
+            session.commit_mailbox(acceptance.stage(appended.result.as_ref().unwrap()).unwrap()),
+            Some(MailboxCommitEffect::Append)
+        );
+
+        session.issue_mailbox_refresh().unwrap();
+        let refreshed = mailbox_reply_with_cursors(3, 1, &first, None, Some(50));
+        let acceptance = session.match_mailbox_reply(&refreshed).unwrap();
+        assert_eq!(
+            session.commit_mailbox(
+                acceptance
+                    .stage(refreshed.result.as_ref().unwrap())
+                    .unwrap()
+            ),
+            Some(MailboxCommitEffect::Preserve)
+        );
+        assert_eq!(session.visible_ids.len(), 51);
+        assert_eq!(session.next_cursor(), Some(cursor(51)));
+        assert_eq!(session.page_number(), 2);
     }
 
     #[test]
@@ -1167,9 +1259,9 @@ mod tests {
             &mailbox_reply_with_cursors(1, 1, &[1], None, Some(1)),
         );
 
-        session.issue_next_mailbox().unwrap();
+        session.issue_more_mailbox().unwrap();
         assert_eq!(
-            session.issue_next_mailbox(),
+            session.issue_more_mailbox(),
             Err(SessionError::MailboxRequestPending)
         );
         assert_eq!(session.page_number(), 1);
@@ -1186,20 +1278,20 @@ mod tests {
         );
         session.select_message(EntityKey::new(1).unwrap()).unwrap();
 
-        session.issue_next_mailbox().unwrap();
+        session.issue_more_mailbox().unwrap();
         session.cancel_mailbox_submission();
         assert_eq!(session.page_number(), 1);
         assert_eq!(session.selected(), MessageId::new(1).ok());
 
-        session.issue_next_mailbox().unwrap();
+        session.issue_more_mailbox().unwrap();
         assert_eq!(
             session.reject_mailbox(request_id(4), Generation::new(1)),
-            Some(MailboxIntent::Next)
+            Some(MailboxIntent::Append)
         );
         assert_eq!(session.page_number(), 1);
         assert_eq!(session.selected(), MessageId::new(1).ok());
 
-        session.issue_next_mailbox().unwrap();
+        session.issue_more_mailbox().unwrap();
         let empty = mailbox_reply(5, 1, &[]);
         let acceptance = session.match_mailbox_reply(&empty).unwrap();
         assert_eq!(
@@ -1209,13 +1301,13 @@ mod tests {
         assert_eq!(session.page_number(), 1);
         assert_eq!(session.selected(), MessageId::new(1).ok());
 
-        session.issue_next_mailbox().unwrap();
+        session.issue_more_mailbox().unwrap();
         let valid = mailbox_reply_with_cursors(6, 1, &[2], Some(2), None);
         let acceptance = session.match_mailbox_reply(&valid).unwrap();
         let _projected_but_discarded = acceptance.stage(valid.result.as_ref().unwrap()).unwrap();
         assert_eq!(session.page_number(), 1);
         assert_eq!(session.selected(), MessageId::new(1).ok());
-        assert!(session.issue_next_mailbox().is_ok());
+        assert!(session.issue_more_mailbox().is_ok());
     }
 
     #[test]
@@ -1250,7 +1342,7 @@ mod tests {
         let acceptance = session.match_mailbox_reply(&reply).unwrap();
         let commit = acceptance.stage(reply.result.as_ref().unwrap()).unwrap();
         assert!(session.set_folder("Archive").unwrap());
-        assert!(!session.commit_mailbox(commit));
+        assert!(session.commit_mailbox(commit).is_none());
         assert_eq!(session.page_number(), 0);
 
         session.issue_first_mailbox().unwrap();
@@ -1379,16 +1471,7 @@ mod tests {
         session.page_number = MAX_PAGE_NUMBER;
         session.next_cursor = Some(cursor(1));
         assert_eq!(
-            session.issue_next_mailbox(),
-            Err(SessionError::PageNumberExhausted)
-        );
-        assert!(!session.mailbox_pending());
-
-        session.page_number = 0;
-        session.next_cursor = None;
-        session.previous_cursor = Some(cursor(1));
-        assert_eq!(
-            session.issue_previous_mailbox(),
+            session.issue_more_mailbox(),
             Err(SessionError::PageNumberExhausted)
         );
         assert!(!session.mailbox_pending());
@@ -1506,7 +1589,7 @@ mod tests {
             session.complete_mutation(&mutation_reply(3, 1, updated(1, false, false))),
             MutationCompletion::Applied { .. }
         ));
-        assert!(!session.commit_mailbox(old_commit));
+        assert!(session.commit_mailbox(old_commit).is_none());
         assert!(session.mutation_blocks_actions());
 
         session.issue_first_mailbox().unwrap();
@@ -1727,11 +1810,7 @@ mod tests {
     fn navigation_requires_a_committed_boundary_cursor() {
         let mut session = ReadSession::new();
         assert_eq!(
-            session.issue_next_mailbox(),
-            Err(SessionError::NavigationUnavailable)
-        );
-        assert_eq!(
-            session.issue_previous_mailbox(),
+            session.issue_more_mailbox(),
             Err(SessionError::NavigationUnavailable)
         );
     }

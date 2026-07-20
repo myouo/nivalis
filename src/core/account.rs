@@ -257,6 +257,7 @@ pub(crate) enum AccountOperationSuccess {
         generation: AccountGeneration,
         imported: u8,
         has_more: bool,
+        historical: bool,
     },
     Removed {
         account_id: AccountId,
@@ -284,6 +285,7 @@ pub(crate) enum AccountSyncStatus {
         generation: AccountGeneration,
         imported: u8,
         has_more: bool,
+        historical: bool,
     },
     Failed(AccountOperationFailure),
 }
@@ -450,6 +452,7 @@ pub(crate) enum AccountWorkflowOutcome {
         generation: AccountGeneration,
         imported: u8,
         has_more: bool,
+        historical: bool,
     },
     RemovalPending {
         account_id: AccountId,
@@ -499,12 +502,14 @@ impl fmt::Debug for AccountWorkflowOutcome {
                 generation,
                 imported,
                 has_more,
+                historical,
             } => formatter
                 .debug_struct("InboxSynced")
                 .field("account_id", account_id)
                 .field("generation", generation)
                 .field("imported", imported)
                 .field("has_more", has_more)
+                .field("historical", historical)
                 .finish(),
             Self::RemovalPending {
                 account_id,
@@ -1846,12 +1851,14 @@ impl ActiveTask {
                     generation,
                     imported,
                     has_more,
+                    historical,
                 }) => Poll::Ready(Ok(TaskProgress::Finished(
                     AccountWorkflowOutcome::InboxSynced {
                         account_id,
                         generation,
                         imported,
                         has_more,
+                        historical,
                     },
                 ))),
                 Poll::Ready(SyncInboxOutcome::Failed { stage, failure }) => {
@@ -2557,11 +2564,13 @@ fn project_background_sync(
             generation,
             imported,
             has_more,
+            historical,
         }) => AccountSyncStatus::Synced {
             account_id,
             generation,
             imported,
             has_more,
+            historical,
         },
         Err(failure) => AccountSyncStatus::Failed(failure),
         Ok(_) => AccountSyncStatus::Failed(AccountOperationFailure {
@@ -2619,11 +2628,13 @@ fn project_outcome(
             generation,
             imported,
             has_more,
+            historical,
         } => Ok(AccountOperationSuccess::Synced {
             account_id,
             generation,
             imported,
             has_more,
+            historical,
         }),
         AccountWorkflowOutcome::RemovalPending {
             account_id,

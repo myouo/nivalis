@@ -1086,7 +1086,7 @@ fn install_account_receive_stress(
                     AccountReceivePhase::ClosingReader { account_id } => {
                         if !ui.get_active_account_id().is_empty()
                             || ui.get_mailbox_loading()
-                            || ui.get_mailbox_navigation_loading()
+                            || ui.get_mailbox_loading_more()
                             || ui.get_detail_open()
                             || ui.get_detail_loading()
                             || !ui.get_selected_id().is_empty()
@@ -1142,13 +1142,13 @@ fn account_receive_mailbox_observation(
         account_selected: ui.get_active_account_id().as_str() == expected_account_id,
         loading: ui.get_initial_loading()
             || ui.get_mailbox_loading()
-            || ui.get_mailbox_navigation_loading(),
+            || ui.get_mailbox_loading_more(),
         error: ui.get_mailbox_error(),
         total_known: ui.get_total_known(),
         message_total: ui.get_message_total(),
         rows: mails.row_count(),
-        has_previous: ui.get_has_previous_mailbox_page(),
-        has_next: ui.get_has_next_mailbox_page(),
+        has_previous: false,
+        has_next: ui.get_mailbox_has_more(),
         first_account_matches: first
             .as_ref()
             .is_some_and(|mail| mail.account_id.as_str() == expected_account_id),
@@ -1413,7 +1413,7 @@ fn existing_account_sync_ui_gate(
     if ui.get_active_account_id().as_str() != account_key
         || ui.get_initial_loading()
         || ui.get_mailbox_loading()
-        || ui.get_mailbox_navigation_loading()
+        || ui.get_mailbox_loading_more()
     {
         return AccountReceiveGate::Waiting;
     }
@@ -1580,7 +1580,7 @@ fn install_existing_account_sync(
                     ExistingAccountSyncPhase::WaitingForMailbox => {
                         if ui.get_active_account_id().as_str() != config.account_key.as_str()
                             || ui.get_mailbox_loading()
-                            || ui.get_mailbox_navigation_loading()
+                            || ui.get_mailbox_loading_more()
                         {
                             return;
                         }
@@ -1629,7 +1629,7 @@ fn install_existing_account_sync(
                         state.advance(ExistingAccountSyncPhase::WaitingForFinalState { before });
                     }
                     ExistingAccountSyncPhase::WaitingForFinalState { before } => {
-                        if ui.get_mailbox_loading() || ui.get_mailbox_navigation_loading() {
+                        if ui.get_mailbox_loading() || ui.get_mailbox_loading_more() {
                             return;
                         }
                         let after = match read_existing_account_sync_snapshot(
@@ -2078,14 +2078,14 @@ fn install_account_send_stress(
                             sent_selected: ui.get_active_folder().as_str() == "Sent",
                             loading: ui.get_initial_loading()
                                 || ui.get_mailbox_loading()
-                                || ui.get_mailbox_navigation_loading(),
+                                || ui.get_mailbox_loading_more(),
                             error: ui.get_mailbox_error(),
                             total_known: ui.get_total_known(),
                             message_total: ui.get_message_total(),
                             rows: mails.row_count(),
                             drafts: ui.get_draft_count(),
-                            has_previous: ui.get_has_previous_mailbox_page(),
-                            has_next: ui.get_has_next_mailbox_page(),
+                            has_previous: false,
+                            has_next: ui.get_mailbox_has_more(),
                             first_account_matches: first.as_ref().is_some_and(|mail| {
                                 mail.account_id.as_str() == account_id.as_str()
                             }),
@@ -2110,7 +2110,7 @@ fn install_account_send_stress(
                     AccountSendPhase::ClosingSent { account_id } => {
                         if !ui.get_active_account_id().is_empty()
                             || ui.get_mailbox_loading()
-                            || ui.get_mailbox_navigation_loading()
+                            || ui.get_mailbox_loading_more()
                         {
                             return;
                         }
@@ -2790,20 +2790,18 @@ fn write_search_page_matches(ui: &AppWindow) -> bool {
     ui.get_search_query().is_empty()
         && ui.get_mail_actions_enabled()
         && !ui.get_mutation_loading()
-        && page_one_matches(ui)
+        && initial_batch_matches(ui)
 }
 
 fn write_search_result_matches(ui: &AppWindow, expected_starred: bool) -> bool {
     if ui.get_search_query().as_str() != WRITE_SEARCH_QUERY
         || ui.get_mailbox_loading()
-        || ui.get_mailbox_navigation_loading()
+        || ui.get_mailbox_loading_more()
         || ui.get_mutation_loading()
         || ui.get_mailbox_error()
-        || ui.get_mailbox_page_number() != 1
         || ui.get_total_known()
         || ui.get_message_total() != 0
-        || ui.get_has_previous_mailbox_page()
-        || ui.get_has_next_mailbox_page()
+        || ui.get_mailbox_has_more()
     {
         return false;
     }
@@ -2873,16 +2871,16 @@ fn expected_write_search_first_queries(
 
 fn write_search_mismatch(stage: &str, ui: &AppWindow, expected_starred: bool) -> Box<str> {
     format!(
-        "{stage} query={:?} rows={} page={} total_known={} message_total={} starred_total={} mailbox_error={} mailbox_loading={} navigation_loading={} mutation_loading={} actions_enabled={} target_starred={:?} expected_starred={expected_starred}",
+        "{stage} query={:?} rows={} total_known={} message_total={} starred_total={} mailbox_error={} mailbox_loading={} loading_more={} has_more={} mutation_loading={} actions_enabled={} target_starred={:?} expected_starred={expected_starred}",
         ui.get_search_query().as_str(),
         ui.get_mails().row_count(),
-        ui.get_mailbox_page_number(),
         ui.get_total_known(),
         ui.get_message_total(),
         ui.get_starred_count(),
         ui.get_mailbox_error(),
         ui.get_mailbox_loading(),
-        ui.get_mailbox_navigation_loading(),
+        ui.get_mailbox_loading_more(),
+        ui.get_mailbox_has_more(),
         ui.get_mutation_loading(),
         ui.get_mail_actions_enabled(),
         write_search_target_starred(ui)
@@ -2891,24 +2889,24 @@ fn write_search_mismatch(stage: &str, ui: &AppWindow, expected_starred: bool) ->
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PaginationPhase {
+enum WaterfallPhase {
     Initial,
-    Next,
-    Previous,
+    LoadingMore,
+    Resetting,
 }
 
-struct PaginationStress {
-    phase: PaginationPhase,
+struct WaterfallStress {
+    phase: WaterfallPhase,
     transitions: usize,
     baseline: Option<MailboxQueryCounts>,
     deadline: Instant,
     started: Instant,
 }
 
-enum PaginationAction {
+enum WaterfallAction {
     Wait,
-    Next,
-    Previous,
+    LoadMore,
+    Reset,
     Complete(MailboxQueryCounts),
     Fail(Box<str>),
 }
@@ -2921,7 +2919,7 @@ fn install_pagination_stress(
 ) -> Option<Rc<Timer>> {
     if !steps.is_multiple_of(2) {
         eprintln!(
-            "NIVALIS_STRESS_ERROR scenario=pagination reason=transitions_must_be_even transitions={steps}"
+            "NIVALIS_STRESS_ERROR scenario=pagination reason=waterfall_transitions_must_be_even transitions={steps}"
         );
         return None;
     }
@@ -2939,8 +2937,8 @@ fn install_pagination_stress(
             return;
         };
         let started = Instant::now();
-        let state = Rc::new(RefCell::new(PaginationStress {
-            phase: PaginationPhase::Initial,
+        let state = Rc::new(RefCell::new(WaterfallStress {
+            phase: WaterfallPhase::Initial,
             transitions: 0,
             baseline: None,
             deadline: started + Duration::from_millis(timeout),
@@ -2957,27 +2955,27 @@ fn install_pagination_stress(
                 else {
                     return;
                 };
-                let action = pagination_action(
+                let action = waterfall_action(
                     &ui,
                     &mut state.borrow_mut(),
                     steps,
                     Duration::from_millis(timeout),
                 );
                 match action {
-                    PaginationAction::Wait => {}
-                    PaginationAction::Next => ui.invoke_next_mailbox_page(),
-                    PaginationAction::Previous => ui.invoke_previous_mailbox_page(),
-                    PaginationAction::Complete(delta) => {
+                    WaterfallAction::Wait => {}
+                    WaterfallAction::LoadMore => ui.invoke_load_more_mail(),
+                    WaterfallAction::Reset => ui.invoke_retry_mailbox(),
+                    WaterfallAction::Complete(delta) => {
                         let elapsed_ms = state.borrow().started.elapsed().as_millis();
-                        ui.set_status_text("Pagination memory stress complete".into());
+                        ui.set_status_text("Waterfall memory stress complete".into());
                         eprintln!(
-                            "NIVALIS_STRESS_RESULT scenario=pagination transitions={steps} after={} before={} final_page=1 elapsed_ms={elapsed_ms}",
-                            delta.after, delta.before
+                            "NIVALIS_STRESS_RESULT scenario=pagination transitions={steps} first={} after={} before={} final_rows=50 elapsed_ms={elapsed_ms}",
+                            delta.first, delta.after, delta.before
                         );
                         stop_stress(&ui, &timer);
                     }
-                    PaginationAction::Fail(reason) => {
-                        ui.set_status_text("Pagination memory stress failed".into());
+                    WaterfallAction::Fail(reason) => {
+                        ui.set_status_text("Waterfall memory stress failed".into());
                         eprintln!(
                             "NIVALIS_STRESS_ERROR scenario=pagination transitions={} reason={reason}",
                             state.borrow().transitions
@@ -2992,110 +2990,106 @@ fn install_pagination_stress(
     Some(timer)
 }
 
-fn pagination_action(
+fn waterfall_action(
     ui: &AppWindow,
-    state: &mut PaginationStress,
+    state: &mut WaterfallStress,
     target_transitions: usize,
     timeout: Duration,
-) -> PaginationAction {
+) -> WaterfallAction {
     if ui.get_mailbox_error() {
-        return PaginationAction::Fail("mailbox_error".into());
+        return WaterfallAction::Fail("mailbox_error".into());
     }
     let now = Instant::now();
 
     match state.phase {
-        PaginationPhase::Initial => {
+        WaterfallPhase::Initial => {
             if now >= state.deadline {
-                PaginationAction::Fail(page_mismatch("initial_page_timeout", ui))
-            } else if page_one_matches(ui) {
+                WaterfallAction::Fail(waterfall_mismatch("initial_batch_timeout", ui))
+            } else if initial_batch_matches(ui) {
                 state.baseline = Some(mailbox_query_counts());
-                state.phase = PaginationPhase::Next;
+                state.phase = WaterfallPhase::LoadingMore;
                 state.deadline = now + timeout;
-                PaginationAction::Next
+                WaterfallAction::LoadMore
             } else {
-                PaginationAction::Wait
+                WaterfallAction::Wait
             }
         }
-        PaginationPhase::Next => {
+        WaterfallPhase::LoadingMore => {
             if now >= state.deadline {
-                return PaginationAction::Fail("next_page_timeout".into());
+                return WaterfallAction::Fail(waterfall_mismatch("append_timeout", ui));
             }
-            if ui.get_mailbox_navigation_loading() {
-                return PaginationAction::Wait;
+            if ui.get_mailbox_loading_more() {
+                return WaterfallAction::Wait;
             }
-            if !page_two_matches(ui) {
-                return PaginationAction::Fail(page_mismatch("next_page", ui));
+            if !full_waterfall_matches(ui) {
+                return WaterfallAction::Fail(waterfall_mismatch("append", ui));
             }
             let Some(delta) = query_count_delta(state.baseline, mailbox_query_counts()) else {
-                return PaginationAction::Fail("mailbox_query_counter_regressed".into());
+                return WaterfallAction::Fail("mailbox_query_counter_regressed".into());
             };
             let expected_after = u64::try_from(state.transitions / 2 + 1).unwrap_or(u64::MAX);
-            let expected_before = u64::try_from(state.transitions / 2).unwrap_or(u64::MAX);
-            if delta.first != 0 || delta.after != expected_after || delta.before != expected_before
-            {
-                return PaginationAction::Fail(counter_mismatch(
+            let expected_first = u64::try_from(state.transitions / 2).unwrap_or(u64::MAX);
+            if delta.first != expected_first || delta.after != expected_after || delta.before != 0 {
+                return WaterfallAction::Fail(counter_mismatch(
+                    expected_first,
                     expected_after,
-                    expected_before,
+                    0,
                     delta,
                 ));
             }
             state.transitions += 1;
-            state.phase = PaginationPhase::Previous;
+            state.phase = WaterfallPhase::Resetting;
             state.deadline = now + timeout;
-            PaginationAction::Previous
+            WaterfallAction::Reset
         }
-        PaginationPhase::Previous => {
+        WaterfallPhase::Resetting => {
             if now >= state.deadline {
-                return PaginationAction::Fail("previous_page_timeout".into());
+                return WaterfallAction::Fail(waterfall_mismatch("reset_timeout", ui));
             }
-            if ui.get_mailbox_navigation_loading() {
-                return PaginationAction::Wait;
+            if ui.get_mailbox_loading() || ui.get_mailbox_loading_more() {
+                return WaterfallAction::Wait;
             }
-            if !page_one_matches(ui) {
-                return PaginationAction::Fail(page_mismatch("previous_page", ui));
+            if !initial_batch_matches(ui) {
+                return WaterfallAction::Fail(waterfall_mismatch("reset", ui));
             }
             let Some(delta) = query_count_delta(state.baseline, mailbox_query_counts()) else {
-                return PaginationAction::Fail("mailbox_query_counter_regressed".into());
+                return WaterfallAction::Fail("mailbox_query_counter_regressed".into());
             };
             let expected = u64::try_from(state.transitions.div_ceil(2)).unwrap_or(u64::MAX);
-            if delta.first != 0 || delta.after != expected || delta.before != expected {
-                return PaginationAction::Fail(counter_mismatch(expected, expected, delta));
+            if delta.first != expected || delta.after != expected || delta.before != 0 {
+                return WaterfallAction::Fail(counter_mismatch(expected, expected, 0, delta));
             }
             state.transitions += 1;
             if state.transitions == target_transitions {
-                PaginationAction::Complete(delta)
+                WaterfallAction::Complete(delta)
             } else {
-                state.phase = PaginationPhase::Next;
+                state.phase = WaterfallPhase::LoadingMore;
                 state.deadline = now + timeout;
-                PaginationAction::Next
+                WaterfallAction::LoadMore
             }
         }
     }
 }
 
-fn page_one_matches(ui: &AppWindow) -> bool {
-    page_matches(ui, 1, 50, "51", "2", false, true)
+fn initial_batch_matches(ui: &AppWindow) -> bool {
+    waterfall_matches(ui, 50, "51", "2", true)
 }
 
-fn page_two_matches(ui: &AppWindow) -> bool {
-    page_matches(ui, 2, 1, "1", "1", true, false)
+fn full_waterfall_matches(ui: &AppWindow) -> bool {
+    waterfall_matches(ui, 51, "51", "1", false)
 }
 
-fn page_matches(
+fn waterfall_matches(
     ui: &AppWindow,
-    page_number: i32,
     row_count: usize,
     first_id: &str,
     last_id: &str,
-    has_previous: bool,
-    has_next: bool,
+    has_more: bool,
 ) -> bool {
     if ui.get_mailbox_loading()
-        || ui.get_mailbox_navigation_loading()
+        || ui.get_mailbox_loading_more()
         || ui.get_mailbox_error()
-        || ui.get_mailbox_page_number() != page_number
-        || ui.get_has_previous_mailbox_page() != has_previous
-        || ui.get_has_next_mailbox_page() != has_next
+        || ui.get_mailbox_has_more() != has_more
         || !ui.get_total_known()
         || ui.get_message_total() != 51
     {
@@ -3111,7 +3105,7 @@ fn page_matches(
             .is_some_and(|mail| mail.id.as_str() == last_id)
 }
 
-fn page_mismatch(stage: &str, ui: &AppWindow) -> Box<str> {
+fn waterfall_mismatch(stage: &str, ui: &AppWindow) -> Box<str> {
     let mails = ui.get_mails();
     let first = mails
         .row_data(0)
@@ -3122,15 +3116,13 @@ fn page_mismatch(stage: &str, ui: &AppWindow) -> Box<str> {
         .map(|mail| mail.id.to_string())
         .unwrap_or_else(|| "none".to_owned());
     format!(
-        "{stage}_signature page={} rows={} first={} last={} previous={} next={} mailbox_loading={} navigation_loading={}",
-        ui.get_mailbox_page_number(),
+        "{stage}_signature rows={} first={} last={} has_more={} mailbox_loading={} loading_more={}",
         mails.row_count(),
         first,
         last,
-        ui.get_has_previous_mailbox_page(),
-        ui.get_has_next_mailbox_page(),
+        ui.get_mailbox_has_more(),
         ui.get_mailbox_loading(),
-        ui.get_mailbox_navigation_loading()
+        ui.get_mailbox_loading_more()
     )
     .into_boxed_str()
 }
@@ -3148,12 +3140,13 @@ fn query_count_delta(
 }
 
 fn counter_mismatch(
+    expected_first: u64,
     expected_after: u64,
     expected_before: u64,
     actual: MailboxQueryCounts,
 ) -> Box<str> {
     format!(
-        "query_count_mismatch expected_first=0 expected_after={expected_after} expected_before={expected_before} actual_first={} actual_after={} actual_before={}",
+        "query_count_mismatch expected_first={expected_first} expected_after={expected_after} expected_before={expected_before} actual_first={} actual_after={} actual_before={}",
         actual.first, actual.after, actual.before
     )
     .into_boxed_str()
@@ -3883,6 +3876,7 @@ mod tests {
     #[test]
     fn counter_mismatch_reports_expected_and_observed_classes() {
         let message = counter_mismatch(
+            1,
             5,
             4,
             MailboxQueryCounts {
@@ -3891,7 +3885,7 @@ mod tests {
                 before: 2,
             },
         );
-        assert!(message.contains("expected_first=0"));
+        assert!(message.contains("expected_first=1"));
         assert!(message.contains("expected_after=5"));
         assert!(message.contains("expected_before=4"));
         assert!(message.contains("actual_first=1"));

@@ -3435,6 +3435,8 @@ mod tests {
             InboxCheckpointOutcome::Current(super::super::sync::InboxCheckpoint {
                 expected_cursor: Some(7),
                 uid_validity: Some(31),
+                history_cursor: None,
+                history_complete: false,
             })
         );
 

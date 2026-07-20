@@ -8,7 +8,7 @@ use super::{
     stats,
 };
 
-const MAX_RECEIVE_PAGE: usize = 16;
+const MAX_RECEIVE_PAGE: usize = 32;
 const MAX_SENDER_BYTES: usize = 320;
 const MAX_SUBJECT_BYTES: usize = 998;
 const MAX_PREVIEW_BYTES: usize = 2_048;
@@ -21,6 +21,8 @@ const KNOWN_FLAG_BITS: u8 = InboxFlags::SEEN | InboxFlags::FLAGGED;
 pub(crate) struct InboxCheckpoint {
     pub(crate) expected_cursor: Option<u32>,
     pub(crate) uid_validity: Option<u32>,
+    pub(crate) history_cursor: Option<u32>,
+    pub(crate) history_complete: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,10 +116,30 @@ impl InboxEnvelope {
 pub(crate) struct InboxReceivePage {
     account_id: AccountId,
     expected_generation: AccountGeneration,
-    expected_cursor: Option<u32>,
     uid_validity: u32,
-    scanned_through_uid: Option<u32>,
+    progress: InboxReceiveProgress,
     messages: Box<[InboxEnvelope]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InboxReceiveProgress {
+    Forward {
+        expected_cursor: Option<u32>,
+        scanned_through_uid: Option<u32>,
+        bootstrap_history: Option<InboxHistoryProgress>,
+    },
+    History {
+        expected_cursor: u32,
+        expected_history_cursor: u32,
+        next_history_cursor: Option<u32>,
+        history_complete: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InboxHistoryProgress {
+    cursor: Option<u32>,
+    complete: bool,
 }
 
 impl InboxReceivePage {
@@ -127,6 +149,54 @@ impl InboxReceivePage {
         expected_cursor: Option<u32>,
         uid_validity: u32,
         scanned_through_uid: Option<u32>,
+        messages: Vec<InboxEnvelope>,
+    ) -> Result<Self, InboxValidationError> {
+        Self::new_forward(
+            account_id,
+            expected_generation,
+            expected_cursor,
+            uid_validity,
+            scanned_through_uid,
+            None,
+            messages,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_bootstrap(
+        account_id: AccountId,
+        expected_generation: AccountGeneration,
+        uid_validity: u32,
+        scanned_through_uid: Option<u32>,
+        history_cursor: Option<u32>,
+        history_complete: bool,
+        messages: Vec<InboxEnvelope>,
+    ) -> Result<Self, InboxValidationError> {
+        if history_complete != history_cursor.is_none() || history_cursor == Some(0) {
+            return Err(InboxValidationError::HistoryProgress);
+        }
+        Self::new_forward(
+            account_id,
+            expected_generation,
+            None,
+            uid_validity,
+            scanned_through_uid,
+            Some(InboxHistoryProgress {
+                cursor: history_cursor,
+                complete: history_complete,
+            }),
+            messages,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_forward(
+        account_id: AccountId,
+        expected_generation: AccountGeneration,
+        expected_cursor: Option<u32>,
+        uid_validity: u32,
+        scanned_through_uid: Option<u32>,
+        bootstrap_history: Option<InboxHistoryProgress>,
         messages: Vec<InboxEnvelope>,
     ) -> Result<Self, InboxValidationError> {
         if uid_validity == 0 {
@@ -168,9 +238,68 @@ impl InboxReceivePage {
         Ok(Self {
             account_id,
             expected_generation,
-            expected_cursor,
             uid_validity,
-            scanned_through_uid,
+            progress: InboxReceiveProgress::Forward {
+                expected_cursor,
+                scanned_through_uid,
+                bootstrap_history,
+            },
+            messages: messages.into_boxed_slice(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_history(
+        account_id: AccountId,
+        expected_generation: AccountGeneration,
+        expected_cursor: u32,
+        uid_validity: u32,
+        expected_history_cursor: u32,
+        next_history_cursor: Option<u32>,
+        history_complete: bool,
+        messages: Vec<InboxEnvelope>,
+    ) -> Result<Self, InboxValidationError> {
+        if uid_validity == 0 {
+            return Err(InboxValidationError::UidValidity);
+        }
+        if expected_cursor == 0
+            || expected_history_cursor == 0
+            || history_complete != next_history_cursor.is_none()
+            || next_history_cursor
+                .is_some_and(|cursor| cursor == 0 || cursor >= expected_history_cursor)
+        {
+            return Err(InboxValidationError::HistoryProgress);
+        }
+        if messages.len() > MAX_RECEIVE_PAGE {
+            return Err(InboxValidationError::PageSize {
+                found: messages.len(),
+                maximum: MAX_RECEIVE_PAGE,
+            });
+        }
+        let lower_bound = next_history_cursor.unwrap_or(0);
+        let mut unique = HashSet::with_capacity(messages.len());
+        for message in &messages {
+            if message.uid <= lower_bound || message.uid > expected_history_cursor {
+                return Err(InboxValidationError::HistoryMessageOutsideWindow {
+                    uid: message.uid,
+                    lower_bound,
+                    upper_bound: expected_history_cursor,
+                });
+            }
+            if !unique.insert(message.uid) {
+                return Err(InboxValidationError::DuplicateUid(message.uid));
+            }
+        }
+        Ok(Self {
+            account_id,
+            expected_generation,
+            uid_validity,
+            progress: InboxReceiveProgress::History {
+                expected_cursor,
+                expected_history_cursor,
+                next_history_cursor,
+                history_complete,
+            },
             messages: messages.into_boxed_slice(),
         })
     }
@@ -184,7 +313,14 @@ impl InboxReceivePage {
     }
 
     pub(crate) fn expected_cursor(&self) -> Option<u32> {
-        self.expected_cursor
+        match self.progress {
+            InboxReceiveProgress::Forward {
+                expected_cursor, ..
+            } => expected_cursor,
+            InboxReceiveProgress::History {
+                expected_cursor, ..
+            } => Some(expected_cursor),
+        }
     }
 
     pub(crate) fn uid_validity(&self) -> u32 {
@@ -192,7 +328,15 @@ impl InboxReceivePage {
     }
 
     pub(crate) fn scanned_through_uid(&self) -> Option<u32> {
-        self.scanned_through_uid
+        match self.progress {
+            InboxReceiveProgress::Forward {
+                scanned_through_uid,
+                ..
+            } => scanned_through_uid,
+            InboxReceiveProgress::History {
+                expected_cursor, ..
+            } => Some(expected_cursor),
+        }
     }
 
     pub(crate) fn messages(&self) -> &[InboxEnvelope] {
@@ -221,18 +365,34 @@ pub(crate) enum InboxStageOutcome {
 pub(crate) struct InboxCursorTicket {
     account_id: AccountId,
     expected_generation: AccountGeneration,
-    expected_cursor: Option<u32>,
     uid_validity: u32,
-    scanned_through_uid: Option<u32>,
+    progress: InboxReceiveProgress,
 }
 
 impl InboxCursorTicket {
     pub(crate) fn scanned_through_uid(&self) -> Option<u32> {
-        self.scanned_through_uid
+        match self.progress {
+            InboxReceiveProgress::Forward {
+                scanned_through_uid,
+                ..
+            } => scanned_through_uid,
+            InboxReceiveProgress::History {
+                expected_cursor, ..
+            } => Some(expected_cursor),
+        }
     }
 
     fn cursor_boundary(&self) -> Option<u32> {
-        self.scanned_through_uid.or(self.expected_cursor)
+        match self.progress {
+            InboxReceiveProgress::Forward {
+                expected_cursor,
+                scanned_through_uid,
+                ..
+            } => scanned_through_uid.or(expected_cursor),
+            InboxReceiveProgress::History {
+                expected_cursor, ..
+            } => Some(expected_cursor),
+        }
     }
 }
 
@@ -263,7 +423,14 @@ impl InboxCursorCommit {
     }
 
     pub(crate) fn expected_cursor(&self) -> Option<u32> {
-        self.ticket.expected_cursor
+        match self.ticket.progress {
+            InboxReceiveProgress::Forward {
+                expected_cursor, ..
+            } => expected_cursor,
+            InboxReceiveProgress::History {
+                expected_cursor, ..
+            } => Some(expected_cursor),
+        }
     }
 
     pub(crate) fn uid_validity(&self) -> u32 {
@@ -271,7 +438,7 @@ impl InboxCursorCommit {
     }
 
     pub(crate) fn scanned_through_uid(&self) -> Option<u32> {
-        self.ticket.scanned_through_uid
+        self.ticket.scanned_through_uid()
     }
 
     pub(crate) fn last_sync_at_ms(&self) -> i64 {
@@ -303,6 +470,12 @@ pub(crate) enum InboxValidationError {
         scanned_through_uid: Option<u32>,
         uid: u32,
     },
+    HistoryProgress,
+    HistoryMessageOutsideWindow {
+        uid: u32,
+        lower_bound: u32,
+        upper_bound: u32,
+    },
     PageSize {
         found: usize,
         maximum: usize,
@@ -332,7 +505,8 @@ pub(super) fn load_inbox_checkpoint(
 
     let stored = connection
         .query_row(
-            "SELECT folder.role, state.uid_validity, state.change_cursor
+            "SELECT folder.role, state.uid_validity, state.change_cursor,
+                    state.history_cursor, state.history_complete
              FROM folders AS folder
              LEFT JOIN sync_state AS state ON state.folder_id = folder.id
              WHERE folder.account_id = ?1 AND folder.remote_key = ?2",
@@ -342,12 +516,16 @@ pub(super) fn load_inbox_checkpoint(
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<i64>>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
                 ))
             },
         )
         .optional()
         .map_err(DbFailure::database)?;
-    let Some((role, stored_uid_validity, stored_cursor)) = stored else {
+    let Some((role, stored_uid_validity, stored_cursor, stored_history_cursor, history_complete)) =
+        stored
+    else {
         return Ok(InboxCheckpointOutcome::Current(InboxCheckpoint::default()));
     };
     if role != "inbox" {
@@ -364,14 +542,40 @@ pub(super) fn load_inbox_checkpoint(
         })
         .transpose()?;
     let expected_cursor = stored_cursor.as_deref().map(parse_cursor).transpose()?;
+    let history_cursor = stored_history_cursor
+        .map(|value| {
+            u32::try_from(value)
+                .ok()
+                .filter(|value| *value != 0)
+                .ok_or_else(|| DbFailure::database("stored IMAP history cursor is invalid"))
+        })
+        .transpose()?;
+    let history_complete = match history_complete {
+        Some(0) => false,
+        Some(1) => true,
+        Some(_) => return Err(DbFailure::database("stored IMAP history state is invalid")),
+        None => false,
+    };
     if expected_cursor.is_some() && uid_validity.is_none() {
         return Err(DbFailure::database(
             "stored IMAP cursor has no UIDVALIDITY fence",
         ));
     }
+    if history_cursor.is_some() && (expected_cursor.is_none() || uid_validity.is_none()) {
+        return Err(DbFailure::database(
+            "stored IMAP history cursor has no forward cursor fence",
+        ));
+    }
+    if history_complete && history_cursor.is_some() {
+        return Err(DbFailure::database(
+            "completed IMAP history scan retains a cursor",
+        ));
+    }
     Ok(InboxCheckpointOutcome::Current(InboxCheckpoint {
         expected_cursor,
         uid_validity,
+        history_cursor,
+        history_complete,
     }))
 }
 
@@ -387,6 +591,7 @@ pub(super) fn stage_inbox_page(
     }
 
     let inbox = load_inbox(&transaction, page.account_id)?;
+    let expected_cursor = page.expected_cursor();
     let folder_id = match inbox {
         Some(inbox) => {
             if inbox.role.as_ref() != "inbox" {
@@ -394,24 +599,24 @@ pub(super) fn stage_inbox_page(
                     "canonical IMAP inbox has a conflicting folder role",
                 ));
             }
-            if !match_sync_fence(
-                &transaction,
-                inbox.id,
-                page.expected_cursor,
-                page.uid_validity,
-            )? {
+            if !match_sync_fence(&transaction, inbox.id, expected_cursor, page.uid_validity)? {
+                return Ok(InboxStageOutcome::Stale);
+            }
+            if let InboxReceiveProgress::History {
+                expected_history_cursor,
+                ..
+            } = page.progress
+                && !history_fence_matches(&transaction, inbox.id, expected_history_cursor)?
+            {
                 return Ok(InboxStageOutcome::Stale);
             }
             inbox.id
         }
-        None if page.expected_cursor.is_none() => {
+        None if expected_cursor.is_none()
+            && matches!(page.progress, InboxReceiveProgress::Forward { .. }) =>
+        {
             let folder_id = create_inbox(&transaction, page.account_id)?;
-            if !match_sync_fence(
-                &transaction,
-                folder_id,
-                page.expected_cursor,
-                page.uid_validity,
-            )? {
+            if !match_sync_fence(&transaction, folder_id, expected_cursor, page.uid_validity)? {
                 return Ok(InboxStageOutcome::Stale);
             }
             folder_id
@@ -451,12 +656,27 @@ fn stage_messages(
             needs_content,
         });
     }
-    enforce_pending_window_bound(
-        transaction,
-        folder_id,
-        page.uid_validity,
-        page.expected_cursor.unwrap_or(0),
-    )?;
+    match page.progress {
+        InboxReceiveProgress::Forward {
+            expected_cursor, ..
+        } => enforce_pending_window_bound(
+            transaction,
+            folder_id,
+            page.uid_validity,
+            expected_cursor.unwrap_or(0),
+        )?,
+        InboxReceiveProgress::History {
+            expected_history_cursor,
+            next_history_cursor,
+            ..
+        } => enforce_history_window_bound(
+            transaction,
+            folder_id,
+            page.uid_validity,
+            next_history_cursor.unwrap_or(0),
+            expected_history_cursor,
+        )?,
+    }
     stats::rebuild_account(transaction, page.account_id.get())?;
     Ok(InboxStageOutcome::Staged {
         messages: staged.into_boxed_slice(),
@@ -464,9 +684,8 @@ fn stage_messages(
         ticket: InboxCursorTicket {
             account_id: page.account_id,
             expected_generation: page.expected_generation,
-            expected_cursor: page.expected_cursor,
             uid_validity: page.uid_validity,
-            scanned_through_uid: page.scanned_through_uid,
+            progress: page.progress,
         },
     })
 }
@@ -489,24 +708,52 @@ pub(super) fn commit_inbox_cursor(
     let Some(inbox) = load_inbox(&transaction, commit.ticket.account_id)? else {
         return Ok(InboxCursorOutcome::Stale);
     };
+    let expected_cursor = match commit.ticket.progress {
+        InboxReceiveProgress::Forward {
+            expected_cursor, ..
+        } => expected_cursor,
+        InboxReceiveProgress::History {
+            expected_cursor, ..
+        } => Some(expected_cursor),
+    };
     if inbox.role.as_ref() != "inbox"
         || !match_sync_fence(
             &transaction,
             inbox.id,
-            commit.ticket.expected_cursor,
+            expected_cursor,
             commit.ticket.uid_validity,
         )?
     {
         return Ok(InboxCursorOutcome::Stale);
     }
 
-    let pending = load_cursor_window(
-        &transaction,
-        inbox.id,
-        commit.ticket.uid_validity,
-        commit.ticket.expected_cursor.unwrap_or(0),
-        cursor_boundary.unwrap_or(0),
-    )?;
+    let pending = match commit.ticket.progress {
+        InboxReceiveProgress::Forward {
+            expected_cursor, ..
+        } => load_cursor_window(
+            &transaction,
+            inbox.id,
+            commit.ticket.uid_validity,
+            expected_cursor.unwrap_or(0),
+            cursor_boundary.unwrap_or(0),
+        )?,
+        InboxReceiveProgress::History {
+            expected_history_cursor,
+            next_history_cursor,
+            ..
+        } => {
+            if !history_fence_matches(&transaction, inbox.id, expected_history_cursor)? {
+                return Ok(InboxCursorOutcome::Stale);
+            }
+            load_cursor_window(
+                &transaction,
+                inbox.id,
+                commit.ticket.uid_validity,
+                next_history_cursor.unwrap_or(0),
+                expected_history_cursor,
+            )?
+        }
+    };
     if pending.len() > MAX_RECEIVE_PAGE {
         return Err(DbFailure::resource_limit(
             "inbox cursor window exceeds the receive page limit",
@@ -522,8 +769,32 @@ pub(super) fn commit_inbox_cursor(
         });
     }
 
-    let changed = transaction
-        .execute(
+    let changed = match commit.ticket.progress {
+        InboxReceiveProgress::Forward {
+            expected_cursor,
+            bootstrap_history: Some(history),
+            ..
+        } => transaction.execute(
+            "UPDATE sync_state
+             SET change_cursor = ?2, last_sync_at_ms = ?3,
+                 history_cursor = ?6, history_complete = ?7
+             WHERE folder_id = ?1 AND uid_validity = ?4
+               AND ((?5 IS NULL AND change_cursor IS NULL) OR change_cursor = ?5)",
+            params![
+                inbox.id,
+                cursor_boundary.map(|uid| uid.to_string()),
+                commit.last_sync_at_ms,
+                i64::from(commit.ticket.uid_validity),
+                expected_cursor.map(|cursor| cursor.to_string()),
+                history.cursor.map(i64::from),
+                i64::from(history.complete),
+            ],
+        ),
+        InboxReceiveProgress::Forward {
+            expected_cursor,
+            bootstrap_history: None,
+            ..
+        } => transaction.execute(
             "UPDATE sync_state
              SET change_cursor = ?2, last_sync_at_ms = ?3
              WHERE folder_id = ?1 AND uid_validity = ?4
@@ -533,13 +804,32 @@ pub(super) fn commit_inbox_cursor(
                 cursor_boundary.map(|uid| uid.to_string()),
                 commit.last_sync_at_ms,
                 i64::from(commit.ticket.uid_validity),
-                commit
-                    .ticket
-                    .expected_cursor
-                    .map(|cursor| cursor.to_string()),
+                expected_cursor.map(|cursor| cursor.to_string()),
             ],
-        )
-        .map_err(DbFailure::database)?;
+        ),
+        InboxReceiveProgress::History {
+            expected_cursor,
+            expected_history_cursor,
+            next_history_cursor,
+            history_complete,
+        } => transaction.execute(
+            "UPDATE sync_state
+             SET history_cursor = ?2, history_complete = ?3, last_sync_at_ms = ?4
+             WHERE folder_id = ?1 AND uid_validity = ?5
+               AND change_cursor = ?6
+               AND history_cursor = ?7 AND history_complete = 0",
+            params![
+                inbox.id,
+                next_history_cursor.map(i64::from),
+                i64::from(history_complete),
+                commit.last_sync_at_ms,
+                i64::from(commit.ticket.uid_validity),
+                expected_cursor.to_string(),
+                i64::from(expected_history_cursor),
+            ],
+        ),
+    }
+    .map_err(DbFailure::database)?;
     if changed != 1 {
         return Ok(InboxCursorOutcome::Stale);
     }
@@ -698,6 +988,23 @@ fn match_sync_fence(
             }
         }
     }
+}
+
+fn history_fence_matches(
+    transaction: &Transaction<'_>,
+    folder_id: i64,
+    expected_history_cursor: u32,
+) -> Result<bool, DbFailure> {
+    transaction
+        .query_row(
+            "SELECT history_cursor = ?2 AND history_complete = 0
+             FROM sync_state WHERE folder_id = ?1",
+            params![folder_id, i64::from(expected_history_cursor)],
+            |row| row.get(0),
+        )
+        .optional()
+        .map(|matched| matched.unwrap_or(false))
+        .map_err(DbFailure::database)
 }
 
 fn locator_is_tombstoned(
@@ -937,6 +1244,39 @@ fn enforce_pending_window_bound(
     Ok(())
 }
 
+fn enforce_history_window_bound(
+    transaction: &Transaction<'_>,
+    folder_id: i64,
+    uid_validity: u32,
+    lower_bound: u32,
+    upper_bound: u32,
+) -> Result<(), DbFailure> {
+    let count = transaction
+        .query_row(
+            "SELECT count(*) FROM (
+                 SELECT 1 FROM imap_message_locations
+                 WHERE folder_id = ?1 AND uid_validity = ?2
+                   AND uid > ?3 AND uid <= ?4
+                 LIMIT ?5
+             )",
+            params![
+                folder_id,
+                i64::from(uid_validity),
+                i64::from(lower_bound),
+                i64::from(upper_bound),
+                i64::try_from(MAX_RECEIVE_PAGE + 1).expect("page bound fits i64"),
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(DbFailure::database)?;
+    if count > i64::try_from(MAX_RECEIVE_PAGE).expect("receive page limit fits i64") {
+        return Err(DbFailure::resource_limit(
+            "inbox history window exceeds the receive page limit",
+        ));
+    }
+    Ok(())
+}
+
 fn load_cursor_window(
     transaction: &Transaction<'_>,
     folder_id: i64,
@@ -1132,6 +1472,121 @@ mod tests {
             .unwrap()
     }
 
+    fn history_state(connection: &Connection) -> (Option<String>, Option<i64>, bool) {
+        connection
+            .query_row(
+                "SELECT change_cursor, history_cursor, history_complete FROM sync_state",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    fn stage_content_and_commit(
+        connection: &mut Connection,
+        page: &InboxReceivePage,
+        timestamp: i64,
+    ) -> InboxCursorOutcome {
+        let (messages, ticket) = stage_parts(stage_inbox_page(connection, page).unwrap());
+        add_content(connection, &messages);
+        commit_inbox_cursor(
+            connection,
+            &InboxCursorCommit::new(ticket, timestamp).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn recent_bootstrap_and_history_pages_commit_independent_bounded_cursors() {
+        let mut connection = connection();
+        let bootstrap = InboxReceivePage::new_bootstrap(
+            account_id(),
+            generation(GENERATION),
+            UID_VALIDITY,
+            Some(6),
+            Some(4),
+            false,
+            vec![
+                envelope(5, "Five", InboxFlags::new(false, false)),
+                envelope(6, "Six", InboxFlags::new(false, false)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            stage_content_and_commit(&mut connection, &bootstrap, 2_000),
+            InboxCursorOutcome::Committed {
+                scanned_through_uid: Some(6)
+            }
+        );
+        assert_eq!(
+            history_state(&connection),
+            (Some("6".into()), Some(4), false)
+        );
+
+        let middle = InboxReceivePage::new_history(
+            account_id(),
+            generation(GENERATION),
+            6,
+            UID_VALIDITY,
+            4,
+            Some(2),
+            false,
+            vec![
+                envelope(4, "Four", InboxFlags::new(false, false)),
+                envelope(3, "Three", InboxFlags::new(false, false)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            stage_content_and_commit(&mut connection, &middle, 3_000),
+            InboxCursorOutcome::Committed {
+                scanned_through_uid: Some(6)
+            }
+        );
+        assert_eq!(
+            history_state(&connection),
+            (Some("6".into()), Some(2), false)
+        );
+
+        let oldest = InboxReceivePage::new_history(
+            account_id(),
+            generation(GENERATION),
+            6,
+            UID_VALIDITY,
+            2,
+            None,
+            true,
+            vec![
+                envelope(2, "Two", InboxFlags::new(false, false)),
+                envelope(1, "One", InboxFlags::new(false, false)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            stage_content_and_commit(&mut connection, &oldest, 4_000),
+            InboxCursorOutcome::Committed {
+                scanned_through_uid: Some(6)
+            }
+        );
+        assert_eq!(history_state(&connection), (Some("6".into()), None, true));
+        assert_eq!(
+            load_inbox_checkpoint(&connection, account_id(), generation(GENERATION)).unwrap(),
+            InboxCheckpointOutcome::Current(InboxCheckpoint {
+                expected_cursor: Some(6),
+                uid_validity: Some(UID_VALIDITY),
+                history_cursor: None,
+                history_complete: true,
+            })
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM messages", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            6
+        );
+    }
+
     #[test]
     fn validates_page_identity_text_time_and_flags() {
         assert_eq!(
@@ -1248,7 +1703,7 @@ mod tests {
             ),
             Err(InboxValidationError::DuplicateUid(1))
         ));
-        let oversized = (1..=17)
+        let oversized = (1..=33)
             .map(|uid| envelope(uid, "Mail", InboxFlags::new(false, false)))
             .collect();
         assert!(matches!(
@@ -1257,14 +1712,39 @@ mod tests {
                 generation(GENERATION),
                 None,
                 UID_VALIDITY,
-                Some(17),
+                Some(33),
                 oversized,
             ),
             Err(InboxValidationError::PageSize {
-                found: 17,
-                maximum: 16
+                found: 33,
+                maximum: 32
             })
         ));
+        assert_eq!(
+            InboxReceivePage::new_bootstrap(
+                account_id(),
+                generation(GENERATION),
+                UID_VALIDITY,
+                Some(1),
+                Some(0),
+                false,
+                Vec::new(),
+            ),
+            Err(InboxValidationError::HistoryProgress)
+        );
+        assert_eq!(
+            InboxReceivePage::new_history(
+                account_id(),
+                generation(GENERATION),
+                1,
+                UID_VALIDITY,
+                1,
+                Some(0),
+                false,
+                Vec::new(),
+            ),
+            Err(InboxValidationError::HistoryProgress)
+        );
     }
 
     #[test]

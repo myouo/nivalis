@@ -2,7 +2,7 @@ use std::{error::Error, fmt};
 
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(crate) const LATEST_SCHEMA_VERSION: u32 = 13;
+pub(crate) const LATEST_SCHEMA_VERSION: u32 = 14;
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -62,6 +62,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 13,
         sql: include_str!("../../../migrations/0013_repair_draft_stats.sql"),
+    },
+    Migration {
+        version: 14,
+        sql: include_str!("../../../migrations/0014_inbox_history_backfill.sql"),
     },
 ];
 
@@ -918,7 +922,10 @@ mod tests {
 
         migrate(&mut connection).expect("repair v12 draft statistics");
 
-        assert_eq!(schema_version(&connection), 13);
+        assert_eq!(
+            schema_version(&connection),
+            i64::from(LATEST_SCHEMA_VERSION)
+        );
         assert_eq!(mailbox_stats(&connection, 1), [0, 0, 0, 1, 1, 0, 0]);
         let dirty: bool = connection
             .query_row(
@@ -928,6 +935,52 @@ mod tests {
             )
             .expect("read repaired dirty marker");
         assert!(!dirty);
+    }
+
+    #[test]
+    fn v14_starts_history_backfill_below_the_oldest_cached_uid() {
+        let mut connection = memory_connection();
+        enable_foreign_keys(&connection).expect("enable foreign keys");
+        enable_recursive_triggers(&connection).expect("enable recursive triggers");
+        migrate_with(&mut connection, &MIGRATIONS[..13], 13).expect("create v13 schema");
+        insert_account(&connection, 1, "owner@example.test");
+        insert_folder(&connection, 10, 1, "inbox", "inbox");
+        insert_message(&connection, 100, 1, "message-100");
+        insert_message(&connection, 101, 1, "message-101");
+        connection
+            .execute_batch(
+                "INSERT INTO message_folders (message_id, folder_id, account_id)
+                 VALUES (100, 10, 1), (101, 10, 1);
+                 INSERT INTO imap_message_locations
+                     (message_id, folder_id, account_id, uid_validity, uid,
+                      remote_seen, remote_flagged)
+                 VALUES (100, 10, 1, 7, 1199, 0, 0),
+                        (101, 10, 1, 7, 1237, 0, 0);
+                 INSERT INTO sync_state
+                     (folder_id, uid_validity, change_cursor, last_sync_at_ms)
+                 VALUES (10, 7, '1237', 1000);",
+            )
+            .expect("seed truncated v13 inbox state");
+
+        migrate(&mut connection).expect("add bounded history backfill state");
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT change_cursor, history_cursor, history_complete
+                     FROM sync_state WHERE folder_id = 10",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, bool>(2)?,
+                        ))
+                    },
+                )
+                .unwrap(),
+            ("1237".to_owned(), 1198, false)
+        );
     }
 
     #[test]

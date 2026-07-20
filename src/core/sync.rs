@@ -9,7 +9,10 @@ use std::{
 use mail_parser::DateTime;
 
 use crate::{
-    content::{ContentError, ContentLimits, ContentStaging, MimeError, prepare_content},
+    content::{
+        ContentError, ContentLimits, ContentStaging, MimeError, PreparedContent,
+        UnrenderableContentReason, prepare_content, prepare_unrenderable_content,
+    },
     credentials::{
         CredentialClient, CredentialLocator, CredentialOperation, CredentialOutcome,
         CredentialSubmitError,
@@ -47,6 +50,7 @@ pub(super) enum SyncInboxOutcome {
         generation: AccountGeneration,
         imported: u8,
         has_more: bool,
+        historical: bool,
     },
     Failed {
         stage: AccountWorkflowStage,
@@ -103,6 +107,8 @@ async fn run_inbox_sync(
         secret,
         first_uid,
         checkpoint.uid_validity,
+        checkpoint.history_cursor,
+        checkpoint.history_complete,
     ) {
         Ok(request) => request,
         Err(_) => {
@@ -119,17 +125,6 @@ async fn run_inbox_sync(
         }
     };
 
-    if fetched
-        .messages
-        .iter()
-        .any(|message| matches!(message.content, ImapInboxContent::Oversized { .. }))
-    {
-        return sync_failure(
-            AccountWorkflowStage::FetchInbox,
-            InboxSyncFailureKind::ResourceLimit,
-        );
-    }
-
     let staging = match ContentStaging::open(content_root) {
         Ok(staging) => Arc::new(staging),
         Err(_) => {
@@ -144,9 +139,18 @@ async fn run_inbox_sync(
         uid_next: _,
         scanned_through_uid,
         next_uid,
+        bootstrap_history,
+        history_page,
         messages,
     } = fetched;
-    let has_more = next_uid.is_some();
+    let historical = history_page.is_some();
+    let has_more = next_uid.is_some()
+        || bootstrap_history.is_some_and(|history| !history.complete)
+        || history_page.is_some_and(|history| !history.complete)
+        || (history_page.is_none()
+            && bootstrap_history.is_none()
+            && !checkpoint.history_complete
+            && checkpoint.history_cursor.is_some());
     let received_at_fallback = now_ms();
     let envelopes = match messages
         .iter()
@@ -161,14 +165,39 @@ async fn run_inbox_sync(
             );
         }
     };
-    let receive_page = match InboxReceivePage::new(
-        account_id,
-        expected_generation,
-        checkpoint.expected_cursor,
-        uid_validity.get(),
-        scanned_through_uid.map(std::num::NonZeroU32::get),
-        envelopes,
-    ) {
+    let receive_page = match if let Some(history) = history_page {
+        InboxReceivePage::new_history(
+            account_id,
+            expected_generation,
+            scanned_through_uid
+                .expect("history fetch retains the forward cursor")
+                .get(),
+            uid_validity.get(),
+            history.expected_cursor.get(),
+            history.next_cursor.map(std::num::NonZeroU32::get),
+            history.complete,
+            envelopes,
+        )
+    } else if let Some(history) = bootstrap_history {
+        InboxReceivePage::new_bootstrap(
+            account_id,
+            expected_generation,
+            uid_validity.get(),
+            scanned_through_uid.map(std::num::NonZeroU32::get),
+            history.next_cursor.map(std::num::NonZeroU32::get),
+            history.complete,
+            envelopes,
+        )
+    } else {
+        InboxReceivePage::new(
+            account_id,
+            expected_generation,
+            checkpoint.expected_cursor,
+            uid_validity.get(),
+            scanned_through_uid.map(std::num::NonZeroU32::get),
+            envelopes,
+        )
+    } {
         Ok(page) => page,
         Err(_) => {
             return sync_failure(
@@ -207,14 +236,11 @@ async fn run_inbox_sync(
         if !staged.needs_content {
             continue;
         }
-        let ImapInboxContent::Fetched(raw) = message.content else {
-            unreachable!("oversized inbox messages were rejected before staging")
-        };
-        let prepared = match prepare_content(&raw, &staging, ContentLimits::default()) {
+        let prepared = match prepare_inbox_content(&message, &staging, received_at_fallback) {
             Ok(prepared) => prepared,
             Err(failure) => return content_failure(failure),
         };
-        drop(raw);
+        drop(message);
         let published = match prepared.publish() {
             Ok(published) => published,
             Err(_) => {
@@ -289,6 +315,7 @@ async fn run_inbox_sync(
         generation: expected_generation,
         imported,
         has_more,
+        historical,
     }
 }
 
@@ -406,6 +433,42 @@ async fn load_credential(
     }
 }
 
+fn prepare_inbox_content(
+    message: &ImapInboxMessage,
+    staging: &ContentStaging,
+    received_at_fallback: i64,
+) -> Result<PreparedContent, ContentError> {
+    let limits = ContentLimits::default();
+    let reason = match &message.content {
+        ImapInboxContent::Fetched(raw) => match prepare_content(raw, staging, limits) {
+            Ok(prepared) => return Ok(prepared),
+            Err(ContentError::Mime(MimeError::Malformed(_))) => {
+                UnrenderableContentReason::Malformed
+            }
+            Err(ContentError::Mime(MimeError::LimitExceeded { .. })) => {
+                UnrenderableContentReason::SafetyLimit
+            }
+            Err(failure @ ContentError::Storage(_)) => return Err(failure),
+        },
+        ImapInboxContent::Oversized { .. } => UnrenderableContentReason::SafetyLimit,
+    };
+    let sender_name = bounded_utf8(&message.envelope.from_name, MAX_SENDER_BYTES);
+    let sender_address =
+        bounded_sender_address(&message.envelope.from_mailbox, &message.envelope.from_host);
+    let subject = bounded_utf8(&message.envelope.subject, MAX_SUBJECT_BYTES);
+    let received_at_ms = inbox_received_at(message, received_at_fallback);
+    prepare_unrenderable_content(
+        &subject,
+        &sender_name,
+        &sender_address,
+        Some(received_at_ms),
+        u64::from(message.declared_bytes),
+        reason,
+        staging,
+        limits,
+    )
+}
+
 fn inbox_envelope(
     message: &ImapInboxMessage,
     received_at_fallback: i64,
@@ -414,10 +477,7 @@ fn inbox_envelope(
     let sender_address =
         bounded_sender_address(&message.envelope.from_mailbox, &message.envelope.from_host);
     let subject = bounded_utf8(&message.envelope.subject, MAX_SUBJECT_BYTES);
-    let received_at_ms = DateTime::parse_rfc822(&message.internal_date)
-        .filter(DateTime::is_valid)
-        .and_then(|date| date.to_timestamp().checked_mul(1_000))
-        .unwrap_or(received_at_fallback);
+    let received_at_ms = inbox_received_at(message, received_at_fallback);
     InboxEnvelope::new(
         message.uid.get(),
         sender_name.as_bytes(),
@@ -428,6 +488,13 @@ fn inbox_envelope(
         InboxFlags::new(message.flags.seen, message.flags.flagged),
         false,
     )
+}
+
+fn inbox_received_at(message: &ImapInboxMessage, fallback: i64) -> i64 {
+    DateTime::parse_rfc822(&message.internal_date)
+        .filter(DateTime::is_valid)
+        .and_then(|date| date.to_timestamp().checked_mul(1_000))
+        .unwrap_or(fallback)
 }
 
 fn bounded_sender_address(mailbox: &[u8], host: &[u8]) -> String {
@@ -576,20 +643,6 @@ Date: Tue, 01 Jul 2025 12:00:00 +0000\r\n\
 Content-Type: text/plain; charset=utf-8\r\n\
 \r\n\
 first body v1\r\n";
-    const RETRY_ONE_V2: &[u8] = b"From: Alice <alice@example.test>\r\n\
-Subject: Retry one v2\r\n\
-Date: Tue, 01 Jul 2025 12:00:00 +0000\r\n\
-Content-Type: text/plain; charset=utf-8\r\n\
-\r\n\
-first body v2\r\n";
-    const RETRY_TWO: &[u8] = b"From: Bob <bob@example.test>\r\n\
-Subject: Retry two\r\n\
-Date: Tue, 01 Jul 2025 12:01:00 +0000\r\n\
-Content-Type: text/plain; charset=utf-8\r\n\
-\r\n\
-second body\r\n";
-    static RETRY_FETCH_ATTEMPT: AtomicU64 = AtomicU64::new(0);
-
     fn fake_fetch(_: ImapInboxFetchRequest) -> ImapInboxFetchFuture {
         Box::pin(async {
             Ok(ImapInboxPage {
@@ -597,6 +650,8 @@ second body\r\n";
                 uid_next: NonZeroU32::new(3).unwrap(),
                 scanned_through_uid: NonZeroU32::new(1),
                 next_uid: NonZeroU32::new(2),
+                bootstrap_history: None,
+                history_page: None,
                 messages: vec![ImapInboxMessage {
                     uid: NonZeroU32::new(1).unwrap(),
                     flags: ImapInboxFlags {
@@ -627,11 +682,16 @@ second body\r\n";
                 uid_next: NonZeroU32::new(2).unwrap(),
                 scanned_through_uid: NonZeroU32::new(1),
                 next_uid: None,
+                bootstrap_history: None,
+                history_page: None,
                 messages: vec![ImapInboxMessage {
                     uid: NonZeroU32::new(1).unwrap(),
                     flags: ImapInboxFlags::default(),
                     internal_date: "01-Jul-2025 12:00:00 +0000".into(),
-                    envelope: ImapInboxEnvelope::default(),
+                    envelope: ImapInboxEnvelope {
+                        subject: b"Oversized fixture".to_vec().into_boxed_slice(),
+                        ..ImapInboxEnvelope::default()
+                    },
                     declared_bytes: (1024 * 1024) + 1,
                     content: ImapInboxContent::Oversized {
                         declared_bytes: (1024 * 1024) + 1,
@@ -643,18 +703,17 @@ second body\r\n";
     }
 
     fn retry_fetch(_: ImapInboxFetchRequest) -> ImapInboxFetchFuture {
-        let retry = RETRY_FETCH_ATTEMPT.fetch_add(1, Ordering::SeqCst) != 0;
-        Box::pin(async move {
-            let first = if retry { RETRY_ONE_V2 } else { RETRY_ONE_V1 };
-            let second = if retry { RETRY_TWO } else { b"malformed" };
+        Box::pin(async {
             Ok(ImapInboxPage {
                 uid_validity: NonZeroU32::new(7).unwrap(),
                 uid_next: NonZeroU32::new(3).unwrap(),
                 scanned_through_uid: NonZeroU32::new(2),
                 next_uid: None,
+                bootstrap_history: None,
+                history_page: None,
                 messages: vec![
-                    retry_message(1, b"staged one", first),
-                    retry_message(2, b"staged two", second),
+                    retry_message(1, b"staged one", RETRY_ONE_V1),
+                    retry_message(2, b"staged two", b"malformed"),
                 ]
                 .into_boxed_slice(),
             })
@@ -845,11 +904,12 @@ second body\r\n";
     }
 
     #[test]
-    fn oversized_message_is_rejected_before_staging_or_cursor_advance() {
+    fn oversized_message_is_isolated_without_blocking_cursor_advance() {
         let root = temporary_root();
         fs::create_dir(&root).unwrap();
         let database_path = root.join("mail.sqlite3");
-        let (database, replies, database_runtime, _info) =
+        let content_root = root.join("content");
+        let (database, mut replies, database_runtime, _info) =
             sqlite::spawn(database_path.clone()).unwrap();
         let store: Arc<CredentialStore> =
             keyring_core::mock::Store::new().expect("create mock credential store");
@@ -896,18 +956,17 @@ second body\r\n";
                 database.clone(),
                 credentials.clone(),
                 oversized_fetch,
-                root.join("content"),
+                content_root.clone(),
                 configuration.account_id,
                 configuration.generation,
             )
             .await;
             assert!(matches!(
                 outcome,
-                SyncInboxOutcome::Failed {
-                    stage: AccountWorkflowStage::FetchInbox,
-                    failure: AccountWorkflowFailureKind::InboxSync(
-                        InboxSyncFailureKind::ResourceLimit
-                    ),
+                SyncInboxOutcome::Synced {
+                    imported: 1,
+                    has_more: false,
+                    ..
                 }
             ));
             let checkpoint = database
@@ -916,11 +975,24 @@ second body\r\n";
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(
+            assert!(matches!(
                 checkpoint,
-                InboxCheckpointOutcome::Current(Default::default())
-            );
-            assert!(replies.is_empty());
+                InboxCheckpointOutcome::Current(crate::store::sqlite::InboxCheckpoint {
+                    expected_cursor: Some(1),
+                    uid_validity: Some(7),
+                    ..
+                })
+            ));
+            let (_, body_key) =
+                query_message_body(&database, &mut replies, "Oversized fixture").await;
+            let staging = ContentStaging::open(content_root).unwrap();
+            let mut body = String::new();
+            staging
+                .open_file(&body_key)
+                .unwrap()
+                .read_to_string(&mut body)
+                .unwrap();
+            assert!(body.contains("exceeds the local safety limits"));
         });
 
         credential_parts.1.shutdown().unwrap();
@@ -930,8 +1002,7 @@ second body\r\n";
     }
 
     #[test]
-    fn retry_imports_only_content_missing_after_a_partial_failure() {
-        RETRY_FETCH_ATTEMPT.store(0, Ordering::SeqCst);
+    fn malformed_message_is_isolated_without_blocking_the_batch() {
         let root = temporary_root();
         fs::create_dir(&root).unwrap();
         let database_path = root.join("mail.sqlite3");
@@ -979,7 +1050,7 @@ second body\r\n";
                 .unwrap()
                 .unwrap();
 
-            let first = run_inbox_sync(
+            let outcome = run_inbox_sync(
                 database.clone(),
                 credentials.clone(),
                 retry_fetch,
@@ -989,36 +1060,15 @@ second body\r\n";
             )
             .await;
             assert!(matches!(
-                first,
-                SyncInboxOutcome::Failed {
-                    stage: AccountWorkflowStage::ParseContent,
-                    failure: AccountWorkflowFailureKind::InboxSync(
-                        InboxSyncFailureKind::MalformedContent
-                    ),
-                }
-            ));
-            let (first_id, first_key) = query_retry_one(&database, &mut replies).await;
-
-            let retried = run_inbox_sync(
-                database.clone(),
-                credentials.clone(),
-                retry_fetch,
-                content_root.clone(),
-                configuration.account_id,
-                configuration.generation,
-            )
-            .await;
-            assert!(matches!(
-                retried,
+                outcome,
                 SyncInboxOutcome::Synced {
-                    imported: 1,
+                    imported: 2,
                     has_more: false,
                     ..
                 }
             ));
-            let (retried_id, retried_key) = query_retry_one(&database, &mut replies).await;
-            assert_eq!(retried_id, first_id);
-            assert_eq!(retried_key, first_key);
+            let (_, first_key) = query_message_body(&database, &mut replies, "Retry one v1").await;
+            let (_, fallback_key) = query_message_body(&database, &mut replies, "staged two").await;
 
             let staging = ContentStaging::open(content_root).unwrap();
             let mut body = String::new();
@@ -1028,6 +1078,13 @@ second body\r\n";
                 .read_to_string(&mut body)
                 .unwrap();
             assert_eq!(body.trim(), "first body v1");
+            let mut fallback = String::new();
+            staging
+                .open_file(&fallback_key)
+                .unwrap()
+                .read_to_string(&mut fallback)
+                .unwrap();
+            assert!(fallback.contains("MIME content is malformed"));
             let checkpoint = database
                 .try_load_inbox_checkpoint(configuration.account_id, configuration.generation)
                 .unwrap()
@@ -1039,6 +1096,7 @@ second body\r\n";
                 InboxCheckpointOutcome::Current(crate::store::sqlite::InboxCheckpoint {
                     expected_cursor: Some(2),
                     uid_validity: Some(7),
+                    ..
                 })
             ));
         });
@@ -1049,9 +1107,10 @@ second body\r\n";
         fs::remove_dir_all(root).unwrap();
     }
 
-    async fn query_retry_one(
+    async fn query_message_body(
         database: &DatabaseClient,
         replies: &mut crate::store::sqlite::DatabaseReplies,
+        subject: &str,
     ) -> (crate::store::sqlite::MessageId, FileKey) {
         static NEXT_REQUEST: AtomicU64 = AtomicU64::new(10);
         database
@@ -1075,8 +1134,8 @@ second body\r\n";
                     .unwrap()
                     .rows
                     .iter()
-                    .find(|row| row.subject.as_ref() == "Retry one v1")
-                    .expect("MIME-derived metadata remains visible")
+                    .find(|row| row.subject.as_ref() == subject)
+                    .expect("expected message metadata remains visible")
                     .id
             }
             _ => panic!("mailbox query returned an unexpected reply"),

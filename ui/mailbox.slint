@@ -148,10 +148,8 @@ export component MailboxPane inherits Rectangle {
     in property <string> status-text;
     in property <bool> initial-loading: false;
     in property <bool> mailbox-loading: false;
-    in property <bool> has-previous-mailbox-page: false;
-    in property <bool> has-next-mailbox-page: false;
-    in property <bool> mailbox-navigation-loading: false;
-    in property <int> mailbox-page-number: 1;
+    in property <bool> mailbox-has-more: false;
+    in property <bool> mailbox-loading-more: false;
     in property <bool> mailbox-error: false;
     in property <string> mailbox-error-title: "";
     in property <string> mailbox-error-detail: "";
@@ -173,8 +171,7 @@ export component MailboxPane inherits Rectangle {
     callback toggle-star(string);
     callback sync-account(string);
     callback retry;
-    callback previous-mailbox-page;
-    callback next-mailbox-page;
+    callback load-more-mail;
 
     private property <bool> show-loading: root.initial-loading || root.mailbox-loading;
 
@@ -311,11 +308,11 @@ export component MailboxPane inherits Rectangle {
             Rectangle { width: 62%; height: parent.height; background: Theme.primary; }
         }
 
-        if root.mailbox-navigation-loading && !root.show-loading: Rectangle {
+        if root.mailbox-loading-more && !root.show-loading: Rectangle {
             height: 2px;
             background: Theme.surface-container-highest;
             accessible-role: progress-indicator;
-            accessible-label: "Loading mailbox page";
+            accessible-label: "Loading more messages";
             Rectangle { x: (parent.width - self.width) / 2; width: 30%; height: parent.height; background: Theme.primary; }
         }
 
@@ -334,10 +331,22 @@ export component MailboxPane inherits Rectangle {
             SkeletonRow { }
         }
 
-        if !root.show-loading && !root.mailbox-error && root.mails.length > 0: ListView {
+        if !root.show-loading && !root.mailbox-error && root.mails.length > 0: mail-list := ListView {
             accessible-role: list;
             accessible-label: root.active-folder + " messages";
             accessible-item-count: root.mails.length;
+            changed viewport-y => {
+                if (root.mailbox-has-more && !root.mailbox-loading-more
+                    && -self.viewport-y + self.visible-height + 480px >= self.viewport-height) {
+                    root.load-more-mail();
+                }
+            }
+            changed viewport-height => {
+                if (root.mailbox-has-more && !root.mailbox-loading-more
+                    && -self.viewport-y + self.visible-height + 480px >= self.viewport-height) {
+                    root.load-more-mail();
+                }
+            }
             for mail[i] in root.mails: MailRow {
                 mail: mail;
                 selected: root.selected-id == mail.id;
@@ -371,14 +380,13 @@ export component MailboxPane inherits Rectangle {
         }
 
         if !root.show-loading && !root.mailbox-error: Rectangle {
-            height: 52px;
+            height: 34px;
             Rectangle { y: 0; width: parent.width; height: 1px; background: Theme.outline-variant; }
             HorizontalLayout {
                 padding-left: 14px;
-                padding-right: 8px;
+                padding-right: 14px;
                 Text {
-                    text: "Page " + root.mailbox-page-number
-                        + "  ·  Showing " + root.mails.length + (root.mails.length == 1 ? " message" : " messages")
+                    text: "Showing " + root.mails.length + (root.mails.length == 1 ? " message" : " messages")
                         + (root.total-known ? "  ·  " + root.message-total + " total" : "  ·  Total unavailable");
                     color: Theme.on-surface-variant;
                     font-family: Theme.body-font;
@@ -390,21 +398,19 @@ export component MailboxPane inherits Rectangle {
                     accessible-live-region: polite;
                     accessible-label: self.text;
                 }
-                MIconButton {
-                    icon: "chevron_left";
-                    label: "Previous page";
-                    enabled: root.has-previous-mailbox-page;
-                    busy: root.mailbox-navigation-loading;
-                    compact-visual: true;
-                    clicked => { root.previous-mailbox-page(); }
+                if root.mailbox-loading-more: Text {
+                    text: "Loading more…";
+                    color: Theme.primary;
+                    font-family: Theme.body-font;
+                    font-size: 10px;
+                    vertical-alignment: center;
                 }
-                MIconButton {
-                    icon: "chevron_right";
-                    label: "Next page";
-                    enabled: root.has-next-mailbox-page;
-                    busy: root.mailbox-navigation-loading;
-                    compact-visual: true;
-                    clicked => { root.next-mailbox-page(); }
+                if !root.mailbox-loading-more && root.mailbox-has-more: Text {
+                    text: "Scroll for more";
+                    color: Theme.on-surface-variant;
+                    font-family: Theme.body-font;
+                    font-size: 10px;
+                    vertical-alignment: center;
                 }
             }
         }

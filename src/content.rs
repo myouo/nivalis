@@ -279,6 +279,25 @@ pub(crate) struct ContentRecord {
     pub(crate) attachments: Box<[AttachmentRecord]>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnrenderableContentReason {
+    Malformed,
+    SafetyLimit,
+}
+
+impl UnrenderableContentReason {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Malformed => {
+                "This message could not be rendered because its MIME content is malformed. It was kept in the mailbox so synchronization can continue."
+            }
+            Self::SafetyLimit => {
+                "This message could not be rendered because its content exceeds the local safety limits. It was kept in the mailbox so synchronization can continue."
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AttachmentRecord {
     pub(crate) ordinal: u16,
@@ -959,6 +978,36 @@ pub(crate) fn prepare_content(
         },
         body: staged_body,
         attachments: attachments.into_boxed_slice(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_unrenderable_content(
+    subject: &str,
+    sender_name: &str,
+    sender_address: &str,
+    received_at_ms: Option<i64>,
+    original_byte_count: u64,
+    reason: UnrenderableContentReason,
+    staging: &ContentStaging,
+    limits: ContentLimits,
+) -> Result<PreparedContent, ContentError> {
+    let message = reason.message();
+    let body =
+        staging.stage_reader(FileKind::Body, message.as_bytes(), limits.stored_body_bytes)?;
+    Ok(PreparedContent {
+        metadata: ContentMetadata {
+            subject: bounded_display(subject, MAX_SUBJECT_BYTES, false),
+            sender_name: bounded_display(sender_name, MAX_ADDRESS_BYTES, false),
+            sender_address: bounded_display(sender_address, MAX_ADDRESS_BYTES, false),
+            received_at_ms,
+            preview: bounded_prefix(message, limits.preview_bytes).into(),
+            reader_excerpt: bounded_prefix(message, limits.reader_excerpt_bytes).into(),
+            body_truncated: true,
+            body_byte_count: original_byte_count,
+        },
+        body: Some(body),
+        attachments: Box::new([]),
     })
 }
 

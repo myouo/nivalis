@@ -72,10 +72,8 @@ export component AppWindow inherits Window {
     in-out property <bool> detail-open: false;
     in-out property <bool> initial-loading: false;
     in property <bool> mailbox-loading: false;
-    in property <bool> has-previous-mailbox-page: false;
-    in property <bool> has-next-mailbox-page: false;
-    in property <bool> mailbox-navigation-loading: false;
-    in property <int> mailbox-page-number: 1;
+    in property <bool> mailbox-has-more: false;
+    in property <bool> mailbox-loading-more: false;
     in property <bool> mailbox-error: false;
     in property <string> mailbox-error-title: "";
     in property <string> mailbox-error-detail: "";
@@ -151,8 +149,7 @@ export component AppWindow inherits Window {
     callback delete-mail(string);
     callback mark-unread(string);
     callback retry-mailbox;
-    callback previous-mailbox-page;
-    callback next-mailbox-page;
+    callback load-more-mail;
     callback retry-detail;
     callback open-composer;
     callback send-message(string, string, string);
@@ -376,10 +373,8 @@ export component AppWindow inherits Window {
                                 status-text: root.status-text;
                                 initial-loading: root.initial-loading;
                                 mailbox-loading: root.mailbox-loading;
-                                has-previous-mailbox-page: root.has-previous-mailbox-page;
-                                has-next-mailbox-page: root.has-next-mailbox-page;
-                                mailbox-navigation-loading: root.mailbox-navigation-loading;
-                                mailbox-page-number: root.mailbox-page-number;
+                                mailbox-has-more: root.mailbox-has-more;
+                                mailbox-loading-more: root.mailbox-loading-more;
                                 mailbox-error: root.mailbox-error;
                                 mailbox-error-title: root.mailbox-error-title;
                                 mailbox-error-detail: root.mailbox-error-detail;
@@ -411,11 +406,8 @@ export component AppWindow inherits Window {
                                 retry => {
                                     if (!root.outbox-open) { root.retry-mailbox(); }
                                 }
-                                previous-mailbox-page => {
-                                    if (!root.outbox-open) { root.previous-mailbox-page(); }
-                                }
-                                next-mailbox-page => {
-                                    if (!root.outbox-open) { root.next-mailbox-page(); }
+                                load-more-mail => {
+                                    if (!root.outbox-open) { root.load-more-mail(); }
                                 }
                             }
 

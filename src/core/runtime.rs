@@ -1540,6 +1540,8 @@ mod tests {
             uid_next: NonZeroU32::new(uid_next).unwrap(),
             scanned_through_uid: scanned_through_uid.and_then(NonZeroU32::new),
             next_uid: next_uid.and_then(NonZeroU32::new),
+            bootstrap_history: None,
+            history_page: None,
             messages: Box::new([]),
         }
     }
@@ -1798,6 +1800,7 @@ mod tests {
                     generation: account_a.generation,
                     imported: 0,
                     has_more: true,
+                    historical: false,
                 },
                 AccountSyncStatus::Failed(AccountOperationFailure {
                     account_id: Some(account_b.account_id),
@@ -1810,12 +1813,14 @@ mod tests {
                     generation: account_c.generation,
                     imported: 0,
                     has_more: false,
+                    historical: false,
                 },
                 AccountSyncStatus::Synced {
                     account_id: account_a.account_id,
                     generation: account_a.generation,
                     imported: 0,
                     has_more: false,
+                    historical: false,
                 },
             ]
         );

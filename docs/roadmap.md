@@ -39,7 +39,7 @@ Acceptance criteria:
 - The production controller no longer constructs or mutates `MailStore::demo()`.
 - Account catalog, mailbox pages, selected-message details, local flags, Archive, Trash, permanent deletion, and Trash undo travel through the bounded core and SQLite actor.
 - SQLite DTOs map to stable Slint models without truncating database identifiers or copying mailbox-wide data.
-- Mailbox navigation supports real keyset pagination. Obsolete page/detail/search work is coalesced or interrupted.
+- Mailbox scrolling is continuous and prefetches bounded keyset batches near the viewport edge. Obsolete list/detail/search work is coalesced or interrupted.
 - Search uses bounded SQLite FTS with migration, rebuild, update, delete, escaping, and query-plan tests.
 - Empty databases show an honest account/onboarding state. Compose/send remains unavailable until the durable outbox milestone rather than reporting a simulated send.
 - Busy, unavailable, conflict, resource-limit, not-found, loading, and retry feedback are mapped to actionable UI states.

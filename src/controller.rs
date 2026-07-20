@@ -1,8 +1,8 @@
 mod session;
 
 use self::session::{
-    DetailAcceptance, MailAction, MailboxAcceptance, MailboxIntent, MutationCompletion,
-    MutationIntent, MutationScope, ReadSession, SessionError,
+    DetailAcceptance, MailAction, MailboxAcceptance, MailboxCommitEffect, MailboxIntent,
+    MutationCompletion, MutationIntent, MutationScope, ReadSession, SessionError,
 };
 use crate::core::{
     AccountConfigDraft, AccountDirectoryLoadError, AccountOperation, AccountOperationFailure,
@@ -109,10 +109,8 @@ impl Controller {
         ui.set_undo_loading(false);
         ui.set_initial_loading(true);
         ui.set_mailbox_loading(true);
-        ui.set_has_previous_mailbox_page(false);
-        ui.set_has_next_mailbox_page(false);
-        ui.set_mailbox_navigation_loading(false);
-        ui.set_mailbox_page_number(1);
+        ui.set_mailbox_has_more(false);
+        ui.set_mailbox_loading_more(false);
         ui.set_mailbox_error(false);
         ui.set_detail_loading(false);
         ui.set_detail_error(false);
@@ -223,10 +221,7 @@ impl Controller {
         ui.on_retry_mailbox(move || controller.retry_mailbox());
 
         let controller = self.clone();
-        ui.on_previous_mailbox_page(move || controller.navigate_previous());
-
-        let controller = self.clone();
-        ui.on_next_mailbox_page(move || controller.navigate_next());
+        ui.on_load_more_mail(move || controller.load_more_mail());
 
         let controller = self.clone();
         ui.on_retry_detail(move || controller.retry_detail());
@@ -331,10 +326,8 @@ impl Controller {
         self.clear_reader();
         if let Some(ui) = self.ui.upgrade() {
             ui.set_mailbox_loading(true);
-            ui.set_has_previous_mailbox_page(false);
-            ui.set_has_next_mailbox_page(false);
-            ui.set_mailbox_navigation_loading(false);
-            ui.set_mailbox_page_number(1);
+            ui.set_mailbox_has_more(false);
+            ui.set_mailbox_loading_more(false);
             ui.set_mailbox_error(false);
             ui.set_mail_actions_enabled(false);
             ui.set_status_text("Loading local cache".into());
@@ -414,6 +407,7 @@ impl Controller {
                 account_id,
                 imported,
                 has_more,
+                historical,
                 ..
             } => {
                 self.issue_accounts();
@@ -423,10 +417,24 @@ impl Controller {
                 if let Some(ui) = self.ui.upgrade()
                     && !foreground_feedback_active(&ui)
                 {
-                    ui.set_status_text(sync_success_feedback(imported, has_more).into());
+                    ui.set_status_text(
+                        background_sync_feedback(imported, has_more, historical).into(),
+                    );
                 }
-                if imported > 0 && self.state.borrow().shows_inbox_sync_updates() {
-                    self.refresh_after_mutation();
+                let refresh_visible_mailbox = self.ui.upgrade().is_some_and(|ui| {
+                    should_refresh_synced_mailbox(
+                        imported,
+                        self.state.borrow().shows_inbox_sync_updates(),
+                        ui.get_mailbox_loading(),
+                        ui.get_mailbox_loading_more(),
+                    )
+                });
+                if refresh_visible_mailbox {
+                    if historical {
+                        self.refresh_after_historical_sync();
+                    } else {
+                        self.refresh_after_mutation();
+                    }
                 }
             }
             AccountSyncStatus::Failed(failure) => {
@@ -545,6 +553,7 @@ impl Controller {
     }
 
     fn apply_mailbox(&self, acceptance: MailboxAcceptance, page: MailboxPage) {
+        let intent = acceptance.intent();
         let commit = match acceptance.stage(&page) {
             Ok(commit) => commit,
             Err(SessionError::EmptyNavigationPage) => {
@@ -575,54 +584,69 @@ impl Controller {
         let ProjectedMailbox {
             rows,
             stats,
-            previous_cursor,
             next_cursor,
         } = projected;
         let row_count = rows.len();
-        let (committed, replacement_pending) = {
+        let (effect, replacement_pending) = {
             let mut state = self.state.borrow_mut();
-            let committed = state.commit_mailbox(commit);
-            (committed, state.mailbox_pending())
+            let effect = state.commit_mailbox(commit);
+            (effect, state.mailbox_pending())
         };
-        if !committed {
+        let Some(effect) = effect else {
             if !replacement_pending {
                 self.fail_mailbox_request(acceptance.intent(), UserError::mailbox_changed());
             }
             return;
-        }
+        };
         let state = self.state.borrow();
-        debug_assert_eq!(previous_cursor, state.previous_cursor());
-        debug_assert_eq!(next_cursor, state.next_cursor());
-        let has_previous = state.previous_cursor().is_some();
-        let has_next = state.next_cursor().is_some();
-        let page_number = i32::try_from(state.page_number())
-            .expect("session page numbers are bounded to the Slint integer range");
+        if effect != MailboxCommitEffect::Preserve || self.mail_model.row_count() <= 50 {
+            debug_assert_eq!(next_cursor, state.next_cursor());
+        }
+        let has_more = state.next_cursor().is_some();
         drop(state);
 
-        let selected_to_restore = self.selected_reader_key();
-        self.clear_reader();
-        self.mail_model.set_vec(rows);
+        let selected_to_restore = (effect == MailboxCommitEffect::Replace)
+            .then(|| self.selected_reader_key())
+            .flatten();
+        match effect {
+            MailboxCommitEffect::Replace => {
+                self.clear_reader();
+                self.mail_model.set_vec(rows);
+            }
+            MailboxCommitEffect::Append => {
+                for row in rows {
+                    self.mail_model.push(row);
+                }
+            }
+            MailboxCommitEffect::Extend { from } => {
+                for row in rows.into_iter().skip(from) {
+                    self.mail_model.push(row);
+                }
+            }
+            MailboxCommitEffect::Preserve => {}
+        }
+        let loaded_count = self.mail_model.row_count();
         self.apply_stats(stats);
         if let Some(ui) = self.ui.upgrade() {
             ui.set_mailbox_loading(false);
-            ui.set_has_previous_mailbox_page(has_previous);
-            ui.set_has_next_mailbox_page(has_next);
-            ui.set_mailbox_navigation_loading(false);
-            ui.set_mailbox_page_number(page_number);
+            ui.set_mailbox_has_more(has_more);
+            ui.set_mailbox_loading_more(false);
             ui.set_mailbox_error(false);
             ui.set_initial_loading(false);
-            ui.set_status_text(
-                if page_number > 1 {
-                    format!("Page {page_number} loaded from local cache")
-                } else if has_next {
-                    "More cached messages available".to_owned()
-                } else if row_count == 0 {
-                    "Local cache is empty".to_owned()
-                } else {
-                    "Local cache ready".to_owned()
-                }
-                .into(),
-            );
+            if intent != MailboxIntent::Refresh {
+                ui.set_status_text(
+                    if intent == MailboxIntent::Append {
+                        format!("{loaded_count} cached messages loaded")
+                    } else if has_more {
+                        "More cached messages available".to_owned()
+                    } else if row_count == 0 {
+                        "Local cache is empty".to_owned()
+                    } else {
+                        "Local cache ready".to_owned()
+                    }
+                    .into(),
+                );
+            }
         }
         self.sync_mutation_ui();
         if let Some(key) = selected_to_restore
@@ -635,12 +659,8 @@ impl Controller {
         }
     }
 
-    fn navigate_next(&self) {
-        self.submit_mailbox_navigation(MailboxIntent::Next);
-    }
-
-    fn navigate_previous(&self) {
-        self.submit_mailbox_navigation(MailboxIntent::Previous);
+    fn load_more_mail(&self) {
+        self.submit_mailbox_navigation(MailboxIntent::Append);
     }
 
     fn submit_mailbox_navigation(&self, intent: MailboxIntent) {
@@ -648,8 +668,8 @@ impl Controller {
             let mut state = self.state.borrow_mut();
             match intent {
                 MailboxIntent::First => state.issue_first_mailbox(),
-                MailboxIntent::Next => state.issue_next_mailbox(),
-                MailboxIntent::Previous => state.issue_previous_mailbox(),
+                MailboxIntent::Append => state.issue_more_mailbox(),
+                MailboxIntent::Refresh => state.issue_mailbox_refresh(),
             }
         };
         let query = match query {
@@ -664,16 +684,18 @@ impl Controller {
         };
 
         if let Some(ui) = self.ui.upgrade() {
-            ui.set_mailbox_navigation_loading(true);
+            ui.set_mailbox_loading_more(intent == MailboxIntent::Append);
             ui.set_mailbox_error(false);
-            ui.set_status_text(
-                match intent {
-                    MailboxIntent::First => "Refreshing the first page",
-                    MailboxIntent::Next => "Loading the next page",
-                    MailboxIntent::Previous => "Loading the previous page",
-                }
-                .into(),
-            );
+            if intent != MailboxIntent::Refresh {
+                ui.set_status_text(
+                    match intent {
+                        MailboxIntent::First => "Refreshing local mail",
+                        MailboxIntent::Append => "Loading more cached messages",
+                        MailboxIntent::Refresh => unreachable!(),
+                    }
+                    .into(),
+                );
+            }
         }
         if let Err(error) = self.core.try_query_mailbox(query) {
             self.state.borrow_mut().cancel_mailbox_submission();
@@ -699,7 +721,7 @@ impl Controller {
             || self
                 .ui
                 .upgrade()
-                .is_some_and(|ui| ui.get_mailbox_navigation_loading());
+                .is_some_and(|ui| ui.get_mailbox_loading_more());
         if preserves_page {
             self.fail_navigation(error);
         } else {
@@ -714,7 +736,7 @@ impl Controller {
             return;
         }
         if let Some(ui) = self.ui.upgrade() {
-            ui.set_mailbox_navigation_loading(false);
+            ui.set_mailbox_loading_more(false);
             ui.set_status_text(error.title.into());
             show_snackbar(&ui, error.detail, false, &self.snackbar_timer);
         }
@@ -1018,6 +1040,11 @@ impl Controller {
     fn refresh_after_mutation(&self) {
         self.pending_mailbox.borrow_mut().take();
         self.submit_mailbox_navigation(MailboxIntent::First);
+    }
+
+    fn refresh_after_historical_sync(&self) {
+        self.pending_mailbox.borrow_mut().take();
+        self.submit_mailbox_navigation(MailboxIntent::Refresh);
     }
 
     fn notify_mutation_error(&self, intent: MutationIntent, error: UserError) {
@@ -2217,6 +2244,7 @@ impl Controller {
                         generation,
                         imported,
                         has_more,
+                        historical: _,
                     }) if account_id == target.account_id
                         && generation == target.expected_generation =>
                     {
@@ -2622,10 +2650,8 @@ impl Controller {
     fn fail_mailbox(&self, error: UserError) {
         if let Some(ui) = self.ui.upgrade() {
             ui.set_mailbox_loading(false);
-            ui.set_has_previous_mailbox_page(false);
-            ui.set_has_next_mailbox_page(false);
-            ui.set_mailbox_navigation_loading(false);
-            ui.set_mailbox_page_number(1);
+            ui.set_mailbox_has_more(false);
+            ui.set_mailbox_loading_more(false);
             ui.set_mailbox_error(true);
             ui.set_mailbox_error_title(error.title.into());
             ui.set_mailbox_error_detail(error.detail.into());
@@ -2749,12 +2775,39 @@ struct MutationSuccessFeedback {
 fn sync_success_feedback(imported: u8, has_more: bool) -> String {
     match (imported, has_more) {
         (0, false) => "Inbox is up to date".to_owned(),
-        (0, true) => "Checked one bounded range; sync again for more".to_owned(),
+        (0, true) => "Inbox is syncing in the background".to_owned(),
         (1, false) => "Imported 1 new message".to_owned(),
-        (1, true) => "Imported 1 new message; sync again for more".to_owned(),
+        (1, true) => "Imported 1 new message; continuing in the background".to_owned(),
         (count, false) => format!("Imported {count} new messages"),
-        (count, true) => format!("Imported {count} new messages; sync again for more"),
+        (count, true) => {
+            format!("Imported {count} new messages; continuing in the background")
+        }
     }
+}
+
+fn background_sync_feedback(imported: u8, has_more: bool, historical: bool) -> String {
+    if !historical {
+        return sync_success_feedback(imported, has_more);
+    }
+    match (imported, has_more) {
+        (0, false) => "Mail history is fully synced".to_owned(),
+        (0, true) => "Syncing older messages in the background".to_owned(),
+        (1, false) => "Downloaded the last older message".to_owned(),
+        (1, true) => "Downloaded 1 older message; continuing in the background".to_owned(),
+        (count, false) => format!("Downloaded the last {count} older messages"),
+        (count, true) => {
+            format!("Downloaded {count} older messages; continuing in the background")
+        }
+    }
+}
+
+fn should_refresh_synced_mailbox(
+    imported: u8,
+    shows_inbox_updates: bool,
+    mailbox_loading: bool,
+    mailbox_loading_more: bool,
+) -> bool {
+    imported > 0 && shows_inbox_updates && !mailbox_loading && !mailbox_loading_more
 }
 
 fn mutation_success_feedback(intent: MutationIntent) -> MutationSuccessFeedback {
@@ -3819,13 +3872,12 @@ mod tests {
             .unwrap_or_else(|| panic!("mailbox does not contain message {id}"))
     }
 
-    fn mailbox_ready(ui: &AppWindow, row_count: usize, page: i32) -> bool {
+    fn mailbox_ready(ui: &AppWindow, row_count: usize) -> bool {
         !ui.get_initial_loading()
             && !ui.get_mailbox_loading()
-            && !ui.get_mailbox_navigation_loading()
+            && !ui.get_mailbox_loading_more()
             && !ui.get_mutation_loading()
             && !ui.get_mailbox_error()
-            && ui.get_mailbox_page_number() == page
             && ui.get_mails().row_count() == row_count
     }
 
@@ -3988,13 +4040,25 @@ mod tests {
         assert_eq!(sync_success_feedback(0, false), "Inbox is up to date");
         assert_eq!(
             sync_success_feedback(0, true),
-            "Checked one bounded range; sync again for more"
+            "Inbox is syncing in the background"
         );
         assert_eq!(sync_success_feedback(1, false), "Imported 1 new message");
         assert_eq!(
             sync_success_feedback(16, true),
-            "Imported 16 new messages; sync again for more"
+            "Imported 16 new messages; continuing in the background"
         );
+        assert_eq!(
+            background_sync_feedback(16, true, true),
+            "Downloaded 16 older messages; continuing in the background"
+        );
+        assert_eq!(
+            background_sync_feedback(0, false, true),
+            "Mail history is fully synced"
+        );
+        assert!(should_refresh_synced_mailbox(1, true, false, false));
+        assert!(should_refresh_synced_mailbox(16, true, false, false));
+        assert!(!should_refresh_synced_mailbox(0, true, false, false));
+        assert!(!should_refresh_synced_mailbox(16, true, false, true));
     }
 
     #[test]
@@ -4109,7 +4173,7 @@ mod tests {
         let database = TestDatabase::new("mailbox");
         database.seed_bounded_mailbox();
         let mut harness = ControllerHarness::start(&database.path);
-        harness.drive_until("initial bounded mailbox", |ui| mailbox_ready(ui, 50, 1));
+        harness.drive_until("initial bounded mailbox", |ui| mailbox_ready(ui, 50));
 
         assert!(harness.ui.get_has_accounts());
         assert!(harness.ui.get_mail_actions_enabled());
@@ -4158,26 +4222,23 @@ mod tests {
         assert!(!harness.ui.get_account_operation_loading());
 
         assert_eq!(harness.ui.get_message_total(), 51);
-        assert!(harness.ui.get_has_next_mailbox_page());
+        assert!(harness.ui.get_mailbox_has_more());
         assert!(model_contains(&harness.ui, "51"));
 
-        harness.ui.invoke_next_mailbox_page();
-        harness.drive_until("second mailbox page", |ui| mailbox_ready(ui, 1, 2));
+        harness.ui.invoke_load_more_mail();
+        harness.drive_until("continuous mailbox append", |ui| mailbox_ready(ui, 51));
         assert!(model_contains(&harness.ui, "1"));
-        assert!(harness.ui.get_has_previous_mailbox_page());
-
-        harness.ui.invoke_previous_mailbox_page();
-        harness.drive_until("first mailbox page", |ui| mailbox_ready(ui, 50, 1));
         assert!(model_contains(&harness.ui, "51"));
+        assert!(!harness.ui.get_mailbox_has_more());
 
         harness.ui.invoke_switch_account("1".into());
-        harness.drive_until("single-account mailbox", |ui| mailbox_ready(ui, 1, 1));
+        harness.drive_until("single-account mailbox", |ui| mailbox_ready(ui, 1));
         assert_eq!(harness.ui.get_active_account_id().as_str(), "1");
         assert!(harness.ui.get_compose_enabled());
         assert!(model_contains(&harness.ui, "1"));
 
         harness.ui.invoke_switch_account("".into());
-        harness.drive_until("all-account mailbox", |ui| mailbox_ready(ui, 50, 1));
+        harness.drive_until("all-account mailbox", |ui| mailbox_ready(ui, 50));
         assert!(harness.ui.get_active_account_id().is_empty());
         assert!(!harness.ui.get_compose_enabled());
 
@@ -4185,14 +4246,14 @@ mod tests {
         harness.ui.invoke_query_mail("message 49".into());
         thread::sleep(Duration::from_millis(200));
         slint::platform::update_timers_and_animations();
-        harness.drive_until("FTS mailbox result", |ui| mailbox_ready(ui, 1, 1));
+        harness.drive_until("FTS mailbox result", |ui| mailbox_ready(ui, 1));
         assert!(model_contains(&harness.ui, "49"));
 
         harness.ui.set_search_query("".into());
         harness.ui.invoke_query_mail("".into());
         thread::sleep(Duration::from_millis(200));
         slint::platform::update_timers_and_animations();
-        harness.drive_until("cleared FTS mailbox", |ui| mailbox_ready(ui, 50, 1));
+        harness.drive_until("cleared FTS mailbox", |ui| mailbox_ready(ui, 50));
 
         harness.ui.set_detail_open(true);
         harness.ui.invoke_select_mail("51".into());
@@ -4204,45 +4265,45 @@ mod tests {
         assert!(model_summary(&harness.ui, "51").starred);
         harness.ui.invoke_toggle_star("51".into());
         harness.drive_until("star mutation refresh", |ui| {
-            mailbox_ready(ui, 50, 1) && !model_summary(ui, "51").starred
+            mailbox_ready(ui, 50) && !model_summary(ui, "51").starred
         });
 
         assert!(!model_summary(&harness.ui, "50").unread);
         harness.ui.invoke_mark_unread("50".into());
         harness.drive_until("unread mutation refresh", |ui| {
-            mailbox_ready(ui, 50, 1) && model_summary(ui, "50").unread
+            mailbox_ready(ui, 50) && model_summary(ui, "50").unread
         });
 
         harness.ui.invoke_archive("51".into());
         harness.drive_until("archive mutation refresh", |ui| {
-            mailbox_ready(ui, 50, 1) && !model_contains(ui, "51")
+            mailbox_ready(ui, 50) && !model_contains(ui, "51")
         });
 
         harness.ui.invoke_delete_mail("49".into());
         harness.drive_until("Trash mutation refresh", |ui| {
-            mailbox_ready(ui, 49, 1) && !model_contains(ui, "49") && ui.get_snackbar_can_undo()
+            mailbox_ready(ui, 49) && !model_contains(ui, "49") && ui.get_snackbar_can_undo()
         });
         harness.ui.invoke_undo_delete();
         harness.drive_until("Trash undo refresh", |ui| {
-            mailbox_ready(ui, 50, 1) && model_contains(ui, "49") && !ui.get_snackbar_can_undo()
+            mailbox_ready(ui, 50) && model_contains(ui, "49") && !ui.get_snackbar_can_undo()
         });
 
         harness.ui.invoke_delete_mail("48".into());
         harness.drive_until("permanent-delete setup", |ui| {
-            mailbox_ready(ui, 49, 1) && !model_contains(ui, "48")
+            mailbox_ready(ui, 49) && !model_contains(ui, "48")
         });
         harness.ui.invoke_filter_folder("Trash".into());
-        harness.drive_until("Trash folder", |ui| mailbox_ready(ui, 1, 1));
+        harness.drive_until("Trash folder", |ui| mailbox_ready(ui, 1));
         assert!(model_contains(&harness.ui, "48"));
         harness.ui.invoke_delete_mail("48".into());
-        harness.drive_until("permanent deletion", |ui| mailbox_ready(ui, 0, 1));
+        harness.drive_until("permanent deletion", |ui| mailbox_ready(ui, 0));
 
         harness.ui.invoke_filter_folder("Archive".into());
-        harness.drive_until("Archive folder", |ui| mailbox_ready(ui, 1, 1));
+        harness.drive_until("Archive folder", |ui| mailbox_ready(ui, 1));
         assert!(model_contains(&harness.ui, "51"));
 
         harness.ui.invoke_switch_account("51".into());
-        harness.drive_until("configured-account Archive", |ui| mailbox_ready(ui, 1, 1));
+        harness.drive_until("configured-account Archive", |ui| mailbox_ready(ui, 1));
         crate::platform::install_window_handlers(&harness.ui);
         let close_approved = Rc::new(Cell::new(false));
         let approved_callback = close_approved.clone();
@@ -4374,7 +4435,7 @@ mod tests {
 
         let empty_database = TestDatabase::new("empty");
         let mut empty = ControllerHarness::start(&empty_database.path);
-        empty.drive_until("empty mailbox", |ui| mailbox_ready(ui, 0, 1));
+        empty.drive_until("empty mailbox", |ui| mailbox_ready(ui, 0));
         assert!(!empty.ui.get_has_accounts());
         assert!(!empty.ui.get_mail_actions_enabled());
         assert_eq!(empty.ui.get_status_text().as_str(), "Local cache is empty");
@@ -4406,7 +4467,7 @@ mod tests {
             .expect("repair dirty mailbox statistics");
         drop(connection);
         dirty.ui.invoke_retry_mailbox();
-        dirty.drive_until("repaired mailbox retry", |ui| mailbox_ready(ui, 0, 1));
+        dirty.drive_until("repaired mailbox retry", |ui| mailbox_ready(ui, 0));
         assert!(dirty.ui.get_has_accounts());
         assert!(dirty.ui.get_mail_actions_enabled());
         dirty.shutdown();

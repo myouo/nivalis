@@ -33,7 +33,7 @@ const MAX_CLIENT_BYTES: usize = 64 * 1024;
 const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGOUT_TIMEOUT: Duration = Duration::from_secs(1);
 const INBOX_FETCH_TIMEOUT: Duration = Duration::from_secs(45);
-const MAX_INBOX_MESSAGES: usize = 16;
+const MAX_INBOX_MESSAGES: usize = 32;
 const MAX_INBOX_LITERAL_BYTES: usize = 1024 * 1024;
 const MAX_INBOX_PAGE_LITERAL_BYTES: usize = 4 * 1024 * 1024;
 const MAX_INBOX_SERVER_BYTES: usize = MAX_INBOX_PAGE_LITERAL_BYTES + 512 * 1024;
@@ -92,6 +92,8 @@ pub(crate) struct ImapInboxFetchRequest {
     secret: Secret,
     first_uid: NonZeroU32,
     expected_uid_validity: Option<NonZeroU32>,
+    history_cursor: Option<NonZeroU32>,
+    history_complete: bool,
 }
 
 impl ImapInboxFetchRequest {
@@ -103,6 +105,8 @@ impl ImapInboxFetchRequest {
         secret: Secret,
         first_uid: u32,
         expected_uid_validity: Option<u32>,
+        history_cursor: Option<u32>,
+        history_complete: bool,
     ) -> Result<Self, ImapInboxFetchInputError> {
         validate_connection_input(host, port, login, &secret)
             .map_err(ImapInboxFetchInputError::Connection)?;
@@ -112,6 +116,12 @@ impl ImapInboxFetchRequest {
                 NonZeroU32::new(value).ok_or(ImapInboxFetchInputError::ExpectedUidValidity)
             })
             .transpose()?;
+        let history_cursor = history_cursor
+            .map(|value| NonZeroU32::new(value).ok_or(ImapInboxFetchInputError::HistoryCursor))
+            .transpose()?;
+        if history_complete && history_cursor.is_some() {
+            return Err(ImapInboxFetchInputError::HistoryCursor);
+        }
         Ok(Self {
             host: host.into(),
             port,
@@ -119,6 +129,8 @@ impl ImapInboxFetchRequest {
             secret,
             first_uid,
             expected_uid_validity,
+            history_cursor,
+            history_complete,
         })
     }
 }
@@ -134,6 +146,7 @@ pub(crate) enum ImapInboxFetchInputError {
     Connection(ImapDiagnosticInputError),
     FirstUid,
     ExpectedUidValidity,
+    HistoryCursor,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -176,7 +189,22 @@ pub(crate) struct ImapInboxPage {
     pub(crate) uid_next: NonZeroU32,
     pub(crate) scanned_through_uid: Option<NonZeroU32>,
     pub(crate) next_uid: Option<NonZeroU32>,
+    pub(crate) bootstrap_history: Option<ImapBootstrapHistory>,
+    pub(crate) history_page: Option<ImapHistoryPage>,
     pub(crate) messages: Box<[ImapInboxMessage]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ImapBootstrapHistory {
+    pub(crate) next_cursor: Option<NonZeroU32>,
+    pub(crate) complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ImapHistoryPage {
+    pub(crate) expected_cursor: NonZeroU32,
+    pub(crate) next_cursor: Option<NonZeroU32>,
+    pub(crate) complete: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -580,46 +608,68 @@ async fn fetch_canonical_inbox_inner(
         .and_then(NonZeroU32::new)
         .ok_or(ImapInboxFetchFailure::MissingUidNext)?;
     let first_uid = request.first_uid.get();
-    if mailbox.exists == 0 || uid_next.get() <= first_uid {
+    let initial_snapshot = first_uid == 1;
+    let mut selection = if mailbox.exists == 0 || uid_next.get() <= first_uid {
         let scanned_through = first_uid
             .saturating_sub(1)
             .max(uid_next.get().saturating_sub(1));
-        let _ = tokio::time::timeout(LOGOUT_TIMEOUT, session.logout()).await;
-        return Ok(ImapInboxPage {
-            uid_validity,
-            uid_next,
+        UidSelection {
+            uids: Vec::new(),
             scanned_through_uid: NonZeroU32::new(scanned_through),
             next_uid: None,
-            messages: Box::new([]),
-        });
+            bootstrap_history: initial_snapshot.then_some(ImapBootstrapHistory {
+                next_cursor: None,
+                complete: true,
+            }),
+            history_page: None,
+        }
+    } else {
+        // A missing cursor always maps to UID 1, including retries after metadata
+        // staging has persisted UIDVALIDITY but content publication did not finish.
+        search_uids(
+            &mut session,
+            first_uid,
+            uid_next,
+            initial_snapshot,
+            deadline,
+            limits,
+        )
+        .await?
+    };
+    if selection.uids.is_empty()
+        && !initial_snapshot
+        && !request.history_complete
+        && let Some(history_cursor) = request.history_cursor
+    {
+        let expected_cursor =
+            NonZeroU32::new(first_uid - 1).expect("non-initial inbox fetch has a forward cursor");
+        selection = search_history_uids(
+            &mut session,
+            expected_cursor,
+            history_cursor,
+            deadline,
+            limits,
+        )
+        .await?;
     }
-
-    // A missing cursor always maps to UID 1, including retries after metadata
-    // staging has persisted UIDVALIDITY but content publication did not finish.
-    let initial_snapshot = first_uid == 1;
-    let selection = search_uids(
-        &mut session,
-        first_uid,
-        uid_next,
-        initial_snapshot,
-        deadline,
-        limits,
-    )
-    .await?;
     if selection.uids.is_empty() {
-        let scanned_through_uid = NonZeroU32::new(uid_next.get().saturating_sub(1));
         let _ = tokio::time::timeout(LOGOUT_TIMEOUT, session.logout()).await;
         return Ok(ImapInboxPage {
             uid_validity,
             uid_next,
-            scanned_through_uid,
-            next_uid: None,
+            scanned_through_uid: selection.scanned_through_uid,
+            next_uid: selection.next_uid,
+            bootstrap_history: selection.bootstrap_history,
+            history_page: selection.history_page,
             messages: Box::new([]),
         });
     }
 
     let mut metadata = fetch_metadata(&mut session, &selection.uids, deadline, limits).await?;
     metadata.sort_unstable_by_key(|message| message.uid);
+    if selection.history_page.is_some() {
+        metadata.reverse();
+    }
 
     let mut messages = Vec::with_capacity(metadata.len());
     let mut literal_bytes = 0_usize;
@@ -657,17 +707,35 @@ async fn fetch_canonical_inbox_inner(
             content,
         });
     }
-    let scanned_through_uid = deferred_uid
-        .and_then(|uid| uid.get().checked_sub(1))
-        .and_then(NonZeroU32::new)
-        .or(selection.scanned_through_uid);
-    let next_uid = deferred_uid.or(selection.next_uid);
+    let (scanned_through_uid, next_uid, history_page) =
+        if let Some(mut history) = selection.history_page {
+            if deferred_uid.is_some() {
+                history.next_cursor = messages
+                    .iter()
+                    .map(|message| message.uid.get())
+                    .min()
+                    .and_then(|uid| NonZeroU32::new(uid - 1));
+                history.complete = false;
+            }
+            (selection.scanned_through_uid, None, Some(history))
+        } else {
+            (
+                deferred_uid
+                    .and_then(|uid| uid.get().checked_sub(1))
+                    .and_then(NonZeroU32::new)
+                    .or(selection.scanned_through_uid),
+                deferred_uid.or(selection.next_uid),
+                None,
+            )
+        };
     let _ = tokio::time::timeout(LOGOUT_TIMEOUT, session.logout()).await;
     Ok(ImapInboxPage {
         uid_validity,
         uid_next,
         scanned_through_uid,
         next_uid,
+        bootstrap_history: selection.bootstrap_history,
+        history_page,
         messages: messages.into_boxed_slice(),
     })
 }
@@ -707,6 +775,8 @@ struct UidSelection {
     uids: Vec<NonZeroU32>,
     scanned_through_uid: Option<NonZeroU32>,
     next_uid: Option<NonZeroU32>,
+    bootstrap_history: Option<ImapBootstrapHistory>,
+    history_page: Option<ImapHistoryPage>,
 }
 
 async fn search_uids(
@@ -732,7 +802,8 @@ async fn search_uids(
         .collect::<Vec<_>>();
     found.sort_unstable();
 
-    if initial_snapshot && found.len() > limits.max_messages {
+    let initial_has_history = initial_snapshot && found.len() > limits.max_messages;
+    if initial_has_history {
         found.drain(..found.len() - limits.max_messages);
     }
     let next_uid = (!initial_snapshot && found.len() > limits.max_messages)
@@ -741,10 +812,64 @@ async fn search_uids(
     let scanned_through_uid = next_uid
         .and_then(|_| found.last().copied())
         .or_else(|| NonZeroU32::new(uid_next.get().saturating_sub(1)));
+    let bootstrap_history = initial_snapshot.then(|| ImapBootstrapHistory {
+        next_cursor: initial_has_history
+            .then(|| found.first().and_then(|uid| NonZeroU32::new(uid.get() - 1)))
+            .flatten(),
+        complete: !initial_has_history,
+    });
     Ok(UidSelection {
         uids: found,
         scanned_through_uid,
         next_uid,
+        bootstrap_history,
+        history_page: None,
+    })
+}
+
+async fn search_history_uids(
+    session: &mut AuthenticatedSession,
+    expected_cursor: NonZeroU32,
+    history_cursor: NonZeroU32,
+    deadline: Instant,
+    limits: InboxFetchLimits,
+) -> Result<UidSelection, ImapInboxFetchFailure> {
+    if limits.max_messages == 0 {
+        return Err(ImapInboxFetchFailure::ResourceLimit);
+    }
+    let found = match timeout_at(
+        deadline,
+        session.uid_search(format!("UID 1:{}", history_cursor.get())),
+    )
+    .await
+    {
+        Ok(Ok(found)) => found,
+        Ok(Err(error)) => return Err(map_receive_imap_error(&error, false)),
+        Err(_) => return Err(ImapInboxFetchFailure::Timeout),
+    };
+    let mut found = found
+        .into_iter()
+        .filter(|uid| (1..=history_cursor.get()).contains(uid))
+        .filter_map(NonZeroU32::new)
+        .collect::<Vec<_>>();
+    found.sort_unstable();
+    let has_more = found.len() > limits.max_messages;
+    if has_more {
+        found.drain(..found.len() - limits.max_messages);
+    }
+    let next_cursor = has_more
+        .then(|| found.first().and_then(|uid| NonZeroU32::new(uid.get() - 1)))
+        .flatten();
+    Ok(UidSelection {
+        uids: found,
+        scanned_through_uid: Some(expected_cursor),
+        next_uid: None,
+        bootstrap_history: None,
+        history_page: Some(ImapHistoryPage {
+            expected_cursor: history_cursor,
+            next_cursor,
+            complete: !has_more,
+        }),
     })
 }
 
@@ -2135,6 +2260,16 @@ mod inbox_fetch_tests {
         first_uid: u32,
         expected_uid_validity: Option<u32>,
     ) -> ImapInboxFetchRequest {
+        request_with_history(port, first_uid, expected_uid_validity, None, false)
+    }
+
+    fn request_with_history(
+        port: u16,
+        first_uid: u32,
+        expected_uid_validity: Option<u32>,
+        history_cursor: Option<u32>,
+        history_complete: bool,
+    ) -> ImapInboxFetchRequest {
         ImapInboxFetchRequest::new(
             HOST,
             port,
@@ -2142,6 +2277,8 @@ mod inbox_fetch_tests {
             Secret::new(PASSWORD.to_vec()).unwrap(),
             first_uid,
             expected_uid_validity,
+            history_cursor,
+            history_complete,
         )
         .unwrap()
     }
@@ -2591,6 +2728,95 @@ mod inbox_fetch_tests {
             assert_eq!(page.scanned_through_uid.unwrap().get(), 400);
             assert_eq!(page.next_uid.unwrap().get(), 900);
             finish(incremental).await;
+        });
+    }
+
+    #[test]
+    fn recent_first_bootstrap_continues_backwards_until_history_is_complete() {
+        run_async(async {
+            let messages = || {
+                (1..=6)
+                    .map(|uid| fixture(uid, if uid % 2 == 0 { RAW_TWO } else { RAW_ONE }))
+                    .collect::<Vec<_>>()
+            };
+
+            let initial = spawn_server(ServerPlan::messages(messages())).await;
+            let page = fetch_canonical_inbox_with_connector(
+                request(initial.address.port(), None),
+                initial.connector.clone(),
+                limits(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                page.messages
+                    .iter()
+                    .map(|message| message.uid.get())
+                    .collect::<Vec<_>>(),
+                [5, 6]
+            );
+            assert_eq!(page.scanned_through_uid.unwrap().get(), 6);
+            assert_eq!(
+                page.bootstrap_history,
+                Some(ImapBootstrapHistory {
+                    next_cursor: NonZeroU32::new(4),
+                    complete: false,
+                })
+            );
+            finish(initial).await;
+
+            let middle = spawn_server(ServerPlan::messages(messages())).await;
+            let page = fetch_canonical_inbox_with_connector(
+                request_with_history(middle.address.port(), 7, Some(UID_VALIDITY), Some(4), false),
+                middle.connector.clone(),
+                limits(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                page.messages
+                    .iter()
+                    .map(|message| message.uid.get())
+                    .collect::<Vec<_>>(),
+                [4, 3]
+            );
+            assert_eq!(
+                page.history_page,
+                Some(ImapHistoryPage {
+                    expected_cursor: NonZeroU32::new(4).unwrap(),
+                    next_cursor: NonZeroU32::new(2),
+                    complete: false,
+                })
+            );
+            finish(middle).await;
+
+            let oldest = spawn_server(ServerPlan::messages(messages())).await;
+            let page = fetch_canonical_inbox_with_connector(
+                request_with_history(oldest.address.port(), 7, Some(UID_VALIDITY), Some(2), false),
+                oldest.connector.clone(),
+                limits(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                page.messages
+                    .iter()
+                    .map(|message| message.uid.get())
+                    .collect::<Vec<_>>(),
+                [2, 1]
+            );
+            assert_eq!(
+                page.history_page,
+                Some(ImapHistoryPage {
+                    expected_cursor: NonZeroU32::new(2).unwrap(),
+                    next_cursor: None,
+                    complete: true,
+                })
+            );
+            finish(oldest).await;
         });
     }
 

@@ -153,7 +153,6 @@ impl AccountCatalog {
         Ok(ProjectedMailbox {
             rows,
             stats,
-            previous_cursor: page.previous_cursor,
             next_cursor: page.next_cursor,
         })
     }
@@ -348,7 +347,6 @@ pub(crate) struct ProjectedMailboxStats {
 pub(crate) struct ProjectedMailbox {
     pub(crate) rows: Vec<MailSummary>,
     pub(crate) stats: ProjectedMailboxStats,
-    pub(crate) previous_cursor: Option<PageCursor>,
     pub(crate) next_cursor: Option<PageCursor>,
 }
 
@@ -677,7 +675,6 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(projected.previous_cursor, Some(previous_cursor));
         assert_eq!(projected.next_cursor, Some(next_cursor));
     }
 
