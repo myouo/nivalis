@@ -1479,6 +1479,23 @@ mod tests {
         })
     }
 
+    fn delivered_after_fence_without_count(
+        _request: SmtpSubmissionRequest,
+        _cancellation: SmtpSubmissionCancellation,
+        data_fence: SmtpDataFence,
+    ) -> SmtpSubmitFuture {
+        Box::pin(async move {
+            data_fence.await.map_err(|_| SmtpSubmissionFailure {
+                stage: smtp::SmtpSubmissionStage::DataFence,
+                kind: SmtpSubmissionFailureKind::LocalState,
+            })?;
+            Ok(SmtpSubmissionReceipt {
+                response_code: 250,
+                wire_byte_count: 1,
+            })
+        })
+    }
+
     fn disconnected_after_fence(
         _request: SmtpSubmissionRequest,
         _cancellation: SmtpSubmissionCancellation,
@@ -1715,7 +1732,7 @@ mod tests {
                 status_tx,
                 file_gc_tx,
                 cancellations.clone(),
-                delivered_after_fence,
+                delivered_after_fence_without_count,
             );
             let mut driver = Box::pin(driver);
 
