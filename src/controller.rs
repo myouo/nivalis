@@ -3295,7 +3295,7 @@ fn inbox_sync_error(kind: InboxSyncFailureKind) -> UserError {
         },
         InboxSyncFailureKind::Protocol => UserError {
             title: "Server response was not supported",
-            detail: "Confirm that this is an IMAP-over-TLS server on the selected port, then sync again.",
+            detail: "The connection succeeded, but Nivalis could not safely process the IMAP response. Update Nivalis and sync Inbox again; if it continues, report a provider compatibility issue.",
         },
         InboxSyncFailureKind::ResourceLimit => UserError {
             title: "Inbox response exceeds a safety limit",
@@ -4078,7 +4078,7 @@ mod tests {
             (InboxSyncFailureKind::Certificate, "trust settings"),
             (InboxSyncFailureKind::Timeout, "sync Inbox again"),
             (InboxSyncFailureKind::Offline, "Reconnect"),
-            (InboxSyncFailureKind::Protocol, "IMAP-over-TLS"),
+            (InboxSyncFailureKind::Protocol, "provider compatibility"),
             (InboxSyncFailureKind::ResourceLimit, "provider's web app"),
             (InboxSyncFailureKind::Cancelled, "Sync inbox again"),
             (InboxSyncFailureKind::UidValidityChanged, "Open Accounts"),
@@ -4095,6 +4095,10 @@ mod tests {
                 error.detail
             );
         }
+
+        let protocol = inbox_sync_error(InboxSyncFailureKind::Protocol);
+        assert!(protocol.detail.contains("connection succeeded"));
+        assert!(!protocol.detail.contains("selected port"));
     }
 
     #[test]
