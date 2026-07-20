@@ -62,7 +62,15 @@ export component MailRow inherits Rectangle {
             width: 7px;
             if root.mail.unread: Rectangle { width: 6px; height: 6px; border-radius: 3px; background: Theme.primary; }
         }
-        AccountAvatar { initials: root.mail.initials; avatar-color: root.mail.avatar-color; avatar-size: 34px; }
+        VerticalLayout {
+            width: 34px;
+            alignment: center;
+            AccountAvatar {
+                initials: root.mail.initials;
+                avatar-color: root.mail.avatar-color;
+                avatar-size: 34px;
+            }
+        }
 
         VerticalLayout {
             spacing: 1px;

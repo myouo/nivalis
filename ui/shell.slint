@@ -83,15 +83,24 @@ export component AccountSwitcher inherits Rectangle {
         padding-left: 9px;
         padding-right: 8px;
         spacing: 9px;
-        if root.name == "All inboxes": Rectangle {
+        VerticalLayout {
             width: 30px;
-            height: 30px;
-            border-radius: 4px;
-            background: transparent;
-            MaterialIcon { name: "account_circle"; size: 19px; icon-color: Theme.on-surface-variant; }
-            Rectangle { x: 22px; y: 22px; width: 7px; height: 7px; border-radius: 4px; border-width: 1px; border-color: Theme.surface; background: root.has-error ? Theme.error : Theme.success; }
+            alignment: center;
+            if root.name == "All inboxes": Rectangle {
+                width: 30px;
+                height: 30px;
+                border-radius: 4px;
+                background: transparent;
+                MaterialIcon { name: "account_circle"; size: 19px; icon-color: Theme.on-surface-variant; }
+                Rectangle { x: 22px; y: 22px; width: 7px; height: 7px; border-radius: 4px; border-width: 1px; border-color: Theme.surface; background: root.has-error ? Theme.error : Theme.success; }
+            }
+            if root.name != "All inboxes": AccountAvatar {
+                initials: root.initials;
+                avatar-color: root.avatar-color;
+                has-error: root.has-error;
+                avatar-size: 30px;
+            }
         }
-        if root.name != "All inboxes": AccountAvatar { initials: root.initials; avatar-color: root.avatar-color; has-error: root.has-error; avatar-size: 30px; }
         VerticalLayout {
             alignment: center;
             spacing: 1px;
@@ -133,7 +142,16 @@ export component AccountMenuRow inherits Rectangle {
         padding-left: 9px;
         padding-right: 9px;
         spacing: 10px;
-        AccountAvatar { initials: root.account.initials; avatar-color: root.account.avatar-color; has-error: root.account.has-error; avatar-size: 32px; }
+        VerticalLayout {
+            width: 32px;
+            alignment: center;
+            AccountAvatar {
+                initials: root.account.initials;
+                avatar-color: root.account.avatar-color;
+                has-error: root.account.has-error;
+                avatar-size: 32px;
+            }
+        }
         VerticalLayout {
             alignment: center;
             spacing: 1px;
