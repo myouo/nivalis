@@ -2,7 +2,7 @@ use std::{error::Error, fmt};
 
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(crate) const LATEST_SCHEMA_VERSION: u32 = 12;
+pub(crate) const LATEST_SCHEMA_VERSION: u32 = 13;
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -58,6 +58,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 12,
         sql: include_str!("../../../migrations/0012_drafts_outbox.sql"),
+    },
+    Migration {
+        version: 13,
+        sql: include_str!("../../../migrations/0013_repair_draft_stats.sql"),
     },
 ];
 
@@ -801,9 +805,12 @@ mod tests {
             )
             .expect("insert v11 outbox recipients");
 
-        migrate(&mut connection).expect("upgrade v11 schema to v12");
+        migrate(&mut connection).expect("upgrade v11 schema through the current version");
 
-        assert_eq!(schema_version(&connection), 12);
+        assert_eq!(
+            schema_version(&connection),
+            i64::from(LATEST_SCHEMA_VERSION)
+        );
         let smtp: (String, i64, String, String) = connection
             .query_row(
                 "SELECT smtp_host, smtp_port, smtp_security, smtp_state
@@ -880,6 +887,47 @@ mod tests {
             )
             .expect("count automatically sendable migrated rows");
         assert_eq!(active_count, 0);
+    }
+
+    #[test]
+    fn v13_repairs_statistics_left_dirty_by_v12_drafts() {
+        let mut connection = memory_connection();
+        enable_foreign_keys(&connection).expect("enable foreign keys");
+        enable_recursive_triggers(&connection).expect("enable recursive triggers");
+        migrate_with(&mut connection, &MIGRATIONS[..12], 12).expect("create v12 schema");
+        insert_account(&connection, 1, "owner@example.test");
+        insert_folder(&connection, 10, 1, "drafts", "drafts");
+        insert_folder(&connection, 11, 1, "sent", "sent");
+        insert_message(&connection, 100, 1, "local:draft");
+        insert_message(&connection, 101, 1, "local:sent");
+        connection
+            .execute(
+                "INSERT INTO message_folders (message_id, folder_id, account_id)
+                 VALUES (100, 10, 1), (101, 11, 1)",
+                [],
+            )
+            .expect("insert v12 folder memberships");
+        connection
+            .execute(
+                "UPDATE account_mailbox_stats
+                 SET drafts_total = 99, sent_total = 88, dirty = 1
+                 WHERE account_id = 1",
+                [],
+            )
+            .expect("simulate v12 dirty draft statistics");
+
+        migrate(&mut connection).expect("repair v12 draft statistics");
+
+        assert_eq!(schema_version(&connection), 13);
+        assert_eq!(mailbox_stats(&connection, 1), [0, 0, 0, 1, 1, 0, 0]);
+        let dirty: bool = connection
+            .query_row(
+                "SELECT dirty FROM account_mailbox_stats WHERE account_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read repaired dirty marker");
+        assert!(!dirty);
     }
 
     #[test]

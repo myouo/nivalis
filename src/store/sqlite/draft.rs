@@ -180,6 +180,7 @@ pub(crate) fn create_draft(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(DbFailure::database)?;
     let sender = require_account_fence(&transaction, draft.account_id, draft.expected_generation)?;
+    require_clean_stats(&transaction, draft.account_id)?;
     let folder_id = ensure_drafts_folder(&transaction, draft.account_id)?;
     transaction
         .execute(
@@ -226,7 +227,7 @@ pub(crate) fn create_draft(
         )
         .map_err(map_write_error)?;
     replace_recipients(&transaction, message_id, &draft.recipients)?;
-    mark_stats_dirty(&transaction, draft.account_id)?;
+    record_draft_created(&transaction, draft.account_id)?;
     let snapshot = load_draft_from(&transaction, message_id)?
         .ok_or_else(|| DbFailure::database("created draft could not be loaded"))?;
     transaction.commit().map_err(DbFailure::database)?;
@@ -309,7 +310,6 @@ pub(crate) fn update_draft(
     {
         queue_if_unreferenced(&transaction, &previous_body, draft.now_ms)?;
     }
-    mark_stats_dirty(&transaction, draft.account_id)?;
     let snapshot = load_draft_from(&transaction, draft.message_id)?
         .ok_or_else(|| DbFailure::database("updated draft could not be loaded"))?;
     transaction.commit().map_err(DbFailure::database)?;
@@ -573,14 +573,49 @@ fn queue_if_unreferenced(
     Ok(())
 }
 
-fn mark_stats_dirty(transaction: &Transaction<'_>, account_id: AccountId) -> Result<(), DbFailure> {
-    transaction
+fn record_draft_created(
+    transaction: &Transaction<'_>,
+    account_id: AccountId,
+) -> Result<(), DbFailure> {
+    let updated = transaction
         .execute(
-            "UPDATE account_mailbox_stats SET dirty = 1 WHERE account_id = ?1",
+            "UPDATE account_mailbox_stats
+             SET drafts_total = drafts_total + 1, dirty = 0
+             WHERE account_id = ?1 AND dirty = 1
+               AND drafts_total < 9223372036854775807",
             [account_id.get()],
         )
         .map_err(map_write_error)?;
-    Ok(())
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(DbFailure::conflict(
+            "mailbox statistics are missing or inconsistent",
+        ))
+    }
+}
+
+fn require_clean_stats(
+    transaction: &Transaction<'_>,
+    account_id: AccountId,
+) -> Result<(), DbFailure> {
+    let dirty = transaction
+        .query_row(
+            "SELECT dirty FROM account_mailbox_stats WHERE account_id = ?1",
+            [account_id.get()],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()
+        .map_err(DbFailure::database)?;
+    match dirty {
+        Some(false) => Ok(()),
+        Some(true) => Err(DbFailure::conflict(
+            "mailbox statistics must be rebuilt before creating a draft",
+        )),
+        None => Err(DbFailure::conflict(
+            "mail account is missing its statistics row",
+        )),
+    }
 }
 
 fn validate_body(file_key: &FileKey, byte_count: u64) -> Result<(), DbFailure> {
@@ -704,6 +739,14 @@ mod tests {
         assert_eq!(created.preview.as_ref(), "Preview");
         assert_eq!(created.reader_excerpt.as_ref(), "Full reader excerpt");
         assert_eq!(created.recipients.len(), 1);
+        let created_stats: (i64, bool) = connection
+            .query_row(
+                "SELECT drafts_total, dirty FROM account_mailbox_stats WHERE account_id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(created_stats, (1, false));
         assert_eq!(
             load_draft(&connection, created.message_id).unwrap(),
             Some(created.clone())
@@ -755,6 +798,14 @@ mod tests {
         assert_eq!(updated.revision, 1);
         assert_eq!(updated.subject.as_ref(), "Updated");
         assert_eq!(updated.recipients.len(), 2);
+        let updated_stats: (i64, bool) = connection
+            .query_row(
+                "SELECT drafts_total, dirty FROM account_mailbox_stats WHERE account_id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(updated_stats, (1, false));
         let queued_old_body: i64 = connection
             .query_row(
                 "SELECT count(*) FROM file_gc WHERE file_key = ?1",
