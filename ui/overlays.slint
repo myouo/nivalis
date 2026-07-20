@@ -72,18 +72,27 @@ export component AccountSetupOverlay inherits Rectangle {
     in property <bool> operation-loading: false;
     in property <string> operation-stage: "";
     in-out property <string> operation-error: "";
-    callback add-account(string, string, string, string, string, string);
+    callback add-account(string, string, string, string, string, string, string, string);
 
     private property <string> account-name: "";
     private property <string> account-address: "";
     private property <string> account-password: "";
     private property <string> account-login: "";
-    private property <string> account-host: "";
-    private property <string> account-port: "993";
+    private property <string> account-imap-host: "";
+    private property <string> account-imap-port: "993";
+    private property <string> account-smtp-host: "";
+    private property <string> account-smtp-port: "465";
     private property <bool> server-settings-open: false;
     private property <bool> validation-visible: false;
     private property <bool> login-follows-address: true;
-    private property <bool> required-fields-ready: root.account-name != "" && root.account-address != "" && root.account-password != "" && root.account-login != "" && root.account-host != "" && root.account-port != "";
+    private property <bool> required-fields-ready: root.account-name != ""
+        && root.account-address != ""
+        && root.account-password != ""
+        && root.account-login != ""
+        && root.account-imap-host != ""
+        && root.account-imap-port != ""
+        && root.account-smtp-host != ""
+        && root.account-smtp-port != "";
 
     z: 32;
     background: Theme.scrim;
@@ -154,12 +163,24 @@ export component AccountSetupOverlay inherits Rectangle {
                 error: root.validation-visible && root.account-password == "" ? "Enter an app password" : "";
             }
 
-            LabeledTextField {
-                label: "IMAP host";
-                placeholder: "imap.example.com";
-                value <=> root.account-host;
-                enabled: !root.operation-loading;
-                error: root.validation-visible && root.account-host == "" ? "Enter the IMAP host" : "";
+            HorizontalLayout {
+                spacing: 10px;
+                LabeledTextField {
+                    horizontal-stretch: 1;
+                    label: "IMAP host";
+                    placeholder: "imap.example.com";
+                    value <=> root.account-imap-host;
+                    enabled: !root.operation-loading;
+                    error: root.validation-visible && root.account-imap-host == "" ? "Enter the IMAP host" : "";
+                }
+                LabeledTextField {
+                    horizontal-stretch: 1;
+                    label: "SMTP host";
+                    placeholder: "smtp.example.com";
+                    value <=> root.account-smtp-host;
+                    enabled: !root.operation-loading;
+                    error: root.validation-visible && root.account-smtp-host == "" ? "Enter the SMTP host" : "";
+                }
             }
 
             MButton {
@@ -182,12 +203,21 @@ export component AccountSetupOverlay inherits Rectangle {
                     edited(value) => { root.login-follows-address = value == ""; }
                 }
                 LabeledTextField {
-                    width: 112px;
-                    label: "Port";
+                    width: 100px;
+                    label: "IMAP port";
                     placeholder: "993";
-                    value <=> root.account-port;
+                    value <=> root.account-imap-port;
                     enabled: !root.operation-loading;
-                    error: root.validation-visible && root.account-port == "" ? "Enter a port" : "";
+                    error: root.validation-visible && root.account-imap-port == "" ? "Enter IMAP port" : "";
+                }
+                LabeledTextField {
+                    width: 222px;
+                    label: "SMTP port";
+                    placeholder: "465";
+                    helper: "465: implicit TLS; other ports force STARTTLS";
+                    value <=> root.account-smtp-port;
+                    enabled: !root.operation-loading;
+                    error: root.validation-visible && root.account-smtp-port == "" ? "Enter SMTP port" : "";
                 }
             }
 
@@ -236,7 +266,16 @@ export component AccountSetupOverlay inherits Rectangle {
                     clicked => {
                         root.validation-visible = true;
                         if (root.required-fields-ready) {
-                            root.add-account(root.account-name, root.account-address, root.account-login, root.account-host, root.account-port, root.account-password);
+                            root.add-account(
+                                root.account-name,
+                                root.account-address,
+                                root.account-login,
+                                root.account-imap-host,
+                                root.account-imap-port,
+                                root.account-smtp-host,
+                                root.account-smtp-port,
+                                root.account-password,
+                            );
                             root.account-password = "";
                         } else {
                             root.server-settings-open = true;

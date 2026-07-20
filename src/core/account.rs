@@ -29,7 +29,7 @@ use crate::{
         AccountRemovalTicket, AccountValidationError, AccountWrite, AccountWriteOutcome,
         AccountWriteReply, DatabaseClient, DatabaseSubmitError, DiagnosticCommit, DiagnosticRecord,
         DiagnosticTicket, FailureKind, FileGcOutcome, PendingCacheRemoval,
-        PendingCredentialRemoval, RequestId,
+        PendingCredentialRemoval, RequestId, SmtpSecurity,
     },
 };
 
@@ -57,20 +57,31 @@ pub(crate) struct AccountConfigDraft {
     login_name: Box<str>,
     imap_host: Box<str>,
     imap_port: u16,
+    smtp_host: Box<str>,
+    smtp_port: u16,
+    smtp_security: SmtpSecurity,
     accent_rgb: u32,
 }
 
 impl AccountConfigDraft {
     #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         name: &str,
         address: &str,
         login_name: &str,
         imap_host: &str,
         imap_port: u16,
+        smtp_host: &str,
+        smtp_port: u16,
         accent_rgb: u32,
     ) -> Result<Self, AccountValidationError> {
-        let validated = AccountConfigInput::new(
+        let smtp_security = if smtp_port == 465 {
+            SmtpSecurity::ImplicitTls
+        } else {
+            SmtpSecurity::StartTls
+        };
+        let validated = AccountConfigInput::new_with_smtp(
             PLACEHOLDER_CREDENTIAL_KEY,
             name,
             address,
@@ -78,6 +89,10 @@ impl AccountConfigDraft {
             login_name,
             imap_host,
             imap_port,
+            smtp_host,
+            smtp_port,
+            smtp_security,
+            true,
             accent_rgb,
         )?;
         Ok(Self {
@@ -86,6 +101,9 @@ impl AccountConfigDraft {
             login_name: validated.login_name,
             imap_host: validated.imap_host,
             imap_port: validated.imap_port,
+            smtp_host: validated.smtp_host,
+            smtp_port: validated.smtp_port,
+            smtp_security: validated.smtp_security,
             accent_rgb: validated.accent_rgb,
         })
     }
@@ -99,6 +117,10 @@ impl AccountConfigDraft {
             login_name: self.login_name,
             imap_host: self.imap_host,
             imap_port: self.imap_port,
+            smtp_host: self.smtp_host,
+            smtp_port: self.smtp_port,
+            smtp_security: self.smtp_security,
+            smtp_explicit: true,
             accent_rgb: self.accent_rgb,
         }
     }
@@ -2440,7 +2462,7 @@ mod tests {
     }
 
     fn input(key: &str) -> AccountConfigInput {
-        AccountConfigInput::new(
+        AccountConfigInput::new_with_smtp(
             key,
             "Personal",
             "person@example.test",
@@ -2448,6 +2470,10 @@ mod tests {
             "person@example.test",
             "imap.example.test",
             993,
+            "smtp.example.test",
+            465,
+            SmtpSecurity::ImplicitTls,
+            true,
             0x336699,
         )
         .unwrap()
@@ -2464,6 +2490,10 @@ mod tests {
             login_name: "person@example.test".into(),
             imap_host: "imap.example.test".into(),
             imap_port: 993,
+            smtp_host: "smtp.example.test".into(),
+            smtp_port: 465,
+            smtp_security: SmtpSecurity::ImplicitTls,
+            smtp_configured: true,
             accent_rgb: 0x336699,
             lifecycle,
             diagnostic: AccountDiagnostic::Never,
@@ -2480,6 +2510,32 @@ mod tests {
 
     fn secret() -> Secret {
         Secret::new(b"not-a-real-password".to_vec()).unwrap()
+    }
+
+    #[test]
+    fn draft_preserves_explicit_smtp_transport() {
+        for (port, expected_security) in [
+            (465, SmtpSecurity::ImplicitTls),
+            (587, SmtpSecurity::StartTls),
+        ] {
+            let draft = AccountConfigDraft::new(
+                "Personal",
+                "person@example.test",
+                "person@example.test",
+                "imap.example.test",
+                993,
+                "smtp.example.test",
+                port,
+                0x336699,
+            )
+            .unwrap();
+            let input = draft.into_input(&CredentialLocator::parse(KEY).unwrap());
+
+            assert_eq!(&*input.smtp_host, "smtp.example.test");
+            assert_eq!(input.smtp_port, port);
+            assert_eq!(input.smtp_security, expected_security);
+            assert!(input.smtp_explicit);
+        }
     }
 
     #[test]

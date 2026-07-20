@@ -209,6 +209,7 @@ fn move_to_trash(
 ) -> Result<MutationOutcome, DbFailure> {
     let expires_at_ms = checked_expiry(now_ms)?;
     let transaction = immediate_transaction(connection)?;
+    reject_undelivered_outbox(&transaction, id)?;
     let state = load_state(&transaction, id)?;
     let before = load_message_snapshot(&transaction, id)?;
     let (folder_count, trash_count) = membership_counts(&transaction, id)?;
@@ -306,6 +307,7 @@ fn delete_permanently(
 ) -> Result<MutationOutcome, DbFailure> {
     validate_timestamp(now_ms)?;
     let transaction = immediate_transaction(connection)?;
+    reject_undelivered_outbox(&transaction, id)?;
     let state = load_state(&transaction, id)?;
     let before = load_message_snapshot(&transaction, id)?;
     let (_, trash_count) = membership_counts(&transaction, id)?;
@@ -341,6 +343,29 @@ fn delete_permanently(
         account_id: state.account_id,
         stats_delta,
     })
+}
+
+fn reject_undelivered_outbox(
+    transaction: &Transaction<'_>,
+    id: MessageId,
+) -> Result<(), DbFailure> {
+    let protected: bool = transaction
+        .query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM outbox
+                 WHERE message_id = ?1 AND state <> 'delivered'
+             )",
+            [id.get()],
+            |row| row.get(0),
+        )
+        .map_err(DbFailure::database)?;
+    if protected {
+        Err(DbFailure::conflict(
+            "undelivered outbox mail cannot be moved or deleted",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn undo_trash(
@@ -1220,8 +1245,11 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO outbox
-                 (message_id, mime_file_key, envelope_from, wire_byte_count, state)
-                 VALUES (1, 'outbox/1.eml', 'one@example.test', 1, 'pending')",
+                 (message_id, account_id, configuration_generation, artifact_generation,
+                  draft_revision, mime_file_key, rfc_message_id, envelope_from,
+                  wire_byte_count, state, created_at_ms, updated_at_ms, delivered_at_ms)
+                 VALUES (1, 1, 1, 1, 0, 'outbox/1.eml', '<1@example.test>',
+                         'one@example.test', 1, 'delivered', 0, 0, 0)",
                 [],
             )
             .unwrap();

@@ -33,9 +33,19 @@ use super::{
         AccountId, DbFailure, DbReply, Generation, MessageId, MessageMutation, PageSpec, RequestId,
         Tagged,
     },
+    draft::{
+        DraftSnapshot, DraftUpdate, NewDraft, create_draft, load_draft, load_latest_draft,
+        update_draft,
+    },
     file_gc::{FileGcOutcome, run_file_gc},
     migrations::migrate,
     mutation::mutate_message,
+    outbox::{
+        ArtifactObservation, OutboxClaimOutcome, OutboxLease, OutboxRecoveryOutcome, OutboxReport,
+        OutboxReportOutcome, OutboxReservation, OutboxReserveRequest, ReservationRecovery,
+        claim_next_outbox, finalize_outbox, mark_outbox_data_started, recover_outbox,
+        recover_reservation, release_failed_outbox, report_outbox, reserve_outbox, retry_outbox,
+    },
     query::{open_message, query_account_directory, query_mailbox},
     remote::{
         RemoteClaimOutcome, RemoteReportOutcome, RemoteReportSubmission, ReportTransition,
@@ -228,6 +238,10 @@ enum Request {
         staging: Arc<ContentStaging>,
         limit: usize,
         reply: oneshot::Sender<Result<FileGcOutcome, DbFailure>>,
+    },
+    ComposeDb {
+        operation: Box<ComposeDbOperation>,
+        reply: oneshot::Sender<ComposeDbReply>,
     },
     #[cfg(test)]
     RunLongQuery { started: Sender<()> },
@@ -582,6 +596,39 @@ impl DatabaseClient {
         Ok(receiver)
     }
 
+    pub(crate) fn try_compose_db(
+        &self,
+        operation: Box<ComposeDbOperation>,
+    ) -> Result<oneshot::Receiver<ComposeDbReply>, ComposeDbSubmitFailure> {
+        let admission = lock_admission(&self.admission);
+        if !*admission {
+            return Err(ComposeDbSubmitFailure {
+                reason: SubmitError::Closed,
+                operation,
+            });
+        }
+        let (reply, receiver) = oneshot::channel();
+        match self
+            .requests
+            .try_send(Request::ComposeDb { operation, reply })
+        {
+            Ok(()) => Ok(receiver),
+            Err(TrySendError::Full(Request::ComposeDb { operation, .. })) => {
+                Err(ComposeDbSubmitFailure {
+                    reason: SubmitError::Busy,
+                    operation,
+                })
+            }
+            Err(TrySendError::Disconnected(Request::ComposeDb { operation, .. })) => {
+                Err(ComposeDbSubmitFailure {
+                    reason: SubmitError::Closed,
+                    operation,
+                })
+            }
+            Err(_) => unreachable!("try_compose_db only submits compose database requests"),
+        }
+    }
+
     fn try_submit(&self, request: Request) -> Result<(), SubmitError> {
         let admission = lock_admission(&self.admission);
         if !*admission {
@@ -621,6 +668,119 @@ impl DatabaseClient {
 pub(crate) enum SubmitError {
     Busy,
     Closed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ComposeDbOperation {
+    LoadDraft {
+        message_id: MessageId,
+    },
+    LoadLatestDraft {
+        account_id: AccountId,
+    },
+    CreateDraft(NewDraft),
+    UpdateDraft(DraftUpdate),
+    ReserveOutbox(OutboxReserveRequest),
+    FinalizeOutbox {
+        reservation: OutboxReservation,
+        wire_byte_count: u64,
+        now_ms: i64,
+    },
+    RecoverReservation {
+        reservation: OutboxReservation,
+        observation: ArtifactObservation,
+        now_ms: i64,
+    },
+    RecoverOutbox {
+        now_ms: i64,
+    },
+    ClaimNextOutbox {
+        now_ms: i64,
+    },
+    MarkDataStarted {
+        lease: OutboxLease,
+        now_ms: i64,
+    },
+    ReportOutbox {
+        lease: OutboxLease,
+        report: OutboxReport,
+        now_ms: i64,
+    },
+    RetryOutbox {
+        message_id: MessageId,
+        artifact_generation: u64,
+        expected_generation: AccountGeneration,
+        now_ms: i64,
+    },
+    ReleaseFailedOutbox {
+        message_id: MessageId,
+        artifact_generation: u64,
+        now_ms: i64,
+    },
+}
+
+impl ComposeDbOperation {
+    fn is_write(&self) -> bool {
+        !matches!(self, Self::LoadDraft { .. } | Self::LoadLatestDraft { .. })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ComposeDbOutcome {
+    Draft(Option<DraftSnapshot>),
+    LatestDraft(Option<DraftSnapshot>),
+    DraftSaved(DraftSnapshot),
+    OutboxReserved(OutboxReservation),
+    OutboxFinalized(OutboxReportOutcome),
+    ReservationRecovered(ReservationRecovery),
+    OutboxRecovered(OutboxRecoveryOutcome),
+    OutboxClaimed(OutboxClaimOutcome),
+    DataStarted(OutboxReportOutcome),
+    OutboxReported(OutboxReportOutcome),
+    OutboxRetried(OutboxReportOutcome),
+    FailedOutboxReleased(OutboxReportOutcome),
+}
+
+pub(crate) type ComposeDbReply = Result<ComposeDbOutcome, ComposeDbExecutionFailure>;
+
+#[derive(Debug)]
+pub(crate) struct ComposeDbSubmitFailure {
+    reason: SubmitError,
+    operation: Box<ComposeDbOperation>,
+}
+
+impl ComposeDbSubmitFailure {
+    pub(crate) fn reason(&self) -> SubmitError {
+        self.reason
+    }
+
+    pub(crate) fn operation(&self) -> &ComposeDbOperation {
+        &self.operation
+    }
+
+    pub(crate) fn into_parts(self) -> (SubmitError, Box<ComposeDbOperation>) {
+        (self.reason, self.operation)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ComposeDbExecutionFailure {
+    failure: DbFailure,
+    operation: Box<ComposeDbOperation>,
+}
+
+impl ComposeDbExecutionFailure {
+    pub(crate) fn failure(&self) -> &DbFailure {
+        &self.failure
+    }
+
+    pub(crate) fn operation(&self) -> &ComposeDbOperation {
+        &self.operation
+    }
+
+    pub(crate) fn into_parts(self) -> (DbFailure, Box<ComposeDbOperation>) {
+        (self.failure, self.operation)
+    }
 }
 
 pub(crate) type RemoteReportReply = Result<RemoteReportOutcome, RemoteReportExecutionFailure>;
@@ -1189,6 +1349,11 @@ fn run_actor(
                 }
                 continue;
             }
+            Request::ComposeDb { operation, reply } => {
+                let result = execute_compose_db(&mut connection, operation, &control.write_gate);
+                let _ = reply.send(result);
+                continue;
+            }
             #[cfg(test)]
             Request::RunLongQuery { started } => {
                 // Arm the existing progress hook so tests interrupt an active VM, not a gap
@@ -1470,6 +1635,79 @@ fn execute_file_gc(
     run_file_gc(connection, staging, limit)
 }
 
+fn execute_compose_db(
+    connection: &mut Connection,
+    operation: Box<ComposeDbOperation>,
+    write_gate: &Mutex<()>,
+) -> ComposeDbReply {
+    let _write_guard = lock_write_gate(write_gate);
+    let result = match operation.as_ref() {
+        ComposeDbOperation::LoadDraft { message_id } => {
+            load_draft(connection, *message_id).map(ComposeDbOutcome::Draft)
+        }
+        ComposeDbOperation::LoadLatestDraft { account_id } => {
+            load_latest_draft(connection, *account_id).map(ComposeDbOutcome::LatestDraft)
+        }
+        ComposeDbOperation::CreateDraft(draft) => {
+            create_draft(connection, draft).map(ComposeDbOutcome::DraftSaved)
+        }
+        ComposeDbOperation::UpdateDraft(draft) => {
+            update_draft(connection, draft).map(ComposeDbOutcome::DraftSaved)
+        }
+        ComposeDbOperation::ReserveOutbox(request) => {
+            reserve_outbox(connection, request).map(ComposeDbOutcome::OutboxReserved)
+        }
+        ComposeDbOperation::FinalizeOutbox {
+            reservation,
+            wire_byte_count,
+            now_ms,
+        } => finalize_outbox(connection, reservation, *wire_byte_count, *now_ms)
+            .map(ComposeDbOutcome::OutboxFinalized),
+        ComposeDbOperation::RecoverReservation {
+            reservation,
+            observation,
+            now_ms,
+        } => recover_reservation(connection, reservation, *observation, *now_ms)
+            .map(ComposeDbOutcome::ReservationRecovered),
+        ComposeDbOperation::RecoverOutbox { now_ms } => {
+            recover_outbox(connection, *now_ms).map(ComposeDbOutcome::OutboxRecovered)
+        }
+        ComposeDbOperation::ClaimNextOutbox { now_ms } => {
+            claim_next_outbox(connection, *now_ms).map(ComposeDbOutcome::OutboxClaimed)
+        }
+        ComposeDbOperation::MarkDataStarted { lease, now_ms } => {
+            mark_outbox_data_started(connection, *lease, *now_ms).map(ComposeDbOutcome::DataStarted)
+        }
+        ComposeDbOperation::ReportOutbox {
+            lease,
+            report,
+            now_ms,
+        } => {
+            report_outbox(connection, *lease, report, *now_ms).map(ComposeDbOutcome::OutboxReported)
+        }
+        ComposeDbOperation::RetryOutbox {
+            message_id,
+            artifact_generation,
+            expected_generation,
+            now_ms,
+        } => retry_outbox(
+            connection,
+            *message_id,
+            *artifact_generation,
+            *expected_generation,
+            *now_ms,
+        )
+        .map(ComposeDbOutcome::OutboxRetried),
+        ComposeDbOperation::ReleaseFailedOutbox {
+            message_id,
+            artifact_generation,
+            now_ms,
+        } => release_failed_outbox(connection, *message_id, *artifact_generation, *now_ms)
+            .map(ComposeDbOutcome::FailedOutboxReleased),
+    };
+    result.map_err(|failure| ComposeDbExecutionFailure { failure, operation })
+}
+
 fn drain_accepted_writes(
     connection: &mut Connection,
     requests: &Receiver<Request>,
@@ -1525,6 +1763,16 @@ fn drain_accepted_writes(
                 let result = execute_account_write(connection, write, write_gate);
                 if first_failure.is_none()
                     && let Err(failure) = &result
+                {
+                    first_failure = Some(failure.failure.clone());
+                }
+                let _ = reply.send(result);
+            }
+            Request::ComposeDb { operation, reply } => {
+                let result = execute_compose_db(connection, operation, write_gate);
+                if first_failure.is_none()
+                    && let Err(failure) = &result
+                    && failure.operation().is_write()
                 {
                     first_failure = Some(failure.failure.clone());
                 }
@@ -1994,6 +2242,22 @@ mod tests {
         configuration
     }
 
+    fn actor_draft(account: &super::super::account::AccountConfiguration, label: &str) -> NewDraft {
+        NewDraft::new(
+            account.account_id,
+            account.generation,
+            &format!("draft-{label}"),
+            label,
+            label,
+            label,
+            crate::content::FileKey::parse("body/00000000000000000000000000000000.txt").unwrap(),
+            label.len() as u64,
+            Vec::new(),
+            1,
+        )
+        .unwrap()
+    }
+
     fn claimed_remote_intent(client: &DatabaseClient) -> Box<super::super::remote::RemoteClaim> {
         let outcome = receive_remote_claim(client.try_claim_remote(1).unwrap()).unwrap();
         let RemoteClaimOutcome::Claimed(claim) = outcome else {
@@ -2133,6 +2397,114 @@ mod tests {
                      inbox_unread = CASE account_id WHEN 1 THEN 3 ELSE 5 END;",
             )
             .unwrap();
+    }
+
+    #[test]
+    fn compose_submission_returns_operation_and_reuses_released_capacity() {
+        let (sender, receiver) = bounded(1);
+        let connection = Connection::open_in_memory().unwrap();
+        let client = DatabaseClient {
+            requests: sender,
+            admission: Arc::new(Mutex::new(true)),
+            interrupt: Arc::new(connection.get_interrupt_handle()),
+            mailbox_control: Arc::new(MailboxQueryControl::default()),
+            next_mailbox_gate: Arc::new(Mutex::new(None)),
+            next_mailbox_long: Arc::new(AtomicBool::new(false)),
+            write_gate: Arc::new(Mutex::new(())),
+        };
+        let first_reply = client
+            .try_compose_db(Box::new(ComposeDbOperation::LoadLatestDraft {
+                account_id: AccountId::new(1).unwrap(),
+            }))
+            .unwrap();
+
+        let operation = Box::new(ComposeDbOperation::LoadDraft {
+            message_id: MessageId::new(1).unwrap(),
+        });
+        let operation_pointer: *const ComposeDbOperation = operation.as_ref();
+        let failure = client.try_compose_db(operation).unwrap_err();
+        assert_eq!(failure.reason(), SubmitError::Busy);
+        assert!(std::ptr::eq(operation_pointer, failure.operation()));
+        let (_, operation) = failure.into_parts();
+
+        drop(receiver.recv().unwrap());
+        drop(first_reply);
+        let second_reply = client.try_compose_db(operation).unwrap();
+        let Request::ComposeDb { operation, .. } = receiver.recv().unwrap() else {
+            panic!("expected recovered compose request");
+        };
+        assert!(std::ptr::eq(operation_pointer, operation.as_ref()));
+        drop(second_reply);
+
+        close_admission(&client.admission);
+        let operation = Box::new(ComposeDbOperation::LoadDraft {
+            message_id: MessageId::new(2).unwrap(),
+        });
+        let operation_pointer: *const ComposeDbOperation = operation.as_ref();
+        let failure = client.try_compose_db(operation).unwrap_err();
+        assert_eq!(failure.reason(), SubmitError::Closed);
+        assert!(std::ptr::eq(operation_pointer, failure.operation()));
+    }
+
+    #[test]
+    fn cancelled_compose_reply_still_persists_accepted_draft() {
+        let (client, _replies, runtime, _info) =
+            spawn_target(Target::Memory, REQUEST_CAPACITY, REPLY_CAPACITY).unwrap();
+        let account = create_actor_account(&client);
+        let receiver = client
+            .try_compose_db(Box::new(ComposeDbOperation::CreateDraft(actor_draft(
+                &account,
+                "cancelled reply",
+            ))))
+            .unwrap();
+        drop(receiver);
+
+        let outcome = receive_oneshot(
+            client
+                .try_compose_db(Box::new(ComposeDbOperation::LoadLatestDraft {
+                    account_id: account.account_id,
+                }))
+                .unwrap(),
+        )
+        .unwrap();
+        let ComposeDbOutcome::LatestDraft(Some(draft)) = outcome else {
+            panic!("expected persisted draft after reply cancellation");
+        };
+        assert_eq!(&*draft.subject, "cancelled reply");
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn shutdown_drains_an_accepted_compose_write() {
+        let path = temporary_database_path();
+        remove_database_files(&path);
+        let (client, _replies, runtime, _info) =
+            spawn_target(Target::File(path.clone()), 2, REPLY_CAPACITY).unwrap();
+        let account = create_actor_account(&client);
+        let (started_tx, started_rx) = bounded(1);
+        client.try_run_long_query(started_tx).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let receiver = client
+            .try_compose_db(Box::new(ComposeDbOperation::CreateDraft(actor_draft(
+                &account,
+                "shutdown drain",
+            ))))
+            .unwrap();
+        drop(receiver);
+
+        runtime.shutdown().unwrap();
+
+        let connection = Connection::open(&path).unwrap();
+        let subject: String = connection
+            .query_row(
+                "SELECT subject FROM messages WHERE remote_key = 'draft-shutdown drain'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(subject, "shutdown drain");
+        drop(connection);
+        remove_database_files(&path);
     }
 
     #[test]

@@ -23,6 +23,29 @@ pub(crate) enum AccountAuthKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SmtpSecurity {
+    ImplicitTls,
+    StartTls,
+}
+
+impl SmtpSecurity {
+    fn database_value(self) -> &'static str {
+        match self {
+            Self::ImplicitTls => "implicit_tls",
+            Self::StartTls => "starttls",
+        }
+    }
+
+    pub(super) fn from_database(value: &str) -> Result<Self, DbFailure> {
+        match value {
+            "implicit_tls" => Ok(Self::ImplicitTls),
+            "starttls" => Ok(Self::StartTls),
+            _ => Err(DbFailure::database("invalid SMTP security mode")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AccountLifecycle {
     Active,
     Disabled,
@@ -158,6 +181,10 @@ pub(crate) struct AccountConfigInput {
     pub(crate) login_name: Box<str>,
     pub(crate) imap_host: Box<str>,
     pub(crate) imap_port: u16,
+    pub(crate) smtp_host: Box<str>,
+    pub(crate) smtp_port: u16,
+    pub(crate) smtp_security: SmtpSecurity,
+    pub(crate) smtp_explicit: bool,
     pub(crate) accent_rgb: u32,
 }
 
@@ -173,6 +200,37 @@ impl AccountConfigInput {
         imap_port: u16,
         accent_rgb: u32,
     ) -> Result<Self, AccountValidationError> {
+        Self::new_with_smtp(
+            credential_key,
+            name,
+            address,
+            auth_kind,
+            login_name,
+            imap_host,
+            imap_port,
+            imap_host,
+            465,
+            SmtpSecurity::ImplicitTls,
+            false,
+            accent_rgb,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_smtp(
+        credential_key: &str,
+        name: &str,
+        address: &str,
+        auth_kind: AccountAuthKind,
+        login_name: &str,
+        imap_host: &str,
+        imap_port: u16,
+        smtp_host: &str,
+        smtp_port: u16,
+        smtp_security: SmtpSecurity,
+        smtp_explicit: bool,
+        accent_rgb: u32,
+    ) -> Result<Self, AccountValidationError> {
         Ok(Self {
             credential_key: validate_credential_key(credential_key)?.into(),
             name: validate_text(name, MAX_NAME_BYTES, AccountValidationError::Name)?.into(),
@@ -184,6 +242,12 @@ impl AccountConfigInput {
             imap_port: (imap_port != 0)
                 .then_some(imap_port)
                 .ok_or(AccountValidationError::Port)?,
+            smtp_host: validate_host(smtp_host)?.into(),
+            smtp_port: (smtp_port != 0)
+                .then_some(smtp_port)
+                .ok_or(AccountValidationError::Port)?,
+            smtp_security,
+            smtp_explicit,
             accent_rgb: (accent_rgb <= 0x00ff_ffff)
                 .then_some(accent_rgb)
                 .ok_or(AccountValidationError::Accent)?,
@@ -202,6 +266,10 @@ pub(crate) struct AccountConfiguration {
     pub(crate) login_name: Box<str>,
     pub(crate) imap_host: Box<str>,
     pub(crate) imap_port: u16,
+    pub(crate) smtp_host: Box<str>,
+    pub(crate) smtp_port: u16,
+    pub(crate) smtp_security: SmtpSecurity,
+    pub(crate) smtp_configured: bool,
     pub(crate) accent_rgb: u32,
     pub(crate) lifecycle: AccountLifecycle,
     pub(crate) diagnostic: AccountDiagnostic,
@@ -421,8 +489,9 @@ pub(super) fn create_account(
     transaction
         .execute(
             "INSERT INTO account_connections
-                 (account_id, credential_key, auth_kind, login_name, imap_host, imap_port)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (account_id, credential_key, auth_kind, login_name, imap_host, imap_port,
+                  smtp_host, smtp_port, smtp_security, smtp_state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 account_id.get(),
                 input.credential_key.as_ref(),
@@ -430,6 +499,14 @@ pub(super) fn create_account(
                 input.login_name.as_ref(),
                 input.imap_host.as_ref(),
                 i64::from(input.imap_port),
+                input.smtp_host.as_ref(),
+                i64::from(input.smtp_port),
+                input.smtp_security.database_value(),
+                if input.smtp_explicit {
+                    "configured"
+                } else {
+                    "needs_configuration"
+                },
             ],
         )
         .map_err(map_account_write_error)?;
@@ -475,8 +552,9 @@ pub(super) fn configure_existing_account(
     transaction
         .execute(
             "INSERT INTO account_connections
-                 (account_id, credential_key, auth_kind, login_name, imap_host, imap_port)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (account_id, credential_key, auth_kind, login_name, imap_host, imap_port,
+                  smtp_host, smtp_port, smtp_security, smtp_state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 account_id.get(),
                 input.credential_key.as_ref(),
@@ -484,6 +562,14 @@ pub(super) fn configure_existing_account(
                 input.login_name.as_ref(),
                 input.imap_host.as_ref(),
                 i64::from(input.imap_port),
+                input.smtp_host.as_ref(),
+                i64::from(input.smtp_port),
+                input.smtp_security.database_value(),
+                if input.smtp_explicit {
+                    "configured"
+                } else {
+                    "needs_configuration"
+                },
             ],
         )
         .map_err(map_account_write_error)?;
@@ -608,6 +694,10 @@ pub(super) fn update_account(
                  login_name = ?3,
                  imap_host = ?4,
                  imap_port = ?5,
+                 smtp_host = ?6,
+                 smtp_port = ?7,
+                 smtp_security = ?8,
+                 smtp_state = ?9,
                  diagnostic_state = 'never',
                  last_checked_at_ms = NULL
              WHERE account_id = ?1",
@@ -617,6 +707,14 @@ pub(super) fn update_account(
                 input.login_name.as_ref(),
                 input.imap_host.as_ref(),
                 i64::from(input.imap_port),
+                input.smtp_host.as_ref(),
+                i64::from(input.smtp_port),
+                input.smtp_security.database_value(),
+                if input.smtp_explicit {
+                    "configured"
+                } else {
+                    "needs_configuration"
+                },
             ],
         )
         .map_err(map_account_write_error)?;
@@ -755,6 +853,7 @@ pub(super) fn begin_account_removal(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(DbFailure::database)?;
     let record = require_account_fence(&transaction, account_id, expected_generation)?;
+    reject_account_with_undelivered_outbox(&transaction, account_id)?;
     let (state, credential_key) = match record {
         AccountRecord::Configured(configuration) => {
             require_mutable(&configuration)?;
@@ -826,6 +925,7 @@ pub(super) fn purge_removed_account(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(DbFailure::database)?;
     let record = require_account_fence(&transaction, account_id, expected_generation)?;
+    reject_account_with_undelivered_outbox(&transaction, account_id)?;
     let removing_cache = match &record {
         AccountRecord::Configured(configuration) => {
             configuration.lifecycle == AccountLifecycle::RemovingCache
@@ -1259,6 +1359,27 @@ fn account_provider_rows_remain(
         .map_err(DbFailure::database)
 }
 
+fn reject_account_with_undelivered_outbox(
+    connection: &Connection,
+    account_id: AccountId,
+) -> Result<(), DbFailure> {
+    let protected: bool = connection
+        .query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM outbox
+                 WHERE account_id = ?1 AND state <> 'delivered'
+             )",
+            [account_id.get()],
+            |row| row.get(0),
+        )
+        .map_err(DbFailure::database)?;
+    if protected {
+        Err(DbFailure::conflict("account has undelivered outbox mail"))
+    } else {
+        Ok(())
+    }
+}
+
 fn account_direct_children_remain(
     connection: &Connection,
     account_id: AccountId,
@@ -1343,6 +1464,10 @@ fn load_account_from(
         String,
         i64,
         String,
+        i64,
+        String,
+        String,
+        String,
         String,
         Option<i64>,
         i64,
@@ -1352,6 +1477,8 @@ fn load_account_from(
             "SELECT account.id, account.configuration_generation, connection.credential_key,
                     account.name, account.address, connection.auth_kind,
                     connection.login_name, connection.imap_host, connection.imap_port,
+                    connection.smtp_host, connection.smtp_port, connection.smtp_security,
+                    connection.smtp_state,
                     account.state, connection.diagnostic_state,
                     connection.last_checked_at_ms,
                     account.accent_rgb
@@ -1374,6 +1501,10 @@ fn load_account_from(
                     row.get(10)?,
                     row.get(11)?,
                     row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
+                    row.get(15)?,
+                    row.get(16)?,
                 ))
             },
         )
@@ -1389,6 +1520,10 @@ fn load_account_from(
         login_name,
         imap_host,
         imap_port,
+        smtp_host,
+        smtp_port,
+        smtp_security,
+        smtp_state,
         state,
         diagnostic_state,
         last_checked_at_ms,
@@ -1412,6 +1547,15 @@ fn load_account_from(
         imap_host: imap_host.into_boxed_str(),
         imap_port: u16::try_from(imap_port)
             .map_err(|_| DbFailure::database("invalid IMAP port in account configuration"))?,
+        smtp_host: smtp_host.into_boxed_str(),
+        smtp_port: u16::try_from(smtp_port)
+            .map_err(|_| DbFailure::database("invalid SMTP port in account configuration"))?,
+        smtp_security: SmtpSecurity::from_database(&smtp_security)?,
+        smtp_configured: match smtp_state.as_str() {
+            "configured" => true,
+            "needs_configuration" => false,
+            _ => return Err(DbFailure::database("invalid SMTP configuration state")),
+        },
         accent_rgb: u32::try_from(accent_rgb)
             .map_err(|_| DbFailure::database("invalid account accent in configuration"))?,
         lifecycle: AccountLifecycle::from_database(&state)?,
@@ -2107,9 +2251,16 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO outbox
-                     (message_id, mime_file_key, envelope_from, wire_byte_count, state)
-                 VALUES (1, ?1, 'owner@example.test', 1, 'pending')",
-                [outbox_key],
+                     (message_id, account_id, configuration_generation, artifact_generation,
+                      draft_revision, mime_file_key, rfc_message_id, envelope_from,
+                      wire_byte_count, state, created_at_ms, updated_at_ms, delivered_at_ms)
+                 VALUES (1, ?1, ?2, 1, 0, ?3, '<1@example.test>',
+                         'owner@example.test', 1, 'delivered', 0, 0, 0)",
+                params![
+                    created.account_id.get(),
+                    created.generation.get(),
+                    outbox_key
+                ],
             )
             .unwrap();
         connection

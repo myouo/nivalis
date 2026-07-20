@@ -2,10 +2,12 @@ mod account;
 mod actor;
 mod content;
 mod domain;
+mod draft;
 mod file_gc;
 mod journal;
 mod migrations;
 mod mutation;
+mod outbox;
 mod query;
 pub(crate) mod remote;
 mod stats;
@@ -20,7 +22,7 @@ pub(crate) use account::{
     AccountDiagnosticKind, AccountGeneration, AccountLifecycle, AccountPurgeOutcome, AccountRecord,
     AccountRemovalTicket, AccountSetupTarget, AccountValidationError, AccountWrite,
     AccountWriteOutcome, DiagnosticCommit, DiagnosticEpoch, DiagnosticRecord, DiagnosticTicket,
-    PendingCacheRemoval, PendingCredentialRemoval, RemovedAccount,
+    PendingCacheRemoval, PendingCredentialRemoval, RemovedAccount, SmtpSecurity,
 };
 #[allow(unused_imports)]
 pub(crate) use actor::{
@@ -28,6 +30,11 @@ pub(crate) use actor::{
     ContentImportExecutionFailure, ContentImportOutcome, ContentImportReply,
     ContentImportSubmission, ContentImportSubmitFailure, RemoteReportExecutionFailure,
     RemoteReportReply, RemoteReportSubmitFailure,
+};
+#[allow(unused_imports)]
+pub(crate) use actor::{
+    ComposeDbExecutionFailure, ComposeDbOperation, ComposeDbOutcome, ComposeDbReply,
+    ComposeDbSubmitFailure,
 };
 pub(crate) use actor::{
     DatabaseClient, DatabaseInfo, DatabaseReplies, DatabaseRuntime, StartError,
@@ -50,7 +57,21 @@ pub(crate) use domain::{
     MessageId, MessageMutation, MutationOutcome, PageSpec, RequestId, Tagged, UndoToken,
 };
 #[allow(unused_imports)]
+pub(crate) use draft::{
+    DraftRecipient, DraftSnapshot, DraftUpdate, NewDraft, create_draft, load_draft,
+    load_latest_draft, update_draft,
+};
+#[allow(unused_imports)]
 pub(crate) use file_gc::FileGcOutcome;
+#[allow(unused_imports)]
+pub(crate) use outbox::{
+    ArtifactObservation, OutboxClaim, OutboxClaimOutcome, OutboxErrorClass, OutboxLease,
+    OutboxRecipient, OutboxRecoveryOutcome, OutboxReport, OutboxReportOutcome, OutboxReservation,
+    OutboxReservationToken, OutboxReserveRequest, OutboxState, RecipientKind, ReservationRecovery,
+    claim_next_outbox, claim_outbox, finalize_outbox, load_outbox_state, mark_outbox_data_started,
+    recover_outbox, recover_reservation, release_failed_outbox, report_outbox, reserve_outbox,
+    retry_outbox,
+};
 #[allow(unused_imports)]
 pub(crate) use sync::{
     InboxCheckpoint, InboxCheckpointOutcome, InboxCursorCommit, InboxCursorOutcome,

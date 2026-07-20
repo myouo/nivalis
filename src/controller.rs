@@ -147,9 +147,13 @@ impl Controller {
         ui.on_manage_account(move |key| controller.manage_account(key.as_str()));
 
         let controller = self.clone();
-        ui.on_add_account(move |name, address, login, host, port, password| {
-            controller.add_account(name, address, login, host, port, password);
-        });
+        ui.on_add_account(
+            move |name, address, login, imap_host, imap_port, smtp_host, smtp_port, password| {
+                controller.add_account(
+                    name, address, login, imap_host, imap_port, smtp_host, smtp_port, password,
+                );
+            },
+        );
 
         let controller = self.clone();
         ui.on_diagnose_account(move |key| controller.diagnose_account(key.as_str()));
@@ -988,25 +992,34 @@ impl Controller {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn add_account(
         self: &Rc<Self>,
         name: SharedString,
         address: SharedString,
         login: SharedString,
-        host: SharedString,
-        port: SharedString,
+        imap_host: SharedString,
+        imap_port: SharedString,
+        smtp_host: SharedString,
+        smtp_port: SharedString,
         password: SharedString,
     ) {
-        let Some(port) = parse_imap_port(port.as_str()) else {
-            self.show_account_error(UserError::account_port());
+        let Some(imap_port) = parse_mail_port(imap_port.as_str()) else {
+            self.show_account_error(UserError::account_imap_port());
+            return;
+        };
+        let Some(smtp_port) = parse_mail_port(smtp_port.as_str()) else {
+            self.show_account_error(UserError::account_smtp_port());
             return;
         };
         let draft = match AccountConfigDraft::new(
             name.as_str(),
             address.as_str(),
             login.as_str(),
-            host.as_str(),
-            port,
+            imap_host.as_str(),
+            imap_port,
+            smtp_host.as_str(),
+            smtp_port,
             account_accent(address.as_str()),
         ) {
             Ok(draft) => draft,
@@ -1816,10 +1829,17 @@ impl UserError {
         }
     }
 
-    const fn account_port() -> Self {
+    const fn account_imap_port() -> Self {
         Self {
             title: "Check the IMAP port",
             detail: "Enter a port from 1 to 65535. Secure IMAP normally uses 993.",
+        }
+    }
+
+    const fn account_smtp_port() -> Self {
+        Self {
+            title: "Check the SMTP port",
+            detail: "Enter a port from 1 to 65535. Port 465 uses implicit TLS; other ports require STARTTLS.",
         }
     }
 
@@ -1859,7 +1879,7 @@ impl UserError {
     }
 }
 
-fn parse_imap_port(value: &str) -> Option<u16> {
+fn parse_mail_port(value: &str) -> Option<u16> {
     if value.is_empty() || value.trim() != value || !value.bytes().all(|byte| byte.is_ascii_digit())
     {
         return None;
@@ -1891,10 +1911,10 @@ fn account_validation_error(error: AccountValidationError) -> UserError {
             detail: "Enter the login name required by your mail provider. It is usually your email address.",
         },
         AccountValidationError::Host => UserError {
-            title: "Check the IMAP server",
-            detail: "Enter a valid server name, such as imap.example.com. Nivalis always verifies its certificate.",
+            title: "Check the mail server names",
+            detail: "Enter valid IMAP and SMTP server names. Nivalis always verifies their certificates.",
         },
-        AccountValidationError::Port => UserError::account_port(),
+        AccountValidationError::Port => UserError::account_imap_port(),
         AccountValidationError::CredentialKey
         | AccountValidationError::Accent
         | AccountValidationError::Generation
@@ -2491,9 +2511,10 @@ mod tests {
 
     #[test]
     fn account_inputs_and_diagnostic_guidance_are_bounded_and_stable() {
-        assert_eq!(parse_imap_port("993"), Some(993));
+        assert_eq!(parse_mail_port("993"), Some(993));
+        assert_eq!(parse_mail_port("465"), Some(465));
         for invalid in ["", "0", " 993", "993 ", "-1", "65536", "imap"] {
-            assert_eq!(parse_imap_port(invalid), None, "accepted {invalid:?}");
+            assert_eq!(parse_mail_port(invalid), None, "accepted {invalid:?}");
         }
         assert_eq!(
             account_accent("user@example.test"),
@@ -2596,11 +2617,29 @@ mod tests {
             "user@example.test".into(),
             "imap.example.test".into(),
             "0".into(),
+            "smtp.example.test".into(),
+            "465".into(),
             "not-retained".into(),
         );
         assert_eq!(
             harness.ui.get_account_operation_error().as_str(),
             "Enter a port from 1 to 65535. Secure IMAP normally uses 993."
+        );
+        assert!(!harness.ui.get_account_operation_loading());
+
+        harness.ui.invoke_add_account(
+            "Personal".into(),
+            "user@example.test".into(),
+            "user@example.test".into(),
+            "imap.example.test".into(),
+            "993".into(),
+            "smtp.example.test".into(),
+            "0".into(),
+            "not-retained".into(),
+        );
+        assert_eq!(
+            harness.ui.get_account_operation_error().as_str(),
+            "Enter a port from 1 to 65535. Port 465 uses implicit TLS; other ports require STARTTLS."
         );
         assert!(!harness.ui.get_account_operation_loading());
 

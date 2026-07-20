@@ -3,6 +3,7 @@ import "../assets/fonts/MaterialSymbolsRounded-Subset.ttf";
 import { Theme } from "theme.slint";
 import { MailboxPane } from "mailbox.slint";
 import { ReaderPane } from "reader.slint";
+import { ComposerOverlay } from "composer.slint";
 import {
     NavigationPane, TitleBar
 } from "shell.slint";
@@ -34,6 +35,7 @@ export component AppWindow inherits Window {
     in property <[AccountItem]> accounts;
     in property <MailDetail> selected-mail;
     in property <bool> has-accounts: true;
+    in property <bool> compose-enabled: false;
     in property <bool> mail-actions-enabled: true;
     in property <bool> mutation-loading: false;
     in property <bool> undo-loading: false;
@@ -51,6 +53,13 @@ export component AppWindow inherits Window {
     in property <bool> active-account-error: true;
     in property <string> active-folder: "Inbox";
     in-out property <string> search-query: "";
+    in-out property <bool> composer-open: false;
+    in-out property <string> compose-to: "";
+    in-out property <string> compose-subject: "";
+    in-out property <string> compose-body: "";
+    in-out property <string> composer-error: "";
+    in property <bool> composer-loading: false;
+    in property <string> composer-status: "";
     in-out property <bool> detail-open: false;
     in-out property <bool> initial-loading: false;
     in property <bool> mailbox-loading: false;
@@ -93,17 +102,29 @@ export component AppWindow inherits Window {
 
     private property <bool> compact-layout: false;
     private property <bool> wide-sidebar: true;
+    private property <bool> short-window: false;
     private property <length> navigation-width: 248px;
     private property <bool> sidebar-collapsed: false;
     private property <bool> filter-menu-open: false;
     private property <bool> error-banner-dismissed: false;
     private property <bool> is-maximized: false;
+    private property <bool> blocking-overlay-open: root.account-menu-open
+        || root.account-setup-open
+        || root.account-status-open
+        || root.account-remove-open
+        || root.settings-open
+        || root.more-menu-open
+        || root.filter-menu-open
+        || root.message-menu-open
+        || root.composer-open
+        || root.delete-dialog-open;
 
     changed width => {
         root.compact-layout = root.width < 760px;
         root.wide-sidebar = root.width >= 1080px && !root.sidebar-collapsed;
         root.navigation-width = root.wide-sidebar ? 248px : 54px;
     }
+    changed height => { root.short-window = root.height < 660px; }
     changed sidebar-collapsed => {
         root.wide-sidebar = root.width >= 1080px && !root.sidebar-collapsed;
         root.navigation-width = root.wide-sidebar ? 248px : 54px;
@@ -121,8 +142,10 @@ export component AppWindow inherits Window {
     callback previous-mailbox-page;
     callback next-mailbox-page;
     callback retry-detail;
+    callback send-message(string, string, string);
+    callback save-draft(string, string, string);
     callback switch-account(string);
-    callback add-account(string, string, string, string, string, string);
+    callback add-account(string, string, string, string, string, string, string, string);
     callback manage-account(string);
     callback diagnose-account(string);
     callback sync-account(string);
@@ -136,6 +159,16 @@ export component AppWindow inherits Window {
 
     app-focus := FocusScope {
         focus-on-tab-navigation: false;
+
+        KeyBinding {
+            keys: @keys(Control + N);
+            activated => {
+                if (root.compose-enabled && !root.blocking-overlay-open) {
+                    root.composer-error = "";
+                    root.composer-open = true;
+                }
+            }
+        }
 
         key-pressed(event) => {
             if (event.text == Key.Escape) {
@@ -151,6 +184,11 @@ export component AppWindow inherits Window {
                 }
                 else if (root.delete-dialog-open) {
                     if (!root.mutation-loading) { root.delete-dialog-open = false; }
+                }
+                else if (root.composer-open) {
+                    if (!root.composer-loading) {
+                        root.save-draft(root.compose-to, root.compose-subject, root.compose-body);
+                    }
                 }
                 else if (root.message-menu-open) { root.message-menu-open = false; }
                 else if (root.account-menu-open) { root.account-menu-open = false; }
@@ -195,6 +233,7 @@ export component AppWindow inherits Window {
                         account-initials: root.active-account-initials;
                         account-color: root.active-account-color;
                         account-error: root.active-account-error;
+                        compose-enabled: root.compose-enabled;
                         account-menu-open: root.account-menu-open;
                         settings-open: root.settings-open;
                         active-folder: root.active-folder;
@@ -202,6 +241,12 @@ export component AppWindow inherits Window {
                         starred-count: root.starred-count;
                         draft-count: root.draft-count;
                         collapsed(value) => { root.sidebar-collapsed = value; }
+                        compose => {
+                            if (root.compose-enabled) {
+                                root.composer-error = "";
+                                root.composer-open = true;
+                            }
+                        }
                         folder-selected(folder) => { root.filter-folder(folder); root.detail-open = false; }
                         open-accounts => { root.account-menu-open = true; }
                         open-settings => { root.settings-open = true; }
@@ -338,8 +383,8 @@ export component AppWindow inherits Window {
         operation-loading: root.account-operation-loading;
         operation-stage: root.account-operation-stage;
         operation-error <=> root.account-operation-error;
-        add-account(name, address, login, host, port, password) => {
-            root.add-account(name, address, login, host, port, password);
+        add-account(name, address, login, imap-host, imap-port, smtp-host, smtp-port, password) => {
+            root.add-account(name, address, login, imap-host, imap-port, smtp-host, smtp-port, password);
         }
     }
 
@@ -402,6 +447,26 @@ export component AppWindow inherits Window {
         dark-mode <=> root.dark-mode;
         high-contrast <=> root.high-contrast;
         reduced-motion <=> root.reduced-motion;
+    }
+
+    if root.composer-open: ComposerOverlay {
+        width: parent.width;
+        height: parent.height;
+        compact-layout: root.compact-layout;
+        short-window: root.short-window;
+        composer-open <=> root.composer-open;
+        compose-to <=> root.compose-to;
+        compose-subject <=> root.compose-subject;
+        compose-body <=> root.compose-body;
+        composer-error <=> root.composer-error;
+        composer-loading: root.composer-loading;
+        composer-status: root.composer-status;
+        send-message(to, subject, body) => {
+            root.send-message(to, subject, body);
+        }
+        save-draft(to, subject, body) => {
+            root.save-draft(to, subject, body);
+        }
     }
 
     if root.message-menu-open: MessageMenuOverlay {

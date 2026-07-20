@@ -1337,6 +1337,8 @@ mod tests {
                     "user@example.test",
                     "imap.example.test",
                     993,
+                    "smtp.example.test",
+                    465,
                     0x336699,
                 )
                 .unwrap(),
@@ -1528,6 +1530,8 @@ mod tests {
                     "retry@example.test",
                     "imap.example.test",
                     993,
+                    "smtp.example.test",
+                    465,
                     0x335577,
                 )
                 .unwrap(),

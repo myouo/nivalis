@@ -290,8 +290,11 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO outbox
-                 (message_id, mime_file_key, envelope_from, wire_byte_count, state)
-                 VALUES (3, ?1, 'sender@example.test', 1, 'ready')",
+                 (message_id, account_id, configuration_generation, artifact_generation,
+                  draft_revision, mime_file_key, rfc_message_id, envelope_from,
+                  wire_byte_count, state, created_at_ms, updated_at_ms)
+                 VALUES (3, 1, 1, 1, 0, ?1, '<3@example.test>',
+                         'sender@example.test', 1, 'ready', 0, 0)",
                 [outbox.as_str()],
             )
             .expect("reference outbox file");

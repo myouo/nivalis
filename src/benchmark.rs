@@ -79,8 +79,10 @@ struct AccountDiagnosticConfig {
     name: String,
     address: String,
     login: String,
-    host: String,
-    port: String,
+    imap_host: String,
+    imap_port: String,
+    smtp_host: String,
+    smtp_port: String,
     secret: Zeroizing<Vec<u8>>,
     expected: AccountDiagnosticExpectation,
 }
@@ -88,10 +90,10 @@ struct AccountDiagnosticConfig {
 impl AccountDiagnosticConfig {
     fn load() -> Result<Self, &'static str> {
         let secret_path = required_account_diagnostic_env("NIVALIS_STRESS_ACCOUNT_SECRET_FILE")?;
-        let host = required_account_diagnostic_env("NIVALIS_STRESS_ACCOUNT_IMAP_HOST")?;
+        let imap_host = required_account_diagnostic_env("NIVALIS_STRESS_ACCOUNT_IMAP_HOST")?;
         // The harness copies through Slint to exercise production UI, so it only accepts fake
         // credentials for a loopback fixture rather than a real provider secret.
-        if !is_loopback_imap_host(&host) {
+        if !is_loopback_imap_host(&imap_host) {
             return Err("nonlocal_host_rejected");
         }
         Ok(Self {
@@ -99,9 +101,11 @@ impl AccountDiagnosticConfig {
                 .unwrap_or_else(|_| "Memory diagnostic".into()),
             address: required_account_diagnostic_env("NIVALIS_STRESS_ACCOUNT_ADDRESS")?,
             login: required_account_diagnostic_env("NIVALIS_STRESS_ACCOUNT_LOGIN")?,
-            host,
-            port: std::env::var("NIVALIS_STRESS_ACCOUNT_IMAP_PORT")
+            smtp_host: imap_host.clone(),
+            imap_host,
+            imap_port: std::env::var("NIVALIS_STRESS_ACCOUNT_IMAP_PORT")
                 .unwrap_or_else(|_| "993".into()),
+            smtp_port: "465".into(),
             secret: read_account_diagnostic_secret(&PathBuf::from(secret_path))?,
             expected: std::env::var("NIVALIS_STRESS_ACCOUNT_EXPECTED_RESULT")
                 .ok()
@@ -287,8 +291,10 @@ fn install_account_diagnostic_stress(
                             config.name.into(),
                             config.address.into(),
                             config.login.into(),
-                            config.host.into(),
-                            config.port.into(),
+                            config.imap_host.into(),
+                            config.imap_port.into(),
+                            config.smtp_host.into(),
+                            config.smtp_port.into(),
                             secret,
                         );
                         state.cleanup_required = true;
@@ -689,8 +695,10 @@ fn install_account_receive_stress(
                             config.name.into(),
                             config.address.into(),
                             config.login.into(),
-                            config.host.into(),
-                            config.port.into(),
+                            config.imap_host.into(),
+                            config.imap_port.into(),
+                            config.smtp_host.into(),
+                            config.smtp_port.into(),
                             secret,
                         );
                         state.cleanup_required = true;

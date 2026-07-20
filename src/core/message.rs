@@ -566,6 +566,8 @@ mod tests {
                 "user@example.test",
                 "imap.example.test",
                 993,
+                "smtp.example.test",
+                465,
                 0x123456,
             )
             .unwrap(),

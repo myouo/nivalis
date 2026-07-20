@@ -2,7 +2,7 @@ use std::{error::Error, fmt};
 
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(crate) const LATEST_SCHEMA_VERSION: u32 = 11;
+pub(crate) const LATEST_SCHEMA_VERSION: u32 = 12;
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -54,6 +54,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 11,
         sql: include_str!("../../../migrations/0011_account_configuration.sql"),
+    },
+    Migration {
+        version: 12,
+        sql: include_str!("../../../migrations/0012_drafts_outbox.sql"),
     },
 ];
 
@@ -206,6 +210,8 @@ mod tests {
         "message_tombstone_imap_locations",
         "message_tombstones",
         "messages",
+        "local_drafts",
+        "draft_recipients",
         "outbox",
         "outbox_recipients",
         "remote_account_reconciliations",
@@ -446,8 +452,11 @@ mod tests {
                 "idx_messages_legacy_reconcile_pending".to_owned(),
                 "idx_messages_starred".to_owned(),
                 "idx_messages_unread".to_owned(),
+                "idx_local_drafts_updated".to_owned(),
+                "idx_outbox_lease".to_owned(),
                 "idx_outbox_mime_file".to_owned(),
                 "idx_outbox_pending".to_owned(),
+                "idx_outbox_reservation".to_owned(),
                 "idx_remote_intents_account_due".to_owned(),
                 "idx_remote_intents_global_due".to_owned(),
             ])
@@ -576,8 +585,11 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO outbox
-                 (message_id, mime_file_key, envelope_from, wire_byte_count, state)
-                 VALUES (100, 'mime/100.eml', 'user@example.test', 256, 'pending')",
+                 (message_id, account_id, configuration_generation, artifact_generation,
+                  draft_revision, mime_file_key, rfc_message_id, envelope_from,
+                  wire_byte_count, state, created_at_ms, updated_at_ms)
+                 VALUES (100, 1, 1, 1, 0, 'mime/100.eml', '<100@example.test>',
+                         'user@example.test', 256, 'ready', 0, 0)",
                 [],
             )
             .expect("insert outbox item");
@@ -720,7 +732,7 @@ mod tests {
         migrate_with(&mut connection, &MIGRATIONS[..10], 10).expect("create v10 schema");
         insert_account(&connection, 1, "owner@example.test");
 
-        migrate(&mut connection).expect("upgrade v10 schema to v11");
+        migrate_with(&mut connection, &MIGRATIONS[..11], 11).expect("upgrade v10 schema to v11");
 
         assert_eq!(schema_version(&connection), 11);
         let accounts: i64 = connection
@@ -745,8 +757,129 @@ mod tests {
         assert_eq!(directory.rows.len(), 1);
         assert_eq!(directory.rows[0].state.as_ref(), "needs_setup");
 
-        migrate(&mut connection).expect("run v11 migration again");
+        migrate_with(&mut connection, &MIGRATIONS[..11], 11).expect("run v11 migration again");
         assert_eq!(schema_version(&connection), 11);
+    }
+
+    #[test]
+    fn v12_upgrade_preserves_nonempty_v11_outbox_without_enabling_smtp() {
+        let mut connection = memory_connection();
+        enable_foreign_keys(&connection).expect("enable foreign keys");
+        enable_recursive_triggers(&connection).expect("enable recursive triggers");
+        migrate_with(&mut connection, &MIGRATIONS[..11], 11).expect("create v11 schema");
+        insert_account(&connection, 1, "owner@example.test");
+        connection
+            .execute(
+                "INSERT INTO account_connections
+                 (account_id, credential_key, auth_kind, login_name, imap_host, imap_port)
+                 VALUES (1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'app_password',
+                         'owner@example.test', 'imap.example.test', 993)",
+                [],
+            )
+            .expect("insert v11 account connection");
+        insert_message(&connection, 100, 1, "pending-message");
+        insert_message(&connection, 101, 1, "inflight-message");
+        connection
+            .execute(
+                "INSERT INTO outbox
+                 (message_id, mime_file_key, envelope_from, wire_byte_count, state,
+                  attempt_count, next_attempt_at_ms)
+                 VALUES (100, 'outbound/pending.eml', 'owner@example.test', 9437184,
+                         'pending', 2, 1234),
+                        (101, 'outbound/inflight.eml', 'owner@example.test', 512,
+                         'in_flight', 3, NULL)",
+                [],
+            )
+            .expect("insert nonempty v11 outbox");
+        connection
+            .execute(
+                "INSERT INTO outbox_recipients
+                 (message_id, kind, ordinal, address, display_name)
+                 VALUES (100, 'to', 0, 'first@example.test', 'First'),
+                        (101, 'cc', 0, 'second@example.test', 'Second')",
+                [],
+            )
+            .expect("insert v11 outbox recipients");
+
+        migrate(&mut connection).expect("upgrade v11 schema to v12");
+
+        assert_eq!(schema_version(&connection), 12);
+        let smtp: (String, i64, String, String) = connection
+            .query_row(
+                "SELECT smtp_host, smtp_port, smtp_security, smtp_state
+                 FROM account_connections WHERE account_id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("load migrated SMTP configuration");
+        assert_eq!(
+            smtp,
+            (
+                "imap.example.test".to_owned(),
+                465,
+                "implicit_tls".to_owned(),
+                "needs_configuration".to_owned(),
+            )
+        );
+        let rows = connection
+            .prepare(
+                "SELECT message_id, mime_file_key, wire_byte_count, state,
+                        delivery_started, error_class, error_code
+                 FROM outbox ORDER BY message_id",
+            )
+            .expect("prepare migrated outbox query")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })
+            .expect("query migrated outbox")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect migrated outbox");
+        assert_eq!(
+            rows,
+            [
+                (
+                    100,
+                    "outbound/pending.eml".to_owned(),
+                    8 * 1024 * 1024,
+                    "permanent_failure".to_owned(),
+                    0,
+                    "configuration".to_owned(),
+                    "legacy_unverified".to_owned(),
+                ),
+                (
+                    101,
+                    "outbound/inflight.eml".to_owned(),
+                    512,
+                    "uncertain".to_owned(),
+                    1,
+                    "ambiguous".to_owned(),
+                    "legacy_unverified".to_owned(),
+                ),
+            ]
+        );
+        let recipient_count: i64 = connection
+            .query_row("SELECT count(*) FROM outbox_recipients", [], |row| {
+                row.get(0)
+            })
+            .expect("count migrated recipients");
+        assert_eq!(recipient_count, 2);
+        let active_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM outbox
+                 WHERE state IN ('reserved', 'ready', 'in_flight', 'retry_wait')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count automatically sendable migrated rows");
+        assert_eq!(active_count, 0);
     }
 
     #[test]
@@ -2384,8 +2517,11 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO outbox
-                 (message_id, mime_file_key, envelope_from, wire_byte_count, state)
-                 VALUES (100, 'outbox.eml', 'sender@example.test', 1, 'pending')",
+                 (message_id, account_id, configuration_generation, artifact_generation,
+                  draft_revision, mime_file_key, rfc_message_id, envelope_from,
+                  wire_byte_count, state, created_at_ms, updated_at_ms)
+                 VALUES (100, 1, 1, 1, 0, 'outbox.eml', '<100@example.test>',
+                         'sender@example.test', 1, 'ready', 0, 0)",
                 [],
             )
             .expect("reference Outbox file");
@@ -2441,8 +2577,11 @@ mod tests {
         let missing_source = connection
             .execute(
                 "INSERT INTO outbox
-                 (message_id, mime_file_key, envelope_from, wire_byte_count, state)
-                 VALUES (100, '', 'sender@example.test', 128, 'pending')",
+                 (message_id, account_id, configuration_generation, artifact_generation,
+                  draft_revision, mime_file_key, rfc_message_id, envelope_from,
+                  wire_byte_count, state, created_at_ms, updated_at_ms)
+                 VALUES (100, 1, 1, 1, 0, '', '<100@example.test>',
+                         'sender@example.test', 128, 'ready', 0, 0)",
                 [],
             )
             .expect_err("MIME file key must not be empty");
@@ -2454,8 +2593,11 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO outbox
-                 (message_id, mime_file_key, envelope_from, wire_byte_count, state)
-                 VALUES (100, 'mime/100.eml', 'sender@example.test', 128, 'pending')",
+                 (message_id, account_id, configuration_generation, artifact_generation,
+                  draft_revision, mime_file_key, rfc_message_id, envelope_from,
+                  wire_byte_count, state, created_at_ms, updated_at_ms)
+                 VALUES (100, 1, 1, 1, 0, 'mime/100.eml', '<100@example.test>',
+                         'sender@example.test', 128, 'ready', 0, 0)",
                 [],
             )
             .expect("insert durable outbox source");

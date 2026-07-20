@@ -142,6 +142,12 @@ pub(crate) enum RemoveOutcome {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReservedFileObservation {
+    Missing,
+    Published { byte_count: u64 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct StorageError {
     pub(crate) operation: StorageOperation,
     pub(crate) kind: io::ErrorKind,
@@ -221,6 +227,7 @@ impl FileKey {
         let extension = match kind {
             "body" => ".txt",
             "attachment" => ".bin",
+            "outbound" => ".eml",
             _ => return Err(StorageError::invalid(StorageOperation::ValidateRoot)),
         };
         let Some(token) = file_name.strip_suffix(extension) else {
@@ -243,6 +250,8 @@ impl FileKey {
     fn kind(&self) -> FileKind {
         if self.0.starts_with("body/") {
             FileKind::Body
+        } else if self.0.starts_with("outbound/") {
+            FileKind::Outbound
         } else {
             FileKind::Attachment
         }
@@ -412,6 +421,7 @@ pub(crate) struct ContentStaging {
     root: PathBuf,
     body: PathBuf,
     attachment: PathBuf,
+    outbound: PathBuf,
 }
 
 impl ContentStaging {
@@ -432,7 +442,8 @@ impl ContentStaging {
             ensure_private_directory(&root)?;
             let body = root.join("body");
             let attachment = root.join("attachment");
-            for directory in [&body, &attachment] {
+            let outbound = root.join("outbound");
+            for directory in [&body, &attachment, &outbound] {
                 ensure_private_directory(directory)?;
             }
             sync_directory(&root)?;
@@ -440,6 +451,7 @@ impl ContentStaging {
                 root,
                 body,
                 attachment,
+                outbound,
             })
         }
     }
@@ -458,6 +470,7 @@ impl ContentStaging {
         let directory = match key.kind() {
             FileKind::Body => self.body.as_path(),
             FileKind::Attachment => self.attachment.as_path(),
+            FileKind::Outbound => self.outbound.as_path(),
         };
         Ok((directory, directory.join(key.file_name())))
     }
@@ -537,35 +550,153 @@ impl ContentStaging {
     ) -> Result<StagedFile, StorageError> {
         for _ in 0..8 {
             let token = unique_token();
-            let (directory, extension) = match kind {
-                FileKind::Body => (&self.body, "txt"),
-                FileKind::Attachment => (&self.attachment, "bin"),
-            };
-            ensure_private_directory(directory)?;
+            let extension = kind.extension();
             let key = FileKey::parse(&format!("{}/{token}.{extension}", kind.as_str()))?;
-            let final_path = directory.join(key.file_name());
-            let temporary_path = directory.join(format!(".{token}.{extension}.part"));
-            let file = match create_private_file(&temporary_path) {
-                Ok(file) => file,
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => {
-                    return Err(StorageError::new(StorageOperation::CreateTemporary, &error));
-                }
-            };
-            let mut staged = StagedFile {
-                key,
-                temporary_path,
-                final_path,
-                file: Some(file),
-                byte_count: 0,
-            };
-            staged.copy_from(&mut reader, maximum)?;
-            return Ok(staged);
+            match self.stage_reader_at(&key, &mut reader, maximum) {
+                Ok(staged) => return Ok(staged),
+                Err(error) if error.kind == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
         }
         Err(StorageError {
             operation: StorageOperation::CreateTemporary,
             kind: io::ErrorKind::AlreadyExists,
         })
+    }
+
+    pub(crate) fn stage_reader_at(
+        &self,
+        key: &FileKey,
+        mut reader: impl Read,
+        maximum: usize,
+    ) -> Result<StagedFile, StorageError> {
+        let kind = key.kind();
+        let directory = match kind {
+            FileKind::Body => &self.body,
+            FileKind::Attachment => &self.attachment,
+            FileKind::Outbound => &self.outbound,
+        };
+        ensure_private_directory(directory)?;
+        let final_path = directory.join(key.file_name());
+        let temporary_path = reserved_temporary_path(directory, key, kind);
+        remove_reserved_partial(&temporary_path)?;
+        let file = create_private_file(&temporary_path)
+            .map_err(|error| StorageError::new(StorageOperation::CreateTemporary, &error))?;
+        let mut staged = StagedFile {
+            key: key.clone(),
+            temporary_path,
+            final_path,
+            file: Some(file),
+            byte_count: 0,
+        };
+        staged.copy_from(&mut reader, maximum)?;
+        Ok(staged)
+    }
+
+    pub(crate) fn stage_writer_at<F>(
+        &self,
+        key: &FileKey,
+        maximum: usize,
+        write: F,
+    ) -> Result<StagedFile, StorageError>
+    where
+        F: FnOnce(&mut dyn Write) -> io::Result<()>,
+    {
+        let kind = key.kind();
+        let directory = match kind {
+            FileKind::Body => &self.body,
+            FileKind::Attachment => &self.attachment,
+            FileKind::Outbound => &self.outbound,
+        };
+        ensure_private_directory(directory)?;
+        let final_path = directory.join(key.file_name());
+        let temporary_path = reserved_temporary_path(directory, key, kind);
+        remove_reserved_partial(&temporary_path)?;
+        let mut file = create_private_file(&temporary_path)
+            .map_err(|error| StorageError::new(StorageOperation::CreateTemporary, &error))?;
+        let byte_count_result = {
+            let mut bounded = BoundedWriter {
+                inner: &mut file,
+                written: 0,
+                maximum,
+            };
+            write(&mut bounded).map(|()| bounded.written)
+        };
+        let byte_count = match byte_count_result {
+            Ok(byte_count) => byte_count,
+            Err(error) => {
+                drop(file);
+                let _ = fs::remove_file(&temporary_path);
+                let _ = sync_parent_directory(&temporary_path);
+                return Err(StorageError::new(StorageOperation::WriteTemporary, &error));
+            }
+        };
+        if let Err(error) = file.sync_all() {
+            drop(file);
+            let _ = fs::remove_file(&temporary_path);
+            let _ = sync_parent_directory(&temporary_path);
+            return Err(StorageError::new(StorageOperation::SyncTemporary, &error));
+        }
+        Ok(StagedFile {
+            key: key.clone(),
+            temporary_path,
+            final_path,
+            file: Some(file),
+            byte_count: byte_count as u64,
+        })
+    }
+
+    pub(crate) fn observe_reserved_file(
+        &self,
+        key: &FileKey,
+        maximum: u64,
+    ) -> Result<ReservedFileObservation, StorageError> {
+        let operation = StorageOperation::OpenPublished;
+        let kind = key.kind();
+        let (directory, path) = self.published_location(key, operation)?;
+        let temporary_path = reserved_temporary_path(directory, key, kind);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                remove_reserved_partial(&temporary_path)?;
+                return Ok(ReservedFileObservation::Missing);
+            }
+            Err(error) => return Err(StorageError::new(operation, &error)),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > maximum {
+            return Err(StorageError::invalid(operation));
+        }
+        remove_reserved_partial(&temporary_path)?;
+        Ok(ReservedFileObservation::Published {
+            byte_count: metadata.len(),
+        })
+    }
+}
+
+struct BoundedWriter<'a> {
+    inner: &'a mut File,
+    written: usize,
+    maximum: usize,
+}
+
+impl Write for BoundedWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let remaining = self.maximum.saturating_sub(self.written);
+        if buffer.len() > remaining {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "bounded private file limit exceeded",
+            ));
+        }
+        let written = self.inner.write(buffer)?;
+        self.written = self.written.checked_add(written).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::FileTooLarge, "private file size overflow")
+        })?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -573,15 +704,48 @@ impl ContentStaging {
 pub(crate) enum FileKind {
     Body,
     Attachment,
+    Outbound,
 }
 
 impl FileKind {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Body => "body",
             Self::Attachment => "attachment",
+            Self::Outbound => "outbound",
         }
     }
+
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Body => "txt",
+            Self::Attachment => "bin",
+            Self::Outbound => "eml",
+        }
+    }
+}
+
+fn reserved_temporary_path(directory: &Path, key: &FileKey, kind: FileKind) -> PathBuf {
+    let token = key
+        .file_name()
+        .strip_suffix(kind.extension())
+        .and_then(|name| name.strip_suffix('.'))
+        .unwrap_or(key.file_name());
+    directory.join(format!(".{token}.{}.part", kind.extension()))
+}
+
+fn remove_reserved_partial(path: &Path) -> Result<(), StorageError> {
+    let operation = StorageOperation::RemoveTemporary;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(StorageError::new(operation, &error)),
+    };
+    if !metadata.is_file() && !metadata.file_type().is_symlink() {
+        return Err(StorageError::invalid(operation));
+    }
+    fs::remove_file(path).map_err(|error| StorageError::new(operation, &error))?;
+    sync_parent_directory(path)
 }
 
 #[derive(Debug)]
@@ -625,7 +789,11 @@ impl StagedFile {
         Ok(())
     }
 
-    fn publish(mut self) -> Result<PublishedFile, StorageError> {
+    pub(crate) fn byte_count(&self) -> u64 {
+        self.byte_count
+    }
+
+    pub(crate) fn publish(mut self) -> Result<PublishedFile, StorageError> {
         self.file.take();
         fs::hard_link(&self.temporary_path, &self.final_path)
             .map_err(|error| StorageError::new(StorageOperation::Publish, &error))?;
@@ -651,10 +819,20 @@ impl Drop for StagedFile {
 }
 
 #[derive(Debug)]
-struct PublishedFile {
+pub(crate) struct PublishedFile {
     key: FileKey,
     path: PathBuf,
     retained: bool,
+}
+
+impl PublishedFile {
+    pub(crate) fn key(&self) -> &FileKey {
+        &self.key
+    }
+
+    pub(crate) fn retain(&mut self) {
+        self.retained = true;
+    }
 }
 
 impl Drop for PublishedFile {
