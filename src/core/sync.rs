@@ -16,8 +16,8 @@ use crate::{
     },
     network::imap::{
         ImapIdleRequest, ImapInboxFetchFailure, ImapInboxFetchRequest, ImapInboxMessage,
-        ImapInboxPage, ImapMessageContentFetchRequest, fetch_canonical_inbox_metadata,
-        fetch_imap_message_content,
+        ImapInboxPage, ImapMessageContentFetchRequest, fetch_cached_imap_message_content,
+        fetch_canonical_inbox_metadata, fetch_imap_message_content,
     },
     store::sqlite::{
         AccountAuthKind, AccountGeneration, AccountId, AccountLifecycle, AccountRecord,
@@ -30,7 +30,6 @@ use crate::{
 
 use super::account::{AccountWorkflowFailureKind, AccountWorkflowStage, InboxSyncFailureKind};
 
-const FILE_GC_LIMIT: usize = 16;
 const MAX_SENDER_BYTES: usize = 320;
 const MAX_SUBJECT_BYTES: usize = 998;
 
@@ -119,33 +118,54 @@ async fn run_message_content_fetch(
         Ok(configuration) => configuration,
         Err(outcome) => return content_outcome_from_sync(outcome),
     };
-    let secret = match load_credential(&credentials, &configuration.credential_key).await {
-        Ok(secret) => secret,
-        Err(outcome) => return content_outcome_from_sync(outcome),
-    };
-    let request = match ImapMessageContentFetchRequest::new(
+    let cached = match fetch_cached_imap_message_content(
         &configuration.imap_host,
         configuration.imap_port,
         &configuration.login_name,
-        secret,
         target.uid_validity,
         target.uid,
-    ) {
-        Ok(request) => request,
-        Err(_) => {
-            return content_fetch_failure(
-                AccountWorkflowStage::FetchInbox,
-                InboxSyncFailureKind::Protocol,
-            );
-        }
-    };
-    let raw = match fetch_imap_message_content(request).await {
-        Ok(raw) => raw,
+    )
+    .await
+    {
+        Ok(cached) => cached,
         Err(failure) => {
             return content_fetch_failure(
                 AccountWorkflowStage::FetchInbox,
                 map_fetch_failure(failure),
             );
+        }
+    };
+    let raw = if let Some(raw) = cached {
+        raw
+    } else {
+        let secret = match load_credential(&credentials, &configuration.credential_key).await {
+            Ok(secret) => secret,
+            Err(outcome) => return content_outcome_from_sync(outcome),
+        };
+        let request = match ImapMessageContentFetchRequest::new(
+            &configuration.imap_host,
+            configuration.imap_port,
+            &configuration.login_name,
+            secret,
+            target.uid_validity,
+            target.uid,
+        ) {
+            Ok(request) => request,
+            Err(_) => {
+                return content_fetch_failure(
+                    AccountWorkflowStage::FetchInbox,
+                    InboxSyncFailureKind::Protocol,
+                );
+            }
+        };
+        match fetch_imap_message_content(request).await {
+            Ok(raw) => raw,
+            Err(failure) => {
+                return content_fetch_failure(
+                    AccountWorkflowStage::FetchInbox,
+                    map_fetch_failure(failure),
+                );
+            }
         }
     };
     let staging = match ContentStaging::open(content_root) {
@@ -194,9 +214,6 @@ async fn run_message_content_fetch(
             };
         }
         Err(_) => return FetchMessageContentOutcome::DatabaseClosed,
-    }
-    if !collect_files(&database, &staging).await {
-        return FetchMessageContentOutcome::DatabaseClosed;
     }
     FetchMessageContentOutcome::Fetched {
         account_id,
@@ -473,14 +490,6 @@ async fn run_inbox_sync(
             uid_validity,
         )
         .expect("a validated IMAP configuration remains valid for IDLE"),
-    }
-}
-
-async fn collect_files(database: &DatabaseClient, staging: &Arc<ContentStaging>) -> bool {
-    match database.try_run_file_gc(staging, FILE_GC_LIMIT) {
-        Ok(receiver) => receiver.await.is_ok(),
-        Err(DatabaseSubmitError::Busy) => true,
-        Err(DatabaseSubmitError::Closed) => false,
     }
 }
 

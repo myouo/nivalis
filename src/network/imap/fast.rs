@@ -60,6 +60,7 @@ pub(super) struct ProtocolSession {
     read_buffer: Box<[u8]>,
     capabilities: CapabilitySet,
     next_tag: u32,
+    pending_idle_completion: Option<ProtocolTag>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,12 +136,8 @@ impl ProtocolSession {
                     match self.read_response_or_cancel(deadline, cancellation).await? {
                         IdleRead::Response(response) => Ok(response),
                         IdleRead::Cancelled => {
-                            let changed = self.finish_idle(tag, false).await?;
-                            return Ok(if changed {
-                                ProtocolIdleOutcome::Changed
-                            } else {
-                                ProtocolIdleOutcome::Cancelled
-                            });
+                            self.defer_idle_finish(tag).await?;
+                            return Ok(ProtocolIdleOutcome::Cancelled);
                         }
                     }
                 }
@@ -232,7 +229,19 @@ impl ProtocolSession {
                 .decode(&mut self.input)
                 .map_err(map_protocol_error)?
             {
-                DecodeStatus::Complete(response) => return Ok(response),
+                DecodeStatus::Complete(response) => {
+                    if let Some(pending) = self.pending_idle_completion.as_ref()
+                        && let Response::Tagged { tag, status, .. } = &response
+                        && pending.matches(tag)
+                    {
+                        if *status != mail_protocol_imap::Status::Ok {
+                            return Err(ImapInboxFetchFailure::Protocol);
+                        }
+                        self.pending_idle_completion = None;
+                        continue;
+                    }
+                    return Ok(response);
+                }
                 DecodeStatus::Incomplete => {}
             }
             let read = match timeout_at(deadline, self.io.read(&mut self.read_buffer)).await {
@@ -372,6 +381,19 @@ impl ProtocolSession {
         }
     }
 
+    async fn defer_idle_finish(&mut self, tag: ProtocolTag) -> Result<(), ImapInboxFetchFailure> {
+        if self.pending_idle_completion.is_some() {
+            return Err(ImapInboxFetchFailure::Protocol);
+        }
+        let deadline = Instant::now() + IDLE_FINISH_TIMEOUT;
+        self.write_wire(b"DONE\r\n", deadline).await?;
+        // Do not wait a network round trip for the tagged IDLE completion.
+        // The next foreground command is safely pipelined behind DONE, and
+        // read_response consumes this one outstanding completion first.
+        self.pending_idle_completion = Some(tag);
+        Ok(())
+    }
+
     async fn read_response_or_cancel(
         &mut self,
         deadline: Instant,
@@ -441,6 +463,54 @@ pub(super) async fn open_protocol_session(
     deadline: Instant,
     limits: InboxFetchLimits,
 ) -> Result<ProtocolSession, ImapInboxFetchFailure> {
+    let (mut session, preauthenticated) =
+        connect_protocol_session(host, port, connector, deadline, limits).await?;
+    if !preauthenticated {
+        session
+            .login(login.as_bytes(), secret.expose(), deadline)
+            .await?;
+    }
+    if session.capabilities.is_empty() {
+        session.load_capabilities(deadline).await?;
+    }
+    session.require_imap_capability()?;
+    #[cfg(feature = "bench-harness")]
+    super::record_protocol_session_open();
+    Ok(session)
+}
+
+pub(super) async fn open_protocol_inbox_session(
+    host: &str,
+    port: u16,
+    login: &str,
+    secret: &Secret,
+    connector: TlsConnector,
+    deadline: Instant,
+    limits: InboxFetchLimits,
+) -> Result<(ProtocolSession, ProtocolMailbox), ImapInboxFetchFailure> {
+    let (mut session, preauthenticated) =
+        connect_protocol_session(host, port, connector, deadline, limits).await?;
+    let mailbox = session
+        .authenticate_and_examine(
+            login.as_bytes(),
+            secret.expose(),
+            preauthenticated,
+            deadline,
+        )
+        .await?;
+    session.require_imap_capability()?;
+    #[cfg(feature = "bench-harness")]
+    super::record_protocol_session_open();
+    Ok((session, mailbox))
+}
+
+async fn connect_protocol_session(
+    host: &str,
+    port: u16,
+    connector: TlsConnector,
+    deadline: Instant,
+    limits: InboxFetchLimits,
+) -> Result<(ProtocolSession, bool), ImapInboxFetchFailure> {
     let server_name =
         ServerName::try_from(host.to_owned()).map_err(|_| ImapInboxFetchFailure::Protocol)?;
     let tcp = match timeout_at(deadline, TcpStream::connect((host, port))).await {
@@ -472,7 +542,9 @@ pub(super) async fn open_protocol_session(
         // Metadata sessions are cached and reused by the on-demand body path.
         // The operation-specific checks below the codec retain the stricter
         // per-message publication ceiling.
-        limits.max_page_literal_bytes,
+        limits
+            .max_page_literal_bytes
+            .max(super::MAX_METADATA_HEADER_BYTES),
         limits.max_server_bytes,
         256,
     );
@@ -483,27 +555,129 @@ pub(super) async fn open_protocol_session(
         read_buffer: vec![0_u8; READ_CHUNK_BYTES].into_boxed_slice(),
         capabilities: CapabilitySet::new(),
         next_tag: 1,
+        pending_idle_completion: None,
     };
     let preauthenticated = session.read_greeting(deadline).await?;
-    if !preauthenticated {
-        session
-            .login(login.as_bytes(), secret.expose(), deadline)
-            .await?;
-    }
-    if session.capabilities.is_empty() {
-        session.load_capabilities(deadline).await?;
-    }
-    if !session.capabilities.contains(&Capability::Imap4Rev1)
-        && !session.capabilities.contains(&Capability::Imap4Rev2)
-    {
-        return Err(ImapInboxFetchFailure::Protocol);
-    }
-    #[cfg(feature = "bench-harness")]
-    super::record_protocol_session_open();
-    Ok(session)
+    Ok((session, preauthenticated))
 }
 
 impl ProtocolSession {
+    fn require_imap_capability(&self) -> Result<(), ImapInboxFetchFailure> {
+        if self.capabilities.contains(&Capability::Imap4Rev1)
+            || self.capabilities.contains(&Capability::Imap4Rev2)
+        {
+            Ok(())
+        } else {
+            Err(ImapInboxFetchFailure::Protocol)
+        }
+    }
+
+    async fn authenticate_and_examine(
+        &mut self,
+        login: &[u8],
+        secret: &[u8],
+        preauthenticated: bool,
+        deadline: Instant,
+    ) -> Result<ProtocolMailbox, ImapInboxFetchFailure> {
+        let login_tag = if preauthenticated {
+            None
+        } else {
+            Some(self.send_login(login, secret, deadline).await?)
+        };
+        let capability_tag = if preauthenticated && self.capabilities.is_empty() {
+            Some(self.send_command(b"CAPABILITY", deadline).await?)
+        } else {
+            None
+        };
+        let examine = if self.supports_condstore() {
+            b"EXAMINE INBOX (CONDSTORE)".as_slice()
+        } else {
+            b"EXAMINE INBOX".as_slice()
+        };
+        let examine_tag = self.send_command(examine, deadline).await?;
+
+        let mut login_done = login_tag.is_none();
+        let mut capability_done = capability_tag.is_none();
+        let mut examine_done = false;
+        let mut mailbox = ProtocolMailbox::default();
+        while !(login_done && capability_done && examine_done) {
+            let response = self.read_response(deadline).await?;
+            match &response {
+                Response::Tagged { tag, status, .. }
+                    if login_tag
+                        .as_ref()
+                        .is_some_and(|expected| expected.matches(tag)) =>
+                {
+                    self.merge_capability_response(&response)?;
+                    match status {
+                        mail_protocol_imap::Status::Ok => login_done = true,
+                        mail_protocol_imap::Status::No => {
+                            return Err(ImapInboxFetchFailure::Authentication);
+                        }
+                        _ => return Err(ImapInboxFetchFailure::Protocol),
+                    }
+                }
+                Response::Tagged { tag, status, .. }
+                    if capability_tag
+                        .as_ref()
+                        .is_some_and(|expected| expected.matches(tag)) =>
+                {
+                    if *status != mail_protocol_imap::Status::Ok {
+                        return Err(ImapInboxFetchFailure::Protocol);
+                    }
+                    capability_done = true;
+                }
+                Response::Tagged { tag, status, .. } if examine_tag.matches(tag) => {
+                    if *status != mail_protocol_imap::Status::Ok {
+                        return Err(match status {
+                            mail_protocol_imap::Status::No => ImapInboxFetchFailure::Permission,
+                            _ => ImapInboxFetchFailure::Protocol,
+                        });
+                    }
+                    merge_response_code(&response, &mut mailbox)?;
+                    examine_done = true;
+                }
+                Response::Tagged { .. } => return Err(ImapInboxFetchFailure::Protocol),
+                _ => {
+                    self.merge_capability_response(&response)?;
+                    match parse_untagged(&response).map_err(map_protocol_error)? {
+                        Some(UntaggedData::Exists(exists)) => mailbox.exists = exists,
+                        Some(UntaggedData::Status(status)) => {
+                            if status.kind == StatusKind::Bye {
+                                return Err(ImapInboxFetchFailure::Offline);
+                            }
+                            merge_status_code(status.code, &mut mailbox)?;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if self.capabilities.is_empty() {
+            self.load_capabilities(deadline).await?;
+        }
+        Ok(mailbox)
+    }
+
+    async fn send_login(
+        &mut self,
+        login: &[u8],
+        secret: &[u8],
+        deadline: Instant,
+    ) -> Result<ProtocolTag, ImapInboxFetchFailure> {
+        let login = quote_astring(login)?;
+        let mut password = quote_astring(secret)?;
+        let mut command = Vec::with_capacity(login.len() + password.len() + 7);
+        command.extend_from_slice(b"LOGIN ");
+        command.extend_from_slice(&login);
+        command.push(b' ');
+        command.extend_from_slice(&password);
+        let result = self.send_command(&command, deadline).await;
+        command.zeroize();
+        password.zeroize();
+        result
+    }
+
     async fn read_greeting(&mut self, deadline: Instant) -> Result<bool, ImapInboxFetchFailure> {
         let response = self.read_response(deadline).await?;
         let Some(UntaggedData::Status(status)) =
@@ -531,17 +705,7 @@ impl ProtocolSession {
         secret: &[u8],
         deadline: Instant,
     ) -> Result<(), ImapInboxFetchFailure> {
-        let login = quote_astring(login)?;
-        let mut password = quote_astring(secret)?;
-        let mut command = Vec::with_capacity(login.len() + password.len() + 7);
-        command.extend_from_slice(b"LOGIN ");
-        command.extend_from_slice(&login);
-        command.push(b' ');
-        command.extend_from_slice(&password);
-        let send_result = self.send_command(&command, deadline).await;
-        command.zeroize();
-        password.zeroize();
-        let tag = send_result?;
+        let tag = self.send_login(login, secret, deadline).await?;
         loop {
             let response = self.read_response(deadline).await?;
             match &response {

@@ -303,6 +303,9 @@ impl<'a> Iterator for FetchAddressIter<'a> {
         let parsed =
             parse_address(self.remaining, 0).expect("FetchAddressList stores validated addresses");
         self.remaining = &self.remaining[parsed.end..];
+        if self.remaining.starts_with(b" (") {
+            self.remaining = &self.remaining[1..];
+        }
         Some(parsed.address)
     }
 }
@@ -539,6 +542,7 @@ fn parse_address_list(input: &[u8], start: usize) -> Result<usize, ProtocolError
         cursor = parse_address(input, cursor)?.end;
         match input.get(cursor) {
             Some(b'(') => {}
+            Some(b' ') if input.get(cursor + 1) == Some(&b'(') => cursor += 1,
             Some(b')') => return Ok(cursor + 1),
             None => return Err(invalid("unterminated IMAP address list").at(cursor)),
             _ => return Err(invalid("IMAP envelope address separator").at(cursor)),

@@ -4,7 +4,7 @@ Measured on 2026-07-21. Latencies below are warm-cache Criterion intervals from 
 
 | Workload | 10,000 messages | 100,000 messages |
 | --- | ---: | ---: |
-| First screen, 20 complete summary rows | 96.2–96.5µs | 99.6–100.5µs |
+| First screen, 50 complete summary rows | 142.1–142.6µs | 148.2–148.7µs |
 | Recent 50 complete summary rows operable | 142.1–142.6µs | 148.2–148.7µs |
 | Cached 64KiB body | 24.1–25.0µs | 23.7–23.8µs |
 | Sender search | 56.1–56.5µs | 495.1–497.2µs |
@@ -18,19 +18,22 @@ These numbers isolate the local data path; they do not include process launch, r
 
 ## Real-account local-first path
 
-The release `bench-harness` was run against a disposable copy of a real 1,154-message account database. The newest message's cached content row was removed only from the copy so the run had to cross the production on-demand BODY fetch. The normal account database and content directory were not modified.
+The release `bench-harness` was run against a disposable, empty-index copy of a real account database. The provider reported 1,161 remote messages; the run built the newest 50-row local index and then opened the newest message through the production on-demand BODY path. The normal account database and content directory were not modified.
 
 | Gate | Result |
 | --- | ---: |
-| Harness install to locally operable first screen | 220ms |
-| Manual incremental metadata sync through database and UI commit | 2,165ms |
-| Click to fetched, imported, and displayed body | 977ms |
-| Complete metadata + body scenario | 3,142ms |
-| New authenticated IMAP sessions | 1 |
+| Harness install to locally operable first screen | 141ms |
+| Ten cold TLS/LOGIN/EXAMINE sessions opened concurrently | 1,623ms |
+| Newest 50 metadata rows fetched over ten selected sessions | 1,332ms |
+| Cold 50-row sync through database and UI commit | 3,183ms |
+| Uncached 31,736-byte BODY network fetch | 731ms |
+| Click to fetched, imported, and displayed body | 777ms |
+| Complete cold metadata + body scenario | 3,960ms |
+| New authenticated IMAP sessions | 10 |
 | Foreground selected-session reuse | 1 |
 | IDLE handoffs cancelled cleanly | 1 |
 
-The first-screen clock begins when the benchmark hook is installed immediately before the native event loop, so it includes local controller/database/UI projection but not binary loading or `AppWindow` construction. Public-network timings naturally vary with the provider. The session counters are the important protocol invariant: metadata, IDLE, and foreground body used one authenticated selected session; the foreground request did not pay a second TCP/TLS/LOGIN handshake.
+The first-screen clock begins when the benchmark hook is installed immediately before the native event loop, so it includes local controller/database/UI projection but not binary loading or `AppWindow` construction. Public-network timings naturally vary with the provider. The cold pool and metadata phases are reported separately: the 50-message remote phase is at the 1.3-second target boundary, while a brand-new pool still pays the provider's 1.6-second connection floor in the background. The UI never waits for either phase. The foreground BODY request reuses the most recently synchronized selected session and does not pay another TCP/TLS/LOGIN handshake.
 
 ## Resource bounds
 
@@ -42,15 +45,17 @@ The first-screen clock begins when the benchmark hook is installed immediately b
 | Per-account Tokio spawned tasks | 0; account and IDLE futures are polled inline |
 | Simultaneous account workflows | 1 global foreground/background workflow |
 | IDLE watches | 10 global maximum |
-| Selected IMAP sessions retained | 10 global maximum |
+| Selected IMAP sessions retained in the warm cache | 10 global maximum and 10 per active account |
+| Transient selected sessions in one metadata operation | 10 global maximum |
+| Combined cache + IDLE + active-operation selected sessions | 30 global maximum |
 | Configured plaintext buffers per retained IMAP session | 32KiB |
-| Configured plaintext buffers for ten IDLE sessions | 320KiB |
+| Configured plaintext buffers at the 30-session upper bound | 960KiB |
 | SQLite connections | 2 global: writer + UI reader |
 | SQLite configured page caches | 1MiB writer + 512KiB reader |
 | SQLite worker threads | 0 |
 | Search migration batch | 16 messages per idle transaction |
 
-The 32KiB connection figure covers Nivalis's two fixed 16KiB plaintext buffers. TCP, Rustls, allocator, kernel socket, certificate, and server-dependent state are additional and must be assessed with whole-process RSS/PSS measurements. A metadata page may temporarily open one secondary IMAP connection for a balanced batch, but it is logged out rather than retained. Foreground body and manual-sync work cancel the matching IDLE command, complete `DONE`, and reclaim the already authenticated/selected session instead of keeping a second warm connection.
+The 32KiB connection figure covers Nivalis's two fixed 16KiB plaintext buffers. TCP, Rustls, allocator, kernel socket, certificate, and server-dependent state are additional and must be assessed with whole-process RSS/PSS measurements. A 24- to 50-message metadata page may use up to ten selected sessions, splitting 50 messages into ten five-message ranges. Those sessions are retained in the global LRU pool so a waterfall history request can use the 1.3-second warm path; work below 24 messages remains on one session. Foreground body and manual-sync work cancel the matching IDLE command and reclaim an authenticated selected session, with BODY reads preferring the most recently synchronized primary.
 
 Disconnected IDLE sessions are dropped, successful/time-limited/cancelled sessions return to the bounded cache, and every ready watch is removed with `swap_remove`. Tests fill all ten watch slots and exercise the disconnect path, so reconnect attempts cannot grow the watch vector or session cache.
 

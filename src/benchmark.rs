@@ -1737,6 +1737,10 @@ fn install_existing_account_sync(
                             return;
                         }
                         if !ui.get_account_operation_error().is_empty() {
+                            eprintln!(
+                                "NIVALIS_PERF manual_sync_failure={}",
+                                ui.get_account_operation_error()
+                            );
                             fail_existing_account_sync(&ui, &timer, "manual_sync_failed");
                             state.phase = ExistingAccountSyncPhase::Complete;
                             return;

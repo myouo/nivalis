@@ -1044,6 +1044,16 @@ impl Controller {
     }
 
     fn fetch_message_content(self: &Rc<Self>, message_id: MessageId, account_id: i64) {
+        // Reading a message is P0 work. Closing the history reply lets the
+        // account driver cancel that waterfall request on its next poll instead
+        // of making the reader wait behind up to 50 remote headers.
+        if let Some(task) = self.history_task.borrow_mut().take() {
+            task.abort();
+            self.remote_append_pending.set(false);
+            if let Some(ui) = self.ui.upgrade() {
+                ui.set_mailbox_loading_more(false);
+            }
+        }
         {
             let mut task = self.content_task.borrow_mut();
             if task.as_ref().is_some_and(|task| !task.is_finished()) {
@@ -1112,7 +1122,6 @@ impl Controller {
                             ui.set_status_text("Opening downloaded body from local cache".into());
                         }
                         controller.refresh_selected_detail_from_cache(message_id);
-                        controller.refresh_after_historical_sync();
                     }
                     Err(failure) => controller
                         .finish_content_fetch_error(message_id, account_operation_error(failure)),
@@ -2613,8 +2622,15 @@ impl Controller {
                             ui.set_status_text(feedback.clone().into());
                             show_snackbar(&ui, &feedback, false, &controller.snackbar_timer);
                         }
+                        // A foreground sync has exactly one completion and should
+                        // become visible immediately. The 50ms coalescing window
+                        // remains reserved for bursty background IDLE events.
+                        if historical {
+                            controller.refresh_after_historical_sync();
+                        } else {
+                            controller.refresh_after_mutation();
+                        }
                         controller.issue_accounts();
-                        controller.schedule_sync_refresh(historical);
                     }
                     Err(failure) => {
                         controller.finish_sync_with_error(account_operation_error(failure))

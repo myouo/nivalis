@@ -106,7 +106,7 @@ The credential boundary stores refresh tokens and app passwords in the operating
 
 Memory is measured from stripped release builds after startup and after the bounded workloads that the current implementation supports. Provider-enabled milestones must additionally pass a representative multi-account sync/open/close cycle before release. `memory-report.md` defines the Linux procedure and records which execution paths each result actually covers.
 
-The last full release-RSS baseline predates schema v15: revision `24d616f8b947965acc32998438608d7714eaaf19` peaked at 38,760KiB empty-idle and 42,856KiB for the loopback account-send lifecycle. It remains a regression reference, not evidence for the new two-connection/IDLE path. Current local and real-account latency measurements are recorded in `docs/performance.md`; a ten-live-account RSS/PSS soak remains an explicit release measurement gap.
+The last full release-RSS baseline predates schema v15: revision `24d616f8b947965acc32998438608d7714eaaf19` peaked at 38,760KiB empty-idle and 42,856KiB for the loopback account-send lifecycle. It remains a regression reference, not evidence for the current bounded metadata-pool/IDLE path. Current local and real-account latency measurements are recorded in `docs/performance.md`; a ten-live-account RSS/PSS soak remains an explicit release measurement gap.
 
 The release gates are:
 

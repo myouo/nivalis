@@ -1169,7 +1169,6 @@ pub(super) struct AccountWorkflows {
     scheduler: SyncScheduler,
     auto_sync: AutoSyncState,
     background_status: Option<AccountSyncStatus>,
-    history_prefetch: Option<(AccountId, AccountGeneration)>,
     idle_watches: Vec<IdleWatch>,
 }
 
@@ -1213,7 +1212,6 @@ impl AccountWorkflows {
                 AutoSyncState::Disabled
             },
             background_status: None,
-            history_prefetch: None,
             idle_watches: Vec::with_capacity(MAX_IDLE_WATCHES),
         }
     }
@@ -1546,21 +1544,10 @@ impl AccountWorkflows {
                 Poll::Ready(Ok(TaskProgress::Finished(outcome))) => {
                     let mut active = self.active.take().expect("active account task was polled");
                     let reload_targets = outcome_changes_sync_targets(&outcome);
-                    let history_prefetch = match &outcome {
-                        AccountWorkflowOutcome::InboxSynced {
-                            account_id,
-                            generation,
-                            has_more: true,
-                            bootstrap: true,
-                            ..
-                        } if active.reply.is_none() => Some((*account_id, *generation)),
-                        _ => None,
-                    };
                     let idle_watch = match &outcome {
                         AccountWorkflowOutcome::InboxSynced {
                             account_id,
                             generation,
-                            bootstrap: false,
                             idle,
                             ..
                         } => Some((*account_id, *generation, idle.clone())),
@@ -1574,9 +1561,6 @@ impl AccountWorkflows {
                             self.background_status =
                                 Some(project_background_sync(outcome.clone(), active.identity));
                         }
-                    }
-                    if history_prefetch.is_some() {
-                        self.history_prefetch = history_prefetch;
                     }
                     if let Some((account_id, generation, request)) = idle_watch {
                         self.register_idle_watch(account_id, generation, request);
@@ -1810,37 +1794,6 @@ impl AccountWorkflows {
         &mut self,
         context: &mut Context<'_>,
     ) -> Poll<Result<(), AccountDriverError>> {
-        if let Some((account_id, generation)) = self.history_prefetch {
-            let Some(content_root) = self.content_root.clone() else {
-                self.history_prefetch = None;
-                return Poll::Pending;
-            };
-            match self
-                .scheduler
-                .take_manual(account_id, generation, Instant::now())
-            {
-                Ok(Some(token)) => {
-                    self.history_prefetch = None;
-                    self.active = Some(ActiveTask {
-                        identity: Identity::new(account_id, generation),
-                        reply: None,
-                        sync_token: Some(token),
-                        state: ActiveTaskState::Syncing(start_inbox_sync(
-                            self.database.clone(),
-                            self.credentials.clone(),
-                            self.inbox_fetch_probe,
-                            content_root,
-                            account_id,
-                            generation,
-                            true,
-                        )),
-                    });
-                    return Poll::Ready(Ok(()));
-                }
-                Ok(None) => return Poll::Pending,
-                Err(_) => return Poll::Ready(Err(AccountDriverError::WorkflowRejected)),
-            }
-        }
         match &mut self.auto_sync {
             AutoSyncState::Disabled => Poll::Pending,
             AutoSyncState::SubmitTargets => match self.database.try_load_sync_targets() {

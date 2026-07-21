@@ -45,6 +45,32 @@ fn parses_rfc_fetch_response_without_copying() {
 }
 
 #[test]
+fn accepts_single_space_between_provider_envelope_addresses() {
+    let wire = Bytes::from_static(
+        b"(ENVELOPE (NIL NIL ((NIL NIL \"one\" \"example.test\") (NIL NIL \"two\" \"example.test\")) NIL NIL NIL NIL NIL NIL NIL))",
+    );
+    let parsed = FetchResponse::parse(&wire).unwrap();
+    let FetchResponseItem::Envelope(envelope) = parsed.items().next().unwrap() else {
+        panic!("ENVELOPE expected");
+    };
+    let mailboxes = envelope
+        .from()
+        .iter()
+        .map(|address| address.mailbox.decoded().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(mailboxes[0].as_ref(), b"one");
+    assert_eq!(mailboxes[1].as_ref(), b"two");
+
+    let malformed = Bytes::from_static(
+        b"(ENVELOPE (NIL NIL ((NIL NIL \"one\" \"example.test\")  (NIL NIL \"two\" \"example.test\")) NIL NIL NIL NIL NIL NIL NIL))",
+    );
+    assert_eq!(
+        FetchResponse::parse(&malformed).unwrap_err().kind(),
+        ErrorKind::InvalidSyntax
+    );
+}
+
+#[test]
 fn parses_rev1_rfc822_response_items_as_nstrings() {
     let wire = Bytes::from_static(
         b"(RFC822 {4}\r\nbody RFC822.HEADER NIL RFC822.TEXT \"text\" X-RAW atom)",
