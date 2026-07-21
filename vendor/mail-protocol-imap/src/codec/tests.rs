@@ -116,7 +116,11 @@ fn response_round_trip() {
 fn response_decoder_enforces_status_separators_and_semantics_atomically() {
     for valid in [
         b"A1 OK \r\n".as_slice(),
+        b"A1 OK\r\n",
         b"* OK \r\n",
+        b"* OK\r\n",
+        b"* OK [UNSEEN 3212]\r\n",
+        b"A2 OK [READ-ONLY]\r\n",
         b"* OK  [ALERT] is plain text\r\n",
     ] {
         let mut input = BytesMut::from(valid);
@@ -128,10 +132,8 @@ fn response_decoder_enforces_status_separators_and_semantics_atomically() {
     }
 
     for invalid in [
-        b"A1 OK\r\n".as_slice(),
-        b"A1\tOK done\r\n",
+        b"A1\tOK done\r\n".as_slice(),
         b"A1 OK\ttext\r\n",
-        b"* OK\r\n",
         b"* ID  NIL\r\n",
         b"* CAPABILITY IDLE\r\n",
         b"* OK [UIDNEXT 0] bad\r\n",
@@ -150,18 +152,16 @@ fn response_decoder_enforces_status_separators_and_semantics_atomically() {
     ResponseEncoder.encode(&empty, &mut output).unwrap();
     assert_eq!(output.as_ref(), b"A1 OK \r\n");
 
-    let malformed_code = Response::Tagged {
+    let omitted_text_code = Response::Tagged {
         tag: Bytes::from_static(b"A2"),
         status: Status::No,
         information: Bytes::from_static(b"[ALERT]"),
     };
-    let mut output = BytesMut::from(&b"prefix"[..]);
-    assert!(
-        ResponseEncoder
-            .encode(&malformed_code, &mut output)
-            .is_err()
-    );
-    assert_eq!(output.as_ref(), b"prefix");
+    let mut output = BytesMut::new();
+    ResponseEncoder
+        .encode(&omitted_text_code, &mut output)
+        .unwrap();
+    assert_eq!(output.as_ref(), b"A2 NO [ALERT]\r\n");
 }
 
 #[test]

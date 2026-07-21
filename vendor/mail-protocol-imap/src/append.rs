@@ -9,6 +9,7 @@ use crate::{
 };
 
 pub(crate) const DATE_TIME_LEN: usize = 28;
+pub(crate) const SINGLE_DIGIT_DAY_DATE_TIME_LEN: usize = DATE_TIME_LEN - 1;
 
 /// Validated RFC 9051 arguments following an APPEND mailbox.
 ///
@@ -294,6 +295,51 @@ pub(crate) fn validate_date_time(input: &[u8]) -> Result<(), ProtocolError> {
     }
 }
 
+pub(crate) fn server_date_time_len(input: &[u8]) -> Result<usize, ProtocolError> {
+    if validate_date_time(input).is_ok() {
+        return Ok(DATE_TIME_LEN);
+    }
+    let Some(value) = input.get(..SINGLE_DIGIT_DAY_DATE_TIME_LEN) else {
+        return Err(invalid("truncated IMAP server date-time"));
+    };
+    let month_valid = [
+        b"Jan".as_slice(),
+        b"Feb",
+        b"Mar",
+        b"Apr",
+        b"May",
+        b"Jun",
+        b"Jul",
+        b"Aug",
+        b"Sep",
+        b"Oct",
+        b"Nov",
+        b"Dec",
+    ]
+    .iter()
+    .any(|month| value[3..6].eq_ignore_ascii_case(month));
+    let digit_positions = [1, 7, 8, 9, 10, 12, 13, 15, 16, 18, 19, 22, 23, 24, 25];
+    if value[0] != b'"'
+        || !value[1].is_ascii_digit()
+        || value[2] != b'-'
+        || !month_valid
+        || value[6] != b'-'
+        || value[11] != b' '
+        || value[14] != b':'
+        || value[17] != b':'
+        || value[20] != b' '
+        || !matches!(value[21], b'+' | b'-')
+        || value[26] != b'"'
+        || digit_positions
+            .iter()
+            .any(|position| !value[*position].is_ascii_digit())
+    {
+        Err(invalid("IMAP server date-time"))
+    } else {
+        Ok(SINGLE_DIGIT_DAY_DATE_TIME_LEN)
+    }
+}
+
 fn required_space(
     input: &[u8],
     cursor: usize,
@@ -384,6 +430,7 @@ mod tests {
             b"(\\) {1}\r\nx",
             b"(\\Seen)\t{1}\r\nx",
             b"\"17-Not-2026 12:34:56 +0800\" {1}\r\nx",
+            b"\"2-Jul-2026 08:40:30 +0800\" {1}\r\nx",
             b"\"17-Jul-2026 12:34:56 +0800\"  {1}\r\nx",
             b"\"17-Jul-2026 12:34:56 +0800\" \"x\"",
         ] {

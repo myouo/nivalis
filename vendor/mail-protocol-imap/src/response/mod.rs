@@ -326,13 +326,14 @@ fn parse_status_response(data: &Bytes, kind: StatusKind) -> Result<StatusRespons
 
 fn take_status_response_text<'a>(input: &'a [u8], name: &[u8]) -> Result<&'a [u8], ProtocolError> {
     let boundary = name.len();
-    if input.get(boundary) != Some(&b' ') {
-        return Err(ProtocolError::new(
+    match input.get(boundary) {
+        None => Ok(&input[input.len()..]),
+        Some(b' ') => Ok(&input[boundary + 1..]),
+        Some(_) => Err(ProtocolError::new(
             ErrorKind::InvalidSyntax,
             "IMAP status response text separator",
-        ));
+        )),
     }
-    Ok(&input[boundary + 1..])
 }
 
 fn parse_status_kind(value: &[u8]) -> Option<StatusKind> {
@@ -901,7 +902,7 @@ mod tests {
     }
 
     #[test]
-    fn bracketed_code_requires_resp_text_space_and_exact_code_separator() {
+    fn bracketed_code_accepts_omitted_text_but_requires_exact_separator() {
         let empty_text = Response::Tagged {
             tag: Bytes::from_static(b"A1"),
             status: crate::Status::Ok,
@@ -909,6 +910,16 @@ mod tests {
         };
         assert_eq!(
             empty_text.parsed_response_code().unwrap(),
+            Some(ResponseCode::Alert)
+        );
+
+        let omitted_text = Response::Tagged {
+            tag: Bytes::from_static(b"A1"),
+            status: crate::Status::Ok,
+            information: Bytes::from_static(b"[ALERT]"),
+        };
+        assert_eq!(
+            omitted_text.parsed_response_code().unwrap(),
             Some(ResponseCode::Alert)
         );
 
@@ -924,8 +935,7 @@ mod tests {
         ));
 
         for invalid in [
-            b"[ALERT]".as_slice(),
-            b"[ALERT]\ttext",
+            b"[ALERT]\ttext".as_slice(),
             b"[UIDNEXT\t1] text",
             b"[UIDNEXT  1] text",
             b"[UIDNEXT ] text",
@@ -947,8 +957,37 @@ mod tests {
                 if text.as_ref() == b" [ALERT] text"
         ));
 
-        for invalid in [b"OK".as_slice(), b"OK\t[ALERT] text"] {
+        let no_text = parse_untagged(&untagged(b"OK")).unwrap().unwrap();
+        assert!(matches!(
+            no_text,
+            UntaggedData::Status(StatusResponse { code: None, text, .. })
+                if text.is_empty()
+        ));
+
+        for invalid in [b"OK\t[ALERT] text".as_slice()] {
             assert!(parse_untagged(&untagged(invalid)).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn accepts_commercial_server_status_codes_without_human_text() {
+        for (wire, expected) in [
+            (b"OK [UNSEEN 3212]".as_slice(), ResponseCode::Unseen(3212)),
+            (
+                b"OK [UIDVALIDITY 1677043120]",
+                ResponseCode::UidValidity(1_677_043_120),
+            ),
+            (b"OK [UIDNEXT 4470]", ResponseCode::UidNext(4470)),
+            (b"OK [READ-ONLY]", ResponseCode::ReadOnly),
+        ] {
+            assert!(matches!(
+                parse_untagged(&untagged(wire)).unwrap(),
+                Some(UntaggedData::Status(StatusResponse {
+                    code: Some(code),
+                    text,
+                    ..
+                })) if code == expected && text.is_empty()
+            ));
         }
     }
 

@@ -163,24 +163,21 @@ pub(super) fn parse_response(frame: &Bytes) -> Result<Response, ProtocolError> {
     let tag = &content[..tag_end];
     let after_tag = &content[tag_end + 1..];
     validate_tag(tag)?;
-    let Some(status_end) = after_tag
+    let status_end = after_tag
         .iter()
-        .position(|byte| matches!(byte, b' ' | b'\t'))
-    else {
-        return Err(ProtocolError::new(
-            ErrorKind::InvalidSyntax,
-            "IMAP tagged response text separator",
-        ));
+        .position(|byte| matches!(byte, b' ' | b'\t'));
+    let (status, information) = if let Some(status_end) = status_end {
+        if status_end == 0 || after_tag[status_end] != b' ' {
+            return Err(ProtocolError::new(
+                ErrorKind::InvalidSyntax,
+                "IMAP tagged response text separator",
+            )
+            .at(tag_end + 1 + status_end));
+        }
+        (&after_tag[..status_end], &after_tag[status_end + 1..])
+    } else {
+        (after_tag, &after_tag[after_tag.len()..])
     };
-    if status_end == 0 || after_tag[status_end] != b' ' {
-        return Err(ProtocolError::new(
-            ErrorKind::InvalidSyntax,
-            "IMAP tagged response text separator",
-        )
-        .at(tag_end + 1 + status_end));
-    }
-    let status = &after_tag[..status_end];
-    let information = &after_tag[status_end + 1..];
     let status = if eq_ascii(status, b"OK") {
         Status::Ok
     } else if eq_ascii(status, b"NO") {

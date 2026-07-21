@@ -45,6 +45,20 @@ fn parses_rfc_fetch_response_without_copying() {
 }
 
 #[test]
+fn accepts_commercial_server_internal_date_with_an_unpadded_day() {
+    let wire =
+        Bytes::from_static(b"(INTERNALDATE \"2-Jul-2026 08:40:30 +0800\" UID 7 RFC822.SIZE 42)");
+    let parsed = FetchResponse::parse(&wire).unwrap();
+    let items = parsed.items().collect::<Vec<_>>();
+    assert_eq!(
+        items[0],
+        FetchResponseItem::InternalDate(b"\"2-Jul-2026 08:40:30 +0800\"")
+    );
+    assert_eq!(items[1], FetchResponseItem::Uid(7));
+    assert_eq!(items[2], FetchResponseItem::Rfc822Size(42));
+}
+
+#[test]
 fn accepts_single_space_between_provider_envelope_addresses() {
     let wire = Bytes::from_static(
         b"(ENVELOPE (NIL NIL ((NIL NIL \"one\" \"example.test\") (NIL NIL \"two\" \"example.test\")) NIL NIL NIL NIL NIL NIL NIL))",

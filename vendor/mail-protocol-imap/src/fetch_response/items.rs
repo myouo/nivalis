@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use mail_protocol_core::ProtocolError;
 
-use crate::append::{DATE_TIME_LEN, validate_date_time};
+use crate::append::server_date_time_len;
 use crate::fetch::{FetchSection, parse_section};
 
 use super::body::{BodyStructure, parse_body};
@@ -262,13 +262,14 @@ fn parse_item(input: &[u8], max_depth: usize) -> Result<ParsedItem<'_>, Protocol
         let envelope = parse_envelope(input, value_start)?;
         (FetchResponseItem::Envelope(envelope.value), envelope.end, 0)
     } else if name.eq_ignore_ascii_case(b"INTERNALDATE") {
+        let date_time_len = server_date_time_len(&input[value_start..])
+            .map_err(|error| shift_error(error, value_start))?;
         let end = value_start
-            .checked_add(DATE_TIME_LEN)
+            .checked_add(date_time_len)
             .ok_or_else(|| invalid("IMAP INTERNALDATE length"))?;
         let value = input
             .get(value_start..end)
             .ok_or_else(|| invalid("truncated IMAP INTERNALDATE").at(value_start))?;
-        validate_date_time(value).map_err(|error| shift_error(error, value_start))?;
         (FetchResponseItem::InternalDate(value), end, 0)
     } else if name.eq_ignore_ascii_case(b"RFC822") {
         let value = parse_nstring(input, value_start)?;

@@ -301,10 +301,11 @@ pub(crate) fn split_bracketed_response_text(input: &[u8]) -> Result<(&[u8], &[u8
     };
     let code = &input[1..close];
     require_non_empty(code, "IMAP response code")?;
-    if input.get(close + 1) != Some(&b' ') {
-        return Err(invalid("IMAP response-code text separator"));
+    match input.get(close + 1) {
+        None => Ok((code, &input[input.len()..])),
+        Some(b' ') => Ok((code, &input[close + 2..])),
+        Some(_) => Err(invalid("IMAP response-code text separator")),
     }
-    Ok((code, &input[close + 2..]))
 }
 
 fn encode_response_code(item: &ResponseCode, dst: &mut BytesMut) -> Result<(), ProtocolError> {

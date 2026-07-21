@@ -32,6 +32,7 @@ use super::account::{AccountWorkflowFailureKind, AccountWorkflowStage, InboxSync
 
 const MAX_SENDER_BYTES: usize = 320;
 const MAX_SUBJECT_BYTES: usize = 998;
+const MAX_INTERNAL_DATE_BYTES: usize = 64;
 
 pub(super) type ImapInboxFetchFuture =
     Pin<Box<dyn Future<Output = Result<ImapInboxPage, ImapInboxFetchFailure>> + 'static>>;
@@ -660,8 +661,38 @@ fn inbox_received_at(message: &ImapInboxMessage, fallback: i64) -> i64 {
 
 fn parse_received_at(value: &str) -> Option<i64> {
     DateTime::parse_rfc822(value)
+        .or_else(|| parse_imap_internal_date(value))
         .filter(DateTime::is_valid)
         .and_then(|date| date.to_timestamp().checked_mul(1_000))
+}
+
+fn parse_imap_internal_date(value: &str) -> Option<DateTime> {
+    let value = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(value);
+    if value.len() > MAX_INTERNAL_DATE_BYTES {
+        return None;
+    }
+    let (day, rest) = value.split_once('-')?;
+    let (month, tail) = rest.split_once('-')?;
+    if !(1..=2).contains(&day.len())
+        || !day.bytes().all(|byte| byte.is_ascii_digit())
+        || month.len() != 3
+        || !month.bytes().all(|byte| byte.is_ascii_alphabetic())
+    {
+        return None;
+    }
+    let mut normalized = String::with_capacity(value.len().saturating_add(1));
+    if day.len() == 1 {
+        normalized.push('0');
+    }
+    normalized.push_str(day);
+    normalized.push(' ');
+    normalized.push_str(month);
+    normalized.push(' ');
+    normalized.push_str(tail);
+    DateTime::parse_rfc822(&normalized)
 }
 
 fn bounded_sender_address(mailbox: &[u8], host: &[u8]) -> String {
@@ -850,6 +881,20 @@ first body v1\r\n";
         assert_eq!(
             inbox_received_at(&message, 0),
             parse_received_at("Tue, 01 Jul 2025 13:30:00 +0000").unwrap()
+        );
+
+        let commercial_internal_date = ImapInboxMessage {
+            internal_date: "2-Jul-2026 08:40:30 +0800".into(),
+            envelope: ImapInboxEnvelope::default(),
+            ..message
+        };
+        assert_eq!(
+            inbox_received_at(&commercial_internal_date, 0),
+            parse_received_at("Thu, 02 Jul 2026 08:40:30 +0800").unwrap()
+        );
+        assert_eq!(
+            parse_received_at("02-Jul-2026 08:40:30 +0800"),
+            parse_received_at("Thu, 02 Jul 2026 08:40:30 +0800")
         );
     }
 

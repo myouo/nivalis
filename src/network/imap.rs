@@ -1111,7 +1111,20 @@ async fn open_protocol_inbox_pool(
         "NIVALIS_PERF metadata_pool_open_elapsed_ms={}",
         pool_started.elapsed().as_millis()
     );
-    Ok((primary?, secondary))
+    resolve_pool_primary(primary, secondary)
+}
+
+fn resolve_pool_primary<T, E>(primary: Result<T, E>, secondary: Vec<T>) -> Result<(T, Vec<T>), E> {
+    match primary {
+        Ok(primary) => Ok((primary, secondary)),
+        Err(failure) => {
+            let mut secondary = secondary.into_iter();
+            let Some(promoted) = secondary.next() else {
+                return Err(failure);
+            };
+            Ok((promoted, secondary.collect()))
+        }
+    }
 }
 
 async fn fetch_canonical_inbox_inner(
@@ -3766,6 +3779,7 @@ mod inbox_fetch_tests {
         metadata_status: Option<&'static str>,
         extra_metadata: usize,
         omit_body_uid: bool,
+        omit_status_response_text: bool,
         stall_body: Option<oneshot::Sender<()>>,
     }
 
@@ -3779,6 +3793,7 @@ mod inbox_fetch_tests {
                 metadata_status: None,
                 extra_metadata: 0,
                 omit_body_uid: false,
+                omit_status_response_text: false,
                 stall_body: None,
             }
         }
@@ -3849,6 +3864,22 @@ mod inbox_fetch_tests {
         assert!(!primary.is_empty());
         assert!(!secondary.is_empty());
         assert_eq!(total(&primary), total(&secondary));
+    }
+
+    #[test]
+    fn metadata_pool_promotes_a_healthy_connection_when_the_primary_is_throttled() {
+        assert_eq!(
+            resolve_pool_primary::<_, &str>(Err("throttled"), vec![2, 3]),
+            Ok((2, vec![3]))
+        );
+        assert_eq!(
+            resolve_pool_primary::<_, &str>(Ok(1), vec![2, 3]),
+            Ok((1, vec![2, 3]))
+        );
+        assert_eq!(
+            resolve_pool_primary::<u8, _>(Err("offline"), Vec::new()),
+            Err("offline")
+        );
     }
 
     #[test]
@@ -4226,7 +4257,11 @@ mod inbox_fetch_tests {
         tagged(
             &mut stream,
             &login,
-            "OK [CAPABILITY IMAP4rev1] authenticated",
+            if plan.omit_status_response_text {
+                "OK [CAPABILITY IMAP4rev1]"
+            } else {
+                "OK [CAPABILITY IMAP4rev1] authenticated"
+            },
         )
         .await;
         let Some(examine) = read_command(&mut stream).await else {
@@ -4242,7 +4277,17 @@ mod inbox_fetch_tests {
         if let Some(uid_validity) = plan.uid_validity {
             stream
                 .get_mut()
-                .write_all(format!("* OK [UIDVALIDITY {uid_validity}] epoch\r\n").as_bytes())
+                .write_all(
+                    format!(
+                        "* OK [UIDVALIDITY {uid_validity}]{}\r\n",
+                        if plan.omit_status_response_text {
+                            ""
+                        } else {
+                            " epoch"
+                        }
+                    )
+                    .as_bytes(),
+                )
                 .await
                 .unwrap();
         }
@@ -4254,11 +4299,37 @@ mod inbox_fetch_tests {
         if !plan.omit_uid_next {
             stream
                 .get_mut()
-                .write_all(format!("* OK [UIDNEXT {uid_next}] next\r\n").as_bytes())
+                .write_all(
+                    format!(
+                        "* OK [UIDNEXT {uid_next}]{}\r\n",
+                        if plan.omit_status_response_text {
+                            ""
+                        } else {
+                            " next"
+                        }
+                    )
+                    .as_bytes(),
+                )
                 .await
                 .unwrap();
         }
-        tagged(&mut stream, &examine, "OK [READ-ONLY] selected").await;
+        if plan.omit_status_response_text {
+            stream
+                .get_mut()
+                .write_all(b"* OK [UNSEEN 1]\r\n")
+                .await
+                .unwrap();
+        }
+        tagged(
+            &mut stream,
+            &examine,
+            if plan.omit_status_response_text {
+                "OK [READ-ONLY]"
+            } else {
+                "OK [READ-ONLY] selected"
+            },
+        )
+        .await;
         let mut commands = vec![login, examine];
 
         let mut pending_metadata = None;
@@ -5133,6 +5204,30 @@ mod inbox_fetch_tests {
             assert_eq!(page.scanned_through_uid.unwrap().get(), 999);
             assert_eq!(page.next_uid, None);
             assert_eq!(finish(historical_empty).await.len(), 3);
+        });
+    }
+
+    #[test]
+    fn accepts_commercial_server_status_codes_without_descriptive_text() {
+        run_async(async {
+            let mut plan = ServerPlan::messages(vec![fixture(1, RAW_ONE)]);
+            plan.omit_status_response_text = true;
+            let server = spawn_server(plan).await;
+
+            let page = fetch_canonical_inbox_with_connector(
+                request(server.address.port(), None),
+                server.connector.clone(),
+                limits(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(page.uid_validity.get(), UID_VALIDITY);
+            assert_eq!(page.uid_next.get(), 2);
+            assert_eq!(page.messages.len(), 1);
+            assert_eq!(page.messages[0].uid.get(), 1);
+            finish(server).await;
         });
     }
 
