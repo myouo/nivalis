@@ -1,0 +1,25 @@
+[package]
+name = "nivalis-protocol-benchmarks"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[dependencies]
+bytes = "1.11"
+criterion = { version = "0.7.0", default-features = false }
+mail-protocol-core = { path = "../vendor/mail-protocol-core" }
+mail-protocol-imap = { path = "../vendor/mail-protocol-imap" }
+
+[[bench]]
+name = "imap_protocol"
+harness = false
+
+[profile.bench]
+opt-level = 3
+lto = false
+codegen-units = 16
+
+[workspace]
+members = ["."]
+resolver = "3"

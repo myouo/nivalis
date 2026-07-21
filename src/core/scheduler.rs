@@ -30,7 +30,6 @@ impl SyncToken {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SyncCompletion {
     Complete,
-    HasMore,
     Failed,
 }
 
@@ -221,10 +220,6 @@ impl SyncScheduler {
                 target.consecutive_failures = 0;
                 target.readiness = TargetReadiness::Waiting(deadline_after(now, SUCCESS_INTERVAL));
             }
-            SyncCompletion::HasMore => {
-                target.consecutive_failures = 0;
-                target.readiness = TargetReadiness::Waiting(now);
-            }
             SyncCompletion::Failed => {
                 let delay = failure_delay(target.consecutive_failures);
                 target.consecutive_failures = target.consecutive_failures.saturating_add(1);
@@ -298,7 +293,7 @@ mod tests {
     }
 
     #[test]
-    fn one_page_tokens_rotate_fairly_across_accounts() {
+    fn completed_tokens_rotate_fairly_across_accounts() {
         let now = Instant::now();
         let mut scheduler = SyncScheduler::new();
         scheduler
@@ -306,13 +301,14 @@ mod tests {
             .unwrap();
 
         let mut order = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..3 {
             let (account_id, token) = take_account(&mut scheduler, now);
             order.push(account_id);
-            assert!(scheduler.complete(token, SyncCompletion::HasMore, now));
+            assert!(scheduler.complete(token, SyncCompletion::Complete, now));
         }
 
-        assert_eq!(order, [1, 2, 3, 1]);
+        assert_eq!(order, [1, 2, 3]);
+        assert_eq!(take_account(&mut scheduler, now + SUCCESS_INTERVAL).0, 1);
     }
 
     #[test]

@@ -584,6 +584,71 @@ fn account_receive_private_permissions(
         && body_metadata.file_type().is_file()
 }
 
+fn account_receive_metadata_database_gate(
+    database_path: &std::path::Path,
+    expected_account_id: &str,
+    expected_message_id: &str,
+) -> AccountReceiveGate {
+    let Ok(expected_account_id) = expected_account_id.parse::<i64>() else {
+        return AccountReceiveGate::Failed("database_account_identity_invalid");
+    };
+    let Ok(expected_message_id) = expected_message_id.parse::<i64>() else {
+        return AccountReceiveGate::Failed("database_message_identity_invalid");
+    };
+    let connection = match Connection::open_with_flags(
+        database_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(connection) => connection,
+        Err(_) => return AccountReceiveGate::Failed("database_evidence_unavailable"),
+    };
+    if connection.pragma_update(None, "query_only", true).is_err() {
+        return AccountReceiveGate::Failed("database_evidence_unavailable");
+    }
+    let row = connection
+        .query_row(
+            "SELECT message.account_id,
+                    (SELECT count(*) FROM messages WHERE account_id = message.account_id),
+                    message.subject,
+                    content.message_id IS NOT NULL
+             FROM messages AS message
+             LEFT JOIN message_content AS content ON content.message_id = message.id
+             WHERE message.id = ?1
+               AND EXISTS (
+                   SELECT 1
+                   FROM message_folders AS membership
+                   JOIN folders AS folder ON folder.id = membership.folder_id
+                   WHERE membership.message_id = message.id
+                     AND folder.role = 'inbox'
+               )",
+            [expected_message_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            },
+        )
+        .optional();
+    let (account_id, message_total, subject, content_available) = match row {
+        Ok(Some(row)) => row,
+        Ok(None) => return AccountReceiveGate::Waiting,
+        Err(_) => return AccountReceiveGate::Failed("database_evidence_unavailable"),
+    };
+    if account_id != expected_account_id || message_total != 1 {
+        return AccountReceiveGate::Failed("database_message_count_mismatch");
+    }
+    if subject != ACCOUNT_RECEIVE_EXPECTED_SUBJECT {
+        return AccountReceiveGate::Failed("database_fixture_mismatch");
+    }
+    if content_available {
+        return AccountReceiveGate::Failed("database_content_loaded_before_selection");
+    }
+    AccountReceiveGate::Ready
+}
+
 fn account_receive_database_gate(
     database_path: &std::path::Path,
     content_path: &std::path::Path,
@@ -1027,9 +1092,8 @@ fn install_account_receive_stress(
                                     return;
                                 };
                                 let message_id = message.id;
-                                match account_receive_database_gate(
+                                match account_receive_metadata_database_gate(
                                     &database_path,
-                                    &content_path,
                                     account_id.as_str(),
                                     message_id.as_str(),
                                 ) {
@@ -1077,6 +1141,20 @@ fn install_account_receive_stress(
                                 state.phase = AccountReceivePhase::Complete;
                             }
                             AccountReceiveGate::Ready => {
+                                match account_receive_database_gate(
+                                    &database_path,
+                                    &content_path,
+                                    account_id.as_str(),
+                                    message_id.as_str(),
+                                ) {
+                                    AccountReceiveGate::Waiting => return,
+                                    AccountReceiveGate::Failed(reason) => {
+                                        fail_account_receive_stress(&ui, &timer, reason, true);
+                                        state.phase = AccountReceivePhase::Complete;
+                                        return;
+                                    }
+                                    AccountReceiveGate::Ready => {}
+                                }
                                 let account_id = account_id.clone();
                                 ui.invoke_switch_account(SharedString::default());
                                 state.advance(AccountReceivePhase::ClosingReader { account_id });
@@ -1369,9 +1447,6 @@ fn existing_account_sync_transition_gate(
     before: &ExistingAccountSyncSnapshot,
     after: &ExistingAccountSyncSnapshot,
 ) -> AccountReceiveGate {
-    if before.content_total != before.inbox_total || after.content_total != after.inbox_total {
-        return AccountReceiveGate::Failed("database_content_incomplete");
-    }
     let Some(after_sync_at) = after.last_sync_at_ms else {
         return AccountReceiveGate::Failed("sync_timestamp_missing");
     };
@@ -1424,10 +1499,7 @@ fn existing_account_sync_ui_gate(
         || i64::from(ui.get_message_total()) != snapshot.inbox_total
         || ui.get_mails().row_count() != snapshot.visible_message_ids.len()
     {
-        return AccountReceiveGate::Failed("ui_database_count_mismatch");
-    }
-    if snapshot.content_total != snapshot.inbox_total {
-        return AccountReceiveGate::Failed("database_content_incomplete");
+        return AccountReceiveGate::Waiting;
     }
     for (index, expected_id) in snapshot.visible_message_ids.iter().enumerate() {
         let Some(message) = ui.get_mails().row_data(index) else {
@@ -1466,8 +1538,17 @@ fn existing_account_ready(ui: &AppWindow, account_key: &str) -> Result<bool, &'s
 enum ExistingAccountSyncPhase {
     WaitingForInitialState,
     WaitingForMailbox,
-    Syncing { before: ExistingAccountSyncSnapshot },
-    WaitingForFinalState { before: ExistingAccountSyncSnapshot },
+    Syncing {
+        before: ExistingAccountSyncSnapshot,
+    },
+    WaitingForFinalState {
+        before: ExistingAccountSyncSnapshot,
+    },
+    WaitingForBody {
+        message_id: SharedString,
+        metadata_elapsed_ms: u128,
+        body_started: Instant,
+    },
     Complete,
 }
 
@@ -1483,6 +1564,29 @@ impl ExistingAccountSyncStress {
         self.phase = phase;
         self.deadline = Instant::now() + self.transition_timeout;
     }
+}
+
+fn existing_message_content_available(
+    database_path: &std::path::Path,
+    message_id: i64,
+) -> Result<bool, &'static str> {
+    let connection = Connection::open_with_flags(
+        database_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|_| "database_evidence_unavailable")?;
+    connection
+        .pragma_update(None, "query_only", true)
+        .map_err(|_| "database_evidence_unavailable")?;
+    connection
+        .query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM message_content WHERE message_id = ?1
+             )",
+            [message_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| "database_evidence_unavailable")
 }
 
 fn install_existing_account_sync(
@@ -1665,9 +1769,85 @@ fn install_existing_account_sync(
                             }
                             AccountReceiveGate::Ready => {}
                         }
-                        ui.set_status_text("Existing account sync verification complete".into());
+                        let Some(message) = ui.get_mails().row_data(0) else {
+                            fail_existing_account_sync(&ui, &timer, "synced_message_missing");
+                            state.phase = ExistingAccountSyncPhase::Complete;
+                            return;
+                        };
+                        let Some(message_key) = EntityKey::parse(message.id.as_str()) else {
+                            fail_existing_account_sync(&ui, &timer, "synced_message_invalid");
+                            state.phase = ExistingAccountSyncPhase::Complete;
+                            return;
+                        };
+                        match existing_message_content_available(
+                            &database_path,
+                            message_key.get(),
+                        ) {
+                            Ok(false) => {}
+                            Ok(true) => {
+                                fail_existing_account_sync(
+                                    &ui,
+                                    &timer,
+                                    "message_content_preloaded",
+                                );
+                                state.phase = ExistingAccountSyncPhase::Complete;
+                                return;
+                            }
+                            Err(reason) => {
+                                fail_existing_account_sync(&ui, &timer, reason);
+                                state.phase = ExistingAccountSyncPhase::Complete;
+                                return;
+                            }
+                        }
+                        let metadata_elapsed_ms = state.started.elapsed().as_millis();
+                        let message_id = message.id;
+                        ui.set_detail_open(true);
+                        ui.invoke_select_mail(message_id.clone());
+                        state.advance(ExistingAccountSyncPhase::WaitingForBody {
+                            message_id,
+                            metadata_elapsed_ms,
+                            body_started: Instant::now(),
+                        });
+                    }
+                    ExistingAccountSyncPhase::WaitingForBody {
+                        message_id,
+                        metadata_elapsed_ms,
+                        body_started,
+                    } => {
+                        if ui.get_detail_loading() || ui.get_detail_content_pending() {
+                            return;
+                        }
+                        if ui.get_detail_error() || !ui.get_detail_content_error().is_empty() {
+                            fail_existing_account_sync(&ui, &timer, "message_content_fetch_failed");
+                            state.phase = ExistingAccountSyncPhase::Complete;
+                            return;
+                        }
+                        if ui.get_selected_id().as_str() != message_id.as_str()
+                            || ui.get_selected_mail().id.as_str() != message_id.as_str()
+                        {
+                            return;
+                        }
+                        let Some(message_key) = EntityKey::parse(message_id.as_str()) else {
+                            fail_existing_account_sync(&ui, &timer, "synced_message_invalid");
+                            state.phase = ExistingAccountSyncPhase::Complete;
+                            return;
+                        };
+                        match existing_message_content_available(
+                            &database_path,
+                            message_key.get(),
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => return,
+                            Err(reason) => {
+                                fail_existing_account_sync(&ui, &timer, reason);
+                                state.phase = ExistingAccountSyncPhase::Complete;
+                                return;
+                            }
+                        }
+                        let body_elapsed_ms = body_started.elapsed().as_millis();
+                        ui.set_status_text("Existing account local-first verification complete".into());
                         eprintln!(
-                            "NIVALIS_STRESS_RESULT scenario=existing-account-sync steps=1 manual_sync=1 timestamp=1 database=1 ui=1 elapsed_ms={}",
+                            "NIVALIS_STRESS_RESULT scenario=existing-account-sync steps=1 manual_sync=1 metadata=1 on_demand_body=1 database=1 ui=1 metadata_elapsed_ms={metadata_elapsed_ms} body_elapsed_ms={body_elapsed_ms} total_elapsed_ms={}",
                             state.started.elapsed().as_millis()
                         );
                         stop_stress(&ui, &timer);
@@ -3638,7 +3818,7 @@ mod tests {
         incomplete.content_total -= 1;
         assert_eq!(
             existing_account_sync_transition_gate(&before, &incomplete),
-            AccountReceiveGate::Failed("database_content_incomplete")
+            AccountReceiveGate::Ready
         );
         let invalid_cursor = existing_sync_snapshot(Some(7), Some("042"), Some(2_000), 3);
         assert_eq!(

@@ -13,6 +13,7 @@ bench-harness = []
 
 [dependencies]
 async-imap = { version = "=0.11.3", default-features = false, features = ["runtime-tokio"] }
+bytes = "1.11"
 crossbeam-channel = { version = "=0.5.16", default-features = false, features = ["std"] }
 getrandom = { version = "=0.4.3", default-features = false }
 keyring-core = { version = "=1.0.0", default-features = false }
@@ -24,6 +25,8 @@ lettre = { version = "=0.11.22", default-features = false, features = [
     "rustls-platform-verifier",
 ] }
 mail-parser = { version = "=0.11.5", default-features = false, features = ["full_encoding"] }
+mail-protocol-core = { path = "vendor/mail-protocol-core" }
+mail-protocol-imap = { path = "vendor/mail-protocol-imap" }
 rusqlite = { version = "=0.40.1", default-features = false, features = [
     "bundled",
     "hooks",

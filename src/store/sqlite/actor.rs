@@ -28,7 +28,8 @@ use super::{
     },
     content::{
         ContentBatchToken, ContentManifest, ReserveContentRequest,
-        finalize_content_with_commit_hook, reserve_content,
+        finalize_content_batch_with_commit_hook, finalize_content_with_commit_hook,
+        reserve_content, reserve_content_batch,
     },
     domain::{
         AccountId, DbFailure, DbReply, Generation, MessageId, MessageMutation, PageSpec, RequestId,
@@ -55,8 +56,9 @@ use super::{
         claim_remote, report_remote,
     },
     sync::{
-        ActiveImapAccountFence, InboxCheckpointOutcome, InboxCursorCommit, InboxCursorOutcome,
-        InboxReceivePage, InboxStageOutcome, active_imap_account_fence, commit_inbox_cursor,
+        ActiveImapAccountFence, ImapMessageContentTargetOutcome, InboxCheckpointOutcome,
+        InboxCursorCommit, InboxCursorOutcome, InboxReceivePage, InboxStageOutcome,
+        active_imap_account_fence, commit_inbox_cursor, load_imap_message_content_target,
         load_inbox_checkpoint, stage_inbox_page,
     },
 };
@@ -67,6 +69,8 @@ const SQLITE_CACHE_KIB: i64 = 1024;
 const SQLITE_MAX_VALUE_BYTES: i32 = 2 * 1024 * 1024;
 const MAILBOX_PROGRESS_OPS: i32 = 4096;
 const CONTENT_IMPORT_TTL_MS: i64 = 60 * 1_000;
+const MAX_CONTENT_IMPORT_BATCH: usize = 128;
+const CONTENT_TRANSACTION_CHUNK: usize = 7;
 
 pub(crate) type PendingCredentialRemovalReply = Result<Box<[PendingCredentialRemoval]>, DbFailure>;
 pub(crate) type PendingCacheRemovalReply = Result<Box<[PendingCacheRemoval]>, DbFailure>;
@@ -211,6 +215,12 @@ enum Request {
         expected_generation: AccountGeneration,
         reply: oneshot::Sender<Result<InboxCheckpointOutcome, DbFailure>>,
     },
+    LoadImapMessageContentTarget {
+        message_id: MessageId,
+        account_id: AccountId,
+        expected_generation: AccountGeneration,
+        reply: oneshot::Sender<Result<ImapMessageContentTargetOutcome, DbFailure>>,
+    },
     LoadPendingCredentialRemovals {
         reply: oneshot::Sender<PendingCredentialRemovalReply>,
     },
@@ -232,6 +242,10 @@ enum Request {
     ImportContent {
         submission: Box<ContentImportSubmission>,
         reply: oneshot::Sender<ContentImportReply>,
+    },
+    ImportContentBatch {
+        submission: Box<ContentImportBatchSubmission>,
+        reply: oneshot::Sender<ContentImportBatchReply>,
     },
     StageInbox {
         page: Box<InboxReceivePage>,
@@ -408,6 +422,23 @@ impl DatabaseClient {
         Ok(receiver)
     }
 
+    pub(crate) fn try_load_imap_message_content_target(
+        &self,
+        message_id: MessageId,
+        account_id: AccountId,
+        expected_generation: AccountGeneration,
+    ) -> Result<oneshot::Receiver<Result<ImapMessageContentTargetOutcome, DbFailure>>, SubmitError>
+    {
+        let (reply, receiver) = oneshot::channel();
+        self.try_submit(Request::LoadImapMessageContentTarget {
+            message_id,
+            account_id,
+            expected_generation,
+            reply,
+        })?;
+        Ok(receiver)
+    }
+
     pub(crate) fn try_load_pending_credential_removals(
         &self,
     ) -> Result<oneshot::Receiver<PendingCredentialRemovalReply>, SubmitError> {
@@ -529,6 +560,39 @@ impl DatabaseClient {
                 })
             }
             Err(_) => unreachable!("try_import_content only submits content imports"),
+        }
+    }
+
+    pub(crate) fn try_import_content_batch(
+        &self,
+        submission: Box<ContentImportBatchSubmission>,
+    ) -> Result<oneshot::Receiver<ContentImportBatchReply>, ContentImportBatchSubmitFailure> {
+        let admission = lock_admission(&self.admission);
+        if !*admission {
+            return Err(ContentImportBatchSubmitFailure {
+                reason: SubmitError::Closed,
+                submission,
+            });
+        }
+        let (reply, receiver) = oneshot::channel();
+        match self
+            .requests
+            .try_send(Request::ImportContentBatch { submission, reply })
+        {
+            Ok(()) => Ok(receiver),
+            Err(TrySendError::Full(Request::ImportContentBatch { submission, .. })) => {
+                Err(ContentImportBatchSubmitFailure {
+                    reason: SubmitError::Busy,
+                    submission,
+                })
+            }
+            Err(TrySendError::Disconnected(Request::ImportContentBatch { submission, .. })) => {
+                Err(ContentImportBatchSubmitFailure {
+                    reason: SubmitError::Closed,
+                    submission,
+                })
+            }
+            Err(_) => unreachable!("try_import_content_batch only submits content imports"),
         }
     }
 
@@ -914,6 +978,51 @@ impl ContentImportExecutionFailure {
 
     pub(crate) fn into_parts(self) -> (DbFailure, Box<ContentImportSubmission>) {
         (self.failure, self.submission)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ContentImportBatchSubmission {
+    submissions: Box<[ContentImportSubmission]>,
+}
+
+impl ContentImportBatchSubmission {
+    pub(crate) fn new(submissions: Vec<ContentImportSubmission>) -> Self {
+        Self {
+            submissions: submissions.into_boxed_slice(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ContentImportBatchOutcome {
+    pub(crate) imported: u8,
+}
+
+pub(crate) type ContentImportBatchReply =
+    Result<ContentImportBatchOutcome, ContentImportBatchExecutionFailure>;
+
+#[derive(Debug)]
+pub(crate) struct ContentImportBatchSubmitFailure {
+    reason: SubmitError,
+    submission: Box<ContentImportBatchSubmission>,
+}
+
+impl ContentImportBatchSubmitFailure {
+    pub(crate) fn reason(&self) -> SubmitError {
+        self.reason
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ContentImportBatchExecutionFailure {
+    failure: DbFailure,
+    submission: Box<ContentImportBatchSubmission>,
+}
+
+impl ContentImportBatchExecutionFailure {
+    pub(crate) fn failure(&self) -> &DbFailure {
+        &self.failure
     }
 }
 
@@ -1322,6 +1431,22 @@ fn run_actor(
                 }
                 continue;
             }
+            Request::LoadImapMessageContentTarget {
+                message_id,
+                account_id,
+                expected_generation,
+                reply,
+            } => {
+                if !reply.is_closed() {
+                    let _ = reply.send(load_imap_message_content_target(
+                        &connection,
+                        message_id,
+                        account_id,
+                        expected_generation,
+                    ));
+                }
+                continue;
+            }
             Request::LoadPendingCredentialRemovals { reply } => {
                 if !reply.is_closed() {
                     let _ = reply.send(load_pending_credential_removals(&connection));
@@ -1356,6 +1481,12 @@ fn run_actor(
             Request::ImportContent { submission, reply } => {
                 let result =
                     execute_content_import(&mut connection, submission, &control.write_gate);
+                let _ = reply.send(result);
+                continue;
+            }
+            Request::ImportContentBatch { submission, reply } => {
+                let result =
+                    execute_content_import_batch(&mut connection, submission, &control.write_gate);
                 let _ = reply.send(result);
                 continue;
             }
@@ -1638,6 +1769,96 @@ fn execute_content_import(
     }
 }
 
+fn execute_content_import_batch(
+    connection: &mut Connection,
+    mut submission: Box<ContentImportBatchSubmission>,
+    write_gate: &Mutex<()>,
+) -> ContentImportBatchReply {
+    let _write_guard = lock_write_gate(write_gate);
+    let result = (|| {
+        if submission.submissions.is_empty()
+            || submission.submissions.len() > MAX_CONTENT_IMPORT_BATCH
+        {
+            return Err(DbFailure::resource_limit(format!(
+                "content import batch must contain between 1 and {MAX_CONTENT_IMPORT_BATCH} messages"
+            )));
+        }
+        let account_id = submission.submissions[0].account_id;
+        let expected_generation = submission.submissions[0].expected_generation;
+        if submission.submissions.iter().any(|item| {
+            item.account_id != account_id || item.expected_generation != expected_generation
+        }) {
+            return Err(DbFailure::conflict(
+                "content import batch crosses account generation fences",
+            ));
+        }
+        match active_imap_account_fence(connection, account_id, expected_generation)? {
+            ActiveImapAccountFence::Current => {}
+            ActiveImapAccountFence::Stale => {
+                return Err(DbFailure::conflict(
+                    "content import account changed or is not active; reload and retry",
+                ));
+            }
+            ActiveImapAccountFence::NotFound => {
+                return Err(DbFailure::not_found(
+                    "content import account no longer exists",
+                ));
+            }
+        }
+
+        let mut imported = 0_u8;
+        for start in (0..submission.submissions.len()).step_by(CONTENT_TRANSACTION_CHUNK) {
+            let end = (start + CONTENT_TRANSACTION_CHUNK).min(submission.submissions.len());
+            let now_ms = current_time_ms()?;
+            let expires_at_ms = now_ms
+                .checked_add(CONTENT_IMPORT_TTL_MS)
+                .ok_or_else(|| DbFailure::resource_limit("content import lease overflow"))?;
+            let records = submission.submissions[start..end]
+                .iter()
+                .map(|item| item.content.record())
+                .collect::<Vec<_>>();
+            let requests = submission.submissions[start..end]
+                .iter()
+                .zip(&records)
+                .map(|(item, record)| {
+                    ReserveContentRequest::new(
+                        item.message_id,
+                        item.account_id.get(),
+                        next_content_batch_token(),
+                        ContentManifest::from_record(record)?,
+                        now_ms,
+                        expires_at_ms,
+                    )
+                })
+                .collect::<Result<Vec<_>, DbFailure>>()?;
+            let reservations = reserve_content_batch(connection, requests)?;
+            finalize_content_batch_with_commit_hook(
+                connection,
+                &reservations,
+                &records,
+                now_ms,
+                || {
+                    for item in &mut submission.submissions[start..end] {
+                        item.content.retain_files();
+                    }
+                },
+            )?;
+            imported = imported
+                .checked_add(u8::try_from(end - start).expect("content chunk fits in u8"))
+                .expect("content batch fits in u8");
+        }
+        Ok(ContentImportBatchOutcome { imported })
+    })();
+
+    match result {
+        Ok(outcome) => Ok(outcome),
+        Err(failure) => Err(ContentImportBatchExecutionFailure {
+            failure,
+            submission,
+        }),
+    }
+}
+
 fn execute_inbox_stage(
     connection: &mut Connection,
     page: Box<InboxReceivePage>,
@@ -1764,6 +1985,15 @@ fn drain_accepted_writes(
             }
             Request::ImportContent { submission, reply } => {
                 let result = execute_content_import(connection, submission, write_gate);
+                if first_failure.is_none()
+                    && let Err(failure) = &result
+                {
+                    first_failure = Some(failure.failure.clone());
+                }
+                let _ = reply.send(result);
+            }
+            Request::ImportContentBatch { submission, reply } => {
+                let result = execute_content_import_batch(connection, submission, write_gate);
                 if first_failure.is_none()
                     && let Err(failure) = &result
                 {
@@ -3353,7 +3583,12 @@ mod tests {
         let commit = InboxCursorCommit::new(ticket, 1_700_000_001_000).unwrap();
         let outcome =
             receive_oneshot(client.try_commit_inbox_cursor(Box::new(commit)).unwrap()).unwrap();
-        assert_eq!(outcome, InboxCursorOutcome::ContentPending { missing: 1 });
+        assert_eq!(
+            outcome,
+            InboxCursorOutcome::Committed {
+                scanned_through_uid: Some(7)
+            }
+        );
         assert!(replies.is_empty());
         runtime.shutdown().unwrap();
     }

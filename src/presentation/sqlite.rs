@@ -807,6 +807,7 @@ mod tests {
                     body_truncated: true,
                     body_byte_count: 80_000,
                     body_file_key: Some("body-key".into()),
+                    content_available: true,
                 },
                 "Archive",
             )

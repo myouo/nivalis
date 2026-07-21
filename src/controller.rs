@@ -11,9 +11,9 @@ use crate::core::{
     COMPOSE_SUBJECT_BYTE_LIMIT, COMPOSE_TO_FIELD_BYTE_LIMIT, ComposeDraftIdentity,
     ComposeDraftInput, ComposeFailure, ComposeFailureKind, ComposeOperation,
     ComposeOperationResponseError, ComposeOperationSubmitError, ComposeSuccess, CoreHandle, Event,
-    EventReceiver, InboxSyncFailureKind, MailboxLoadError, MessageLoadError, MutationSubmitError,
-    OutboxCancelOutcome, OutboxDriverFault, OutboxErrorClass, OutboxState, OutboxStatus,
-    OutboxSummary, OutboxSummaryPage, RequestId, SubmitError, UncertainResolution,
+    EventReceiver, InboxSyncFailureKind, MailboxLoadError, MessageId, MessageLoadError,
+    MutationSubmitError, OutboxCancelOutcome, OutboxDriverFault, OutboxErrorClass, OutboxState,
+    OutboxStatus, OutboxSummary, OutboxSummaryPage, RequestId, SubmitError, UncertainResolution,
 };
 use crate::credentials::Secret;
 use crate::presentation::sqlite::{
@@ -33,6 +33,8 @@ use std::{
     rc::Rc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+const SYNC_REFRESH_COALESCE: Duration = Duration::from_millis(50);
 
 pub(crate) fn install(
     ui: &AppWindow,
@@ -66,6 +68,8 @@ struct Controller {
     outbox_model: Rc<VecModel<OutboxItem>>,
     outbox_snapshots: RefCell<Box<[OutboxSummary]>>,
     account_task: RefCell<Option<slint::JoinHandle<()>>>,
+    history_task: RefCell<Option<slint::JoinHandle<()>>>,
+    content_task: RefCell<Option<slint::JoinHandle<()>>>,
     compose_task: RefCell<Option<slint::JoinHandle<()>>>,
     outbox_task: RefCell<Option<slint::JoinHandle<()>>>,
     outbox_busy: Cell<bool>,
@@ -79,6 +83,10 @@ struct Controller {
     account_cancelable: Cell<bool>,
     pending_account_selection: Cell<Option<i64>>,
     search_timer: Rc<Timer>,
+    sync_refresh_timer: Rc<Timer>,
+    pending_sync_refresh: Cell<Option<bool>>,
+    remote_history_more: Cell<bool>,
+    remote_append_pending: Cell<bool>,
     snackbar_timer: Rc<Timer>,
 }
 
@@ -114,6 +122,8 @@ impl Controller {
         ui.set_mailbox_error(false);
         ui.set_detail_loading(false);
         ui.set_detail_error(false);
+        ui.set_detail_content_pending(false);
+        ui.set_detail_content_error(SharedString::default());
         ui.set_total_known(true);
         ui.set_data_source_label("SQLite cache".into());
         ui.set_status_text("Loading local cache".into());
@@ -146,6 +156,8 @@ impl Controller {
             outbox_model,
             outbox_snapshots: RefCell::new(Box::new([])),
             account_task: RefCell::new(None),
+            history_task: RefCell::new(None),
+            content_task: RefCell::new(None),
             compose_task: RefCell::new(None),
             outbox_task: RefCell::new(None),
             outbox_busy: Cell::new(false),
@@ -159,6 +171,10 @@ impl Controller {
             account_cancelable: Cell::new(false),
             pending_account_selection: Cell::new(None),
             search_timer: Rc::new(Timer::default()),
+            sync_refresh_timer: Rc::new(Timer::default()),
+            pending_sync_refresh: Cell::new(None),
+            remote_history_more: Cell::new(false),
+            remote_append_pending: Cell::new(false),
             snackbar_timer: Rc::new(Timer::default()),
         }
     }
@@ -401,7 +417,7 @@ impl Controller {
         }
     }
 
-    fn handle_account_sync_status(&self, status: AccountSyncStatus) {
+    fn handle_account_sync_status(self: &Rc<Self>, status: AccountSyncStatus) {
         match status {
             AccountSyncStatus::Synced {
                 account_id,
@@ -413,6 +429,11 @@ impl Controller {
                 self.issue_accounts();
                 if !self.sync_status_is_visible(account_id) {
                     return;
+                }
+                if self.selected_account_matches(account_id)
+                    && self.state.borrow().can_load_remote_history()
+                {
+                    self.remote_history_more.set(has_more);
                 }
                 if let Some(ui) = self.ui.upgrade()
                     && !foreground_feedback_active(&ui)
@@ -430,11 +451,7 @@ impl Controller {
                     )
                 });
                 if refresh_visible_mailbox {
-                    if historical {
-                        self.refresh_after_historical_sync();
-                    } else {
-                        self.refresh_after_mutation();
-                    }
+                    self.schedule_sync_refresh(historical);
                 }
             }
             AccountSyncStatus::Failed(failure) => {
@@ -460,6 +477,13 @@ impl Controller {
             AccountKey::All => true,
             AccountKey::Account(selected) => selected.get() == account_id.get(),
         }
+    }
+
+    fn selected_account_matches(&self, account_id: crate::store::sqlite::AccountId) -> bool {
+        matches!(
+            self.state.borrow().account(),
+            AccountKey::Account(selected) if selected.get() == account_id.get()
+        )
     }
 
     fn handle_accounts(&self, reply: Tagged<AccountDirectory>) {
@@ -527,6 +551,7 @@ impl Controller {
 
         let pending_page = self.pending_mailbox.borrow_mut().take();
         if scope_reset {
+            self.reset_remote_history_scope();
             self.reload_mailbox();
         } else if let Some(pending) = pending_page {
             self.apply_mailbox(pending.acceptance, pending.page);
@@ -602,10 +627,14 @@ impl Controller {
         if effect != MailboxCommitEffect::Preserve || self.mail_model.row_count() <= 50 {
             debug_assert_eq!(next_cursor, state.next_cursor());
         }
-        let has_more = state.next_cursor().is_some();
+        let has_more = state.next_cursor().is_some()
+            || (state.can_load_remote_history() && self.remote_history_more.get());
         drop(state);
 
         let selected_to_restore = (effect == MailboxCommitEffect::Replace)
+            .then(|| self.selected_reader_key())
+            .flatten();
+        let selected_to_refresh = (effect == MailboxCommitEffect::Preserve)
             .then(|| self.selected_reader_key())
             .flatten();
         match effect {
@@ -623,7 +652,14 @@ impl Controller {
                     self.mail_model.push(row);
                 }
             }
-            MailboxCommitEffect::Preserve => {}
+            MailboxCommitEffect::Preserve => {
+                for (index, row) in rows.into_iter().enumerate() {
+                    if index >= self.mail_model.row_count() {
+                        break;
+                    }
+                    self.mail_model.set_row_data(index, row);
+                }
+            }
         }
         let loaded_count = self.mail_model.row_count();
         self.apply_stats(stats);
@@ -657,10 +693,133 @@ impl Controller {
             }
             self.select_message(key.encode());
         }
+        if let Some(key) = selected_to_refresh
+            && self.ui.upgrade().is_some_and(|ui| ui.get_detail_open())
+            && visible_summary_state(self.mail_model.as_ref(), key).is_some()
+        {
+            self.select_message(key.encode());
+        }
+        if self.remote_append_pending.replace(false) {
+            if self.state.borrow_mut().enable_remote_tail_navigation() {
+                self.submit_mailbox_navigation(MailboxIntent::Append);
+            } else {
+                self.finish_history_load_without_refresh();
+            }
+        }
     }
 
-    fn load_more_mail(&self) {
-        self.submit_mailbox_navigation(MailboxIntent::Append);
+    fn load_more_mail(self: &Rc<Self>) {
+        if self.state.borrow().next_cursor().is_some() {
+            self.submit_mailbox_navigation(MailboxIntent::Append);
+        } else if self.state.borrow().can_load_remote_history() && self.remote_history_more.get() {
+            self.sync_next_history_page();
+        }
+    }
+
+    fn sync_next_history_page(self: &Rc<Self>) {
+        let account = self.state.borrow().account();
+        if !self.state.borrow().can_load_remote_history() {
+            return;
+        }
+        let Some(target) = self.account_operation_target(account.encode().as_str()) else {
+            self.fail_history_load(UserError::selection());
+            return;
+        };
+        let Some(request_id) = self.next_account_request_id() else {
+            self.fail_history_load(UserError::account_session_limit());
+            return;
+        };
+        {
+            let mut task = self.history_task.borrow_mut();
+            if task.as_ref().is_some_and(|task| !task.is_finished()) {
+                return;
+            }
+            task.take();
+        }
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_mailbox_loading_more(true);
+            ui.set_mailbox_error(false);
+            ui.set_status_text("Loading 50 message headers in the background".into());
+        }
+        let response = match self
+            .core
+            .try_account_operation(AccountOperation::SyncInbox {
+                request_id,
+                account_id: target.account_id,
+                expected_generation: target.expected_generation,
+            }) {
+            Ok(response) => response,
+            Err(failure) => {
+                self.fail_history_load(account_submit_error(failure.reason()));
+                return;
+            }
+        };
+        let weak = Rc::downgrade(self);
+        let task = slint::spawn_local(async move {
+            let result = response.await;
+            let Some(controller) = weak.upgrade() else {
+                return;
+            };
+            controller.history_task.borrow_mut().take();
+            match result {
+                Ok(reply) if reply.request_id == request_id => match reply.result {
+                    Ok(AccountOperationSuccess::Synced {
+                        account_id,
+                        generation,
+                        imported,
+                        has_more,
+                        historical,
+                    }) if account_id == target.account_id
+                        && generation == target.expected_generation
+                        && controller.selected_account_matches(account_id) =>
+                    {
+                        controller.remote_history_more.set(has_more);
+                        controller.issue_accounts();
+                        if historical {
+                            controller.remote_append_pending.set(true);
+                            controller.refresh_after_historical_sync();
+                        } else if imported > 0 {
+                            controller.refresh_after_mutation();
+                        } else {
+                            controller.finish_history_load_without_refresh();
+                        }
+                    }
+                    Err(failure) => {
+                        controller.fail_history_load(account_operation_error(failure));
+                    }
+                    Ok(_) => controller.fail_history_load(UserError::account_result()),
+                },
+                Ok(_) => controller.fail_history_load(UserError::account_result()),
+                Err(error) => {
+                    controller.fail_history_load(account_response_error(error));
+                }
+            }
+        });
+        match task {
+            Ok(task) => *self.history_task.borrow_mut() = Some(task),
+            Err(_) => self.fail_history_load(UserError::account_runtime()),
+        }
+    }
+
+    fn finish_history_load_without_refresh(&self) {
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_mailbox_loading_more(false);
+            ui.set_mailbox_has_more(
+                self.state.borrow().next_cursor().is_some()
+                    || (self.state.borrow().can_load_remote_history()
+                        && self.remote_history_more.get()),
+            );
+            ui.set_status_text("All available messages loaded".into());
+        }
+    }
+
+    fn fail_history_load(&self, error: UserError) {
+        self.history_task.borrow_mut().take();
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_mailbox_loading_more(false);
+            ui.set_status_text(error.title.into());
+            show_snackbar(&ui, error.detail, false, &self.snackbar_timer);
+        }
     }
 
     fn submit_mailbox_navigation(&self, intent: MailboxIntent) {
@@ -730,6 +889,7 @@ impl Controller {
     }
 
     fn fail_navigation(&self, error: UserError) {
+        self.remote_append_pending.set(false);
         if self.state.borrow().mutation_refresh_pending() {
             self.fail_mailbox(error);
             self.sync_mutation_ui();
@@ -775,7 +935,7 @@ impl Controller {
         }
     }
 
-    fn handle_detail(&self, reply: Tagged<Option<MessageDetail>>) {
+    fn handle_detail(self: &Rc<Self>, reply: Tagged<Option<MessageDetail>>) {
         let acceptance = self.state.borrow_mut().accept_message(&reply);
         match acceptance {
             DetailAcceptance::Stale => {}
@@ -805,6 +965,9 @@ impl Controller {
                     self.fail_detail(UserError::mail_data());
                     return;
                 };
+                let message_id = detail.id;
+                let account_id = detail.account_id;
+                let content_available = detail.content_available;
                 let folder = self.state.borrow().folder_label();
                 let projected = {
                     let catalog = self.catalog.borrow();
@@ -824,13 +987,32 @@ impl Controller {
                     ui.set_selected_mail(projected);
                     ui.set_detail_loading(false);
                     ui.set_detail_error(false);
-                    ui.set_status_text("Message loaded from local cache".into());
+                    ui.set_detail_content_pending(!content_available);
+                    ui.set_detail_content_error(SharedString::default());
+                    ui.set_status_text(
+                        if content_available {
+                            "Message loaded from local cache"
+                        } else {
+                            "Headers loaded from local cache; fetching body in background"
+                        }
+                        .into(),
+                    );
+                }
+                if content_available {
+                    if let Some(task) = self.content_task.borrow_mut().take() {
+                        task.abort();
+                    }
+                } else {
+                    self.fetch_message_content(message_id, account_id);
                 }
             }
         }
     }
 
     fn select_message(&self, key: SharedString) {
+        if let Some(task) = self.content_task.borrow_mut().take() {
+            task.abort();
+        }
         let Some(id) = EntityKey::parse(key.as_str()) else {
             self.reject_selection("This message can no longer be identified");
             return;
@@ -851,11 +1033,139 @@ impl Controller {
             ui.set_selected_mail(MailDetail::default());
             ui.set_detail_loading(true);
             ui.set_detail_error(false);
+            ui.set_detail_content_pending(false);
+            ui.set_detail_content_error(SharedString::default());
             ui.set_status_text("Loading message".into());
         }
         if let Err(error) = self.core.try_open_message(query) {
             self.state.borrow_mut().cancel_detail_submission();
             self.fail_detail(submit_error(error));
+        }
+    }
+
+    fn fetch_message_content(self: &Rc<Self>, message_id: MessageId, account_id: i64) {
+        {
+            let mut task = self.content_task.borrow_mut();
+            if task.as_ref().is_some_and(|task| !task.is_finished()) {
+                return;
+            }
+            task.take();
+        }
+        let Some(account_key) = EntityKey::new(account_id).map(AccountKey::Account) else {
+            self.finish_content_fetch_error(message_id, UserError::selection());
+            return;
+        };
+        let Some(target) = self
+            .catalog
+            .borrow()
+            .as_ref()
+            .and_then(|catalog| catalog.operation_target(account_key))
+        else {
+            self.finish_content_fetch_error(message_id, UserError::selection());
+            return;
+        };
+        let Some(request_id) = self.next_account_request_id() else {
+            self.finish_content_fetch_error(message_id, UserError::account_session_limit());
+            return;
+        };
+        let response =
+            match self
+                .core
+                .try_account_operation(AccountOperation::FetchMessageContent {
+                    request_id,
+                    message_id,
+                    account_id: target.account_id,
+                    expected_generation: target.expected_generation,
+                }) {
+                Ok(response) => response,
+                Err(failure) => {
+                    self.finish_content_fetch_error(
+                        message_id,
+                        account_submit_error(failure.reason()),
+                    );
+                    return;
+                }
+            };
+        let weak = Rc::downgrade(self);
+        let task = slint::spawn_local(async move {
+            let result = response.await;
+            let Some(controller) = weak.upgrade() else {
+                return;
+            };
+            controller.content_task.borrow_mut().take();
+            match result {
+                Ok(reply) if reply.request_id == request_id => match reply.result {
+                    Ok(AccountOperationSuccess::MessageContentFetched {
+                        message_id: fetched_message,
+                        account_id,
+                        generation,
+                    }) if fetched_message == message_id
+                        && account_id == target.account_id
+                        && generation == target.expected_generation =>
+                    {
+                        if !controller.selected_message_matches(message_id) {
+                            return;
+                        }
+                        if let Some(ui) = controller.ui.upgrade() {
+                            ui.set_detail_content_pending(true);
+                            ui.set_detail_content_error(SharedString::default());
+                            ui.set_status_text("Opening downloaded body from local cache".into());
+                        }
+                        controller.refresh_selected_detail_from_cache(message_id);
+                        controller.refresh_after_historical_sync();
+                    }
+                    Err(failure) => controller
+                        .finish_content_fetch_error(message_id, account_operation_error(failure)),
+                    Ok(_) => controller
+                        .finish_content_fetch_error(message_id, UserError::account_result()),
+                },
+                Ok(_) => {
+                    controller.finish_content_fetch_error(message_id, UserError::account_result())
+                }
+                Err(error) => {
+                    controller.finish_content_fetch_error(message_id, account_response_error(error))
+                }
+            }
+        });
+        match task {
+            Ok(task) => *self.content_task.borrow_mut() = Some(task),
+            Err(_) => self.finish_content_fetch_error(message_id, UserError::account_runtime()),
+        }
+    }
+
+    fn selected_message_matches(&self, message_id: MessageId) -> bool {
+        self.ui.upgrade().is_some_and(|ui| {
+            EntityKey::parse(ui.get_selected_id().as_str())
+                .is_some_and(|key| key.get() == message_id.get())
+        })
+    }
+
+    fn refresh_selected_detail_from_cache(&self, message_id: MessageId) {
+        let Some(key) = EntityKey::new(message_id.get()) else {
+            self.finish_content_fetch_error(message_id, UserError::selection());
+            return;
+        };
+        let query = match self.state.borrow_mut().select_message(key) {
+            Ok(query) => query,
+            Err(error) => {
+                self.finish_content_fetch_error(message_id, session_error(error));
+                return;
+            }
+        };
+        if let Err(error) = self.core.try_open_message(query) {
+            self.state.borrow_mut().cancel_detail_submission();
+            self.finish_content_fetch_error(message_id, submit_error(error));
+        }
+    }
+
+    fn finish_content_fetch_error(&self, message_id: MessageId, error: UserError) {
+        if !self.selected_message_matches(message_id) {
+            return;
+        }
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_detail_content_pending(false);
+            ui.set_detail_content_error(error.detail.into());
+            ui.set_status_text(error.title.into());
         }
     }
 
@@ -1047,6 +1357,35 @@ impl Controller {
         self.submit_mailbox_navigation(MailboxIntent::Refresh);
     }
 
+    fn schedule_sync_refresh(self: &Rc<Self>, historical: bool) {
+        let combined = self
+            .pending_sync_refresh
+            .get()
+            .map_or(historical, |pending| pending && historical);
+        self.pending_sync_refresh.set(Some(combined));
+        let timer = self.sync_refresh_timer.clone();
+        let controller = Rc::downgrade(self);
+        timer.start(TimerMode::SingleShot, SYNC_REFRESH_COALESCE, move || {
+            let Some(controller) = controller.upgrade() else {
+                return;
+            };
+            let Some(historical) = controller.pending_sync_refresh.take() else {
+                return;
+            };
+            let busy = controller
+                .ui
+                .upgrade()
+                .is_some_and(|ui| ui.get_mailbox_loading() || ui.get_mailbox_loading_more());
+            if busy {
+                controller.schedule_sync_refresh(historical);
+            } else if historical {
+                controller.refresh_after_historical_sync();
+            } else {
+                controller.refresh_after_mutation();
+            }
+        });
+    }
+
     fn notify_mutation_error(&self, intent: MutationIntent, error: UserError) {
         if matches!(intent, MutationIntent::UndoTrash { .. }) && self.show_undo_error(error) {
             return;
@@ -1092,6 +1431,7 @@ impl Controller {
             ui.set_active_folder(self.state.borrow().folder_label().into());
             ui.set_detail_open(false);
         }
+        self.reset_remote_history_scope();
         self.reload_mailbox();
     }
 
@@ -1101,6 +1441,7 @@ impl Controller {
             Ok(false) => self.restore_search_text(),
             Ok(true) => {
                 self.restore_search_text();
+                self.reset_remote_history_scope();
                 self.reload_mailbox();
             }
             Err(error) => {
@@ -1142,7 +1483,20 @@ impl Controller {
         if let Some(ui) = self.ui.upgrade() {
             ui.set_detail_open(false);
         }
+        self.reset_remote_history_scope();
         self.reload_mailbox();
+    }
+
+    fn reset_remote_history_scope(&self) {
+        if let Some(task) = self.history_task.borrow_mut().take() {
+            task.abort();
+        }
+        self.remote_append_pending.set(false);
+        self.remote_history_more
+            .set(self.state.borrow().can_load_remote_history());
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_mailbox_loading_more(false);
+        }
     }
 
     fn manage_account(&self, key: &str) {
@@ -2244,18 +2598,23 @@ impl Controller {
                         generation,
                         imported,
                         has_more,
-                        historical: _,
+                        historical,
                     }) if account_id == target.account_id
                         && generation == target.expected_generation =>
                     {
-                        let feedback = sync_success_feedback(imported, has_more);
+                        let feedback = background_sync_feedback(imported, has_more, historical);
+                        if controller.selected_account_matches(account_id)
+                            && controller.state.borrow().can_load_remote_history()
+                        {
+                            controller.remote_history_more.set(has_more);
+                        }
                         controller.finish_account_task();
                         if let Some(ui) = controller.ui.upgrade() {
                             ui.set_status_text(feedback.clone().into());
                             show_snackbar(&ui, &feedback, false, &controller.snackbar_timer);
                         }
                         controller.issue_accounts();
-                        controller.reload_mailbox();
+                        controller.schedule_sync_refresh(historical);
                     }
                     Err(failure) => {
                         controller.finish_sync_with_error(account_operation_error(failure))
@@ -2614,12 +2973,17 @@ impl Controller {
     }
 
     fn clear_reader(&self) {
+        if let Some(task) = self.content_task.borrow_mut().take() {
+            task.abort();
+        }
         self.state.borrow_mut().clear_selection();
         if let Some(ui) = self.ui.upgrade() {
             ui.set_selected_id(SharedString::default());
             ui.set_selected_mail(MailDetail::default());
             ui.set_detail_loading(false);
             ui.set_detail_error(false);
+            ui.set_detail_content_pending(false);
+            ui.set_detail_content_error(SharedString::default());
             ui.set_detail_open(false);
             ui.set_delete_dialog_open(false);
         }
@@ -2638,6 +3002,7 @@ impl Controller {
         self.account_model.set_vec(Vec::new());
         self.catalog.borrow_mut().take();
         self.pending_mailbox.borrow_mut().take();
+        self.reset_remote_history_scope();
         if let Some(ui) = self.ui.upgrade() {
             ui.set_has_accounts(false);
             ui.set_compose_enabled(false);
@@ -2665,6 +3030,8 @@ impl Controller {
         if let Some(ui) = self.ui.upgrade() {
             ui.set_detail_loading(false);
             ui.set_detail_error(true);
+            ui.set_detail_content_pending(false);
+            ui.set_detail_content_error(SharedString::default());
             ui.set_detail_error_title(error.title.into());
             ui.set_detail_error_detail(error.detail.into());
             ui.set_status_text(error.title.into());
@@ -2675,6 +3042,12 @@ impl Controller {
         self.state.borrow_mut().cancel_pending();
         self.pending_mailbox.borrow_mut().take();
         if let Some(task) = self.account_task.borrow_mut().take() {
+            task.abort();
+        }
+        if let Some(task) = self.history_task.borrow_mut().take() {
+            task.abort();
+        }
+        if let Some(task) = self.content_task.borrow_mut().take() {
             task.abort();
         }
         self.account_cancelable.set(false);
@@ -2775,13 +3148,11 @@ struct MutationSuccessFeedback {
 fn sync_success_feedback(imported: u8, has_more: bool) -> String {
     match (imported, has_more) {
         (0, false) => "Inbox is up to date".to_owned(),
-        (0, true) => "Inbox is syncing in the background".to_owned(),
+        (0, true) => "More messages are available; scroll down to load them".to_owned(),
         (1, false) => "Imported 1 new message".to_owned(),
-        (1, true) => "Imported 1 new message; continuing in the background".to_owned(),
+        (1, true) => "Imported 1 new message; scroll down for more".to_owned(),
         (count, false) => format!("Imported {count} new messages"),
-        (count, true) => {
-            format!("Imported {count} new messages; continuing in the background")
-        }
+        (count, true) => format!("Imported {count} new messages; scroll down for more"),
     }
 }
 
@@ -2791,13 +3162,11 @@ fn background_sync_feedback(imported: u8, has_more: bool, historical: bool) -> S
     }
     match (imported, has_more) {
         (0, false) => "Mail history is fully synced".to_owned(),
-        (0, true) => "Syncing older messages in the background".to_owned(),
+        (0, true) => "Older messages are available; scroll down to load them".to_owned(),
         (1, false) => "Downloaded the last older message".to_owned(),
-        (1, true) => "Downloaded 1 older message; continuing in the background".to_owned(),
+        (1, true) => "Downloaded 1 older message; scroll down for more".to_owned(),
         (count, false) => format!("Downloaded the last {count} older messages"),
-        (count, true) => {
-            format!("Downloaded {count} older messages; continuing in the background")
-        }
+        (count, true) => format!("Downloaded {count} older messages; scroll down for more"),
     }
 }
 
@@ -4040,16 +4409,16 @@ mod tests {
         assert_eq!(sync_success_feedback(0, false), "Inbox is up to date");
         assert_eq!(
             sync_success_feedback(0, true),
-            "Inbox is syncing in the background"
+            "More messages are available; scroll down to load them"
         );
         assert_eq!(sync_success_feedback(1, false), "Imported 1 new message");
         assert_eq!(
             sync_success_feedback(16, true),
-            "Imported 16 new messages; continuing in the background"
+            "Imported 16 new messages; scroll down for more"
         );
         assert_eq!(
             background_sync_feedback(16, true, true),
-            "Downloaded 16 older messages; continuing in the background"
+            "Downloaded 16 older messages; scroll down for more"
         );
         assert_eq!(
             background_sync_feedback(0, false, true),

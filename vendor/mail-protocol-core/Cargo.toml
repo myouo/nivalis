@@ -1,0 +1,14 @@
+[package]
+name = "mail-protocol-core"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+bytes = "1.11"
+memchr = "2.7"
+
+[lints.rust]
+unsafe_code = "forbid"

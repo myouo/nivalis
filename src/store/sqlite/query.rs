@@ -40,7 +40,8 @@ const MAILBOX_SELECT: &str = "
 const OPEN_MESSAGE_SQL: &str = "
     SELECT m.id, m.account_id, m.sender_name, m.sender_address, m.subject, m.received_at_ms,
            m.unread, m.starred, m.has_attachment, coalesce(c.reader_excerpt, ''),
-           coalesce(c.truncated, 0), coalesce(c.body_byte_count, 0), c.body_file_key
+           coalesce(c.truncated, 0), coalesce(c.body_byte_count, 0), c.body_file_key,
+           c.message_id IS NOT NULL
       FROM messages AS m
       LEFT JOIN message_content AS c ON c.message_id = m.id
      WHERE m.id = ?1";
@@ -384,6 +385,7 @@ pub(super) fn open_message(
                 body_file_key: row
                     .get::<_, Option<String>>(12)?
                     .map(String::into_boxed_str),
+                content_available: row.get(13)?,
             })
         })
         .optional()
@@ -983,6 +985,7 @@ mod tests {
         assert!(!detail.has_attachment);
         assert!(detail.body_truncated);
         assert_eq!(detail.body_byte_count, 70_000);
+        assert!(detail.content_available);
     }
 
     #[test]
@@ -1006,6 +1009,7 @@ mod tests {
         assert!(!detail.unread);
         assert!(detail.starred);
         assert!(detail.has_attachment);
+        assert!(!detail.content_available);
     }
 
     #[test]

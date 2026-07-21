@@ -26,8 +26,8 @@ use crate::{
         AccountGeneration, AccountId, AccountLifecycle, AccountPurgeOutcome, AccountRecord,
         AccountRemovalTicket, AccountSyncTarget, AccountValidationError, AccountWrite,
         AccountWriteOutcome, AccountWriteReply, DatabaseClient, DatabaseSubmitError,
-        DiagnosticCommit, DiagnosticRecord, DiagnosticTicket, FailureKind, PendingCacheRemoval,
-        PendingCredentialRemoval, RequestId, SmtpSecurity,
+        DiagnosticCommit, DiagnosticRecord, DiagnosticTicket, FailureKind, MessageId,
+        PendingCacheRemoval, PendingCredentialRemoval, RequestId, SmtpSecurity,
     },
 };
 
@@ -35,7 +35,10 @@ use crate::{
 use super::sync::production_imap_inbox_fetch;
 use super::{
     scheduler::{SchedulerError, SyncCompletion, SyncScheduler, SyncToken},
-    sync::{ImapInboxFetchProbe, SyncInboxFuture, SyncInboxOutcome, start_inbox_sync},
+    sync::{
+        FetchMessageContentFuture, FetchMessageContentOutcome, ImapInboxFetchProbe,
+        SyncInboxFuture, SyncInboxOutcome, start_inbox_sync, start_message_content_fetch,
+    },
 };
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -162,6 +165,12 @@ pub(crate) enum AccountOperation {
         account_id: AccountId,
         expected_generation: AccountGeneration,
     },
+    FetchMessageContent {
+        request_id: RequestId,
+        message_id: MessageId,
+        account_id: AccountId,
+        expected_generation: AccountGeneration,
+    },
     Remove {
         request_id: RequestId,
         account_id: AccountId,
@@ -176,6 +185,7 @@ impl AccountOperation {
             | Self::RetryCredential { request_id, .. }
             | Self::Diagnose { request_id, .. }
             | Self::SyncInbox { request_id, .. }
+            | Self::FetchMessageContent { request_id, .. }
             | Self::Remove { request_id, .. } => *request_id,
         }
     }
@@ -228,6 +238,18 @@ impl fmt::Debug for AccountOperation {
                 .field("account_id", account_id)
                 .field("expected_generation", expected_generation)
                 .finish(),
+            Self::FetchMessageContent {
+                request_id,
+                message_id,
+                account_id,
+                expected_generation,
+            } => formatter
+                .debug_struct("FetchMessageContent")
+                .field("request_id", request_id)
+                .field("message_id", message_id)
+                .field("account_id", account_id)
+                .field("expected_generation", expected_generation)
+                .finish(),
             Self::Remove {
                 request_id,
                 account_id,
@@ -258,6 +280,11 @@ pub(crate) enum AccountOperationSuccess {
         imported: u8,
         has_more: bool,
         historical: bool,
+    },
+    MessageContentFetched {
+        message_id: MessageId,
+        account_id: AccountId,
+        generation: AccountGeneration,
     },
     Removed {
         account_id: AccountId,
@@ -299,6 +326,7 @@ pub(crate) enum AccountWorkflowStage {
     LoadCredential,
     ConnectImap,
     LoadInboxCheckpoint,
+    LoadMessageTarget,
     FetchInbox,
     StageInbox,
     ParseContent,
@@ -453,6 +481,12 @@ pub(crate) enum AccountWorkflowOutcome {
         imported: u8,
         has_more: bool,
         historical: bool,
+        bootstrap: bool,
+    },
+    MessageContentFetched {
+        message_id: MessageId,
+        account_id: AccountId,
+        generation: AccountGeneration,
     },
     RemovalPending {
         account_id: AccountId,
@@ -503,6 +537,7 @@ impl fmt::Debug for AccountWorkflowOutcome {
                 imported,
                 has_more,
                 historical,
+                bootstrap,
             } => formatter
                 .debug_struct("InboxSynced")
                 .field("account_id", account_id)
@@ -510,6 +545,17 @@ impl fmt::Debug for AccountWorkflowOutcome {
                 .field("imported", imported)
                 .field("has_more", has_more)
                 .field("historical", historical)
+                .field("bootstrap", bootstrap)
+                .finish(),
+            Self::MessageContentFetched {
+                message_id,
+                account_id,
+                generation,
+            } => formatter
+                .debug_struct("MessageContentFetched")
+                .field("message_id", message_id)
+                .field("account_id", account_id)
+                .field("generation", generation)
                 .finish(),
             Self::RemovalPending {
                 account_id,
@@ -1118,6 +1164,7 @@ pub(super) struct AccountWorkflows {
     scheduler: SyncScheduler,
     auto_sync: AutoSyncState,
     background_status: Option<AccountSyncStatus>,
+    history_prefetch: Option<(AccountId, AccountGeneration)>,
 }
 
 impl AccountWorkflows {
@@ -1160,6 +1207,7 @@ impl AccountWorkflows {
                 AutoSyncState::Disabled
             },
             background_status: None,
+            history_prefetch: None,
         }
     }
 
@@ -1168,7 +1216,11 @@ impl AccountWorkflows {
     }
 
     pub(super) fn can_start_user_operation(&self) -> bool {
-        matches!(self.recovery, RecoveryState::Complete) && self.active.is_none()
+        matches!(self.recovery, RecoveryState::Complete)
+            && (self.active.is_none()
+                || self.active.as_ref().is_some_and(|active| {
+                    active.reply.is_none() && matches!(active.state, ActiveTaskState::Syncing(_))
+                }))
     }
 
     pub(super) fn start_user_operation(
@@ -1177,6 +1229,19 @@ impl AccountWorkflows {
         reply: oneshot::Sender<AccountOperationReply>,
     ) -> Result<(), AccountDriverError> {
         debug_assert!(self.can_start_user_operation());
+        if self.active.as_ref().is_some_and(|active| {
+            active.reply.is_none() && matches!(active.state, ActiveTaskState::Syncing(_))
+        }) {
+            let interrupted = self
+                .active
+                .take()
+                .expect("preemptible background sync is active");
+            if let Some(token) = interrupted.sync_token {
+                let _ = self
+                    .scheduler
+                    .complete(token, SyncCompletion::Failed, Instant::now());
+            }
+        }
         let request_id = operation.request_id();
         match operation {
             AccountOperation::Setup {
@@ -1363,6 +1428,41 @@ impl AccountWorkflows {
                         content_root,
                         account_id,
                         expected_generation,
+                        true,
+                    )),
+                });
+            }
+            AccountOperation::FetchMessageContent {
+                message_id,
+                account_id,
+                expected_generation,
+                ..
+            } => {
+                let Some(content_root) = self.content_root.clone() else {
+                    let _ = reply.send(AccountOperationReply {
+                        request_id,
+                        result: Err(AccountOperationFailure {
+                            account_id: Some(account_id),
+                            generation: Some(expected_generation),
+                            stage: AccountWorkflowStage::ParseContent,
+                            kind: AccountWorkflowFailureKind::InboxSync(
+                                InboxSyncFailureKind::Storage,
+                            ),
+                        }),
+                    });
+                    return Ok(());
+                };
+                self.active = Some(ActiveTask {
+                    identity: Identity::new(account_id, expected_generation),
+                    reply: Some(UserReply { request_id, reply }),
+                    sync_token: None,
+                    state: ActiveTaskState::FetchingMessageContent(start_message_content_fetch(
+                        self.database.clone(),
+                        self.credentials.clone(),
+                        content_root,
+                        message_id,
+                        account_id,
+                        expected_generation,
                     )),
                 });
             }
@@ -1430,6 +1530,16 @@ impl AccountWorkflows {
                 Poll::Ready(Ok(TaskProgress::Finished(outcome))) => {
                     let mut active = self.active.take().expect("active account task was polled");
                     let reload_targets = outcome_changes_sync_targets(&outcome);
+                    let history_prefetch = match &outcome {
+                        AccountWorkflowOutcome::InboxSynced {
+                            account_id,
+                            generation,
+                            has_more: true,
+                            bootstrap: true,
+                            ..
+                        } if active.reply.is_none() => Some((*account_id, *generation)),
+                        _ => None,
+                    };
                     if let Some(token) = active.sync_token {
                         let completion = sync_completion(&outcome);
                         let completed = self.scheduler.complete(token, completion, Instant::now());
@@ -1438,6 +1548,9 @@ impl AccountWorkflows {
                             self.background_status =
                                 Some(project_background_sync(outcome.clone(), active.identity));
                         }
+                    }
+                    if history_prefetch.is_some() {
+                        self.history_prefetch = history_prefetch;
                     }
                     if let Some(user) = active.reply.take() {
                         let _ = user.reply.send(AccountOperationReply {
@@ -1594,6 +1707,37 @@ impl AccountWorkflows {
         &mut self,
         context: &mut Context<'_>,
     ) -> Poll<Result<(), AccountDriverError>> {
+        if let Some((account_id, generation)) = self.history_prefetch {
+            let Some(content_root) = self.content_root.clone() else {
+                self.history_prefetch = None;
+                return Poll::Pending;
+            };
+            match self
+                .scheduler
+                .take_manual(account_id, generation, Instant::now())
+            {
+                Ok(Some(token)) => {
+                    self.history_prefetch = None;
+                    self.active = Some(ActiveTask {
+                        identity: Identity::new(account_id, generation),
+                        reply: None,
+                        sync_token: Some(token),
+                        state: ActiveTaskState::Syncing(start_inbox_sync(
+                            self.database.clone(),
+                            self.credentials.clone(),
+                            self.inbox_fetch_probe,
+                            content_root,
+                            account_id,
+                            generation,
+                            true,
+                        )),
+                    });
+                    return Poll::Ready(Ok(()));
+                }
+                Ok(None) => return Poll::Pending,
+                Err(_) => return Poll::Ready(Err(AccountDriverError::WorkflowRejected)),
+            }
+        }
         match &mut self.auto_sync {
             AutoSyncState::Disabled => Poll::Pending,
             AutoSyncState::SubmitTargets => match self.database.try_load_sync_targets() {
@@ -1681,6 +1825,7 @@ impl AccountWorkflows {
                                 content_root,
                                 token.account_id(),
                                 token.generation(),
+                                false,
                             )),
                         });
                         Poll::Ready(Ok(()))
@@ -1773,6 +1918,7 @@ struct ActiveTask {
 
 enum ActiveTaskState {
     Syncing(SyncInboxFuture),
+    FetchingMessageContent(FetchMessageContentFuture),
     LoadingRetry {
         account_id: AccountId,
         expected_generation: AccountGeneration,
@@ -1836,7 +1982,9 @@ impl ActiveTask {
     ) -> Poll<Result<TaskProgress, AccountDriverError>> {
         if matches!(
             self.state,
-            ActiveTaskState::ProbingDiagnostic { .. } | ActiveTaskState::Syncing(_)
+            ActiveTaskState::ProbingDiagnostic { .. }
+                | ActiveTaskState::Syncing(_)
+                | ActiveTaskState::FetchingMessageContent(_)
         ) && let Some(user) = self.reply.as_mut()
             && user.reply.poll_closed(context).is_ready()
         {
@@ -1852,6 +2000,7 @@ impl ActiveTask {
                     imported,
                     has_more,
                     historical,
+                    bootstrap,
                 }) => Poll::Ready(Ok(TaskProgress::Finished(
                     AccountWorkflowOutcome::InboxSynced {
                         account_id,
@@ -1859,6 +2008,7 @@ impl ActiveTask {
                         imported,
                         has_more,
                         historical,
+                        bootstrap,
                     },
                 ))),
                 Poll::Ready(SyncInboxOutcome::Failed { stage, failure }) => {
@@ -1868,6 +2018,29 @@ impl ActiveTask {
                     })))
                 }
                 Poll::Ready(SyncInboxOutcome::DatabaseClosed) => {
+                    Poll::Ready(Err(AccountDriverError::DatabaseClosed))
+                }
+            },
+            ActiveTaskState::FetchingMessageContent(fetch) => match fetch.as_mut().poll(context) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(FetchMessageContentOutcome::Fetched {
+                    account_id,
+                    generation,
+                    message_id,
+                }) => Poll::Ready(Ok(TaskProgress::Finished(
+                    AccountWorkflowOutcome::MessageContentFetched {
+                        message_id,
+                        account_id,
+                        generation,
+                    },
+                ))),
+                Poll::Ready(FetchMessageContentOutcome::Failed { stage, failure }) => {
+                    Poll::Ready(Ok(TaskProgress::Finished(AccountWorkflowOutcome::Failed {
+                        stage,
+                        failure,
+                    })))
+                }
+                Poll::Ready(FetchMessageContentOutcome::DatabaseClosed) => {
                     Poll::Ready(Err(AccountDriverError::DatabaseClosed))
                 }
             },
@@ -2546,10 +2719,7 @@ fn outcome_changes_sync_targets(outcome: &AccountWorkflowOutcome) -> bool {
 
 fn sync_completion(outcome: &AccountWorkflowOutcome) -> SyncCompletion {
     match outcome {
-        AccountWorkflowOutcome::InboxSynced { has_more: true, .. } => SyncCompletion::HasMore,
-        AccountWorkflowOutcome::InboxSynced {
-            has_more: false, ..
-        } => SyncCompletion::Complete,
+        AccountWorkflowOutcome::InboxSynced { .. } => SyncCompletion::Complete,
         _ => SyncCompletion::Failed,
     }
 }
@@ -2629,12 +2799,22 @@ fn project_outcome(
             imported,
             has_more,
             historical,
+            bootstrap: _,
         } => Ok(AccountOperationSuccess::Synced {
             account_id,
             generation,
             imported,
             has_more,
             historical,
+        }),
+        AccountWorkflowOutcome::MessageContentFetched {
+            message_id,
+            account_id,
+            generation,
+        } => Ok(AccountOperationSuccess::MessageContentFetched {
+            message_id,
+            account_id,
+            generation,
         }),
         AccountWorkflowOutcome::RemovalPending {
             account_id,

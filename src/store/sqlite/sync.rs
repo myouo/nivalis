@@ -8,7 +8,7 @@ use super::{
     stats,
 };
 
-const MAX_RECEIVE_PAGE: usize = 32;
+const MAX_RECEIVE_PAGE: usize = 50;
 const MAX_SENDER_BYTES: usize = 320;
 const MAX_SUBJECT_BYTES: usize = 998;
 const MAX_PREVIEW_BYTES: usize = 2_048;
@@ -28,6 +28,20 @@ pub(crate) struct InboxCheckpoint {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InboxCheckpointOutcome {
     Current(InboxCheckpoint),
+    Stale,
+    NotFound,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ImapMessageContentTarget {
+    pub(crate) uid_validity: u32,
+    pub(crate) uid: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImapMessageContentTargetOutcome {
+    Current(ImapMessageContentTarget),
+    AlreadyAvailable,
     Stale,
     NotFound,
 }
@@ -449,7 +463,6 @@ impl InboxCursorCommit {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InboxCursorOutcome {
     Committed { scanned_through_uid: Option<u32> },
-    ContentPending { missing: u8 },
     Stale,
 }
 
@@ -577,6 +590,66 @@ pub(super) fn load_inbox_checkpoint(
         history_cursor,
         history_complete,
     }))
+}
+
+pub(super) fn load_imap_message_content_target(
+    connection: &Connection,
+    message_id: MessageId,
+    account_id: AccountId,
+    expected_generation: AccountGeneration,
+) -> Result<ImapMessageContentTargetOutcome, DbFailure> {
+    match active_imap_account_fence(connection, account_id, expected_generation)? {
+        ActiveImapAccountFence::Current => {}
+        ActiveImapAccountFence::Stale => return Ok(ImapMessageContentTargetOutcome::Stale),
+        ActiveImapAccountFence::NotFound => return Ok(ImapMessageContentTargetOutcome::NotFound),
+    }
+
+    let target = connection
+        .query_row(
+            "SELECT location.uid_validity, location.uid,
+                    content.message_id IS NOT NULL
+             FROM messages AS message
+             JOIN imap_message_locations AS location
+               ON location.message_id = message.id
+              AND location.account_id = message.account_id
+             JOIN folders AS folder
+               ON folder.id = location.folder_id
+              AND folder.account_id = location.account_id
+              AND folder.role = 'inbox'
+             JOIN sync_state AS state
+               ON state.folder_id = folder.id
+              AND state.uid_validity = location.uid_validity
+             LEFT JOIN message_content AS content ON content.message_id = message.id
+             WHERE message.id = ?1 AND message.account_id = ?2
+             LIMIT 1",
+            params![message_id.get(), account_id.get()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(DbFailure::database)?;
+    let Some((uid_validity, uid, content_available)) = target else {
+        return Ok(ImapMessageContentTargetOutcome::NotFound);
+    };
+    if content_available {
+        return Ok(ImapMessageContentTargetOutcome::AlreadyAvailable);
+    }
+    let uid_validity = u32::try_from(uid_validity)
+        .ok()
+        .filter(|value| *value != 0)
+        .ok_or_else(|| DbFailure::database("stored message UIDVALIDITY is invalid"))?;
+    let uid = u32::try_from(uid)
+        .ok()
+        .filter(|value| *value != 0)
+        .ok_or_else(|| DbFailure::database("stored message UID is invalid"))?;
+    Ok(ImapMessageContentTargetOutcome::Current(
+        ImapMessageContentTarget { uid_validity, uid },
+    ))
 }
 
 pub(super) fn stage_inbox_page(
@@ -727,48 +800,14 @@ pub(super) fn commit_inbox_cursor(
         return Ok(InboxCursorOutcome::Stale);
     }
 
-    let pending = match commit.ticket.progress {
-        InboxReceiveProgress::Forward {
-            expected_cursor, ..
-        } => load_cursor_window(
-            &transaction,
-            inbox.id,
-            commit.ticket.uid_validity,
-            expected_cursor.unwrap_or(0),
-            cursor_boundary.unwrap_or(0),
-        )?,
-        InboxReceiveProgress::History {
-            expected_history_cursor,
-            next_history_cursor,
-            ..
-        } => {
-            if !history_fence_matches(&transaction, inbox.id, expected_history_cursor)? {
-                return Ok(InboxCursorOutcome::Stale);
-            }
-            load_cursor_window(
-                &transaction,
-                inbox.id,
-                commit.ticket.uid_validity,
-                next_history_cursor.unwrap_or(0),
-                expected_history_cursor,
-            )?
-        }
-    };
-    if pending.len() > MAX_RECEIVE_PAGE {
-        return Err(DbFailure::resource_limit(
-            "inbox cursor window exceeds the receive page limit",
-        ));
+    if let InboxReceiveProgress::History {
+        expected_history_cursor,
+        ..
+    } = commit.ticket.progress
+        && !history_fence_matches(&transaction, inbox.id, expected_history_cursor)?
+    {
+        return Ok(InboxCursorOutcome::Stale);
     }
-    let missing = pending
-        .iter()
-        .filter(|message| !message.has_content)
-        .count();
-    if missing != 0 {
-        return Ok(InboxCursorOutcome::ContentPending {
-            missing: u8::try_from(missing).expect("receive pages fit in u8"),
-        });
-    }
-
     let changed = match commit.ticket.progress {
         InboxReceiveProgress::Forward {
             expected_cursor,
@@ -845,11 +884,6 @@ struct InboxFolder {
     role: Box<str>,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct CursorWindowMessage {
-    has_content: bool,
-}
-
 fn account_fence_matches(
     connection: &Connection,
     account_id: AccountId,
@@ -900,10 +934,10 @@ pub(super) fn active_imap_account_fence(
 }
 
 fn load_inbox(
-    transaction: &Transaction<'_>,
+    connection: &Connection,
     account_id: AccountId,
 ) -> Result<Option<InboxFolder>, DbFailure> {
-    let existing = transaction
+    let existing = connection
         .query_row(
             "SELECT id, role FROM folders
              WHERE account_id = ?1 AND remote_key = ?2",
@@ -1275,44 +1309,6 @@ fn enforce_history_window_bound(
         ));
     }
     Ok(())
-}
-
-fn load_cursor_window(
-    transaction: &Transaction<'_>,
-    folder_id: i64,
-    uid_validity: u32,
-    cursor: u32,
-    last_uid: u32,
-) -> Result<Vec<CursorWindowMessage>, DbFailure> {
-    let mut statement = transaction
-        .prepare(
-            "SELECT content.message_id IS NOT NULL
-             FROM imap_message_locations AS location
-             LEFT JOIN message_content AS content ON content.message_id = location.message_id
-             WHERE location.folder_id = ?1 AND location.uid_validity = ?2
-               AND location.uid > ?3 AND location.uid <= ?4
-             ORDER BY location.uid
-             LIMIT ?5",
-        )
-        .map_err(DbFailure::database)?;
-    let rows = statement
-        .query_map(
-            params![
-                folder_id,
-                i64::from(uid_validity),
-                i64::from(cursor),
-                i64::from(last_uid),
-                i64::try_from(MAX_RECEIVE_PAGE + 1).expect("page bound fits i64"),
-            ],
-            |row| {
-                Ok(CursorWindowMessage {
-                    has_content: row.get(0)?,
-                })
-            },
-        )
-        .map_err(DbFailure::database)?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(DbFailure::database)
 }
 
 fn parse_cursor(value: &str) -> Result<u32, DbFailure> {
@@ -1703,7 +1699,7 @@ mod tests {
             ),
             Err(InboxValidationError::DuplicateUid(1))
         ));
-        let oversized = (1..=33)
+        let oversized = (1..=51)
             .map(|uid| envelope(uid, "Mail", InboxFlags::new(false, false)))
             .collect();
         assert!(matches!(
@@ -1712,12 +1708,12 @@ mod tests {
                 generation(GENERATION),
                 None,
                 UID_VALIDITY,
-                Some(33),
+                Some(51),
                 oversized,
             ),
             Err(InboxValidationError::PageSize {
-                found: 33,
-                maximum: 32
+                found: 51,
+                maximum: 50
             })
         ));
         assert_eq!(
@@ -1748,7 +1744,7 @@ mod tests {
     }
 
     #[test]
-    fn stages_visible_mail_and_commits_cursor_only_after_content() {
+    fn stages_visible_mail_and_commits_cursor_before_content_import() {
         let mut connection = connection();
         let outcome = stage_inbox_page(
             &mut connection,
@@ -1782,13 +1778,6 @@ mod tests {
         let commit = InboxCursorCommit::new(ticket, 2_000).unwrap();
         assert_eq!(
             commit_inbox_cursor(&mut connection, &commit).unwrap(),
-            InboxCursorOutcome::ContentPending { missing: 2 }
-        );
-        assert_eq!(sync_state(&connection), Some((19, None, None)));
-
-        add_content(&connection, &staged);
-        assert_eq!(
-            commit_inbox_cursor(&mut connection, &commit).unwrap(),
             InboxCursorOutcome::Committed {
                 scanned_through_uid: Some(42)
             }
@@ -1796,6 +1785,67 @@ mod tests {
         assert_eq!(
             sync_state(&connection),
             Some((19, Some("42".to_owned()), Some(2_000)))
+        );
+        assert!(staged.iter().all(|message| message.needs_content));
+    }
+
+    #[test]
+    fn on_demand_content_target_is_fenced_and_disappears_after_import() {
+        let mut connection = connection();
+        let (staged, ticket) = stage_parts(
+            stage_inbox_page(
+                &mut connection,
+                &page(
+                    None,
+                    UID_VALIDITY,
+                    vec![envelope(9, "Selected", InboxFlags::new(false, false))],
+                ),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            commit_inbox_cursor(
+                &mut connection,
+                &InboxCursorCommit::new(ticket, 2_000).unwrap(),
+            )
+            .unwrap(),
+            InboxCursorOutcome::Committed {
+                scanned_through_uid: Some(9)
+            }
+        );
+        assert_eq!(
+            load_imap_message_content_target(
+                &connection,
+                staged[0].message_id,
+                account_id(),
+                generation(GENERATION),
+            )
+            .unwrap(),
+            ImapMessageContentTargetOutcome::Current(ImapMessageContentTarget {
+                uid_validity: UID_VALIDITY,
+                uid: 9,
+            })
+        );
+        add_content(&connection, &staged);
+        assert_eq!(
+            load_imap_message_content_target(
+                &connection,
+                staged[0].message_id,
+                account_id(),
+                generation(GENERATION),
+            )
+            .unwrap(),
+            ImapMessageContentTargetOutcome::AlreadyAvailable
+        );
+        assert_eq!(
+            load_imap_message_content_target(
+                &connection,
+                staged[0].message_id,
+                account_id(),
+                generation(GENERATION + 1),
+            )
+            .unwrap(),
+            ImapMessageContentTargetOutcome::Stale
         );
     }
 

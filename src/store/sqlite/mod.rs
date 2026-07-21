@@ -27,9 +27,10 @@ pub(crate) use account::{
 #[allow(unused_imports)]
 pub(crate) use actor::{
     AccountWriteExecutionFailure, AccountWriteReply, AccountWriteSubmitFailure,
-    ContentImportExecutionFailure, ContentImportOutcome, ContentImportReply,
-    ContentImportSubmission, ContentImportSubmitFailure, RemoteReportExecutionFailure,
-    RemoteReportReply, RemoteReportSubmitFailure,
+    ContentImportBatchExecutionFailure, ContentImportBatchOutcome, ContentImportBatchReply,
+    ContentImportBatchSubmission, ContentImportBatchSubmitFailure, ContentImportExecutionFailure,
+    ContentImportOutcome, ContentImportReply, ContentImportSubmission, ContentImportSubmitFailure,
+    RemoteReportExecutionFailure, RemoteReportReply, RemoteReportSubmitFailure,
 };
 #[allow(unused_imports)]
 pub(crate) use actor::{
@@ -76,9 +77,10 @@ pub(crate) use outbox::{
 };
 #[allow(unused_imports)]
 pub(crate) use sync::{
-    InboxCheckpoint, InboxCheckpointOutcome, InboxCursorCommit, InboxCursorOutcome,
-    InboxCursorTicket, InboxEnvelope, InboxFlags, InboxReceivePage, InboxStageOutcome,
-    InboxValidationError, StagedInboxMessage,
+    ImapMessageContentTarget, ImapMessageContentTargetOutcome, InboxCheckpoint,
+    InboxCheckpointOutcome, InboxCursorCommit, InboxCursorOutcome, InboxCursorTicket,
+    InboxEnvelope, InboxFlags, InboxReceivePage, InboxStageOutcome, InboxValidationError,
+    StagedInboxMessage,
 };
 
 #[cfg(test)]

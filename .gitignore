@@ -1,4 +1,5 @@
 /target
+/benchmarks/target
 /node_modules
 .agents/
 .codex/

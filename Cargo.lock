@@ -3038,6 +3038,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "mail-protocol-core"
+version = "0.3.0"
+dependencies = [
+ "bytes",
+ "memchr",
+]
+
+[[package]]
+name = "mail-protocol-imap"
+version = "0.3.0"
+dependencies = [
+ "bytes",
+ "mail-protocol-core",
+ "memchr",
+]
+
+[[package]]
 name = "maybe-rayon"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3174,12 +3191,15 @@ name = "nivalis-mail"
 version = "0.1.0"
 dependencies = [
  "async-imap",
+ "bytes",
  "crossbeam-channel",
  "getrandom 0.4.3",
  "i-slint-backend-testing",
  "keyring-core",
  "lettre",
  "mail-parser",
+ "mail-protocol-core",
+ "mail-protocol-imap",
  "rcgen",
  "rusqlite",
  "rustls",

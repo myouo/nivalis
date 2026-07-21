@@ -89,6 +89,10 @@ impl MailboxAcceptance {
             intent: self.intent,
             page_number: self.target_page,
             visible_ids: page.rows.iter().map(|row| row.id).collect(),
+            tail_cursor: page.rows.last().map(|row| PageCursor {
+                received_at_ms: row.received_at_ms,
+                message_id: row.id,
+            }),
             next_cursor: page.next_cursor,
             mutation_refresh: self.mutation_refresh,
         })
@@ -100,6 +104,7 @@ pub(crate) struct MailboxCommit {
     intent: MailboxIntent,
     page_number: u64,
     visible_ids: Box<[MessageId]>,
+    tail_cursor: Option<PageCursor>,
     next_cursor: Option<PageCursor>,
     mutation_refresh: Option<RequestStamp>,
 }
@@ -181,6 +186,7 @@ pub(crate) struct ReadSession {
     search: Box<str>,
     visible_ids: Box<[MessageId]>,
     selected: Option<MessageId>,
+    tail_cursor: Option<PageCursor>,
     next_cursor: Option<PageCursor>,
     page_number: u64,
     accounts_request: Option<RequestStamp>,
@@ -202,6 +208,7 @@ impl ReadSession {
             search: Box::default(),
             visible_ids: Box::new([]),
             selected: None,
+            tail_cursor: None,
             next_cursor: None,
             page_number: 0,
             accounts_request: None,
@@ -234,6 +241,12 @@ impl ReadSession {
         )
     }
 
+    pub(crate) fn can_load_remote_history(&self) -> bool {
+        matches!(self.account, AccountKey::Account(_))
+            && self.folder == FolderScope::Inbox
+            && self.search.is_empty()
+    }
+
     pub(crate) fn search(&self) -> &str {
         &self.search
     }
@@ -249,6 +262,13 @@ impl ReadSession {
 
     pub(crate) fn next_cursor(&self) -> Option<PageCursor> {
         self.next_cursor
+    }
+
+    pub(crate) fn enable_remote_tail_navigation(&mut self) -> bool {
+        if self.next_cursor.is_none() {
+            self.next_cursor = self.tail_cursor;
+        }
+        self.next_cursor.is_some()
     }
 
     #[cfg(test)]
@@ -543,12 +563,14 @@ impl ReadSession {
                 let mut visible_ids = self.visible_ids.to_vec();
                 visible_ids.extend_from_slice(&commit.visible_ids);
                 self.visible_ids = visible_ids.into_boxed_slice();
+                self.tail_cursor = commit.tail_cursor;
                 self.next_cursor = commit.next_cursor;
                 self.page_number = commit.page_number;
                 MailboxCommitEffect::Append
             }
             MailboxIntent::First => {
                 self.visible_ids = commit.visible_ids;
+                self.tail_cursor = commit.tail_cursor;
                 self.next_cursor = commit.next_cursor;
                 self.page_number = commit.page_number;
                 self.selected = None;
@@ -560,6 +582,7 @@ impl ReadSession {
                     let from = self.visible_ids.len();
                     let extended = commit.visible_ids.len() > from;
                     self.visible_ids = commit.visible_ids;
+                    self.tail_cursor = commit.tail_cursor;
                     self.next_cursor = commit.next_cursor;
                     self.page_number = commit.page_number;
                     if extended {
@@ -571,6 +594,7 @@ impl ReadSession {
                     MailboxCommitEffect::Preserve
                 } else {
                     self.visible_ids = commit.visible_ids;
+                    self.tail_cursor = commit.tail_cursor;
                     self.next_cursor = commit.next_cursor;
                     self.page_number = commit.page_number;
                     self.selected = None;
@@ -817,6 +841,7 @@ impl ReadSession {
     fn invalidate_mailbox(&mut self) {
         self.visible_ids = Box::new([]);
         self.selected = None;
+        self.tail_cursor = None;
         self.next_cursor = None;
         self.page_number = 0;
         self.mailbox_request = None;
@@ -1034,6 +1059,7 @@ mod tests {
             body_truncated: false,
             body_byte_count: 4,
             body_file_key: None,
+            content_available: true,
         }
     }
 
@@ -1244,6 +1270,33 @@ mod tests {
         assert_eq!(session.visible_ids.len(), 51);
         assert_eq!(session.next_cursor(), Some(cursor(51)));
         assert_eq!(session.page_number(), 2);
+    }
+
+    #[test]
+    fn completed_visible_window_can_resume_from_its_tail_after_remote_history_arrives() {
+        let first = (1..=50).collect::<Vec<_>>();
+        let mut session = ReadSession::new();
+        session.issue_first_mailbox().unwrap();
+        commit_reply(
+            &mut session,
+            &mailbox_reply_with_cursors(1, 1, &first, None, Some(50)),
+        );
+        session.issue_more_mailbox().unwrap();
+        commit_reply(
+            &mut session,
+            &mailbox_reply_with_cursors(2, 1, &[51], Some(51), None),
+        );
+        assert_eq!(session.next_cursor(), None);
+
+        session.issue_mailbox_refresh().unwrap();
+        commit_reply(
+            &mut session,
+            &mailbox_reply_with_cursors(3, 1, &first, None, Some(50)),
+        );
+        assert_eq!(session.next_cursor(), None);
+        assert!(session.enable_remote_tail_navigation());
+        assert_eq!(session.next_cursor(), Some(cursor(51)));
+        assert!(session.issue_more_mailbox().is_ok());
     }
 
     #[test]

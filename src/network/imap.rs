@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     fmt,
     future::{Future, poll_fn},
     io,
@@ -12,7 +13,11 @@ use std::{
 use async_imap::{
     Client, Session,
     error::Error as ImapError,
-    imap_proto::types::{AttributeValue, Response, Status},
+    imap_proto::types::{Response, Status},
+};
+use mail_protocol_imap::{
+    FetchEnvelope as ProtocolEnvelope, FetchFlag, FetchResponseItem, Response as ProtocolResponse,
+    Status as ProtocolStatus, StatusKind, UntaggedData, parse_untagged,
 };
 use rustls::{ClientConfig, Error as RustlsError, crypto, pki_types::ServerName};
 use rustls_platform_verifier::BuilderVerifierExt;
@@ -26,6 +31,10 @@ use tokio_rustls::{TlsConnector, client::TlsStream};
 
 use crate::credentials::Secret;
 
+mod fast;
+
+use fast::{ProtocolSession, ProtocolTag, map_protocol_error, open_protocol_session};
+
 const MAX_HOST_BYTES: usize = 253;
 const MAX_LOGIN_BYTES: usize = 320;
 const MAX_SERVER_BYTES: usize = 256 * 1024;
@@ -33,17 +42,27 @@ const MAX_CLIENT_BYTES: usize = 64 * 1024;
 const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGOUT_TIMEOUT: Duration = Duration::from_secs(1);
 const INBOX_FETCH_TIMEOUT: Duration = Duration::from_secs(45);
-const MAX_INBOX_MESSAGES: usize = 32;
+const PARALLEL_SESSION_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_INBOX_MESSAGES: usize = 50;
+const FIRST_SCREEN_MESSAGES: usize = 20;
+const MAX_BODY_CONNECTIONS: usize = 2;
+const MIN_PARALLEL_BODY_MESSAGES: usize = 8;
 const MAX_INBOX_LITERAL_BYTES: usize = 1024 * 1024;
-const MAX_INBOX_PAGE_LITERAL_BYTES: usize = 4 * 1024 * 1024;
+const MAX_INBOX_PAGE_LITERAL_BYTES: usize = 20 * 1024 * 1024;
 const MAX_INBOX_SERVER_BYTES: usize = MAX_INBOX_PAGE_LITERAL_BYTES + 512 * 1024;
 const MAX_INBOX_CLIENT_BYTES: usize = 64 * 1024;
+const MAX_ON_DEMAND_MESSAGE_BYTES: usize = 20 * 1024 * 1024;
+const MAX_ON_DEMAND_SERVER_BYTES: usize = MAX_ON_DEMAND_MESSAGE_BYTES + 512 * 1024;
 const MAX_INTERNAL_DATE_BYTES: usize = 64;
+const MAX_ENVELOPE_DATE_BYTES: usize = 128;
 const MAX_ENVELOPE_SUBJECT_BYTES: usize = 998;
 const MAX_ENVELOPE_NAME_BYTES: usize = 320;
 const MAX_ENVELOPE_MAILBOX_BYTES: usize = 320;
 const MAX_ENVELOPE_HOST_BYTES: usize = 253;
 const MAX_ENVELOPE_MESSAGE_ID_BYTES: usize = 998;
+const MAX_CACHED_INBOX_SESSIONS: usize = 8;
+const CACHED_INBOX_SESSION_TTL: Duration = Duration::from_secs(6 * 60);
+const CACHED_SESSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 static PLATFORM_CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
 
@@ -149,6 +168,51 @@ pub(crate) enum ImapInboxFetchInputError {
     HistoryCursor,
 }
 
+pub(crate) struct ImapMessageContentFetchRequest {
+    host: Box<str>,
+    port: u16,
+    login: Box<str>,
+    secret: Secret,
+    uid_validity: NonZeroU32,
+    uid: NonZeroU32,
+}
+
+impl ImapMessageContentFetchRequest {
+    pub(crate) fn new(
+        host: &str,
+        port: u16,
+        login: &str,
+        secret: Secret,
+        uid_validity: u32,
+        uid: u32,
+    ) -> Result<Self, ImapMessageContentFetchInputError> {
+        validate_connection_input(host, port, login, &secret)
+            .map_err(ImapMessageContentFetchInputError::Connection)?;
+        Ok(Self {
+            host: host.into(),
+            port,
+            login: login.into(),
+            secret,
+            uid_validity: NonZeroU32::new(uid_validity)
+                .ok_or(ImapMessageContentFetchInputError::UidValidity)?,
+            uid: NonZeroU32::new(uid).ok_or(ImapMessageContentFetchInputError::Uid)?,
+        })
+    }
+}
+
+impl fmt::Debug for ImapMessageContentFetchRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ImapMessageContentFetchRequest([REDACTED])")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImapMessageContentFetchInputError {
+    Connection(ImapDiagnosticInputError),
+    UidValidity,
+    Uid,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ImapInboxFlags {
     pub(crate) seen: bool,
@@ -160,6 +224,7 @@ pub(crate) struct ImapInboxFlags {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ImapInboxEnvelope {
+    pub(crate) date: Box<[u8]>,
     pub(crate) subject: Box<[u8]>,
     pub(crate) from_name: Box<[u8]>,
     pub(crate) from_mailbox: Box<[u8]>,
@@ -169,6 +234,7 @@ pub(crate) struct ImapInboxEnvelope {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ImapInboxContent {
+    NotFetched,
     Fetched(Box<[u8]>),
     Oversized { declared_bytes: u32 },
 }
@@ -401,6 +467,78 @@ async fn diagnose_with_connector(
 
 type AuthenticatedSession = Session<BoundedIo<TlsStream<TcpStream>>>;
 
+struct CachedInboxSession {
+    host: Box<str>,
+    port: u16,
+    login: Box<str>,
+    uid_validity: NonZeroU32,
+    cached_at: Instant,
+    session: ProtocolSession,
+}
+
+thread_local! {
+    static CACHED_INBOX_SESSIONS: RefCell<Vec<CachedInboxSession>> = const {
+        RefCell::new(Vec::new())
+    };
+}
+
+fn take_cached_inbox_session(
+    host: &str,
+    port: u16,
+    login: &str,
+    uid_validity: NonZeroU32,
+) -> Option<ProtocolSession> {
+    let now = Instant::now();
+    CACHED_INBOX_SESSIONS.with_borrow_mut(|sessions| {
+        sessions.retain(|entry| {
+            now.saturating_duration_since(entry.cached_at) <= CACHED_INBOX_SESSION_TTL
+        });
+        let index = sessions.iter().position(|entry| {
+            entry.host.as_ref() == host
+                && entry.port == port
+                && entry.login.as_ref() == login
+                && entry.uid_validity == uid_validity
+        })?;
+        Some(sessions.swap_remove(index).session)
+    })
+}
+
+fn cache_inbox_session(
+    host: &str,
+    port: u16,
+    login: &str,
+    uid_validity: NonZeroU32,
+    session: ProtocolSession,
+) {
+    let now = Instant::now();
+    CACHED_INBOX_SESSIONS.with_borrow_mut(|sessions| {
+        sessions.retain(|entry| {
+            now.saturating_duration_since(entry.cached_at) <= CACHED_INBOX_SESSION_TTL
+                && !(entry.host.as_ref() == host
+                    && entry.port == port
+                    && entry.login.as_ref() == login
+                    && entry.uid_validity == uid_validity)
+        });
+        if sessions.len() == MAX_CACHED_INBOX_SESSIONS {
+            let oldest = sessions
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.cached_at)
+                .map(|(index, _)| index)
+                .expect("a full session cache contains an entry");
+            sessions.swap_remove(oldest);
+        }
+        sessions.push(CachedInboxSession {
+            host: host.into(),
+            port,
+            login: login.into(),
+            uid_validity,
+            cached_at: now,
+            session,
+        });
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn open_app_password_session(
     host: &str,
@@ -523,6 +661,119 @@ pub(crate) async fn fetch_canonical_inbox(
         .await
 }
 
+pub(crate) async fn fetch_canonical_inbox_metadata(
+    request: ImapInboxFetchRequest,
+) -> Result<ImapInboxPage, ImapInboxFetchFailure> {
+    let connector = platform_connector().map_err(map_diagnostic_failure)?;
+    fetch_canonical_inbox_with_mode(
+        request,
+        connector,
+        InboxFetchLimits::production(),
+        None,
+        InboxFetchMode::Metadata,
+        true,
+    )
+    .await
+}
+
+pub(crate) async fn fetch_imap_message_content(
+    request: ImapMessageContentFetchRequest,
+) -> Result<Box<[u8]>, ImapInboxFetchFailure> {
+    let connector = platform_connector().map_err(map_diagnostic_failure)?;
+    fetch_imap_message_content_inner(request, connector, on_demand_limits(), true).await
+}
+
+fn on_demand_limits() -> InboxFetchLimits {
+    InboxFetchLimits {
+        timeout: INBOX_FETCH_TIMEOUT,
+        max_server_bytes: MAX_ON_DEMAND_SERVER_BYTES,
+        max_client_bytes: MAX_INBOX_CLIENT_BYTES,
+        max_messages: 1,
+        max_message_literal_bytes: MAX_ON_DEMAND_MESSAGE_BYTES,
+        max_page_literal_bytes: MAX_ON_DEMAND_MESSAGE_BYTES,
+        body_connections: 1,
+    }
+}
+
+async fn fetch_imap_message_content_with_connector(
+    request: ImapMessageContentFetchRequest,
+    connector: TlsConnector,
+    limits: InboxFetchLimits,
+) -> Result<Box<[u8]>, ImapInboxFetchFailure> {
+    fetch_imap_message_content_inner(request, connector, limits, false).await
+}
+
+async fn fetch_imap_message_content_inner(
+    request: ImapMessageContentFetchRequest,
+    connector: TlsConnector,
+    limits: InboxFetchLimits,
+    reuse_cached_session: bool,
+) -> Result<Box<[u8]>, ImapInboxFetchFailure> {
+    let deadline = Instant::now() + limits.timeout;
+    if reuse_cached_session
+        && let Some(mut session) = take_cached_inbox_session(
+            request.host.as_ref(),
+            request.port,
+            request.login.as_ref(),
+            request.uid_validity,
+        )
+    {
+        match fetch_body(&mut session, request.uid, deadline, limits).await {
+            Ok(content) => {
+                cache_inbox_session(
+                    request.host.as_ref(),
+                    request.port,
+                    request.login.as_ref(),
+                    request.uid_validity,
+                    session,
+                );
+                return Ok(content);
+            }
+            Err(
+                ImapInboxFetchFailure::Offline
+                | ImapInboxFetchFailure::Timeout
+                | ImapInboxFetchFailure::Protocol
+                | ImapInboxFetchFailure::ResourceLimit,
+            ) => {}
+            Err(failure) => return Err(failure),
+        }
+    }
+    let mut session = open_protocol_session(
+        request.host.as_ref(),
+        request.port,
+        request.login.as_ref(),
+        &request.secret,
+        connector,
+        deadline,
+        limits,
+    )
+    .await?;
+    let mailbox = session.examine_inbox(deadline).await?;
+    let actual_uid_validity = mailbox
+        .uid_validity
+        .and_then(NonZeroU32::new)
+        .ok_or(ImapInboxFetchFailure::MissingUidValidity)?;
+    if actual_uid_validity != request.uid_validity {
+        return Err(ImapInboxFetchFailure::UidValidityChanged {
+            expected: request.uid_validity.get(),
+            actual: actual_uid_validity.get(),
+        });
+    }
+    let content = fetch_body(&mut session, request.uid, deadline, limits).await?;
+    if reuse_cached_session {
+        cache_inbox_session(
+            request.host.as_ref(),
+            request.port,
+            request.login.as_ref(),
+            request.uid_validity,
+            session,
+        );
+    } else {
+        session.logout(Instant::now() + LOGOUT_TIMEOUT).await;
+    }
+    Ok(content)
+}
+
 pub(crate) async fn fetch_canonical_inbox_cancellable(
     request: ImapInboxFetchRequest,
     cancellation: ImapInboxFetchCancellation,
@@ -543,7 +794,27 @@ async fn fetch_canonical_inbox_with_connector(
     limits: InboxFetchLimits,
     cancellation: Option<ImapInboxFetchCancellation>,
 ) -> Result<ImapInboxPage, ImapInboxFetchFailure> {
-    let operation = fetch_canonical_inbox_inner(request, connector, limits);
+    fetch_canonical_inbox_with_mode(
+        request,
+        connector,
+        limits,
+        cancellation,
+        InboxFetchMode::Complete,
+        false,
+    )
+    .await
+}
+
+async fn fetch_canonical_inbox_with_mode(
+    request: ImapInboxFetchRequest,
+    connector: TlsConnector,
+    limits: InboxFetchLimits,
+    cancellation: Option<ImapInboxFetchCancellation>,
+    mode: InboxFetchMode,
+    cache_primary_session: bool,
+) -> Result<ImapInboxPage, ImapInboxFetchFailure> {
+    let operation =
+        fetch_canonical_inbox_inner(request, connector, limits, mode, cache_primary_session);
     let Some(ImapInboxFetchCancellation(receiver)) = cancellation else {
         return operation.await;
     };
@@ -568,28 +839,56 @@ async fn fetch_canonical_inbox_inner(
     request: ImapInboxFetchRequest,
     connector: TlsConnector,
     limits: InboxFetchLimits,
+    mode: InboxFetchMode,
+    cache_primary_session: bool,
 ) -> Result<ImapInboxPage, ImapInboxFetchFailure> {
     let deadline = Instant::now() + limits.timeout;
-    let (mut session, login_capabilities) = open_app_password_session(
-        request.host.as_ref(),
-        request.port,
-        request.login.as_ref(),
-        &request.secret,
-        connector,
-        deadline,
-        limits.max_server_bytes,
-        limits.max_client_bytes,
-    )
-    .await
-    .map_err(map_diagnostic_failure)?;
-    require_imap_capability(&mut session, login_capabilities, deadline)
-        .await
-        .map_err(map_diagnostic_failure)?;
-
-    let mailbox = match timeout_at(deadline, session.examine("INBOX")).await {
-        Ok(Ok(mailbox)) => mailbox,
-        Ok(Err(error)) => return Err(map_receive_imap_error(&error, true)),
-        Err(_) => return Err(ImapInboxFetchFailure::Timeout),
+    let body_connector = connector.clone();
+    let cached_session = if cache_primary_session {
+        request.expected_uid_validity.and_then(|uid_validity| {
+            take_cached_inbox_session(
+                request.host.as_ref(),
+                request.port,
+                request.login.as_ref(),
+                uid_validity,
+            )
+        })
+    } else {
+        None
+    };
+    let (mut session, mailbox) = if let Some(mut cached) = cached_session {
+        let probe_deadline = deadline.min(Instant::now() + CACHED_SESSION_PROBE_TIMEOUT);
+        match cached.examine_inbox(probe_deadline).await {
+            Ok(mailbox) => (cached, mailbox),
+            Err(failure) if recoverable_cached_session_failure(failure) => {
+                let mut fresh = open_protocol_session(
+                    request.host.as_ref(),
+                    request.port,
+                    request.login.as_ref(),
+                    &request.secret,
+                    connector,
+                    deadline,
+                    limits,
+                )
+                .await?;
+                let mailbox = fresh.examine_inbox(deadline).await?;
+                (fresh, mailbox)
+            }
+            Err(failure) => return Err(failure),
+        }
+    } else {
+        let mut fresh = open_protocol_session(
+            request.host.as_ref(),
+            request.port,
+            request.login.as_ref(),
+            &request.secret,
+            connector,
+            deadline,
+            limits,
+        )
+        .await?;
+        let mailbox = fresh.examine_inbox(deadline).await?;
+        (fresh, mailbox)
     };
     let uid_validity = mailbox
         .uid_validity
@@ -609,6 +908,68 @@ async fn fetch_canonical_inbox_inner(
         .ok_or(ImapInboxFetchFailure::MissingUidNext)?;
     let first_uid = request.first_uid.get();
     let initial_snapshot = first_uid == 1;
+    let selection_limits = if initial_snapshot {
+        InboxFetchLimits {
+            max_messages: limits.max_messages.min(FIRST_SCREEN_MESSAGES),
+            ..limits
+        }
+    } else {
+        limits
+    };
+    if mode == InboxFetchMode::Metadata && initial_snapshot && mailbox.exists > 0 {
+        let mut metadata = fetch_latest_metadata_by_sequence(
+            &mut session,
+            mailbox.exists,
+            deadline,
+            selection_limits,
+        )
+        .await?;
+        metadata.sort_unstable_by_key(|message| message.uid);
+        let has_history = usize::try_from(mailbox.exists)
+            .map_err(|_| ImapInboxFetchFailure::ResourceLimit)?
+            > metadata.len();
+        let next_cursor = has_history
+            .then(|| {
+                metadata
+                    .first()
+                    .and_then(|message| NonZeroU32::new(message.uid.get() - 1))
+            })
+            .flatten();
+        let messages = metadata
+            .into_iter()
+            .map(|metadata| ImapInboxMessage {
+                uid: metadata.uid,
+                flags: metadata.flags,
+                internal_date: metadata.internal_date,
+                envelope: metadata.envelope,
+                declared_bytes: metadata.declared_bytes,
+                content: ImapInboxContent::NotFetched,
+            })
+            .collect::<Vec<_>>();
+        if cache_primary_session {
+            cache_inbox_session(
+                request.host.as_ref(),
+                request.port,
+                request.login.as_ref(),
+                uid_validity,
+                session,
+            );
+        } else {
+            session.logout(Instant::now() + LOGOUT_TIMEOUT).await;
+        }
+        return Ok(ImapInboxPage {
+            uid_validity,
+            uid_next,
+            scanned_through_uid: NonZeroU32::new(uid_next.get().saturating_sub(1)),
+            next_uid: None,
+            bootstrap_history: Some(ImapBootstrapHistory {
+                next_cursor,
+                complete: !has_history,
+            }),
+            history_page: None,
+            messages: messages.into_boxed_slice(),
+        });
+    }
     let mut selection = if mailbox.exists == 0 || uid_next.get() <= first_uid {
         let scanned_through = first_uid
             .saturating_sub(1)
@@ -632,7 +993,7 @@ async fn fetch_canonical_inbox_inner(
             uid_next,
             initial_snapshot,
             deadline,
-            limits,
+            selection_limits,
         )
         .await?
     };
@@ -653,7 +1014,17 @@ async fn fetch_canonical_inbox_inner(
         .await?;
     }
     if selection.uids.is_empty() {
-        let _ = tokio::time::timeout(LOGOUT_TIMEOUT, session.logout()).await;
+        if cache_primary_session {
+            cache_inbox_session(
+                request.host.as_ref(),
+                request.port,
+                request.login.as_ref(),
+                uid_validity,
+                session,
+            );
+        } else {
+            session.logout(Instant::now() + LOGOUT_TIMEOUT).await;
+        }
         return Ok(ImapInboxPage {
             uid_validity,
             uid_next,
@@ -665,48 +1036,146 @@ async fn fetch_canonical_inbox_inner(
         });
     }
 
-    let mut metadata = fetch_metadata(&mut session, &selection.uids, deadline, limits).await?;
+    if mode == InboxFetchMode::Metadata {
+        let mut secondary_session = None;
+        let mut metadata = if limits.body_connections > 1
+            && selection.uids.len() >= MIN_PARALLEL_BODY_MESSAGES
+        {
+            let split = selection.uids.len().div_ceil(2);
+            let (primary_uids, secondary_uids) = selection.uids.split_at(split);
+            let secondary_deadline = deadline.min(Instant::now() + PARALLEL_SESSION_TIMEOUT);
+            let primary_fetch = fetch_metadata(&mut session, primary_uids, deadline, limits);
+            let secondary_fetch = async {
+                match open_inbox_body_session(
+                    request.host.as_ref(),
+                    request.port,
+                    request.login.as_ref(),
+                    &request.secret,
+                    body_connector,
+                    uid_validity,
+                    secondary_deadline,
+                    limits,
+                )
+                .await
+                {
+                    Ok(mut secondary) => {
+                        let result =
+                            fetch_metadata(&mut secondary, secondary_uids, deadline, limits).await;
+                        (Some(secondary), result)
+                    }
+                    Err(failure) => (None, Err(failure)),
+                }
+            };
+            let (primary_result, (secondary, secondary_result)) =
+                join_pair(primary_fetch, secondary_fetch).await;
+            secondary_session = secondary;
+            match (primary_result, secondary_result) {
+                (Ok(mut primary), Ok(secondary)) => {
+                    primary.extend(secondary);
+                    primary
+                }
+                (Ok(mut primary), Err(_)) => {
+                    primary.extend(
+                        fetch_metadata(&mut session, secondary_uids, deadline, limits).await?,
+                    );
+                    primary
+                }
+                (Err(_), Ok(mut secondary)) => {
+                    let Some(secondary_connection) = secondary_session.as_mut() else {
+                        return Err(ImapInboxFetchFailure::Protocol);
+                    };
+                    secondary.extend(
+                        fetch_metadata(secondary_connection, primary_uids, deadline, limits)
+                            .await?,
+                    );
+                    secondary
+                }
+                (Err(primary_failure), Err(_)) => return Err(primary_failure),
+            }
+        } else {
+            fetch_metadata(&mut session, &selection.uids, deadline, limits).await?
+        };
+        metadata.sort_unstable_by_key(|message| message.uid);
+        if selection.history_page.is_some() {
+            metadata.reverse();
+        }
+        let messages = metadata
+            .into_iter()
+            .map(|metadata| ImapInboxMessage {
+                uid: metadata.uid,
+                flags: metadata.flags,
+                internal_date: metadata.internal_date,
+                envelope: metadata.envelope,
+                declared_bytes: metadata.declared_bytes,
+                content: ImapInboxContent::NotFetched,
+            })
+            .collect::<Vec<_>>();
+        if let Some(secondary) = secondary_session {
+            secondary.logout(Instant::now() + LOGOUT_TIMEOUT).await;
+        }
+        if cache_primary_session {
+            cache_inbox_session(
+                request.host.as_ref(),
+                request.port,
+                request.login.as_ref(),
+                uid_validity,
+                session,
+            );
+        } else {
+            session.logout(Instant::now() + LOGOUT_TIMEOUT).await;
+        }
+        return Ok(ImapInboxPage {
+            uid_validity,
+            uid_next,
+            scanned_through_uid: selection.scanned_through_uid,
+            next_uid: selection.next_uid,
+            bootstrap_history: selection.bootstrap_history,
+            history_page: selection.history_page,
+            messages: messages.into_boxed_slice(),
+        });
+    }
+
+    let (mut metadata, mut secondary_session) =
+        if limits.body_connections > 1 && selection.uids.len() >= MIN_PARALLEL_BODY_MESSAGES {
+            let secondary_deadline = deadline.min(Instant::now() + PARALLEL_SESSION_TIMEOUT);
+            let metadata_fetch = fetch_metadata(&mut session, &selection.uids, deadline, limits);
+            let secondary_open = open_inbox_body_session(
+                request.host.as_ref(),
+                request.port,
+                request.login.as_ref(),
+                &request.secret,
+                body_connector,
+                uid_validity,
+                secondary_deadline,
+                limits,
+            );
+            let (metadata, secondary) = join_pair(metadata_fetch, secondary_open).await;
+            (metadata?, secondary.ok())
+        } else {
+            (
+                fetch_metadata(&mut session, &selection.uids, deadline, limits).await?,
+                None,
+            )
+        };
     metadata.sort_unstable_by_key(|message| message.uid);
     if selection.history_page.is_some() {
         metadata.reverse();
     }
 
-    let mut messages = Vec::with_capacity(metadata.len());
-    let mut literal_bytes = 0_usize;
-    let mut deferred_uid = None;
-    for metadata in metadata {
-        let declared_bytes = usize::try_from(metadata.declared_bytes)
-            .map_err(|_| ImapInboxFetchFailure::ResourceLimit)?;
-        let content = if declared_bytes > limits.max_message_literal_bytes {
-            ImapInboxContent::Oversized {
-                declared_bytes: metadata.declared_bytes,
-            }
-        } else {
-            let next_total = literal_bytes
-                .checked_add(declared_bytes)
-                .ok_or(ImapInboxFetchFailure::ResourceLimit)?;
-            if next_total > limits.max_page_literal_bytes {
-                deferred_uid = Some(metadata.uid);
-                break;
-            }
-            let raw = fetch_body(&mut session, metadata.uid, deadline, limits).await?;
-            literal_bytes = literal_bytes
-                .checked_add(raw.len())
-                .ok_or(ImapInboxFetchFailure::ResourceLimit)?;
-            if literal_bytes > limits.max_page_literal_bytes {
-                return Err(ImapInboxFetchFailure::ResourceLimit);
-            }
-            ImapInboxContent::Fetched(raw)
-        };
-        messages.push(ImapInboxMessage {
-            uid: metadata.uid,
-            flags: metadata.flags,
-            internal_date: metadata.internal_date,
-            envelope: metadata.envelope,
-            declared_bytes: metadata.declared_bytes,
-            content,
-        });
+    let fetched = fetch_message_contents(
+        &mut session,
+        secondary_session.as_mut(),
+        metadata,
+        limits.max_page_literal_bytes,
+        deadline,
+        limits,
+    )
+    .await?;
+    if let Some(secondary) = secondary_session {
+        secondary.logout(Instant::now() + LOGOUT_TIMEOUT).await;
     }
+    let messages = fetched.messages.into_vec();
+    let deferred_uid = fetched.deferred_uid;
     let (scanned_through_uid, next_uid, history_page) =
         if let Some(mut history) = selection.history_page {
             if deferred_uid.is_some() {
@@ -728,7 +1197,7 @@ async fn fetch_canonical_inbox_inner(
                 None,
             )
         };
-    let _ = tokio::time::timeout(LOGOUT_TIMEOUT, session.logout()).await;
+    session.logout(Instant::now() + LOGOUT_TIMEOUT).await;
     Ok(ImapInboxPage {
         uid_validity,
         uid_next,
@@ -740,6 +1209,12 @@ async fn fetch_canonical_inbox_inner(
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InboxFetchMode {
+    Metadata,
+    Complete,
+}
+
 #[derive(Clone, Copy)]
 struct InboxFetchLimits {
     timeout: Duration,
@@ -748,6 +1223,7 @@ struct InboxFetchLimits {
     max_messages: usize,
     max_message_literal_bytes: usize,
     max_page_literal_bytes: usize,
+    body_connections: usize,
 }
 
 impl InboxFetchLimits {
@@ -759,8 +1235,36 @@ impl InboxFetchLimits {
             max_messages: MAX_INBOX_MESSAGES,
             max_message_literal_bytes: MAX_INBOX_LITERAL_BYTES,
             max_page_literal_bytes: MAX_INBOX_PAGE_LITERAL_BYTES,
+            body_connections: MAX_BODY_CONNECTIONS,
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_inbox_body_session(
+    host: &str,
+    port: u16,
+    login: &str,
+    secret: &Secret,
+    connector: TlsConnector,
+    expected_uid_validity: NonZeroU32,
+    deadline: Instant,
+    limits: InboxFetchLimits,
+) -> Result<ProtocolSession, ImapInboxFetchFailure> {
+    let mut session =
+        open_protocol_session(host, port, login, secret, connector, deadline, limits).await?;
+    let mailbox = session.examine_inbox(deadline).await?;
+    let actual_uid_validity = mailbox
+        .uid_validity
+        .and_then(NonZeroU32::new)
+        .ok_or(ImapInboxFetchFailure::MissingUidValidity)?;
+    if actual_uid_validity != expected_uid_validity {
+        return Err(ImapInboxFetchFailure::UidValidityChanged {
+            expected: expected_uid_validity.get(),
+            actual: actual_uid_validity.get(),
+        });
+    }
+    Ok(session)
 }
 
 struct InboxMetadata {
@@ -780,7 +1284,7 @@ struct UidSelection {
 }
 
 async fn search_uids(
-    session: &mut AuthenticatedSession,
+    session: &mut ProtocolSession,
     first_uid: u32,
     uid_next: NonZeroU32,
     initial_snapshot: bool,
@@ -790,11 +1294,9 @@ async fn search_uids(
     if limits.max_messages == 0 {
         return Err(ImapInboxFetchFailure::ResourceLimit);
     }
-    let found = match timeout_at(deadline, session.uid_search(format!("UID {first_uid}:*"))).await {
-        Ok(Ok(found)) => found,
-        Ok(Err(error)) => return Err(map_receive_imap_error(&error, false)),
-        Err(_) => return Err(ImapInboxFetchFailure::Timeout),
-    };
+    let found = session
+        .uid_search(format!("UID {first_uid}:*"), deadline)
+        .await?;
     let mut found = found
         .into_iter()
         .filter(|uid| (first_uid..uid_next.get()).contains(uid))
@@ -828,7 +1330,7 @@ async fn search_uids(
 }
 
 async fn search_history_uids(
-    session: &mut AuthenticatedSession,
+    session: &mut ProtocolSession,
     expected_cursor: NonZeroU32,
     history_cursor: NonZeroU32,
     deadline: Instant,
@@ -837,16 +1339,9 @@ async fn search_history_uids(
     if limits.max_messages == 0 {
         return Err(ImapInboxFetchFailure::ResourceLimit);
     }
-    let found = match timeout_at(
-        deadline,
-        session.uid_search(format!("UID 1:{}", history_cursor.get())),
-    )
-    .await
-    {
-        Ok(Ok(found)) => found,
-        Ok(Err(error)) => return Err(map_receive_imap_error(&error, false)),
-        Err(_) => return Err(ImapInboxFetchFailure::Timeout),
-    };
+    let found = session
+        .uid_search(format!("UID 1:{}", history_cursor.get()), deadline)
+        .await?;
     let mut found = found
         .into_iter()
         .filter(|uid| (1..=history_cursor.get()).contains(uid))
@@ -874,7 +1369,7 @@ async fn search_history_uids(
 }
 
 async fn fetch_metadata(
-    session: &mut AuthenticatedSession,
+    session: &mut ProtocolSession,
     uids: &[NonZeroU32],
     deadline: Instant,
     limits: InboxFetchLimits,
@@ -886,11 +1381,7 @@ async fn fetch_metadata(
         .collect::<Vec<_>>()
         .join(",");
     let command = format!("UID FETCH {uid_set} (UID FLAGS INTERNALDATE RFC822.SIZE ENVELOPE)");
-    let id = match timeout_at(deadline, session.run_command(command)).await {
-        Ok(Ok(id)) => id,
-        Ok(Err(error)) => return Err(map_receive_imap_error(&error, false)),
-        Err(_) => return Err(ImapInboxFetchFailure::Timeout),
-    };
+    let id = session.run_command(command, deadline).await?;
     let mut messages = Vec::with_capacity(limits.max_messages);
     loop {
         let response = read_receive_response(session, deadline).await?;
@@ -918,25 +1409,307 @@ async fn fetch_metadata(
             ReceiveResponse::Other => {}
         }
     }
+    if messages.len() != uids.len() {
+        return Err(ImapInboxFetchFailure::Protocol);
+    }
     Ok(messages)
 }
 
+async fn fetch_latest_metadata_by_sequence(
+    session: &mut ProtocolSession,
+    exists: u32,
+    deadline: Instant,
+    limits: InboxFetchLimits,
+) -> Result<Vec<InboxMetadata>, ImapInboxFetchFailure> {
+    let maximum =
+        u32::try_from(limits.max_messages).map_err(|_| ImapInboxFetchFailure::ResourceLimit)?;
+    if maximum == 0 {
+        return Err(ImapInboxFetchFailure::ResourceLimit);
+    }
+    let expected = exists.min(maximum);
+    let first_sequence = exists - expected + 1;
+    let command = format!("FETCH {first_sequence}:* (UID FLAGS INTERNALDATE RFC822.SIZE ENVELOPE)");
+    let id = session.run_command(command, deadline).await?;
+    let mut messages = Vec::with_capacity(
+        usize::try_from(expected).map_err(|_| ImapInboxFetchFailure::ResourceLimit)?,
+    );
+    loop {
+        let response = read_receive_response(session, deadline).await?;
+        match response {
+            ReceiveResponse::Done { tag, status } if tag == id => {
+                require_ok_status(status)?;
+                break;
+            }
+            ReceiveResponse::Done { .. } => return Err(ImapInboxFetchFailure::Protocol),
+            ReceiveResponse::Fetch(fetch) => {
+                if messages.len() == limits.max_messages {
+                    return Err(ImapInboxFetchFailure::ResourceLimit);
+                }
+                let message = parse_metadata(fetch)?;
+                if messages
+                    .iter()
+                    .any(|existing: &InboxMetadata| existing.uid == message.uid)
+                {
+                    return Err(ImapInboxFetchFailure::Protocol);
+                }
+                messages.push(message);
+            }
+            ReceiveResponse::Bye => return Err(ImapInboxFetchFailure::Offline),
+            ReceiveResponse::Other => {}
+        }
+    }
+    if messages.len()
+        != usize::try_from(expected).map_err(|_| ImapInboxFetchFailure::ResourceLimit)?
+    {
+        return Err(ImapInboxFetchFailure::Protocol);
+    }
+    Ok(messages)
+}
+
+struct ContentFetchPage {
+    messages: Box<[ImapInboxMessage]>,
+    deferred_uid: Option<NonZeroU32>,
+}
+
+async fn fetch_message_contents(
+    session: &mut ProtocolSession,
+    secondary_session: Option<&mut ProtocolSession>,
+    metadata: Vec<InboxMetadata>,
+    maximum_literal_bytes: usize,
+    deadline: Instant,
+    limits: InboxFetchLimits,
+) -> Result<ContentFetchPage, ImapInboxFetchFailure> {
+    let mut included = Vec::with_capacity(metadata.len());
+    let mut declared_total = 0_usize;
+    let mut deferred_uid = None;
+    for message in metadata {
+        let declared_bytes = usize::try_from(message.declared_bytes)
+            .map_err(|_| ImapInboxFetchFailure::ResourceLimit)?;
+        if declared_bytes <= limits.max_message_literal_bytes {
+            let next_total = declared_total
+                .checked_add(declared_bytes)
+                .ok_or(ImapInboxFetchFailure::ResourceLimit)?;
+            if next_total > maximum_literal_bytes {
+                deferred_uid = Some(message.uid);
+                break;
+            }
+            declared_total = next_total;
+        }
+        included.push(message);
+    }
+
+    let mut body_work = Vec::with_capacity(included.len());
+    for message in &included {
+        let declared_bytes = usize::try_from(message.declared_bytes)
+            .map_err(|_| ImapInboxFetchFailure::ResourceLimit)?;
+        if declared_bytes <= limits.max_message_literal_bytes {
+            body_work.push((message.uid, declared_bytes));
+        }
+    }
+    let mut bodies = if body_work.is_empty() {
+        Vec::new()
+    } else if let Some(secondary) = secondary_session
+        && body_work.len() >= MIN_PARALLEL_BODY_MESSAGES
+    {
+        fetch_bodies_parallel(session, secondary, &body_work, deadline, limits).await?
+    } else {
+        let uids = body_work.iter().map(|(uid, _)| *uid).collect::<Vec<_>>();
+        fetch_bodies(session, &uids, deadline, limits).await?
+    };
+
+    let mut actual_total = 0_usize;
+    let mut messages = Vec::with_capacity(included.len());
+    for metadata in included {
+        let declared_bytes = usize::try_from(metadata.declared_bytes)
+            .map_err(|_| ImapInboxFetchFailure::ResourceLimit)?;
+        let content = if declared_bytes > limits.max_message_literal_bytes {
+            ImapInboxContent::Oversized {
+                declared_bytes: metadata.declared_bytes,
+            }
+        } else {
+            let index = bodies
+                .iter()
+                .position(|body| body.uid == metadata.uid)
+                .ok_or(ImapInboxFetchFailure::Protocol)?;
+            let body = bodies.swap_remove(index);
+            actual_total = actual_total
+                .checked_add(body.bytes.len())
+                .ok_or(ImapInboxFetchFailure::ResourceLimit)?;
+            if actual_total > maximum_literal_bytes {
+                return Err(ImapInboxFetchFailure::ResourceLimit);
+            }
+            ImapInboxContent::Fetched(body.bytes)
+        };
+        messages.push(ImapInboxMessage {
+            uid: metadata.uid,
+            flags: metadata.flags,
+            internal_date: metadata.internal_date,
+            envelope: metadata.envelope,
+            declared_bytes: metadata.declared_bytes,
+            content,
+        });
+    }
+    if !bodies.is_empty() {
+        return Err(ImapInboxFetchFailure::Protocol);
+    }
+    Ok(ContentFetchPage {
+        messages: messages.into_boxed_slice(),
+        deferred_uid,
+    })
+}
+
+async fn fetch_bodies_parallel(
+    primary: &mut ProtocolSession,
+    secondary: &mut ProtocolSession,
+    work: &[(NonZeroU32, usize)],
+    deadline: Instant,
+    limits: InboxFetchLimits,
+) -> Result<Vec<ProjectedBody>, ImapInboxFetchFailure> {
+    let (primary_uids, secondary_uids) = balanced_body_partitions(work);
+    let (primary_result, secondary_result) = join_pair(
+        fetch_bodies(primary, &primary_uids, deadline, limits),
+        fetch_bodies(secondary, &secondary_uids, deadline, limits),
+    )
+    .await;
+    match (primary_result, secondary_result) {
+        (Ok(mut primary_bodies), Ok(secondary_bodies)) => {
+            primary_bodies.extend(secondary_bodies);
+            Ok(primary_bodies)
+        }
+        (Ok(mut primary_bodies), Err(_)) => {
+            primary_bodies.extend(fetch_bodies(primary, &secondary_uids, deadline, limits).await?);
+            Ok(primary_bodies)
+        }
+        (Err(_), Ok(mut secondary_bodies)) => {
+            secondary_bodies
+                .extend(fetch_bodies(secondary, &primary_uids, deadline, limits).await?);
+            Ok(secondary_bodies)
+        }
+        (Err(primary_failure), Err(_)) => Err(primary_failure),
+    }
+}
+
+fn balanced_body_partitions(work: &[(NonZeroU32, usize)]) -> (Vec<NonZeroU32>, Vec<NonZeroU32>) {
+    let mut sorted = work.to_vec();
+    sorted.sort_unstable_by(|(left_uid, left_bytes), (right_uid, right_bytes)| {
+        right_bytes
+            .cmp(left_bytes)
+            .then_with(|| left_uid.cmp(right_uid))
+    });
+    let mut primary = Vec::with_capacity(sorted.len().div_ceil(2));
+    let mut secondary = Vec::with_capacity(sorted.len() / 2);
+    let mut primary_bytes = 0_usize;
+    let mut secondary_bytes = 0_usize;
+    for (uid, bytes) in sorted {
+        if primary_bytes <= secondary_bytes {
+            primary.push(uid);
+            primary_bytes = primary_bytes.saturating_add(bytes);
+        } else {
+            secondary.push(uid);
+            secondary_bytes = secondary_bytes.saturating_add(bytes);
+        }
+    }
+    (primary, secondary)
+}
+
+async fn join_pair<A, B>(left: A, right: B) -> (A::Output, B::Output)
+where
+    A: Future,
+    B: Future,
+{
+    let mut left = std::pin::pin!(left);
+    let mut right = std::pin::pin!(right);
+    let mut left_output = None;
+    let mut right_output = None;
+    poll_fn(move |context| {
+        if left_output.is_none()
+            && let Poll::Ready(output) = left.as_mut().poll(context)
+        {
+            left_output = Some(output);
+        }
+        if right_output.is_none()
+            && let Poll::Ready(output) = right.as_mut().poll(context)
+        {
+            right_output = Some(output);
+        }
+        match (left_output.take(), right_output.take()) {
+            (Some(left), Some(right)) => Poll::Ready((left, right)),
+            (left, right) => {
+                left_output = left;
+                right_output = right;
+                Poll::Pending
+            }
+        }
+    })
+    .await
+}
+
+async fn fetch_bodies(
+    session: &mut ProtocolSession,
+    uids: &[NonZeroU32],
+    deadline: Instant,
+    limits: InboxFetchLimits,
+) -> Result<Vec<ProjectedBody>, ImapInboxFetchFailure> {
+    if uids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let uid_set = uids
+        .iter()
+        .map(|uid| uid.get().to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let id = session
+        .run_command(format!("UID FETCH {uid_set} (UID BODY.PEEK[])"), deadline)
+        .await?;
+    let mut bodies = Vec::with_capacity(uids.len());
+    loop {
+        let response = read_receive_response(session, deadline).await?;
+        match response {
+            ReceiveResponse::Done { tag, status } if tag == id => {
+                require_ok_status(status)?;
+                break;
+            }
+            ReceiveResponse::Done { .. } => return Err(ImapInboxFetchFailure::Protocol),
+            ReceiveResponse::Fetch(fetch) => {
+                let Some(bytes) = fetch.body else {
+                    continue;
+                };
+                let uid = match fetch.uid {
+                    Some(uid) => NonZeroU32::new(uid).ok_or(ImapInboxFetchFailure::Protocol)?,
+                    None if uids.len() == 1 => uids[0],
+                    None => return Err(ImapInboxFetchFailure::Protocol),
+                };
+                if !uids.contains(&uid) || bodies.iter().any(|body: &ProjectedBody| body.uid == uid)
+                {
+                    return Err(ImapInboxFetchFailure::Protocol);
+                }
+                if bytes.len() > limits.max_message_literal_bytes {
+                    return Err(ImapInboxFetchFailure::ResourceLimit);
+                }
+                bodies.push(ProjectedBody { uid, bytes });
+            }
+            ReceiveResponse::Bye => return Err(ImapInboxFetchFailure::Offline),
+            ReceiveResponse::Other => {}
+        }
+    }
+    if bodies.len() != uids.len() {
+        return Err(ImapInboxFetchFailure::Protocol);
+    }
+    Ok(bodies)
+}
+
 async fn fetch_body(
-    session: &mut AuthenticatedSession,
+    session: &mut ProtocolSession,
     uid: NonZeroU32,
     deadline: Instant,
     limits: InboxFetchLimits,
 ) -> Result<Box<[u8]>, ImapInboxFetchFailure> {
-    let id = match timeout_at(
-        deadline,
-        session.run_command(format!("UID FETCH {} (UID BODY.PEEK[])", uid.get())),
-    )
-    .await
-    {
-        Ok(Ok(id)) => id,
-        Ok(Err(error)) => return Err(map_receive_imap_error(&error, false)),
-        Err(_) => return Err(ImapInboxFetchFailure::Timeout),
-    };
+    let id = session
+        .run_command(
+            format!("UID FETCH {} (UID BODY.PEEK[])", uid.get()),
+            deadline,
+        )
+        .await?;
     let mut body = None;
     loop {
         let response = read_receive_response(session, deadline).await?;
@@ -966,20 +1739,15 @@ async fn fetch_body(
 }
 
 async fn read_receive_response(
-    session: &mut AuthenticatedSession,
+    session: &mut ProtocolSession,
     deadline: Instant,
 ) -> Result<ReceiveResponse, ImapInboxFetchFailure> {
-    match timeout_at(deadline, session.read_response()).await {
-        Ok(Ok(Some(response))) => project_receive_response(response.parsed()),
-        Ok(Ok(None)) => Err(ImapInboxFetchFailure::Offline),
-        Ok(Err(error)) => Err(map_receive_io_error(&error)),
-        Err(_) => Err(ImapInboxFetchFailure::Timeout),
-    }
+    project_protocol_response(session.read_response(deadline).await?)
 }
 
 enum ReceiveResponse {
     Done {
-        tag: async_imap::imap_proto::RequestId,
+        tag: ProtocolTag,
         status: ReceiveStatus,
     },
     Fetch(ProjectedFetch),
@@ -992,8 +1760,6 @@ enum ReceiveStatus {
     Ok,
     No,
     Bad,
-    PreAuth,
-    Bye,
 }
 
 #[derive(Default)]
@@ -1006,72 +1772,85 @@ struct ProjectedFetch {
     body: Option<Box<[u8]>>,
 }
 
-fn project_receive_response(
-    response: &Response<'_>,
+fn project_protocol_response(
+    response: ProtocolResponse,
 ) -> Result<ReceiveResponse, ImapInboxFetchFailure> {
-    match response {
-        Response::Done { tag, status, .. } => Ok(ReceiveResponse::Done {
-            tag: tag.clone(),
-            status: project_status(status),
-        }),
-        Response::Fetch(_, attributes) => {
+    if let ProtocolResponse::Tagged { tag, status, .. } = response {
+        return Ok(ReceiveResponse::Done {
+            tag: ProtocolTag::from_bytes(tag),
+            status: match status {
+                ProtocolStatus::Ok => ReceiveStatus::Ok,
+                ProtocolStatus::No => ReceiveStatus::No,
+                ProtocolStatus::Bad => ReceiveStatus::Bad,
+                _ => return Err(ImapInboxFetchFailure::Protocol),
+            },
+        });
+    }
+    match parse_untagged(&response).map_err(map_protocol_error)? {
+        Some(UntaggedData::Fetch { data, .. }) => {
             let mut fetch = ProjectedFetch::default();
-            for attribute in attributes {
-                project_fetch_attribute(&mut fetch, attribute)?;
+            for item in data.items() {
+                project_protocol_fetch_item(&mut fetch, item)?;
             }
             Ok(ReceiveResponse::Fetch(fetch))
         }
-        Response::Data {
-            status: Status::Bye,
-            ..
-        } => Ok(ReceiveResponse::Bye),
+        Some(UntaggedData::Status(status)) if status.kind == StatusKind::Bye => {
+            Ok(ReceiveResponse::Bye)
+        }
         _ => Ok(ReceiveResponse::Other),
     }
 }
 
-fn project_status(status: &Status) -> ReceiveStatus {
-    match status {
-        Status::Ok => ReceiveStatus::Ok,
-        Status::No => ReceiveStatus::No,
-        Status::Bad => ReceiveStatus::Bad,
-        Status::PreAuth => ReceiveStatus::PreAuth,
-        Status::Bye => ReceiveStatus::Bye,
-    }
-}
-
-fn project_fetch_attribute(
+fn project_protocol_fetch_item(
     fetch: &mut ProjectedFetch,
-    attribute: &AttributeValue<'_>,
+    item: FetchResponseItem<'_>,
 ) -> Result<(), ImapInboxFetchFailure> {
-    match attribute {
-        AttributeValue::Uid(value) => set_once(&mut fetch.uid, *value)?,
-        AttributeValue::Flags(values) => {
-            let parsed = ImapInboxFlags {
-                seen: has_flag(values, "\\Seen"),
-                flagged: has_flag(values, "\\Flagged"),
-                answered: has_flag(values, "\\Answered"),
-                draft: has_flag(values, "\\Draft"),
-                deleted: has_flag(values, "\\Deleted"),
-            };
-            set_once(&mut fetch.flags, parsed)?;
+    match item {
+        FetchResponseItem::Uid(value) => set_once(&mut fetch.uid, value)?,
+        FetchResponseItem::Flags(values) => {
+            let mut flags = ImapInboxFlags::default();
+            for flag in values.iter() {
+                match flag {
+                    FetchFlag::Seen => flags.seen = true,
+                    FetchFlag::Flagged => flags.flagged = true,
+                    FetchFlag::Answered => flags.answered = true,
+                    FetchFlag::Draft => flags.draft = true,
+                    FetchFlag::Deleted => flags.deleted = true,
+                    _ => {}
+                }
+            }
+            set_once(&mut fetch.flags, flags)?;
         }
-        AttributeValue::InternalDate(value) => {
+        FetchResponseItem::InternalDate(value) => {
+            let value = value
+                .strip_prefix(b"\"")
+                .and_then(|value| value.strip_suffix(b"\""))
+                .ok_or(ImapInboxFetchFailure::Protocol)?;
             if value.len() > MAX_INTERNAL_DATE_BYTES {
                 return Err(ImapInboxFetchFailure::ResourceLimit);
             }
-            set_once(&mut fetch.internal_date, value.to_string().into_boxed_str())?;
+            let value = std::str::from_utf8(value)
+                .map_err(|_| ImapInboxFetchFailure::Protocol)?
+                .to_owned()
+                .into_boxed_str();
+            set_once(&mut fetch.internal_date, value)?;
         }
-        AttributeValue::Rfc822Size(value) => set_once(&mut fetch.declared_bytes, *value)?,
-        AttributeValue::Envelope(value) => {
-            set_once(&mut fetch.envelope, project_envelope(value)?)?;
+        FetchResponseItem::Rfc822Size(value) => set_once(
+            &mut fetch.declared_bytes,
+            u32::try_from(value).map_err(|_| ImapInboxFetchFailure::ResourceLimit)?,
+        )?,
+        FetchResponseItem::Envelope(value) => {
+            set_once(&mut fetch.envelope, project_protocol_envelope(value)?)?;
         }
-        AttributeValue::BodySection {
-            section: None,
-            data: Some(bytes),
-            ..
+        FetchResponseItem::BodySection { section, data, .. } if section.is_entire_message() => {
+            if let Some(bytes) = data.decoded() {
+                set_once(&mut fetch.body, bytes.as_ref().into())?;
+            }
         }
-        | AttributeValue::Rfc822(Some(bytes)) => {
-            set_once(&mut fetch.body, bytes.as_ref().into())?;
+        FetchResponseItem::Rfc822(data) => {
+            if let Some(bytes) = data.decoded() {
+                set_once(&mut fetch.body, bytes.as_ref().into())?;
+            }
         }
         _ => {}
     }
@@ -1128,38 +1907,38 @@ fn set_once<T>(slot: &mut Option<T>, value: T) -> Result<(), ImapInboxFetchFailu
     }
 }
 
-fn has_flag(flags: &[std::borrow::Cow<'_, str>], expected: &str) -> bool {
-    flags
-        .iter()
-        .any(|flag| flag.as_ref().eq_ignore_ascii_case(expected))
-}
-
-fn project_envelope(
-    envelope: &async_imap::imap_proto::types::Envelope<'_>,
+fn project_protocol_envelope(
+    envelope: ProtocolEnvelope<'_>,
 ) -> Result<ImapInboxEnvelope, ImapInboxFetchFailure> {
-    let from = envelope
-        .from
-        .as_ref()
-        .and_then(|addresses| addresses.first());
+    let from = envelope.from().iter().next();
     Ok(ImapInboxEnvelope {
-        subject: bounded_envelope_bytes(envelope.subject.as_deref(), MAX_ENVELOPE_SUBJECT_BYTES)?,
-        from_name: bounded_envelope_bytes(
-            from.and_then(|address| address.name.as_deref()),
+        date: bounded_protocol_nstring(envelope.date(), MAX_ENVELOPE_DATE_BYTES)?,
+        subject: bounded_protocol_nstring(envelope.subject(), MAX_ENVELOPE_SUBJECT_BYTES)?,
+        from_name: bounded_protocol_nstring(
+            from.map(|address| address.name)
+                .unwrap_or(mail_protocol_imap::FetchNString::Nil),
             MAX_ENVELOPE_NAME_BYTES,
         )?,
-        from_mailbox: bounded_envelope_bytes(
-            from.and_then(|address| address.mailbox.as_deref()),
+        from_mailbox: bounded_protocol_nstring(
+            from.map(|address| address.mailbox)
+                .unwrap_or(mail_protocol_imap::FetchNString::Nil),
             MAX_ENVELOPE_MAILBOX_BYTES,
         )?,
-        from_host: bounded_envelope_bytes(
-            from.and_then(|address| address.host.as_deref()),
+        from_host: bounded_protocol_nstring(
+            from.map(|address| address.host)
+                .unwrap_or(mail_protocol_imap::FetchNString::Nil),
             MAX_ENVELOPE_HOST_BYTES,
         )?,
-        message_id: bounded_envelope_bytes(
-            envelope.message_id.as_deref(),
-            MAX_ENVELOPE_MESSAGE_ID_BYTES,
-        )?,
+        message_id: bounded_protocol_nstring(envelope.message_id(), MAX_ENVELOPE_MESSAGE_ID_BYTES)?,
     })
+}
+
+fn bounded_protocol_nstring(
+    value: mail_protocol_imap::FetchNString<'_>,
+    maximum: usize,
+) -> Result<Box<[u8]>, ImapInboxFetchFailure> {
+    let value = value.decoded();
+    bounded_envelope_bytes(value.as_deref(), maximum)
 }
 
 fn bounded_envelope_bytes(
@@ -1178,9 +1957,18 @@ fn require_ok_status(status: ReceiveStatus) -> Result<(), ImapInboxFetchFailure>
     match status {
         ReceiveStatus::Ok => Ok(()),
         ReceiveStatus::No => Err(ImapInboxFetchFailure::Permission),
-        ReceiveStatus::Bad | ReceiveStatus::PreAuth => Err(ImapInboxFetchFailure::Protocol),
-        ReceiveStatus::Bye => Err(ImapInboxFetchFailure::Offline),
+        ReceiveStatus::Bad => Err(ImapInboxFetchFailure::Protocol),
     }
+}
+
+fn recoverable_cached_session_failure(failure: ImapInboxFetchFailure) -> bool {
+    matches!(
+        failure,
+        ImapInboxFetchFailure::Offline
+            | ImapInboxFetchFailure::Timeout
+            | ImapInboxFetchFailure::Protocol
+            | ImapInboxFetchFailure::ResourceLimit
+    )
 }
 
 fn map_diagnostic_failure(failure: ImapDiagnosticFailure) -> ImapInboxFetchFailure {
@@ -2223,6 +3011,14 @@ mod inbox_fetch_tests {
         task: JoinHandle<Vec<Box<str>>>,
     }
 
+    type ParallelServerTranscripts = (Vec<Box<str>>, Vec<Box<str>>);
+
+    struct ParallelTestServer {
+        address: SocketAddr,
+        connector: TlsConnector,
+        task: JoinHandle<ParallelServerTranscripts>,
+    }
+
     fn run_async<F: Future>(future: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .enable_io()
@@ -2248,7 +3044,32 @@ mod inbox_fetch_tests {
             max_messages: 2,
             max_message_literal_bytes: 1024,
             max_page_literal_bytes: 2048,
+            body_connections: 1,
         }
+    }
+
+    #[test]
+    fn body_partitions_balance_declared_bytes_across_two_connections() {
+        let work = [(1, 8), (2, 1), (3, 7), (4, 2)]
+            .into_iter()
+            .map(|(uid, bytes)| (NonZeroU32::new(uid).unwrap(), bytes))
+            .collect::<Vec<_>>();
+        let (primary, secondary) = balanced_body_partitions(&work);
+        let total = |uids: &[NonZeroU32]| {
+            uids.iter()
+                .map(|uid| {
+                    work.iter()
+                        .find(|(candidate, _)| candidate == uid)
+                        .unwrap()
+                        .1
+                })
+                .sum::<usize>()
+        };
+
+        assert_eq!(primary.len() + secondary.len(), work.len());
+        assert!(!primary.is_empty());
+        assert!(!secondary.is_empty());
+        assert_eq!(total(&primary), total(&secondary));
     }
 
     fn request(port: u16, expected_uid_validity: Option<u32>) -> ImapInboxFetchRequest {
@@ -2279,6 +3100,18 @@ mod inbox_fetch_tests {
             expected_uid_validity,
             history_cursor,
             history_complete,
+        )
+        .unwrap()
+    }
+
+    fn content_request(port: u16, uid: u32) -> ImapMessageContentFetchRequest {
+        ImapMessageContentFetchRequest::new(
+            HOST,
+            port,
+            LOGIN,
+            Secret::new(PASSWORD.to_vec()).unwrap(),
+            UID_VALIDITY,
+            uid,
         )
         .unwrap()
     }
@@ -2316,6 +3149,74 @@ mod inbox_fetch_tests {
             let (tcp, _) = listener.accept().await.unwrap();
             let stream = acceptor.accept(tcp).await.unwrap();
             run_server(stream, plan).await
+        });
+        TestServer {
+            address,
+            connector,
+            task,
+        }
+    }
+
+    async fn spawn_parallel_server(
+        messages: Vec<FixtureMessage>,
+        fail_secondary_body: bool,
+    ) -> ParallelTestServer {
+        let (acceptor, connector) = test_tls();
+        let listener = TcpListener::bind((HOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (primary_tcp, _) = listener.accept().await.unwrap();
+            let primary_stream = acceptor.accept(primary_tcp).await.unwrap();
+            let primary_messages = messages.clone();
+            let primary = tokio::spawn(async move {
+                run_server(primary_stream, ServerPlan::messages(primary_messages)).await
+            });
+
+            let (secondary_tcp, _) = listener.accept().await.unwrap();
+            let secondary_stream = acceptor.accept(secondary_tcp).await.unwrap();
+            let secondary =
+                run_body_only_server(secondary_stream, messages, fail_secondary_body).await;
+            (primary.await.unwrap(), secondary)
+        });
+        ParallelTestServer {
+            address,
+            connector,
+            task,
+        }
+    }
+
+    async fn spawn_parallel_metadata_server(messages: Vec<FixtureMessage>) -> ParallelTestServer {
+        let (acceptor, connector) = test_tls();
+        let listener = TcpListener::bind((HOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (primary_tcp, _) = listener.accept().await.unwrap();
+            let primary_stream = acceptor.accept(primary_tcp).await.unwrap();
+            let primary_messages = messages.clone();
+            let primary = tokio::spawn(async move {
+                run_server(primary_stream, ServerPlan::messages(primary_messages)).await
+            });
+
+            let (secondary_tcp, _) = listener.accept().await.unwrap();
+            let secondary_stream = acceptor.accept(secondary_tcp).await.unwrap();
+            let secondary = run_metadata_only_server(secondary_stream, messages).await;
+            (primary.await.unwrap(), secondary)
+        });
+        ParallelTestServer {
+            address,
+            connector,
+            task,
+        }
+    }
+
+    async fn spawn_body_server(messages: Vec<FixtureMessage>) -> TestServer {
+        let (acceptor, connector) = test_tls();
+        let listener = TcpListener::bind((HOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let stream = acceptor.accept(tcp).await.unwrap();
+            run_body_only_server(stream, messages, false).await
         });
         TestServer {
             address,
@@ -2421,62 +3322,85 @@ mod inbox_fetch_tests {
         tagged(&mut stream, &examine, "OK [READ-ONLY] selected").await;
         let mut commands = vec![login, examine];
 
+        let mut pending_metadata = None;
         if !plan.messages.is_empty() {
-            let Some(search) = read_command(&mut stream).await else {
+            let Some(command) = read_command(&mut stream).await else {
                 return commands;
             };
-            assert!(search.contains("UID SEARCH UID "));
-            commands.push(search.clone());
-            let first_uid = search
-                .split_whitespace()
-                .nth(4)
-                .unwrap()
-                .split(':')
-                .next()
-                .unwrap()
-                .parse::<u32>()
-                .unwrap();
-            let uids = plan
-                .messages
-                .iter()
-                .filter(|message| message.uid >= first_uid)
-                .map(|message| message.uid.to_string())
-                .collect::<Vec<_>>()
-                .join(" ");
-            stream
-                .get_mut()
-                .write_all(format!("* SEARCH {uids}\r\n").as_bytes())
-                .await
-                .unwrap();
-            tagged(&mut stream, &search, "OK search complete").await;
+            if command.contains("UID SEARCH UID ") {
+                commands.push(command.clone());
+                let first_uid = command
+                    .split_whitespace()
+                    .nth(4)
+                    .unwrap()
+                    .split(':')
+                    .next()
+                    .unwrap()
+                    .parse::<u32>()
+                    .unwrap();
+                let uids = plan
+                    .messages
+                    .iter()
+                    .filter(|message| message.uid >= first_uid)
+                    .map(|message| message.uid.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                stream
+                    .get_mut()
+                    .write_all(format!("* SEARCH {uids}\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                tagged(&mut stream, &command, "OK search complete").await;
+            } else {
+                pending_metadata = Some(command);
+            }
         }
 
-        let Some(metadata) = read_command(&mut stream).await else {
-            return commands;
+        let metadata = match pending_metadata {
+            Some(metadata) => metadata,
+            None => {
+                let Some(metadata) = read_command(&mut stream).await else {
+                    return commands;
+                };
+                metadata
+            }
         };
         commands.push(metadata.clone());
         if command_name(&metadata) == Some("LOGOUT") {
             tagged(&mut stream, &metadata, "OK logout complete").await;
             return commands;
         }
-        assert!(metadata.contains("UID FETCH "));
+        assert!(metadata.contains("FETCH "));
         if let Some(status) = plan.metadata_status {
             tagged(&mut stream, &metadata, status).await;
             let _ = read_command(&mut stream).await;
             return commands;
         }
-        let requested_uids = metadata
-            .split_whitespace()
-            .nth(3)
-            .unwrap()
-            .split(',')
-            .map(|uid| uid.parse::<u32>().unwrap())
-            .collect::<Vec<_>>();
-        for message in plan
-            .messages
-            .iter()
-            .filter(|message| requested_uids.contains(&message.uid))
-        {
+        let requested_messages = if metadata.contains("UID FETCH") {
+            let requested_uids = metadata
+                .split_whitespace()
+                .nth(3)
+                .unwrap()
+                .split(',')
+                .map(|uid| uid.parse::<u32>().unwrap())
+                .collect::<Vec<_>>();
+            plan.messages
+                .iter()
+                .filter(|message| requested_uids.contains(&message.uid))
+                .collect::<Vec<_>>()
+        } else {
+            let first_sequence = metadata
+                .split_whitespace()
+                .nth(2)
+                .unwrap()
+                .split(':')
+                .next()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            plan.messages.iter().skip(first_sequence - 1).collect()
+        };
+        for message in requested_messages {
             let sequence = plan
                 .messages
                 .iter()
@@ -2504,41 +3428,220 @@ mod inbox_fetch_tests {
                 tagged(&mut stream, &command, "OK logout complete").await;
                 break;
             }
+            if command_name(&command) == Some("EXAMINE") {
+                stream
+                    .get_mut()
+                    .write_all(format!("* {exists} EXISTS\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                if let Some(uid_validity) = plan.uid_validity {
+                    stream
+                        .get_mut()
+                        .write_all(
+                            format!("* OK [UIDVALIDITY {uid_validity}] epoch\r\n").as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                if !plan.omit_uid_next {
+                    stream
+                        .get_mut()
+                        .write_all(format!("* OK [UIDNEXT {uid_next}] next\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+                tagged(&mut stream, &command, "OK [READ-ONLY] selected").await;
+                continue;
+            }
             assert!(command.contains("UID FETCH"));
             if let Some(reached) = plan.stall_body.take() {
                 let _ = reached.send(());
                 let _ = read_command(&mut stream).await;
                 break;
             }
-            let uid: u32 = command.split_whitespace().nth(3).unwrap().parse().unwrap();
-            let message = plan
-                .messages
-                .iter()
-                .find(|message| message.uid == uid)
-                .unwrap();
-            let sequence = plan
-                .messages
-                .iter()
-                .position(|message| message.uid == uid)
+            let requested_body_uids = command
+                .split_whitespace()
+                .nth(3)
                 .unwrap()
-                + 1;
-            let uid_attribute = if plan.omit_body_uid {
-                String::new()
-            } else {
-                format!("UID {uid} ")
-            };
-            let response = format!(
-                "* {sequence} FETCH ({uid_attribute}BODY[] {{{}}}\r\n",
-                message.raw.len()
-            );
-            stream
-                .get_mut()
-                .write_all(response.as_bytes())
-                .await
-                .unwrap();
-            stream.get_mut().write_all(&message.raw).await.unwrap();
-            stream.get_mut().write_all(b")\r\n").await.unwrap();
+                .split(',')
+                .map(|uid| uid.parse::<u32>().unwrap())
+                .collect::<Vec<_>>();
+            for uid in requested_body_uids {
+                let message = plan
+                    .messages
+                    .iter()
+                    .find(|message| message.uid == uid)
+                    .unwrap();
+                let sequence = plan
+                    .messages
+                    .iter()
+                    .position(|message| message.uid == uid)
+                    .unwrap()
+                    + 1;
+                let uid_attribute = if plan.omit_body_uid {
+                    String::new()
+                } else {
+                    format!("UID {uid} ")
+                };
+                let response = format!(
+                    "* {sequence} FETCH ({uid_attribute}BODY[] {{{}}}\r\n",
+                    message.raw.len()
+                );
+                stream
+                    .get_mut()
+                    .write_all(response.as_bytes())
+                    .await
+                    .unwrap();
+                stream.get_mut().write_all(&message.raw).await.unwrap();
+                stream.get_mut().write_all(b")\r\n").await.unwrap();
+            }
             tagged(&mut stream, &command, "OK body complete").await;
+        }
+        commands
+    }
+
+    async fn run_body_only_server(
+        stream: ServerTlsStream<TcpStream>,
+        messages: Vec<FixtureMessage>,
+        fail_body: bool,
+    ) -> Vec<Box<str>> {
+        let mut stream = BufReader::new(stream);
+        stream
+            .get_mut()
+            .write_all(b"* OK parallel body fixture ready\r\n")
+            .await
+            .unwrap();
+        let login = read_command(&mut stream).await.unwrap();
+        assert_eq!(command_name(&login), Some("LOGIN"));
+        tagged(
+            &mut stream,
+            &login,
+            "OK [CAPABILITY IMAP4rev1] authenticated",
+        )
+        .await;
+        let examine = read_command(&mut stream).await.unwrap();
+        assert_eq!(command_name(&examine), Some("EXAMINE"));
+        stream
+            .get_mut()
+            .write_all(format!("* {} EXISTS\r\n", messages.len()).as_bytes())
+            .await
+            .unwrap();
+        stream
+            .get_mut()
+            .write_all(format!("* OK [UIDVALIDITY {UID_VALIDITY}] epoch\r\n").as_bytes())
+            .await
+            .unwrap();
+        let uid_next = messages.last().map_or(1, |message| message.uid + 1);
+        stream
+            .get_mut()
+            .write_all(format!("* OK [UIDNEXT {uid_next}] next\r\n").as_bytes())
+            .await
+            .unwrap();
+        tagged(&mut stream, &examine, "OK [READ-ONLY] selected").await;
+        let mut commands = vec![login, examine];
+
+        while let Some(command) = read_command(&mut stream).await {
+            commands.push(command.clone());
+            if command_name(&command) == Some("LOGOUT") {
+                tagged(&mut stream, &command, "OK logout complete").await;
+                break;
+            }
+            assert!(command.contains("UID FETCH"));
+            if fail_body {
+                break;
+            }
+            let requested_uids = command
+                .split_whitespace()
+                .nth(3)
+                .unwrap()
+                .split(',')
+                .map(|uid| uid.parse::<u32>().unwrap());
+            for uid in requested_uids {
+                let message = messages.iter().find(|message| message.uid == uid).unwrap();
+                let response = format!(
+                    "* {uid} FETCH (UID {uid} BODY[] {{{}}}\r\n",
+                    message.raw.len()
+                );
+                stream
+                    .get_mut()
+                    .write_all(response.as_bytes())
+                    .await
+                    .unwrap();
+                stream.get_mut().write_all(&message.raw).await.unwrap();
+                stream.get_mut().write_all(b")\r\n").await.unwrap();
+            }
+            tagged(&mut stream, &command, "OK body complete").await;
+        }
+        commands
+    }
+
+    async fn run_metadata_only_server(
+        stream: ServerTlsStream<TcpStream>,
+        messages: Vec<FixtureMessage>,
+    ) -> Vec<Box<str>> {
+        let mut stream = BufReader::new(stream);
+        stream
+            .get_mut()
+            .write_all(b"* OK parallel metadata fixture ready\r\n")
+            .await
+            .unwrap();
+        let login = read_command(&mut stream).await.unwrap();
+        assert_eq!(command_name(&login), Some("LOGIN"));
+        tagged(
+            &mut stream,
+            &login,
+            "OK [CAPABILITY IMAP4rev1] authenticated",
+        )
+        .await;
+        let examine = read_command(&mut stream).await.unwrap();
+        assert_eq!(command_name(&examine), Some("EXAMINE"));
+        stream
+            .get_mut()
+            .write_all(format!("* {} EXISTS\r\n", messages.len()).as_bytes())
+            .await
+            .unwrap();
+        stream
+            .get_mut()
+            .write_all(format!("* OK [UIDVALIDITY {UID_VALIDITY}] epoch\r\n").as_bytes())
+            .await
+            .unwrap();
+        let uid_next = messages.last().map_or(1, |message| message.uid + 1);
+        stream
+            .get_mut()
+            .write_all(format!("* OK [UIDNEXT {uid_next}] next\r\n").as_bytes())
+            .await
+            .unwrap();
+        tagged(&mut stream, &examine, "OK [READ-ONLY] selected").await;
+        let mut commands = vec![login, examine];
+
+        while let Some(command) = read_command(&mut stream).await {
+            commands.push(command.clone());
+            if command_name(&command) == Some("LOGOUT") {
+                tagged(&mut stream, &command, "OK logout complete").await;
+                break;
+            }
+            assert!(command.contains("UID FETCH"));
+            assert!(command.contains("ENVELOPE"));
+            assert!(!command.contains("BODY.PEEK"));
+            let requested_uids = command
+                .split_whitespace()
+                .nth(3)
+                .unwrap()
+                .split(',')
+                .map(|uid| uid.parse::<u32>().unwrap())
+                .collect::<Vec<_>>();
+            for message in messages
+                .iter()
+                .filter(|message| requested_uids.contains(&message.uid))
+            {
+                let sequence = messages
+                    .iter()
+                    .position(|candidate| candidate.uid == message.uid)
+                    .unwrap()
+                    + 1;
+                write_metadata(&mut stream, sequence, message).await;
+            }
+            tagged(&mut stream, &command, "OK metadata complete").await;
         }
         commands
     }
@@ -2548,6 +3651,299 @@ mod inbox_fetch_tests {
             .await
             .unwrap()
             .unwrap()
+    }
+
+    async fn finish_parallel(server: ParallelTestServer) -> (Vec<Box<str>>, Vec<Box<str>>) {
+        tokio::time::timeout(TEST_TIMEOUT, server.task)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    fn parallel_messages() -> Vec<FixtureMessage> {
+        (1..=8)
+            .map(|uid| {
+                let raw = vec![b'a'; usize::try_from(uid * 10).unwrap()];
+                fixture(uid, &raw)
+            })
+            .collect()
+    }
+
+    fn parallel_limits() -> InboxFetchLimits {
+        InboxFetchLimits {
+            max_messages: 8,
+            max_page_literal_bytes: 8 * 1024,
+            body_connections: 2,
+            ..limits()
+        }
+    }
+
+    #[test]
+    fn metadata_sync_does_not_issue_body_fetches() {
+        run_async(async {
+            let server = spawn_server(ServerPlan::messages(vec![
+                fixture(1, RAW_ONE),
+                fixture(2, RAW_TWO),
+            ]))
+            .await;
+            let page = fetch_canonical_inbox_with_mode(
+                request(server.address.port(), None),
+                server.connector.clone(),
+                limits(),
+                None,
+                InboxFetchMode::Metadata,
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(page.messages.len(), 2);
+            assert!(
+                page.messages
+                    .iter()
+                    .all(|message| message.content == ImapInboxContent::NotFetched)
+            );
+            let commands = finish(server).await;
+            assert!(
+                commands
+                    .iter()
+                    .all(|command| !command.contains("BODY.PEEK"))
+            );
+        });
+    }
+
+    #[test]
+    fn metadata_sync_splits_large_pages_across_two_selected_sessions() {
+        run_async(async {
+            let mut messages = parallel_messages();
+            messages.push(fixture(9, b"nine"));
+            let server = spawn_parallel_metadata_server(messages).await;
+            let page = fetch_canonical_inbox_with_mode(
+                request_from(server.address.port(), 2, Some(UID_VALIDITY)),
+                server.connector.clone(),
+                parallel_limits(),
+                None,
+                InboxFetchMode::Metadata,
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(page.messages.len(), 8);
+            assert!(
+                page.messages
+                    .iter()
+                    .all(|message| message.content == ImapInboxContent::NotFetched)
+            );
+            let (primary, secondary) = finish_parallel(server).await;
+            for commands in [&primary, &secondary] {
+                assert_eq!(
+                    commands
+                        .iter()
+                        .filter(|command| command.contains("ENVELOPE"))
+                        .count(),
+                    1
+                );
+                assert!(
+                    commands
+                        .iter()
+                        .all(|command| !command.contains("BODY.PEEK"))
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn on_demand_content_fetch_requests_only_the_selected_uid() {
+        run_async(async {
+            let server = spawn_body_server(vec![fixture(7, RAW_TWO)]).await;
+            let body = fetch_imap_message_content_with_connector(
+                content_request(server.address.port(), 7),
+                server.connector.clone(),
+                limits(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(body.as_ref(), RAW_TWO);
+            let commands = finish(server).await;
+            let body_commands = commands
+                .iter()
+                .filter(|command| command.contains("BODY.PEEK"))
+                .collect::<Vec<_>>();
+            assert_eq!(body_commands.len(), 1);
+            assert!(body_commands[0].contains("UID FETCH 7 (UID BODY.PEEK[])"));
+        });
+    }
+
+    #[test]
+    fn on_demand_content_reuses_the_selected_metadata_session() {
+        run_async(async {
+            let server = spawn_server(ServerPlan::messages(vec![fixture(2, RAW_TWO)])).await;
+            let page = fetch_canonical_inbox_with_mode(
+                request(server.address.port(), None),
+                server.connector.clone(),
+                limits(),
+                None,
+                InboxFetchMode::Metadata,
+                true,
+            )
+            .await
+            .unwrap();
+            assert_eq!(page.messages.len(), 1);
+
+            let body = fetch_imap_message_content_inner(
+                content_request(server.address.port(), 2),
+                server.connector.clone(),
+                limits(),
+                true,
+            )
+            .await
+            .unwrap();
+            assert_eq!(body.as_ref(), RAW_TWO);
+
+            let session = take_cached_inbox_session(
+                HOST,
+                server.address.port(),
+                LOGIN,
+                NonZeroU32::new(UID_VALIDITY).unwrap(),
+            )
+            .unwrap();
+            session.logout(Instant::now() + LOGOUT_TIMEOUT).await;
+            let commands = finish(server).await;
+            assert_eq!(
+                commands
+                    .iter()
+                    .filter(|command| command_name(command) == Some("LOGIN"))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                commands
+                    .iter()
+                    .filter(|command| command.contains("BODY.PEEK"))
+                    .count(),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn incremental_metadata_sync_reuses_the_selected_session() {
+        run_async(async {
+            let server = spawn_server(ServerPlan::messages(vec![fixture(2, RAW_TWO)])).await;
+            let first = fetch_canonical_inbox_with_mode(
+                request(server.address.port(), None),
+                server.connector.clone(),
+                limits(),
+                None,
+                InboxFetchMode::Metadata,
+                true,
+            )
+            .await
+            .unwrap();
+            assert_eq!(first.messages.len(), 1);
+
+            let incremental = fetch_canonical_inbox_with_mode(
+                request_from(server.address.port(), 3, Some(UID_VALIDITY)),
+                server.connector.clone(),
+                limits(),
+                None,
+                InboxFetchMode::Metadata,
+                true,
+            )
+            .await
+            .unwrap();
+            assert!(incremental.messages.is_empty());
+
+            let session = take_cached_inbox_session(
+                HOST,
+                server.address.port(),
+                LOGIN,
+                NonZeroU32::new(UID_VALIDITY).unwrap(),
+            )
+            .unwrap();
+            session.logout(Instant::now() + LOGOUT_TIMEOUT).await;
+            let commands = finish(server).await;
+            assert_eq!(
+                commands
+                    .iter()
+                    .filter(|command| command_name(command) == Some("LOGIN"))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                commands
+                    .iter()
+                    .filter(|command| command_name(command) == Some("EXAMINE"))
+                    .count(),
+                2
+            );
+        });
+    }
+
+    #[test]
+    fn parallel_body_fetch_uses_two_bounded_selected_sessions() {
+        run_async(async {
+            let server = spawn_parallel_server(parallel_messages(), false).await;
+            let page = fetch_canonical_inbox_with_connector(
+                request(server.address.port(), None),
+                server.connector.clone(),
+                parallel_limits(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(page.messages.len(), 8);
+            assert!(
+                page.messages
+                    .iter()
+                    .all(|message| matches!(message.content, ImapInboxContent::Fetched(_)))
+            );
+            let (primary, secondary) = finish_parallel(server).await;
+            assert_eq!(
+                primary
+                    .iter()
+                    .filter(|command| command.contains("BODY.PEEK"))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                secondary
+                    .iter()
+                    .filter(|command| command.contains("BODY.PEEK"))
+                    .count(),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn parallel_body_failure_retries_the_unfinished_partition_on_primary() {
+        run_async(async {
+            let server = spawn_parallel_server(parallel_messages(), true).await;
+            let page = fetch_canonical_inbox_with_connector(
+                request(server.address.port(), None),
+                server.connector.clone(),
+                parallel_limits(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(page.messages.len(), 8);
+            let (primary, secondary) = finish_parallel(server).await;
+            assert_eq!(
+                primary
+                    .iter()
+                    .filter(|command| command.contains("BODY.PEEK"))
+                    .count(),
+                2
+            );
+            assert_eq!(
+                secondary
+                    .iter()
+                    .filter(|command| command.contains("BODY.PEEK"))
+                    .count(),
+                1
+            );
+        });
     }
 
     #[test]
@@ -2585,7 +3981,12 @@ mod inbox_fetch_tests {
                     .iter()
                     .filter_map(|command| command_name(command))
                     .collect::<Vec<_>>(),
-                ["LOGIN", "EXAMINE", "UID", "UID", "UID", "UID", "LOGOUT"]
+                ["LOGIN", "EXAMINE", "UID", "UID", "UID", "LOGOUT"]
+            );
+            assert!(
+                commands
+                    .iter()
+                    .any(|command| { command.contains("UID FETCH 1,2 (UID BODY.PEEK[])") })
             );
 
             let empty = spawn_server(ServerPlan::messages(Vec::new())).await;

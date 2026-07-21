@@ -6,26 +6,24 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use mail_parser::DateTime;
+use mail_parser::{DateTime, HeaderName, MessageParser};
 
 use crate::{
-    content::{
-        ContentError, ContentLimits, ContentStaging, MimeError, PreparedContent,
-        UnrenderableContentReason, prepare_content, prepare_unrenderable_content,
-    },
+    content::{ContentError, ContentLimits, ContentStaging, MimeError, prepare_content},
     credentials::{
         CredentialClient, CredentialLocator, CredentialOperation, CredentialOutcome,
         CredentialSubmitError,
     },
     network::imap::{
-        ImapInboxContent, ImapInboxFetchFailure, ImapInboxFetchRequest, ImapInboxMessage,
-        ImapInboxPage, fetch_canonical_inbox,
+        ImapInboxFetchFailure, ImapInboxFetchRequest, ImapInboxMessage, ImapInboxPage,
+        ImapMessageContentFetchRequest, fetch_canonical_inbox_metadata, fetch_imap_message_content,
     },
     store::sqlite::{
         AccountAuthKind, AccountGeneration, AccountId, AccountLifecycle, AccountRecord,
         ContentImportSubmission, DatabaseClient, DatabaseSubmitError, FailureKind,
-        InboxCheckpointOutcome, InboxCursorCommit, InboxCursorOutcome, InboxEnvelope, InboxFlags,
-        InboxReceivePage, InboxStageOutcome,
+        ImapMessageContentTargetOutcome, InboxCheckpointOutcome, InboxCursorCommit,
+        InboxCursorOutcome, InboxEnvelope, InboxFlags, InboxReceivePage, InboxStageOutcome,
+        MessageId,
     },
 };
 
@@ -39,9 +37,11 @@ pub(super) type ImapInboxFetchFuture =
     Pin<Box<dyn Future<Output = Result<ImapInboxPage, ImapInboxFetchFailure>> + 'static>>;
 pub(super) type ImapInboxFetchProbe = fn(ImapInboxFetchRequest) -> ImapInboxFetchFuture;
 pub(super) type SyncInboxFuture = Pin<Box<dyn Future<Output = SyncInboxOutcome> + 'static>>;
+pub(super) type FetchMessageContentFuture =
+    Pin<Box<dyn Future<Output = FetchMessageContentOutcome> + 'static>>;
 
 pub(super) fn production_imap_inbox_fetch(request: ImapInboxFetchRequest) -> ImapInboxFetchFuture {
-    Box::pin(fetch_canonical_inbox(request))
+    Box::pin(fetch_canonical_inbox_metadata(request))
 }
 
 pub(super) enum SyncInboxOutcome {
@@ -51,12 +51,217 @@ pub(super) enum SyncInboxOutcome {
         imported: u8,
         has_more: bool,
         historical: bool,
+        bootstrap: bool,
     },
     Failed {
         stage: AccountWorkflowStage,
         failure: AccountWorkflowFailureKind,
     },
     DatabaseClosed,
+}
+
+pub(super) enum FetchMessageContentOutcome {
+    Fetched {
+        account_id: AccountId,
+        generation: AccountGeneration,
+        message_id: MessageId,
+    },
+    Failed {
+        stage: AccountWorkflowStage,
+        failure: AccountWorkflowFailureKind,
+    },
+    DatabaseClosed,
+}
+
+pub(super) fn start_message_content_fetch(
+    database: DatabaseClient,
+    credentials: CredentialClient,
+    content_root: PathBuf,
+    message_id: MessageId,
+    account_id: AccountId,
+    expected_generation: AccountGeneration,
+) -> FetchMessageContentFuture {
+    Box::pin(run_message_content_fetch(
+        database,
+        credentials,
+        content_root,
+        message_id,
+        account_id,
+        expected_generation,
+    ))
+}
+
+async fn run_message_content_fetch(
+    database: DatabaseClient,
+    credentials: CredentialClient,
+    content_root: PathBuf,
+    message_id: MessageId,
+    account_id: AccountId,
+    expected_generation: AccountGeneration,
+) -> FetchMessageContentOutcome {
+    let target =
+        match load_message_content_target(&database, message_id, account_id, expected_generation)
+            .await
+        {
+            Ok(Some(target)) => target,
+            Ok(None) => {
+                return FetchMessageContentOutcome::Fetched {
+                    account_id,
+                    generation: expected_generation,
+                    message_id,
+                };
+            }
+            Err(outcome) => return outcome,
+        };
+    let configuration = match load_configuration(&database, account_id, expected_generation).await {
+        Ok(configuration) => configuration,
+        Err(outcome) => return content_outcome_from_sync(outcome),
+    };
+    let secret = match load_credential(&credentials, &configuration.credential_key).await {
+        Ok(secret) => secret,
+        Err(outcome) => return content_outcome_from_sync(outcome),
+    };
+    let request = match ImapMessageContentFetchRequest::new(
+        &configuration.imap_host,
+        configuration.imap_port,
+        &configuration.login_name,
+        secret,
+        target.uid_validity,
+        target.uid,
+    ) {
+        Ok(request) => request,
+        Err(_) => {
+            return content_fetch_failure(
+                AccountWorkflowStage::FetchInbox,
+                InboxSyncFailureKind::Protocol,
+            );
+        }
+    };
+    let raw = match fetch_imap_message_content(request).await {
+        Ok(raw) => raw,
+        Err(failure) => {
+            return content_fetch_failure(
+                AccountWorkflowStage::FetchInbox,
+                map_fetch_failure(failure),
+            );
+        }
+    };
+    let staging = match ContentStaging::open(content_root) {
+        Ok(staging) => Arc::new(staging),
+        Err(_) => {
+            return content_fetch_failure(
+                AccountWorkflowStage::ParseContent,
+                InboxSyncFailureKind::Storage,
+            );
+        }
+    };
+    let prepared = match prepare_content(&raw, &staging, ContentLimits::default()) {
+        Ok(prepared) => prepared,
+        Err(failure) => return content_outcome_from_sync(content_failure(failure)),
+    };
+    let published = match prepared.publish() {
+        Ok(published) => published,
+        Err(_) => {
+            return content_fetch_failure(
+                AccountWorkflowStage::ImportContent,
+                InboxSyncFailureKind::Storage,
+            );
+        }
+    };
+    let submission = Box::new(ContentImportSubmission::new(
+        message_id,
+        account_id,
+        expected_generation,
+        published,
+    ));
+    match database.try_import_content(submission) {
+        Ok(receiver) => match receiver.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(failure)) => {
+                return FetchMessageContentOutcome::Failed {
+                    stage: AccountWorkflowStage::ImportContent,
+                    failure: AccountWorkflowFailureKind::Database(failure.failure().kind),
+                };
+            }
+            Err(_) => return FetchMessageContentOutcome::DatabaseClosed,
+        },
+        Err(failure) if failure.reason() == DatabaseSubmitError::Busy => {
+            return FetchMessageContentOutcome::Failed {
+                stage: AccountWorkflowStage::ImportContent,
+                failure: AccountWorkflowFailureKind::Busy,
+            };
+        }
+        Err(_) => return FetchMessageContentOutcome::DatabaseClosed,
+    }
+    if !collect_files(&database, &staging).await {
+        return FetchMessageContentOutcome::DatabaseClosed;
+    }
+    FetchMessageContentOutcome::Fetched {
+        account_id,
+        generation: expected_generation,
+        message_id,
+    }
+}
+
+async fn load_message_content_target(
+    database: &DatabaseClient,
+    message_id: MessageId,
+    account_id: AccountId,
+    expected_generation: AccountGeneration,
+) -> Result<Option<crate::store::sqlite::ImapMessageContentTarget>, FetchMessageContentOutcome> {
+    let receiver = match database.try_load_imap_message_content_target(
+        message_id,
+        account_id,
+        expected_generation,
+    ) {
+        Ok(receiver) => receiver,
+        Err(DatabaseSubmitError::Busy) => {
+            return Err(FetchMessageContentOutcome::Failed {
+                stage: AccountWorkflowStage::LoadMessageTarget,
+                failure: AccountWorkflowFailureKind::Busy,
+            });
+        }
+        Err(DatabaseSubmitError::Closed) => return Err(FetchMessageContentOutcome::DatabaseClosed),
+    };
+    match receiver.await {
+        Ok(Ok(ImapMessageContentTargetOutcome::Current(target))) => Ok(Some(target)),
+        Ok(Ok(ImapMessageContentTargetOutcome::AlreadyAvailable)) => Ok(None),
+        Ok(Ok(ImapMessageContentTargetOutcome::Stale)) => Err(FetchMessageContentOutcome::Failed {
+            stage: AccountWorkflowStage::LoadMessageTarget,
+            failure: AccountWorkflowFailureKind::Database(FailureKind::Conflict),
+        }),
+        Ok(Ok(ImapMessageContentTargetOutcome::NotFound)) => {
+            Err(FetchMessageContentOutcome::Failed {
+                stage: AccountWorkflowStage::LoadMessageTarget,
+                failure: AccountWorkflowFailureKind::Database(FailureKind::NotFound),
+            })
+        }
+        Ok(Err(failure)) => Err(FetchMessageContentOutcome::Failed {
+            stage: AccountWorkflowStage::LoadMessageTarget,
+            failure: AccountWorkflowFailureKind::Database(failure.kind),
+        }),
+        Err(_) => Err(FetchMessageContentOutcome::DatabaseClosed),
+    }
+}
+
+fn content_outcome_from_sync(outcome: SyncInboxOutcome) -> FetchMessageContentOutcome {
+    match outcome {
+        SyncInboxOutcome::Failed { stage, failure } => {
+            FetchMessageContentOutcome::Failed { stage, failure }
+        }
+        SyncInboxOutcome::DatabaseClosed => FetchMessageContentOutcome::DatabaseClosed,
+        SyncInboxOutcome::Synced { .. } => unreachable!("content helpers cannot finish inbox sync"),
+    }
+}
+
+fn content_fetch_failure(
+    stage: AccountWorkflowStage,
+    kind: InboxSyncFailureKind,
+) -> FetchMessageContentOutcome {
+    FetchMessageContentOutcome::Failed {
+        stage,
+        failure: AccountWorkflowFailureKind::InboxSync(kind),
+    }
 }
 
 pub(super) fn start_inbox_sync(
@@ -66,6 +271,7 @@ pub(super) fn start_inbox_sync(
     content_root: PathBuf,
     account_id: AccountId,
     expected_generation: AccountGeneration,
+    allow_history: bool,
 ) -> SyncInboxFuture {
     Box::pin(run_inbox_sync(
         database,
@@ -74,6 +280,7 @@ pub(super) fn start_inbox_sync(
         content_root,
         account_id,
         expected_generation,
+        allow_history,
     ))
 }
 
@@ -81,9 +288,10 @@ async fn run_inbox_sync(
     database: DatabaseClient,
     credentials: CredentialClient,
     fetch_probe: ImapInboxFetchProbe,
-    content_root: PathBuf,
+    _content_root: PathBuf,
     account_id: AccountId,
     expected_generation: AccountGeneration,
+    allow_history: bool,
 ) -> SyncInboxOutcome {
     let configuration = match load_configuration(&database, account_id, expected_generation).await {
         Ok(configuration) => configuration,
@@ -107,8 +315,8 @@ async fn run_inbox_sync(
         secret,
         first_uid,
         checkpoint.uid_validity,
-        checkpoint.history_cursor,
-        checkpoint.history_complete,
+        allow_history.then_some(checkpoint.history_cursor).flatten(),
+        checkpoint.history_complete || !allow_history,
     ) {
         Ok(request) => request,
         Err(_) => {
@@ -125,15 +333,6 @@ async fn run_inbox_sync(
         }
     };
 
-    let staging = match ContentStaging::open(content_root) {
-        Ok(staging) => Arc::new(staging),
-        Err(_) => {
-            return sync_failure(
-                AccountWorkflowStage::ParseContent,
-                InboxSyncFailureKind::Storage,
-            );
-        }
-    };
     let ImapInboxPage {
         uid_validity,
         uid_next: _,
@@ -143,6 +342,7 @@ async fn run_inbox_sync(
         history_page,
         messages,
     } = fetched;
+    let bootstrap = bootstrap_history.is_some();
     let historical = history_page.is_some();
     let has_more = next_uid.is_some()
         || bootstrap_history.is_some_and(|history| !history.complete)
@@ -228,55 +428,8 @@ async fn run_inbox_sync(
         }
     };
 
-    let mut imported = 0_u8;
-    for message in messages.into_vec() {
-        let Some(staged) = staged_message(&staged_messages, message.uid.get()) else {
-            continue;
-        };
-        if !staged.needs_content {
-            continue;
-        }
-        let prepared = match prepare_inbox_content(&message, &staging, received_at_fallback) {
-            Ok(prepared) => prepared,
-            Err(failure) => return content_failure(failure),
-        };
-        drop(message);
-        let published = match prepared.publish() {
-            Ok(published) => published,
-            Err(_) => {
-                return sync_failure(
-                    AccountWorkflowStage::ImportContent,
-                    InboxSyncFailureKind::Storage,
-                );
-            }
-        };
-        let submission = Box::new(ContentImportSubmission::new(
-            staged.message_id,
-            account_id,
-            expected_generation,
-            published,
-        ));
-        match database.try_import_content(submission) {
-            Ok(receiver) => match receiver.await {
-                Ok(Ok(_)) => {
-                    imported = imported
-                        .checked_add(1)
-                        .expect("inbox receive pages fit in u8");
-                }
-                Ok(Err(failure)) => {
-                    return database_failure(
-                        AccountWorkflowStage::ImportContent,
-                        failure.failure().kind,
-                    );
-                }
-                Err(_) => return SyncInboxOutcome::DatabaseClosed,
-            },
-            Err(failure) if failure.reason() == DatabaseSubmitError::Busy => {
-                return busy(AccountWorkflowStage::ImportContent);
-            }
-            Err(_) => return SyncInboxOutcome::DatabaseClosed,
-        }
-    }
+    let imported = u8::try_from(staged_messages.len())
+        .expect("bounded inbox metadata pages fit in an imported count");
 
     let commit = match InboxCursorCommit::new(ticket, now_ms()) {
         Ok(commit) => commit,
@@ -304,18 +457,13 @@ async fn run_inbox_sync(
         return database_failure(AccountWorkflowStage::CommitInbox, FailureKind::Conflict);
     }
 
-    // Collection is intentionally best-effort: the durable cursor is already committed and the
-    // queue will be retried by the next sync or startup janitor.
-    if !collect_files(&database, &staging).await {
-        return SyncInboxOutcome::DatabaseClosed;
-    }
-
     SyncInboxOutcome::Synced {
         account_id,
         generation: expected_generation,
         imported,
         has_more,
         historical,
+        bootstrap,
     }
 }
 
@@ -433,50 +581,14 @@ async fn load_credential(
     }
 }
 
-fn prepare_inbox_content(
-    message: &ImapInboxMessage,
-    staging: &ContentStaging,
-    received_at_fallback: i64,
-) -> Result<PreparedContent, ContentError> {
-    let limits = ContentLimits::default();
-    let reason = match &message.content {
-        ImapInboxContent::Fetched(raw) => match prepare_content(raw, staging, limits) {
-            Ok(prepared) => return Ok(prepared),
-            Err(ContentError::Mime(MimeError::Malformed(_))) => {
-                UnrenderableContentReason::Malformed
-            }
-            Err(ContentError::Mime(MimeError::LimitExceeded { .. })) => {
-                UnrenderableContentReason::SafetyLimit
-            }
-            Err(failure @ ContentError::Storage(_)) => return Err(failure),
-        },
-        ImapInboxContent::Oversized { .. } => UnrenderableContentReason::SafetyLimit,
-    };
-    let sender_name = bounded_utf8(&message.envelope.from_name, MAX_SENDER_BYTES);
-    let sender_address =
-        bounded_sender_address(&message.envelope.from_mailbox, &message.envelope.from_host);
-    let subject = bounded_utf8(&message.envelope.subject, MAX_SUBJECT_BYTES);
-    let received_at_ms = inbox_received_at(message, received_at_fallback);
-    prepare_unrenderable_content(
-        &subject,
-        &sender_name,
-        &sender_address,
-        Some(received_at_ms),
-        u64::from(message.declared_bytes),
-        reason,
-        staging,
-        limits,
-    )
-}
-
 fn inbox_envelope(
     message: &ImapInboxMessage,
     received_at_fallback: i64,
 ) -> Result<InboxEnvelope, crate::store::sqlite::InboxValidationError> {
-    let sender_name = bounded_utf8(&message.envelope.from_name, MAX_SENDER_BYTES);
+    let sender_name = decoded_header(&message.envelope.from_name, MAX_SENDER_BYTES);
     let sender_address =
         bounded_sender_address(&message.envelope.from_mailbox, &message.envelope.from_host);
-    let subject = bounded_utf8(&message.envelope.subject, MAX_SUBJECT_BYTES);
+    let subject = decoded_header(&message.envelope.subject, MAX_SUBJECT_BYTES);
     let received_at_ms = inbox_received_at(message, received_at_fallback);
     InboxEnvelope::new(
         message.uid.get(),
@@ -491,10 +603,15 @@ fn inbox_envelope(
 }
 
 fn inbox_received_at(message: &ImapInboxMessage, fallback: i64) -> i64 {
-    DateTime::parse_rfc822(&message.internal_date)
+    parse_received_at(&String::from_utf8_lossy(&message.envelope.date))
+        .or_else(|| parse_received_at(&message.internal_date))
+        .unwrap_or(fallback)
+}
+
+fn parse_received_at(value: &str) -> Option<i64> {
+    DateTime::parse_rfc822(value)
         .filter(DateTime::is_valid)
         .and_then(|date| date.to_timestamp().checked_mul(1_000))
-        .unwrap_or(fallback)
 }
 
 fn bounded_sender_address(mailbox: &[u8], host: &[u8]) -> String {
@@ -518,6 +635,26 @@ fn bounded_utf8(bytes: &[u8], maximum: usize) -> String {
     truncate_utf8(String::from_utf8_lossy(bytes).into_owned(), maximum)
 }
 
+fn decoded_header(bytes: &[u8], maximum: usize) -> String {
+    if bytes.is_empty() || !bytes.windows(2).any(|window| window == b"=?") {
+        return bounded_utf8(bytes, maximum);
+    }
+
+    let mut synthetic = Vec::with_capacity(bytes.len().saturating_add(13));
+    synthetic.extend_from_slice(b"Subject: ");
+    synthetic.extend_from_slice(bytes);
+    synthetic.extend_from_slice(b"\r\n\r\n");
+    let decoded = MessageParser::new()
+        .header_text(HeaderName::Subject)
+        .default_header_ignore()
+        .parse(&synthetic)
+        .and_then(|message| message.subject().map(str::to_owned));
+    truncate_utf8(
+        decoded.unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned()),
+        maximum,
+    )
+}
+
 fn truncate_utf8(mut value: String, maximum: usize) -> String {
     if value.len() <= maximum {
         return value;
@@ -528,13 +665,6 @@ fn truncate_utf8(mut value: String, maximum: usize) -> String {
     }
     value.truncate(boundary);
     value
-}
-
-fn staged_message(
-    messages: &[crate::store::sqlite::StagedInboxMessage],
-    uid: u32,
-) -> Option<crate::store::sqlite::StagedInboxMessage> {
-    messages.iter().find(|message| message.uid == uid).copied()
 }
 
 fn now_ms() -> i64 {
@@ -598,9 +728,8 @@ fn busy(stage: AccountWorkflowStage) -> SyncInboxOutcome {
 mod tests {
     use super::*;
     use crate::{
-        content::FileKey,
         credentials::{self, Secret},
-        network::imap::{ImapInboxEnvelope, ImapInboxFlags},
+        network::imap::{ImapInboxContent, ImapInboxEnvelope, ImapInboxFlags},
         store::sqlite::{
             self, AccountConfigInput, AccountPurgeOutcome, AccountScope, AccountWrite,
             AccountWriteOutcome, DbReply, FolderScope, Generation, PageBoundary, PageSpec,
@@ -610,7 +739,6 @@ mod tests {
     use keyring_core::CredentialStore;
     use std::{
         fs,
-        io::Read,
         num::NonZeroU32,
         path::{Path, PathBuf},
         sync::{
@@ -643,6 +771,38 @@ Date: Tue, 01 Jul 2025 12:00:00 +0000\r\n\
 Content-Type: text/plain; charset=utf-8\r\n\
 \r\n\
 first body v1\r\n";
+
+    #[test]
+    fn envelope_fallback_decodes_encoded_words_and_prefers_message_date() {
+        assert_eq!(
+            decoded_header(b"=?UTF-8?B?5Lit5paH5Li76aKY?=", MAX_SUBJECT_BYTES),
+            "中文主题"
+        );
+        assert_eq!(
+            decoded_header(
+                b"=?UTF-8?Q?Alice_=E7=88=B1=E4=B8=BD=E4=B8=9D?=",
+                MAX_SENDER_BYTES
+            ),
+            "Alice 爱丽丝"
+        );
+
+        let message = ImapInboxMessage {
+            uid: NonZeroU32::new(1).unwrap(),
+            flags: ImapInboxFlags::default(),
+            internal_date: "01-Jul-2025 12:00:00 +0000".into(),
+            envelope: ImapInboxEnvelope {
+                date: b"Tue, 01 Jul 2025 13:30:00 +0000".as_slice().into(),
+                ..ImapInboxEnvelope::default()
+            },
+            declared_bytes: 0,
+            content: ImapInboxContent::Fetched(Box::new([])),
+        };
+        assert_eq!(
+            inbox_received_at(&message, 0),
+            parse_received_at("Tue, 01 Jul 2025 13:30:00 +0000").unwrap()
+        );
+    }
+
     fn fake_fetch(_: ImapInboxFetchRequest) -> ImapInboxFetchFuture {
         Box::pin(async {
             Ok(ImapInboxPage {
@@ -661,6 +821,9 @@ first body v1\r\n";
                     },
                     internal_date: "01-Jul-2025 12:00:00 +0000".into(),
                     envelope: ImapInboxEnvelope {
+                        date: b"Tue, 01 Jul 2025 12:00:00 +0000"
+                            .to_vec()
+                            .into_boxed_slice(),
                         subject: b"staged subject".to_vec().into_boxed_slice(),
                         from_name: b"Alice".to_vec().into_boxed_slice(),
                         from_mailbox: b"alice".to_vec().into_boxed_slice(),
@@ -735,7 +898,7 @@ first body v1\r\n";
     }
 
     #[test]
-    fn receive_open_close_remove_and_collect_form_one_bounded_slice() {
+    fn receive_metadata_open_and_remove_form_one_bounded_slice() {
         let root = temporary_root();
         let database_path = root.join("mail.sqlite3");
         let content_root = root.join("content");
@@ -791,6 +954,7 @@ first body v1\r\n";
                     content_root.clone(),
                     configuration.account_id,
                     configuration.generation,
+                    true,
                 )
                 .await;
                 assert!(matches!(
@@ -820,9 +984,9 @@ first body v1\r\n";
                     DbReply::Mailbox(reply) => {
                         let page = reply.result.unwrap();
                         assert_eq!(page.rows.len(), 1);
-                        assert_eq!(page.rows[0].subject.as_ref(), "Imported through core");
-                        assert_eq!(page.rows[0].preview.as_ref(), "streamed body");
-                        assert!(page.rows[0].has_attachment);
+                        assert_eq!(page.rows[0].subject.as_ref(), "staged subject");
+                        assert!(page.rows[0].preview.is_empty());
+                        assert!(!page.rows[0].has_attachment);
                         page.rows[0].id
                     }
                     _ => panic!("mailbox query returned an unexpected reply"),
@@ -835,13 +999,9 @@ first body v1\r\n";
                     DbReply::Message(reply) => reply.result.unwrap().unwrap(),
                     _ => panic!("message query returned an unexpected reply"),
                 };
-                let body_key = FileKey::parse(detail.body_file_key.as_deref().unwrap()).unwrap();
-                let staging = Arc::new(ContentStaging::open(content_root.clone()).unwrap());
-                let mut body_file = staging.open_file(&body_key).unwrap();
-                let mut body = String::new();
-                body_file.read_to_string(&mut body).unwrap();
-                assert_eq!(body.trim(), "streamed body");
-                drop(body_file);
+                assert!(!detail.content_available);
+                assert!(detail.reader_excerpt.is_empty());
+                assert!(detail.body_file_key.is_none());
 
                 let removal = database
                     .try_write_account(Box::new(AccountWrite::BeginRemove {
@@ -883,15 +1043,6 @@ first body v1\r\n";
                         _ => panic!("cache purge returned an unexpected reply"),
                     }
                 }
-                let gc = database
-                    .try_run_file_gc(&staging, FILE_GC_LIMIT)
-                    .unwrap()
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert!(gc.removed >= 2, "body and attachment should be reclaimed");
-                let error = staging.open_file(&body_key).unwrap_err();
-                assert_eq!(error.kind, std::io::ErrorKind::NotFound);
             })
             .await
             .expect("bounded receive slice timed out");
@@ -959,6 +1110,7 @@ first body v1\r\n";
                 content_root.clone(),
                 configuration.account_id,
                 configuration.generation,
+                true,
             )
             .await;
             assert!(matches!(
@@ -983,16 +1135,9 @@ first body v1\r\n";
                     ..
                 })
             ));
-            let (_, body_key) =
-                query_message_body(&database, &mut replies, "Oversized fixture").await;
-            let staging = ContentStaging::open(content_root).unwrap();
-            let mut body = String::new();
-            staging
-                .open_file(&body_key)
-                .unwrap()
-                .read_to_string(&mut body)
-                .unwrap();
-            assert!(body.contains("exceeds the local safety limits"));
+            let detail =
+                query_message_without_body(&database, &mut replies, "Oversized fixture").await;
+            assert!(!detail.content_available);
         });
 
         credential_parts.1.shutdown().unwrap();
@@ -1057,6 +1202,7 @@ first body v1\r\n";
                 content_root.clone(),
                 configuration.account_id,
                 configuration.generation,
+                true,
             )
             .await;
             assert!(matches!(
@@ -1067,24 +1213,10 @@ first body v1\r\n";
                     ..
                 }
             ));
-            let (_, first_key) = query_message_body(&database, &mut replies, "Retry one v1").await;
-            let (_, fallback_key) = query_message_body(&database, &mut replies, "staged two").await;
-
-            let staging = ContentStaging::open(content_root).unwrap();
-            let mut body = String::new();
-            staging
-                .open_file(&first_key)
-                .unwrap()
-                .read_to_string(&mut body)
-                .unwrap();
-            assert_eq!(body.trim(), "first body v1");
-            let mut fallback = String::new();
-            staging
-                .open_file(&fallback_key)
-                .unwrap()
-                .read_to_string(&mut fallback)
-                .unwrap();
-            assert!(fallback.contains("MIME content is malformed"));
+            let first = query_message_without_body(&database, &mut replies, "staged one").await;
+            let second = query_message_without_body(&database, &mut replies, "staged two").await;
+            assert!(!first.content_available);
+            assert!(!second.content_available);
             let checkpoint = database
                 .try_load_inbox_checkpoint(configuration.account_id, configuration.generation)
                 .unwrap()
@@ -1107,11 +1239,11 @@ first body v1\r\n";
         fs::remove_dir_all(root).unwrap();
     }
 
-    async fn query_message_body(
+    async fn query_message_without_body(
         database: &DatabaseClient,
         replies: &mut crate::store::sqlite::DatabaseReplies,
         subject: &str,
-    ) -> (crate::store::sqlite::MessageId, FileKey) {
+    ) -> crate::store::sqlite::MessageDetail {
         static NEXT_REQUEST: AtomicU64 = AtomicU64::new(10);
         database
             .try_query_mailbox(
@@ -1147,11 +1279,10 @@ first body v1\r\n";
                 message_id,
             )
             .unwrap();
-        let body_key = match replies.recv().await.unwrap() {
-            DbReply::Message(reply) => reply.result.unwrap().unwrap().body_file_key.unwrap(),
+        match replies.recv().await.unwrap() {
+            DbReply::Message(reply) => reply.result.unwrap().unwrap(),
             _ => panic!("message query returned an unexpected reply"),
-        };
-        (message_id, FileKey::parse(&body_key).unwrap())
+        }
     }
 
     fn temporary_root() -> PathBuf {

@@ -250,6 +250,7 @@ pub(crate) struct MessageDetail {
     pub(crate) body_truncated: bool,
     pub(crate) body_byte_count: u64,
     pub(crate) body_file_key: Option<Box<str>>,
+    pub(crate) content_available: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

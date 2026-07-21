@@ -82,6 +82,8 @@ export component AppWindow inherits Window {
     in property <bool> detail-error: false;
     in property <string> detail-error-title: "";
     in property <string> detail-error-detail: "";
+    in property <bool> detail-content-pending: false;
+    in property <string> detail-content-error: "";
     in-out property <string> status-text: "Local cache";
     in-out property <bool> account-menu-open: false;
     in-out property <bool> account-setup-open: false;
@@ -420,6 +422,8 @@ export component AppWindow inherits Window {
                                 detail-error: root.detail-error;
                                 detail-error-title: root.detail-error-title;
                                 detail-error-detail: root.detail-error-detail;
+                                detail-content-pending: root.detail-content-pending;
+                                detail-content-error: root.detail-content-error;
                                 selected-id: root.selected-id;
                                 selected-mail: root.selected-mail;
                                 detail-open <=> root.detail-open;

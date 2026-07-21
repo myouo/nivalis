@@ -15,6 +15,8 @@ export component ReaderPane inherits Rectangle {
     in property <bool> detail-error: false;
     in property <string> detail-error-title: "";
     in property <string> detail-error-detail: "";
+    in property <bool> detail-content-pending: false;
+    in property <string> detail-content-error: "";
     in property <string> selected-id: "";
     in property <MailDetail> selected-mail;
     in-out property <bool> detail-open: false;
@@ -196,7 +198,55 @@ export component ReaderPane inherits Rectangle {
                 }
 
                 Rectangle { height: 1px; background: Theme.outline-variant; }
-                VerticalLayout {
+                if root.detail-content-pending: Rectangle {
+                    height: 64px;
+                    border-radius: 6px;
+                    background: Theme.surface-container-low;
+                    accessible-role: progress-indicator;
+                    accessible-label: "Fetching message body in the background";
+                    HorizontalLayout {
+                        padding-left: 14px;
+                        padding-right: 14px;
+                        spacing: 10px;
+                        MaterialIcon { name: "progress_activity"; width: 24px; size: 20px; icon-color: Theme.primary; }
+                        Text {
+                            text: "Headers are ready. Fetching the body in the background…";
+                            color: Theme.on-surface-variant;
+                            font-family: Theme.body-font;
+                            font-size: 11px;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                    }
+                }
+
+                if !root.detail-content-pending && root.detail-content-error != "": Rectangle {
+                    height: 68px;
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: Theme.outline-variant;
+                    background: Theme.surface-container-low;
+                    accessible-role: region;
+                    accessible-label: root.detail-content-error;
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 8px;
+                        spacing: 8px;
+                        MaterialIcon { name: "cloud_off"; width: 24px; size: 19px; icon-color: Theme.on-surface-variant; }
+                        Text {
+                            text: root.detail-content-error;
+                            color: Theme.on-surface-variant;
+                            font-family: Theme.body-font;
+                            font-size: 10px;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            wrap: word-wrap;
+                        }
+                        MIconButton { icon: "refresh"; label: "Retry loading message body"; clicked => { root.retry-detail(); } }
+                    }
+                }
+
+                if !root.detail-content-pending && root.detail-content-error == "": VerticalLayout {
                     padding-left: 2px;
                     padding-right: 2px;
                     padding-top: 8px;

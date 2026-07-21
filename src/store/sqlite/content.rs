@@ -211,13 +211,53 @@ pub(super) fn reserve_content(
     connection: &mut Connection,
     request: ReserveContentRequest,
 ) -> Result<ContentReservation, DbFailure> {
+    let transaction = immediate_transaction(connection)?;
+    let reservation = match reserve_content_in_transaction(&transaction, request, true) {
+        Ok(reservation) => reservation,
+        Err(failure)
+            if failure.kind == super::domain::FailureKind::ResourceLimit
+                && failure.message.starts_with("file staging exceeds") =>
+        {
+            transaction.commit().map_err(DbFailure::database)?;
+            return Err(failure);
+        }
+        Err(failure) => return Err(failure),
+    };
+    transaction.commit().map_err(DbFailure::database)?;
+    Ok(reservation)
+}
+
+pub(super) fn reserve_content_batch(
+    connection: &mut Connection,
+    requests: Vec<ReserveContentRequest>,
+) -> Result<Box<[ContentReservation]>, DbFailure> {
+    if requests.is_empty() {
+        return Ok(Box::new([]));
+    }
+    let transaction = immediate_transaction(connection)?;
+    let mut reservations = Vec::with_capacity(requests.len());
+    for (index, request) in requests.into_iter().enumerate() {
+        reservations.push(reserve_content_in_transaction(
+            &transaction,
+            request,
+            index == 0,
+        )?);
+    }
+    transaction.commit().map_err(DbFailure::database)?;
+    Ok(reservations.into_boxed_slice())
+}
+
+fn reserve_content_in_transaction(
+    transaction: &Transaction<'_>,
+    request: ReserveContentRequest,
+    reap_expired: bool,
+) -> Result<ContentReservation, DbFailure> {
     validate_account_id(request.account_id)?;
     validate_lease(request.created_at_ms, request.expires_at_ms)?;
     request.manifest.validate()?;
 
-    let transaction = immediate_transaction(connection)?;
     let Some((database_account_id, generation)) =
-        load_message_identity(&transaction, request.message_id)?
+        load_message_identity(transaction, request.message_id)?
     else {
         return Err(DbFailure::not_found("message no longer exists"));
     };
@@ -244,7 +284,9 @@ pub(super) fn reserve_content(
         ));
     }
 
-    reap_expired_reservations(&transaction, request.created_at_ms)?;
+    if reap_expired {
+        reap_expired_reservations(transaction, request.created_at_ms)?;
+    }
     let staged_file_count: i64 = transaction
         .query_row(
             "SELECT file_count FROM file_staging_usage WHERE singleton = 1",
@@ -258,8 +300,6 @@ pub(super) fn reserve_content(
         .checked_add(request.manifest.file_count())
         .ok_or_else(|| DbFailure::resource_limit("file staging usage overflow"))?;
     if next_staged_file_count > MAX_STAGED_FILES {
-        // Persist bounded recovery progress even when this reservation cannot fit yet.
-        transaction.commit().map_err(DbFailure::database)?;
         return Err(DbFailure::resource_limit(format!(
             "file staging exceeds the {MAX_STAGED_FILES}-file limit"
         )));
@@ -286,7 +326,7 @@ pub(super) fn reserve_content(
 
     if let Some(body_file_key) = request.manifest.body_file_key() {
         insert_staged_file(
-            &transaction,
+            transaction,
             &encoded_token,
             &request,
             next_generation,
@@ -297,7 +337,7 @@ pub(super) fn reserve_content(
     }
     for (ordinal, file_key) in request.manifest.attachments() {
         insert_staged_file(
-            &transaction,
+            transaction,
             &encoded_token,
             &request,
             next_generation,
@@ -307,7 +347,6 @@ pub(super) fn reserve_content(
         )?;
     }
 
-    transaction.commit().map_err(DbFailure::database)?;
     Ok(ContentReservation {
         message_id: request.message_id,
         account_id: request.account_id,
@@ -336,6 +375,50 @@ pub(super) fn finalize_content_with_commit_hook(
     now_ms: i64,
     before_commit: impl FnOnce(),
 ) -> Result<ContentFinalizeOutcome, DbFailure> {
+    validate_content_finalization(reservation, record, now_ms)?;
+    let transaction = immediate_transaction(connection)?;
+    let outcome = finalize_content_in_transaction(&transaction, reservation, record, now_ms)?;
+    // Once this hook runs, durable staging owns cleanup even if commit is uncertain.
+    before_commit();
+    transaction.commit().map_err(DbFailure::database)?;
+    Ok(outcome)
+}
+
+pub(super) fn finalize_content_batch_with_commit_hook(
+    connection: &mut Connection,
+    reservations: &[ContentReservation],
+    records: &[ContentRecord],
+    now_ms: i64,
+    before_commit: impl FnOnce(),
+) -> Result<Box<[ContentFinalizeOutcome]>, DbFailure> {
+    if reservations.len() != records.len() {
+        return Err(DbFailure::conflict(
+            "content reservation and record batch lengths differ",
+        ));
+    }
+    for (reservation, record) in reservations.iter().zip(records) {
+        validate_content_finalization(reservation, record, now_ms)?;
+    }
+    let transaction = immediate_transaction(connection)?;
+    let mut outcomes = Vec::with_capacity(reservations.len());
+    for (reservation, record) in reservations.iter().zip(records) {
+        outcomes.push(finalize_content_in_transaction(
+            &transaction,
+            reservation,
+            record,
+            now_ms,
+        )?);
+    }
+    before_commit();
+    transaction.commit().map_err(DbFailure::database)?;
+    Ok(outcomes.into_boxed_slice())
+}
+
+fn validate_content_finalization(
+    reservation: &ContentReservation,
+    record: &ContentRecord,
+    now_ms: i64,
+) -> Result<(), DbFailure> {
     validate_timestamp(now_ms)?;
     validate_record(record)?;
     let record_manifest = ContentManifest::from_record(record)?;
@@ -347,11 +430,18 @@ pub(super) fn finalize_content_with_commit_hook(
     if now_ms >= reservation.expires_at_ms {
         return Err(DbFailure::conflict("content reservation has expired"));
     }
+    Ok(())
+}
 
-    let transaction = immediate_transaction(connection)?;
-    verify_current_generation(&transaction, reservation)?;
-    verify_persisted_reservation(&transaction, reservation)?;
-    let old_file_keys = load_existing_file_keys(&transaction, reservation.message_id)?;
+fn finalize_content_in_transaction(
+    transaction: &Transaction<'_>,
+    reservation: &ContentReservation,
+    record: &ContentRecord,
+    now_ms: i64,
+) -> Result<ContentFinalizeOutcome, DbFailure> {
+    verify_current_generation(transaction, reservation)?;
+    verify_persisted_reservation(transaction, reservation)?;
+    let old_file_keys = load_existing_file_keys(transaction, reservation.message_id)?;
 
     let body_byte_count = database_byte_count(record.body_byte_count, "content body")?;
     let updated = transaction
@@ -465,12 +555,9 @@ pub(super) fn finalize_content_with_commit_hook(
     }
 
     for file_key in old_file_keys {
-        queue_file_if_unreferenced(&transaction, &file_key, now_ms)?;
+        queue_file_if_unreferenced(transaction, &file_key, now_ms)?;
     }
 
-    // Once this hook runs, durable staging owns cleanup even if commit is uncertain.
-    before_commit();
-    transaction.commit().map_err(DbFailure::database)?;
     Ok(ContentFinalizeOutcome {
         generation: reservation.generation,
     })

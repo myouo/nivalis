@@ -1557,8 +1557,7 @@ mod tests {
                 0 => Ok(empty_inbox_page(3, Some(1), Some(2))),
                 1 => Err(ImapInboxFetchFailure::Offline),
                 2 => Ok(empty_inbox_page(1, None, None)),
-                3 => Ok(empty_inbox_page(2, Some(1), None)),
-                _ => panic!("automatic sync issued more than four immediate probes"),
+                _ => panic!("automatic sync issued more than one immediate probe per account"),
             }
         })
     }
@@ -1732,7 +1731,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_sync_rotates_three_accounts_and_contains_offline_failure() {
+    fn automatic_sync_runs_one_batch_per_account_and_contains_offline_failure() {
         const CREDENTIALS: [&str; 3] = [
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -1781,8 +1780,8 @@ mod tests {
         )
         .unwrap();
         let statuses = wait_for(async {
-            let mut statuses = Vec::with_capacity(4);
-            while statuses.len() < 4 {
+            let mut statuses = Vec::with_capacity(3);
+            while statuses.len() < 3 {
                 match events.recv().await {
                     Some(Event::AccountSyncStatus(status)) => statuses.push(status),
                     Some(_) => {}
@@ -1815,16 +1814,9 @@ mod tests {
                     has_more: false,
                     historical: false,
                 },
-                AccountSyncStatus::Synced {
-                    account_id: account_a.account_id,
-                    generation: account_a.generation,
-                    imported: 0,
-                    has_more: false,
-                    historical: false,
-                },
             ]
         );
-        assert_eq!(AUTO_SYNC_PROBE_CALLS.load(Ordering::Acquire), 4);
+        assert_eq!(AUTO_SYNC_PROBE_CALLS.load(Ordering::Acquire), 3);
         assert_eq!(AUTO_SYNC_PROBE_ACTIVE.load(Ordering::Acquire), 0);
         assert_eq!(AUTO_SYNC_PROBE_PEAK.load(Ordering::Acquire), 1);
 
