@@ -37,6 +37,13 @@ const MAILBOX_SELECT: &str = "
       FROM messages AS m
      WHERE ";
 
+const MAILBOX_SEARCH_SELECT: &str = "
+    SELECT m.id, m.account_id, m.sender_name, m.sender_address, m.subject, m.preview,
+           m.received_at_ms, m.unread, m.starred, m.has_attachment
+      FROM message_search
+      JOIN messages AS m ON m.id = message_search.rowid
+     WHERE message_search MATCH ?1 AND ";
+
 const OPEN_MESSAGE_SQL: &str = "
     SELECT m.id, m.account_id, m.sender_name, m.sender_address, m.subject, m.received_at_ms,
            m.unread, m.starred, m.has_attachment, coalesce(c.reader_excerpt, ''),
@@ -229,7 +236,12 @@ fn page_cursor(row: &MailSummaryDto) -> PageCursor {
 fn mailbox_query(spec: &PageSpec) -> (String, Vec<Value>) {
     let mut sql = String::with_capacity(MAILBOX_SELECT.len() + 768);
     let mut parameters = Vec::with_capacity(5);
-    sql.push_str(MAILBOX_SELECT);
+    if let Some(search) = spec.search.as_deref() {
+        sql.push_str(MAILBOX_SEARCH_SELECT);
+        parameters.push(Value::Text(fts_expression(search)));
+    } else {
+        sql.push_str(MAILBOX_SELECT);
+    }
     sql.push_str(match spec.folder {
         FolderScope::Inbox => {
             "EXISTS (
@@ -314,20 +326,6 @@ fn mailbox_query(spec: &PageSpec) -> (String, Vec<Value>) {
             .expect("writing SQL to a String cannot fail");
     }
 
-    if let Some(search) = spec.search.as_deref() {
-        parameters.push(Value::Text(fts_phrase(search)));
-        let parameter = parameters.len();
-        write!(
-            sql,
-            " AND EXISTS (
-                SELECT 1 FROM message_search
-                 WHERE message_search.rowid = m.id
-                   AND message_search MATCH ?{parameter}
-            )"
-        )
-        .expect("writing SQL to a String cannot fail");
-    }
-
     if let PageBoundary::After(cursor) | PageBoundary::Before(cursor) = spec.boundary {
         parameters.push(Value::Integer(cursor.received_at_ms));
         let time_parameter = parameters.len();
@@ -403,6 +401,48 @@ fn fts_phrase(search: &str) -> String {
     }
     phrase.push('"');
     phrase
+}
+
+fn fts_expression(search: &str) -> String {
+    let has_field = search.split_whitespace().any(|term| {
+        ["from:", "sender:", "subject:", "body:"]
+            .iter()
+            .any(|prefix| term.len() > prefix.len() && term.starts_with(prefix))
+    });
+    if !has_field {
+        return fts_phrase(search);
+    }
+
+    let mut expression = String::with_capacity(search.len() + 64);
+    for term in search.split_whitespace() {
+        let (column, value) = if let Some(value) = term.strip_prefix("from:") {
+            (Some("{sender_name sender_address}"), value)
+        } else if let Some(value) = term.strip_prefix("sender:") {
+            (Some("{sender_name sender_address}"), value)
+        } else if let Some(value) = term.strip_prefix("subject:") {
+            (Some("subject"), value)
+        } else if let Some(value) = term.strip_prefix("body:") {
+            (Some("body"), value)
+        } else {
+            (None, term)
+        };
+        if value.is_empty() {
+            continue;
+        }
+        if !expression.is_empty() {
+            expression.push_str(" AND ");
+        }
+        if let Some(column) = column {
+            expression.push_str(column);
+            expression.push_str(" : ");
+        }
+        expression.push_str(&fts_phrase(value));
+    }
+    if expression.is_empty() {
+        fts_phrase(search)
+    } else {
+        expression
+    }
 }
 
 #[cfg(test)]
@@ -876,6 +916,51 @@ mod tests {
     fn fts_phrase_quotes_user_syntax() {
         assert_eq!(fts_phrase("alpha OR beta"), "\"alpha OR beta\"");
         assert_eq!(fts_phrase("say \"hello\""), "\"say \"\"hello\"\"\"");
+        assert_eq!(
+            fts_expression("from:alice subject:budget body:invoice"),
+            "{sender_name sender_address} : \"alice\" AND subject : \"budget\" AND body : \"invoice\""
+        );
+    }
+
+    #[test]
+    fn search_indexes_sender_subject_body_combinations_and_chinese_text() {
+        let connection = seeded_connection(2);
+        connection
+            .execute(
+                "UPDATE messages
+                 SET sender_name = 'Alice Chen', sender_address = 'alice@example.test',
+                     subject = '季度项目计划'
+                 WHERE id = 2",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO message_content
+                 (message_id, reader_excerpt, truncated, body_byte_count)
+                 VALUES (2, '合同审核完成，季度项目计划正文已经缓存', 0, 64)",
+                [],
+            )
+            .unwrap();
+
+        for search in [
+            "from:alice",
+            "subject:项目计划",
+            "body:合同审核",
+            "from:alice body:项目计划",
+            "项目计划",
+        ] {
+            let spec = PageSpec::new(
+                AccountScope::All,
+                FolderScope::Inbox,
+                Some(search),
+                PageBoundary::First,
+                50,
+            )
+            .unwrap();
+            let page = query_mailbox(&connection, &spec).unwrap();
+            assert_eq!(message_ids(&page), [2], "search: {search}");
+        }
     }
 
     #[test]
@@ -924,7 +1009,7 @@ mod tests {
     }
 
     #[test]
-    fn search_plan_uses_fts_probe_without_temporary_sorting() {
+    fn search_plan_drives_from_fts_before_sorting_the_matching_rows() {
         let connection = seeded_connection(1);
         let spec = PageSpec::new(
             AccountScope::account(1).unwrap(),
@@ -947,19 +1032,20 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
+        let fts = plan
+            .iter()
+            .position(|step| step.contains("message_search VIRTUAL TABLE INDEX"))
+            .expect("search must start from the FTS posting list");
+        let messages = plan
+            .iter()
+            .position(|step| step.contains("SEARCH m USING INTEGER PRIMARY KEY"))
+            .expect("FTS hits must probe messages by rowid");
+        assert!(fts < messages, "unexpected query plan: {plan:?}");
         assert!(
-            plan.iter()
-                .any(|step| step.contains("idx_messages_account_time")),
-            "unexpected query plan: {plan:?}"
+            plan.iter().all(|step| !step.starts_with("SCAN m ")),
+            "search must not scan the mailbox table: {plan:?}"
         );
-        assert!(
-            plan.iter().any(|step| step.contains("VIRTUAL TABLE INDEX")),
-            "unexpected query plan: {plan:?}"
-        );
-        assert!(
-            plan.iter().all(|step| !step.contains("USE TEMP B-TREE")),
-            "search must not materialize an unbounded temporary sort: {plan:?}"
-        );
+        assert!(plan.iter().any(|step| step.contains("USE TEMP B-TREE")));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use crate::{
     AppWindow,
     content::{ContentLimits, ContentStaging, FileKey, prepare_content},
+    network::imap::{ImapRuntimeCounters, imap_runtime_counters},
     store::sqlite::{
         AccountGeneration, AccountId, ContentImportSubmission, DatabaseClient, DatabaseSubmitError,
         FileGcOutcome, MailboxQueryCounts, MessageId, mailbox_query_counts,
@@ -1554,6 +1555,9 @@ enum ExistingAccountSyncPhase {
 
 struct ExistingAccountSyncStress {
     phase: ExistingAccountSyncPhase,
+    launch_started: Instant,
+    local_first_screen_elapsed_ms: Option<u128>,
+    network_before: ImapRuntimeCounters,
     started: Instant,
     deadline: Instant,
     transition_timeout: Duration,
@@ -1611,6 +1615,7 @@ fn install_existing_account_sync(
     let timer = Rc::new(Timer::default());
     let timer_weak = Rc::downgrade(&timer);
     let ui_weak = ui.as_weak();
+    let launch_started = Instant::now();
 
     Timer::single_shot(Duration::from_millis(delay), move || {
         let Some(timer) = timer_weak.upgrade() else {
@@ -1629,6 +1634,9 @@ fn install_existing_account_sync(
         let started = Instant::now();
         let state = Rc::new(RefCell::new(ExistingAccountSyncStress {
             phase: ExistingAccountSyncPhase::WaitingForInitialState,
+            launch_started,
+            local_first_screen_elapsed_ms: None,
+            network_before: imap_runtime_counters(),
             started,
             deadline: started + transition_timeout,
             transition_timeout,
@@ -1711,6 +1719,10 @@ fn install_existing_account_sync(
                                 return;
                             }
                             AccountReceiveGate::Ready => {}
+                        }
+                        if state.local_first_screen_elapsed_ms.is_none() {
+                            state.local_first_screen_elapsed_ms =
+                                Some(state.launch_started.elapsed().as_millis());
                         }
                         ui.invoke_sync_account(config.account_key.clone());
                         if !ui.get_sync_loading() || !ui.get_account_operation_loading() {
@@ -1845,9 +1857,22 @@ fn install_existing_account_sync(
                             }
                         }
                         let body_elapsed_ms = body_started.elapsed().as_millis();
+                        let local_first_screen_elapsed_ms = state
+                            .local_first_screen_elapsed_ms
+                            .expect("the local mailbox gate precedes synchronization");
+                        let network_after = imap_runtime_counters();
+                        let protocol_session_opens = network_after
+                            .protocol_session_opens
+                            .saturating_sub(state.network_before.protocol_session_opens);
+                        let foreground_session_reuses = network_after
+                            .foreground_session_reuses
+                            .saturating_sub(state.network_before.foreground_session_reuses);
+                        let idle_cancellations = network_after
+                            .idle_cancellations
+                            .saturating_sub(state.network_before.idle_cancellations);
                         ui.set_status_text("Existing account local-first verification complete".into());
                         eprintln!(
-                            "NIVALIS_STRESS_RESULT scenario=existing-account-sync steps=1 manual_sync=1 metadata=1 on_demand_body=1 database=1 ui=1 metadata_elapsed_ms={metadata_elapsed_ms} body_elapsed_ms={body_elapsed_ms} total_elapsed_ms={}",
+                            "NIVALIS_STRESS_RESULT scenario=existing-account-sync steps=1 local_first_screen=1 manual_sync=1 metadata=1 on_demand_body=1 database=1 ui=1 local_first_screen_elapsed_ms={local_first_screen_elapsed_ms} metadata_elapsed_ms={metadata_elapsed_ms} body_elapsed_ms={body_elapsed_ms} protocol_session_opens={protocol_session_opens} foreground_session_reuses={foreground_session_reuses} idle_cancellations={idle_cancellations} total_elapsed_ms={}",
                             state.started.elapsed().as_millis()
                         );
                         stop_stress(&ui, &timer);

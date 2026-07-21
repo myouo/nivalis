@@ -15,8 +15,9 @@ use crate::{
         CredentialSubmitError,
     },
     network::imap::{
-        ImapInboxFetchFailure, ImapInboxFetchRequest, ImapInboxMessage, ImapInboxPage,
-        ImapMessageContentFetchRequest, fetch_canonical_inbox_metadata, fetch_imap_message_content,
+        ImapIdleRequest, ImapInboxFetchFailure, ImapInboxFetchRequest, ImapInboxMessage,
+        ImapInboxPage, ImapMessageContentFetchRequest, fetch_canonical_inbox_metadata,
+        fetch_imap_message_content,
     },
     store::sqlite::{
         AccountAuthKind, AccountGeneration, AccountId, AccountLifecycle, AccountRecord,
@@ -52,6 +53,7 @@ pub(super) enum SyncInboxOutcome {
         has_more: bool,
         historical: bool,
         bootstrap: bool,
+        idle: ImapIdleRequest,
     },
     Failed {
         stage: AccountWorkflowStage,
@@ -464,6 +466,13 @@ async fn run_inbox_sync(
         has_more,
         historical,
         bootstrap,
+        idle: ImapIdleRequest::new(
+            &configuration.imap_host,
+            configuration.imap_port,
+            &configuration.login_name,
+            uid_validity,
+        )
+        .expect("a validated IMAP configuration remains valid for IDLE"),
     }
 }
 

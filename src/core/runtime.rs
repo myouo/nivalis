@@ -889,6 +889,11 @@ async fn finish_accepted_mutations_with(
         if pending.is_empty() && active_mutations == 0 {
             break;
         }
+        if active_mutations == 0 {
+            time::sleep(SHUTDOWN_QUERY_INTERRUPT_INTERVAL).await;
+            database.interrupt_queries();
+            continue;
+        }
         let reply = loop {
             match time::timeout(SHUTDOWN_QUERY_INTERRUPT_INTERVAL, database_replies.recv()).await {
                 Ok(Some(reply)) => break reply,
@@ -1389,8 +1394,8 @@ mod tests {
         },
         store::sqlite::{
             AccountAuthKind, AccountConfigInput, AccountConfiguration, AccountDiagnostic,
-            AccountLifecycle, AccountWrite, AccountWriteOutcome, DatabaseClient, FailureKind,
-            OutboxState, SmtpSecurity,
+            AccountId, AccountLifecycle, AccountWrite, AccountWriteOutcome, DatabaseClient,
+            FailureKind, OutboxState, SmtpSecurity,
         },
     };
     use keyring_core::CredentialStore;
@@ -3318,22 +3323,14 @@ mod tests {
         let (started_tx, started_rx) = crossbeam_channel::bounded(1);
         database.0.try_run_long_query(started_tx).unwrap();
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        for offset in 0..16_u64 {
-            database
-                .0
-                .try_query_mailbox(
-                    RequestId::new(100 + offset).unwrap(),
-                    Generation::new(0),
-                    PageSpec::new(
-                        AccountScope::All,
-                        FolderScope::Inbox,
-                        None,
-                        PageBoundary::First,
-                        1,
-                    )
+        let mut queued_reads = Vec::with_capacity(16);
+        for _ in 0..16 {
+            queued_reads.push(
+                database
+                    .0
+                    .try_load_account(AccountId::new(1).unwrap())
                     .unwrap(),
-                )
-                .unwrap();
+            );
         }
         let (core, events, runtime) = spawn_with_options(1, database).unwrap();
         core.try_mutate(mutation_request(1, 0, 1)).unwrap();
@@ -3350,6 +3347,7 @@ mod tests {
         thread::sleep(Duration::from_millis(20));
 
         runtime.shutdown().unwrap();
+        drop(queued_reads);
 
         let connection = Connection::open(&path).unwrap();
         let unread: bool = connection

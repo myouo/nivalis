@@ -10,6 +10,7 @@ mod mutation;
 mod outbox;
 mod query;
 pub(crate) mod remote;
+mod search;
 mod stats;
 mod sync;
 

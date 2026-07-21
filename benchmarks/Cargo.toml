@@ -10,9 +10,14 @@ bytes = "1.11"
 criterion = { version = "0.7.0", default-features = false }
 mail-protocol-core = { path = "../vendor/mail-protocol-core" }
 mail-protocol-imap = { path = "../vendor/mail-protocol-imap" }
+rusqlite = { version = "=0.40.1", default-features = false, features = ["bundled"] }
 
 [[bench]]
 name = "imap_protocol"
+harness = false
+
+[[bench]]
+name = "local_store"
 harness = false
 
 [profile.bench]

@@ -18,8 +18,8 @@ use crate::{
         CredentialOperation, CredentialOutcome, CredentialResponse, CredentialSubmitError, Secret,
     },
     network::imap::{
-        ImapDiagnosticFailure, ImapDiagnosticFailureKind, ImapDiagnosticRequest,
-        diagnose_app_password,
+        ImapDiagnosticFailure, ImapDiagnosticFailureKind, ImapDiagnosticRequest, ImapIdleOutcome,
+        ImapIdleRequest, diagnose_app_password, wait_for_cached_inbox_change,
     },
     store::sqlite::{
         AccountAuthKind, AccountConfigInput, AccountConfiguration, AccountDiagnosticKind,
@@ -45,10 +45,13 @@ use super::{
 const PLACEHOLDER_CREDENTIAL_KEY: &str = "00000000000000000000000000000000";
 const RECOVERY_SUBMISSION_RETRY: Duration = Duration::from_millis(10);
 const SCHEDULER_SUBMISSION_RETRY: Duration = Duration::from_millis(10);
+const IDLE_RECONNECT_DELAY: Duration = Duration::from_secs(2);
+const MAX_IDLE_WATCHES: usize = 10;
 
 pub(super) type ImapDiagnosticFuture =
     Pin<Box<dyn Future<Output = Result<(), ImapDiagnosticFailure>> + 'static>>;
 pub(super) type ImapDiagnosticProbe = fn(ImapDiagnosticRequest) -> ImapDiagnosticFuture;
+type ImapIdleFuture = Pin<Box<dyn Future<Output = ImapIdleOutcome> + 'static>>;
 
 pub(super) fn production_imap_diagnostic(request: ImapDiagnosticRequest) -> ImapDiagnosticFuture {
     Box::pin(diagnose_app_password(request))
@@ -482,6 +485,7 @@ pub(crate) enum AccountWorkflowOutcome {
         has_more: bool,
         historical: bool,
         bootstrap: bool,
+        idle: ImapIdleRequest,
     },
     MessageContentFetched {
         message_id: MessageId,
@@ -538,6 +542,7 @@ impl fmt::Debug for AccountWorkflowOutcome {
                 has_more,
                 historical,
                 bootstrap,
+                idle: _,
             } => formatter
                 .debug_struct("InboxSynced")
                 .field("account_id", account_id)
@@ -1165,6 +1170,7 @@ pub(super) struct AccountWorkflows {
     auto_sync: AutoSyncState,
     background_status: Option<AccountSyncStatus>,
     history_prefetch: Option<(AccountId, AccountGeneration)>,
+    idle_watches: Vec<IdleWatch>,
 }
 
 impl AccountWorkflows {
@@ -1208,6 +1214,7 @@ impl AccountWorkflows {
             },
             background_status: None,
             history_prefetch: None,
+            idle_watches: Vec::with_capacity(MAX_IDLE_WATCHES),
         }
     }
 
@@ -1243,6 +1250,9 @@ impl AccountWorkflows {
             }
         }
         let request_id = operation.request_id();
+        if let Some((account_id, generation)) = foreground_identity(&operation) {
+            self.cancel_idle_watch(account_id, generation);
+        }
         match operation {
             AccountOperation::Setup {
                 mode,
@@ -1508,6 +1518,12 @@ impl AccountWorkflows {
         &mut self,
         context: &mut Context<'_>,
     ) -> Poll<Result<(), AccountDriverError>> {
+        if self.poll_idle_watches(context) {
+            return Poll::Ready(Ok(()));
+        }
+        if self.idle_handoff_pending() {
+            return Poll::Pending;
+        }
         if let Some(active) = self.active.as_mut() {
             match active.poll_one(
                 &self.database,
@@ -1540,6 +1556,16 @@ impl AccountWorkflows {
                         } if active.reply.is_none() => Some((*account_id, *generation)),
                         _ => None,
                     };
+                    let idle_watch = match &outcome {
+                        AccountWorkflowOutcome::InboxSynced {
+                            account_id,
+                            generation,
+                            bootstrap: false,
+                            idle,
+                            ..
+                        } => Some((*account_id, *generation, idle.clone())),
+                        _ => None,
+                    };
                     if let Some(token) = active.sync_token {
                         let completion = sync_completion(&outcome);
                         let completed = self.scheduler.complete(token, completion, Instant::now());
@@ -1551,6 +1577,9 @@ impl AccountWorkflows {
                     }
                     if history_prefetch.is_some() {
                         self.history_prefetch = history_prefetch;
+                    }
+                    if let Some((account_id, generation, request)) = idle_watch {
+                        self.register_idle_watch(account_id, generation, request);
                     }
                     if let Some(user) = active.reply.take() {
                         let _ = user.reply.send(AccountOperationReply {
@@ -1703,6 +1732,80 @@ impl AccountWorkflows {
         }
     }
 
+    fn register_idle_watch(
+        &mut self,
+        account_id: AccountId,
+        generation: AccountGeneration,
+        request: ImapIdleRequest,
+    ) {
+        self.idle_watches
+            .retain(|watch| watch.account_id != account_id || watch.generation != generation);
+        if self.idle_watches.len() == MAX_IDLE_WATCHES {
+            return;
+        }
+        let (cancellation, cancelled) = oneshot::channel();
+        self.idle_watches.push(IdleWatch {
+            account_id,
+            generation,
+            cancellation: Some(cancellation),
+            future: Box::pin(wait_for_cached_inbox_change(request, cancelled)),
+        });
+    }
+
+    fn cancel_idle_watch(&mut self, account_id: AccountId, generation: AccountGeneration) {
+        if let Some(watch) = self
+            .idle_watches
+            .iter_mut()
+            .find(|watch| watch.account_id == account_id && watch.generation == generation)
+            && let Some(cancellation) = watch.cancellation.take()
+        {
+            let _ = cancellation.send(());
+        }
+    }
+
+    fn idle_handoff_pending(&self) -> bool {
+        self.idle_watches
+            .iter()
+            .any(|watch| watch.cancellation.is_none())
+    }
+
+    fn poll_idle_watches(&mut self, context: &mut Context<'_>) -> bool {
+        let mut index = 0;
+        while index < self.idle_watches.len() {
+            let outcome = match self.idle_watches[index].future.as_mut().poll(context) {
+                Poll::Pending => {
+                    index += 1;
+                    continue;
+                }
+                Poll::Ready(outcome) => outcome,
+            };
+            let watch = self.idle_watches.swap_remove(index);
+            let now = Instant::now();
+            let promotion_deadline = match outcome {
+                ImapIdleOutcome::Changed => Some(now),
+                ImapIdleOutcome::Disconnected(_) => now.checked_add(IDLE_RECONNECT_DELAY),
+                ImapIdleOutcome::TimedOut
+                | ImapIdleOutcome::Cancelled
+                | ImapIdleOutcome::Unavailable => None,
+            };
+            if let Some(deadline) = promotion_deadline
+                && self
+                    .scheduler
+                    .promote(watch.account_id, watch.generation, deadline)
+                && matches!(self.auto_sync, AutoSyncState::WaitingForDeadline(_))
+            {
+                self.auto_sync = if deadline <= now {
+                    AutoSyncState::Ready
+                } else {
+                    AutoSyncState::WaitingForDeadline(Box::pin(time::sleep_until(deadline.into())))
+                };
+            }
+            context.waker().wake_by_ref();
+            return true;
+        }
+        false
+    }
+
     fn poll_auto_sync(
         &mut self,
         context: &mut Context<'_>,
@@ -1782,7 +1885,13 @@ impl AccountWorkflows {
                 };
                 let targets = targets
                     .iter()
-                    .map(|target| (target.account_id, target.generation));
+                    .map(|target| (target.account_id, target.generation))
+                    .collect::<Vec<_>>();
+                self.idle_watches.retain(|watch| {
+                    targets.iter().any(|(account_id, generation)| {
+                        watch.account_id == *account_id && watch.generation == *generation
+                    })
+                });
                 self.scheduler
                     .replace_targets(targets, Instant::now())
                     .map_err(|_| AccountDriverError::WorkflowRejected)?;
@@ -1847,6 +1956,22 @@ impl AccountWorkflows {
     }
 }
 
+fn foreground_identity(operation: &AccountOperation) -> Option<(AccountId, AccountGeneration)> {
+    match operation {
+        AccountOperation::SyncInbox {
+            account_id,
+            expected_generation,
+            ..
+        }
+        | AccountOperation::FetchMessageContent {
+            account_id,
+            expected_generation,
+            ..
+        } => Some((*account_id, *expected_generation)),
+        _ => None,
+    }
+}
+
 fn setup_identity(mode: AccountSetupMode) -> Option<(AccountId, AccountGeneration)> {
     match mode {
         AccountSetupMode::Create => None,
@@ -1887,6 +2012,13 @@ enum AutoSyncState {
     WaitingForDeadline(Pin<Box<Sleep>>),
     Paused,
     Ready,
+}
+
+struct IdleWatch {
+    account_id: AccountId,
+    generation: AccountGeneration,
+    cancellation: Option<oneshot::Sender<()>>,
+    future: ImapIdleFuture,
 }
 
 struct UserReply {
@@ -2001,6 +2133,7 @@ impl ActiveTask {
                     has_more,
                     historical,
                     bootstrap,
+                    idle,
                 }) => Poll::Ready(Ok(TaskProgress::Finished(
                     AccountWorkflowOutcome::InboxSynced {
                         account_id,
@@ -2009,6 +2142,7 @@ impl ActiveTask {
                         has_more,
                         historical,
                         bootstrap,
+                        idle,
                     },
                 ))),
                 Poll::Ready(SyncInboxOutcome::Failed { stage, failure }) => {
@@ -2800,6 +2934,7 @@ fn project_outcome(
             has_more,
             historical,
             bootstrap: _,
+            idle: _,
         } => Ok(AccountOperationSuccess::Synced {
             account_id,
             generation,
@@ -2909,6 +3044,41 @@ mod tests {
 
     fn secret() -> Secret {
         Secret::new(b"not-a-real-password".to_vec()).unwrap()
+    }
+
+    #[test]
+    fn idle_watch_tasks_are_bounded_and_ready_disconnects_are_removed() {
+        let (database, _replies, database_runtime, _) =
+            crate::store::sqlite::spawn_in_memory().unwrap();
+        let (credentials, credential_runtime) = crate::credentials::spawn();
+        let mut workflows =
+            AccountWorkflows::new(database, credentials, production_imap_diagnostic);
+        for raw_id in 1..=MAX_IDLE_WATCHES + 1 {
+            let account_id = AccountId::new(i64::try_from(raw_id).unwrap()).unwrap();
+            let request = ImapIdleRequest::new(
+                "imap.example.test",
+                993,
+                &format!("person-{raw_id}@example.test"),
+                std::num::NonZeroU32::new(1).unwrap(),
+            )
+            .unwrap();
+            workflows.register_idle_watch(account_id, generation(1), request);
+        }
+        assert_eq!(workflows.idle_watches.len(), MAX_IDLE_WATCHES);
+
+        workflows.cancel_idle_watch(AccountId::new(1).unwrap(), generation(1));
+        assert!(workflows.idle_handoff_pending());
+        workflows.idle_watches[0].future = Box::pin(async {
+            ImapIdleOutcome::Disconnected(crate::network::imap::ImapInboxFetchFailure::Offline)
+        });
+        let waker = std::task::Waker::noop();
+        let mut context = Context::from_waker(waker);
+        assert!(workflows.poll_idle_watches(&mut context));
+        assert_eq!(workflows.idle_watches.len(), MAX_IDLE_WATCHES - 1);
+
+        drop(workflows);
+        credential_runtime.shutdown().unwrap();
+        database_runtime.shutdown().unwrap();
     }
 
     #[test]

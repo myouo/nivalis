@@ -55,6 +55,7 @@ use super::{
         RemoteClaimOutcome, RemoteReportOutcome, RemoteReportSubmission, ReportTransition,
         claim_remote, report_remote,
     },
+    search::{backfill_complete, backfill_next_batch},
     sync::{
         ActiveImapAccountFence, ImapMessageContentTargetOutcome, InboxCheckpointOutcome,
         InboxCursorCommit, InboxCursorOutcome, InboxReceivePage, InboxStageOutcome,
@@ -64,13 +65,16 @@ use super::{
 };
 
 const REQUEST_CAPACITY: usize = 16;
+const QUERY_REQUEST_CAPACITY: usize = 8;
 const REPLY_CAPACITY: usize = 8;
 const SQLITE_CACHE_KIB: i64 = 1024;
+const SQLITE_QUERY_CACHE_KIB: i64 = 512;
 const SQLITE_MAX_VALUE_BYTES: i32 = 2 * 1024 * 1024;
 const MAILBOX_PROGRESS_OPS: i32 = 4096;
 const CONTENT_IMPORT_TTL_MS: i64 = 60 * 1_000;
 const MAX_CONTENT_IMPORT_BATCH: usize = 128;
 const CONTENT_TRANSACTION_CHUNK: usize = 7;
+const SEARCH_BACKFILL_IDLE_DELAY: Duration = Duration::from_millis(5);
 
 pub(crate) type PendingCredentialRemovalReply = Result<Box<[PendingCredentialRemoval]>, DbFailure>;
 pub(crate) type PendingCacheRemovalReply = Result<Box<[PendingCacheRemoval]>, DbFailure>;
@@ -277,8 +281,10 @@ struct MailboxQueryGate {
 #[derive(Clone)]
 pub(crate) struct DatabaseClient {
     requests: Sender<Request>,
+    query_requests: Option<Sender<Request>>,
     admission: Arc<Mutex<bool>>,
     interrupt: Arc<InterruptHandle>,
+    writer_interrupt: Arc<InterruptHandle>,
     mailbox_control: Arc<MailboxQueryControl>,
     #[cfg(test)]
     next_mailbox_gate: Arc<Mutex<Option<MailboxQueryGate>>>,
@@ -293,7 +299,7 @@ impl DatabaseClient {
         request_id: RequestId,
         generation: Generation,
     ) -> Result<(), SubmitError> {
-        self.try_submit(Request::QueryAccountDirectory {
+        self.try_submit_query(Request::QueryAccountDirectory {
             request_id,
             generation,
         })
@@ -305,7 +311,7 @@ impl DatabaseClient {
         generation: Generation,
         spec: PageSpec,
     ) -> Result<(), SubmitError> {
-        self.try_submit(Request::QueryMailbox {
+        self.try_submit_query(Request::QueryMailbox {
             request_id,
             generation,
             spec,
@@ -343,7 +349,7 @@ impl DatabaseClient {
         generation: Generation,
         id: MessageId,
     ) -> Result<(), SubmitError> {
-        self.try_submit(Request::OpenMessage {
+        self.try_submit_query(Request::OpenMessage {
             request_id,
             generation,
             id,
@@ -389,6 +395,7 @@ impl DatabaseClient {
     pub(crate) fn interrupt_queries(&self) {
         let _write_guard = lock_write_gate(&self.write_gate);
         self.interrupt.interrupt();
+        self.writer_interrupt.interrupt();
     }
 
     pub(crate) fn try_load_account(
@@ -714,6 +721,18 @@ impl DatabaseClient {
             return Err(SubmitError::Closed);
         }
         self.requests.try_send(request).map_err(SubmitError::from)
+    }
+
+    fn try_submit_query(&self, request: Request) -> Result<(), SubmitError> {
+        let admission = lock_admission(&self.admission);
+        if !*admission {
+            return Err(SubmitError::Closed);
+        }
+        self.query_requests
+            .as_ref()
+            .unwrap_or(&self.requests)
+            .try_send(request)
+            .map_err(SubmitError::from)
     }
 
     #[cfg(test)]
@@ -1184,8 +1203,11 @@ pub(crate) struct DatabaseInfo {
     pub(crate) schema_version: u32,
     pub(crate) page_size: u32,
     pub(crate) cache_kib: u32,
+    pub(crate) query_cache_kib: u32,
+    pub(crate) connection_count: u8,
     pub(crate) wal_enabled: bool,
     pub(crate) actor_thread: thread::ThreadId,
+    pub(crate) query_thread: Option<thread::ThreadId>,
 }
 
 pub(crate) fn spawn(
@@ -1228,6 +1250,10 @@ fn spawn_target(
     ),
     StartError,
 > {
+    let query_path = match &target {
+        Target::File(path) => Some(path.clone()),
+        Target::Memory => None,
+    };
     let (request_tx, request_rx) = bounded(request_capacity);
     let (reply_tx, reply_rx) = mpsc::channel(reply_capacity);
     let (shutdown_tx, shutdown_rx) = bounded(1);
@@ -1242,13 +1268,14 @@ fn spawn_target(
     let next_mailbox_gate = Arc::new(Mutex::new(None));
     #[cfg(test)]
     let next_mailbox_long = Arc::new(AtomicBool::new(false));
+    let worker_reply_tx = reply_tx.clone();
     let worker = thread::Builder::new()
         .name("nivalis-sqlite".into())
         .spawn(move || {
             run_actor(
                 target,
                 request_rx,
-                reply_tx,
+                worker_reply_tx,
                 shutdown_rx,
                 startup_tx,
                 ActorControl {
@@ -1269,11 +1296,71 @@ fn spawn_target(
         Err(_) => return Err(startup_failure(worker)),
     };
 
+    let mut info = started.info;
+    let mut query_requests = None;
+    let mut query_shutdown = None;
+    let mut query_interrupt = None;
+    let mut query_worker = None;
+    if let Some(path) = query_path {
+        let (query_tx, query_rx) = bounded(QUERY_REQUEST_CAPACITY);
+        let (query_shutdown_tx, query_shutdown_rx) = bounded(1);
+        let (query_startup_tx, query_startup_rx) = bounded(1);
+        let query_admission = admission.clone();
+        let query_mailbox = mailbox_control.clone();
+        let query_actor = match thread::Builder::new()
+            .name("nivalis-sqlite-query".into())
+            .spawn(move || {
+                run_query_actor(
+                    path,
+                    query_rx,
+                    reply_tx,
+                    query_shutdown_rx,
+                    query_startup_tx,
+                    query_admission,
+                    query_mailbox,
+                )
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                let _ = shutdown_tx.try_send(());
+                let _ = worker.join();
+                return Err(StartError::Thread(error));
+            }
+        };
+        let query_started = match query_startup_rx.recv() {
+            Ok(Ok(started)) => started,
+            Ok(Err(failure)) => {
+                let _ = query_actor.join();
+                let _ = shutdown_tx.try_send(());
+                return Err(StartError::Initialize(failure));
+            }
+            Err(_) => {
+                let failure = startup_failure(query_actor);
+                let _ = shutdown_tx.try_send(());
+                return Err(failure);
+            }
+        };
+        info.query_cache_kib = SQLITE_QUERY_CACHE_KIB as u32;
+        info.connection_count = 2;
+        info.query_thread = Some(query_started.thread);
+        query_requests = Some(query_tx);
+        query_shutdown = Some(query_shutdown_tx);
+        query_interrupt = Some(query_started.interrupt.clone());
+        query_worker = Some(query_actor);
+    }
+
+    let client_interrupt = query_interrupt
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| started.interrupt.clone());
+
     Ok((
         DatabaseClient {
             requests: request_tx,
+            query_requests,
             admission: admission.clone(),
-            interrupt: started.interrupt.clone(),
+            interrupt: client_interrupt,
+            writer_interrupt: started.interrupt.clone(),
             mailbox_control,
             #[cfg(test)]
             next_mailbox_gate,
@@ -1284,12 +1371,15 @@ fn spawn_target(
         DatabaseReplies { replies: reply_rx },
         DatabaseRuntime {
             shutdown: Some(shutdown_tx),
+            query_shutdown,
             admission,
             interrupt: Some(started.interrupt),
+            query_interrupt,
             write_gate,
             worker: Some(worker),
+            query_worker,
         },
-        started.info,
+        info,
     ))
 }
 
@@ -1303,10 +1393,108 @@ struct Started {
     interrupt: Arc<InterruptHandle>,
 }
 
+struct QueryStarted {
+    thread: thread::ThreadId,
+    interrupt: Arc<InterruptHandle>,
+}
+
 struct ActorControl {
     admission: Arc<Mutex<bool>>,
     write_gate: Arc<Mutex<()>>,
     mailbox: Arc<MailboxQueryControl>,
+}
+
+fn run_query_actor(
+    path: PathBuf,
+    requests: Receiver<Request>,
+    replies: mpsc::Sender<DbReply>,
+    shutdown: Receiver<()>,
+    startup: Sender<Result<QueryStarted, DbFailure>>,
+    admission: Arc<Mutex<bool>>,
+    mailbox: Arc<MailboxQueryControl>,
+) -> Result<(), DbFailure> {
+    let connection = match open_query_connection(&path).and_then(|connection| {
+        configure_query_connection(&connection)?;
+        let progress_control = mailbox.clone();
+        connection
+            .progress_handler(
+                MAILBOX_PROGRESS_OPS,
+                Some(move || progress_control.should_interrupt()),
+            )
+            .map_err(DbFailure::database)?;
+        Ok(connection)
+    }) {
+        Ok(connection) => connection,
+        Err(failure) => {
+            let _ = startup.send(Err(failure.clone()));
+            return Err(failure);
+        }
+    };
+    let started = QueryStarted {
+        thread: thread::current().id(),
+        interrupt: Arc::new(connection.get_interrupt_handle()),
+    };
+    if startup.send(Ok(started)).is_err() {
+        return Ok(());
+    }
+
+    loop {
+        let request = select_biased! {
+            recv(shutdown) -> _ => return Ok(()),
+            recv(requests) -> request => match request {
+                Ok(request) => request,
+                Err(_) => return Ok(()),
+            },
+        };
+        let reply = match request {
+            Request::QueryAccountDirectory {
+                request_id,
+                generation,
+            } => DbReply::Accounts(Tagged {
+                request_id,
+                generation,
+                result: query_account_directory(&connection),
+            }),
+            Request::QueryMailbox {
+                request_id,
+                generation,
+                spec,
+                #[cfg(test)]
+                gate,
+                #[cfg(test)]
+                long_query,
+            } => execute_mailbox_query(
+                &connection,
+                request_id,
+                generation,
+                &spec,
+                &mailbox,
+                #[cfg(test)]
+                gate,
+                #[cfg(test)]
+                long_query,
+            ),
+            Request::OpenMessage {
+                request_id,
+                generation,
+                id,
+            } => DbReply::Message(Tagged {
+                request_id,
+                generation,
+                result: open_message(&connection, id),
+            }),
+            _ => {
+                close_admission(&admission);
+                return Err(DbFailure::conflict(
+                    "SQLite query actor received a write request",
+                ));
+            }
+        };
+        if send_reply(&replies, &shutdown, reply).is_err() {
+            close_admission(&admission);
+            return Ok(());
+        }
+    }
 }
 
 fn run_actor(
@@ -1342,10 +1530,11 @@ fn run_actor(
     if startup.send(Ok(started)).is_err() {
         return Ok(());
     }
+    let mut search_backfill_done = backfill_complete(&connection)?;
 
     loop {
-        let request = select_biased! {
-            recv(shutdown) -> _ => {
+        let request = match next_actor_wake(&requests, &shutdown, !search_backfill_done) {
+            ActorWake::Shutdown => {
                 close_admission(&control.admission);
                 return drain_accepted_writes(
                     &mut connection,
@@ -1353,11 +1542,14 @@ fn run_actor(
                     &control.write_gate,
                     None,
                 );
-            },
-            recv(requests) -> request => match request {
-                Ok(request) => request,
-                Err(_) => return Ok(()),
-            },
+            }
+            ActorWake::Closed => return Ok(()),
+            ActorWake::Backfill => {
+                let _write_guard = lock_write_gate(&control.write_gate);
+                search_backfill_done = backfill_next_batch(&mut connection)?;
+                continue;
+            }
+            ActorWake::Request(request) => request,
         };
         let reply = match request {
             Request::QueryAccountDirectory {
@@ -1547,6 +1739,38 @@ fn run_actor(
                 &control.write_gate,
                 mutation_failure(*undelivered),
             );
+        }
+    }
+}
+
+enum ActorWake {
+    Shutdown,
+    Closed,
+    Backfill,
+    Request(Request),
+}
+
+fn next_actor_wake(
+    requests: &Receiver<Request>,
+    shutdown: &Receiver<()>,
+    allow_backfill: bool,
+) -> ActorWake {
+    if allow_backfill {
+        select_biased! {
+            recv(shutdown) -> _ => ActorWake::Shutdown,
+            recv(requests) -> request => match request {
+                Ok(request) => ActorWake::Request(request),
+                Err(_) => ActorWake::Closed,
+            },
+            default(SEARCH_BACKFILL_IDLE_DELAY) => ActorWake::Backfill,
+        }
+    } else {
+        select_biased! {
+            recv(shutdown) -> _ => ActorWake::Shutdown,
+            recv(requests) -> request => match request {
+                Ok(request) => ActorWake::Request(request),
+                Err(_) => ActorWake::Closed,
+            },
         }
     }
 }
@@ -2155,6 +2379,52 @@ fn open_connection(target: Target) -> Result<Connection, DbFailure> {
     }
 }
 
+fn open_query_connection(path: &std::path::Path) -> Result<Connection, DbFailure> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    Connection::open_with_flags(path, flags).map_err(DbFailure::database)
+}
+
+fn configure_query_connection(connection: &Connection) -> Result<(), DbFailure> {
+    connection
+        .busy_timeout(Duration::from_secs(1))
+        .map_err(DbFailure::database)?;
+    connection
+        .set_limit(Limit::SQLITE_LIMIT_LENGTH, SQLITE_MAX_VALUE_BYTES)
+        .map_err(DbFailure::database)?;
+    connection
+        .set_limit(Limit::SQLITE_LIMIT_SQL_LENGTH, 1024 * 1024)
+        .map_err(DbFailure::database)?;
+    connection
+        .set_limit(Limit::SQLITE_LIMIT_COLUMN, 128)
+        .map_err(DbFailure::database)?;
+    connection
+        .set_limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 128)
+        .map_err(DbFailure::database)?;
+    connection
+        .set_limit(Limit::SQLITE_LIMIT_LIKE_PATTERN_LENGTH, 512)
+        .map_err(DbFailure::database)?;
+    connection
+        .set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)
+        .map_err(DbFailure::database)?;
+    connection
+        .set_limit(Limit::SQLITE_LIMIT_WORKER_THREADS, 0)
+        .map_err(DbFailure::database)?;
+    connection
+        .pragma_update(None, "query_only", true)
+        .map_err(DbFailure::database)?;
+    connection
+        .pragma_update(None, "cache_size", -SQLITE_QUERY_CACHE_KIB)
+        .map_err(DbFailure::database)?;
+    connection
+        .pragma_update(None, "mmap_size", 0_i64)
+        .map_err(DbFailure::database)?;
+    connection
+        .pragma_update(None, "temp_store", "FILE")
+        .map_err(DbFailure::database)
+}
+
 fn configure(connection: &mut Connection) -> Result<(), DbFailure> {
     connection
         .busy_timeout(Duration::from_secs(5))
@@ -2224,8 +2494,11 @@ fn database_info(connection: &Connection) -> Result<DatabaseInfo, DbFailure> {
             .map_err(|_| DbFailure::resource_limit("invalid SQLite page size"))?,
         cache_kib: u32::try_from(cache_size.unsigned_abs())
             .map_err(|_| DbFailure::resource_limit("invalid SQLite cache size"))?,
+        query_cache_kib: 0,
+        connection_count: 1,
         wal_enabled: journal_mode.eq_ignore_ascii_case("wal"),
         actor_thread: thread::current().id(),
+        query_thread: None,
     })
 }
 
@@ -2255,10 +2528,13 @@ fn secure_database_file(_path: &std::path::Path) -> Result<(), DbFailure> {
 
 pub(crate) struct DatabaseRuntime {
     shutdown: Option<Sender<()>>,
+    query_shutdown: Option<Sender<()>>,
     admission: Arc<Mutex<bool>>,
     interrupt: Option<Arc<InterruptHandle>>,
+    query_interrupt: Option<Arc<InterruptHandle>>,
     write_gate: Arc<Mutex<()>>,
     worker: Option<thread::JoinHandle<Result<(), DbFailure>>>,
+    query_worker: Option<thread::JoinHandle<Result<(), DbFailure>>>,
 }
 
 impl DatabaseRuntime {
@@ -2271,25 +2547,44 @@ impl DatabaseRuntime {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.try_send(());
         }
+        if let Some(shutdown) = self.query_shutdown.take() {
+            let _ = shutdown.try_send(());
+        }
         let interrupt = self.interrupt.take();
+        let query_interrupt = self.query_interrupt.take();
         while self
             .worker
             .as_ref()
             .is_some_and(|worker| !worker.is_finished())
+            || self
+                .query_worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
         {
             if let Some(interrupt) = &interrupt {
                 let _write_guard = lock_write_gate(&self.write_gate);
                 interrupt.interrupt();
             }
+            if let Some(interrupt) = &query_interrupt {
+                interrupt.interrupt();
+            }
             thread::sleep(Duration::from_millis(1));
         }
-        let Some(worker) = self.worker.take() else {
-            return Ok(());
-        };
-        worker
-            .join()
-            .map_err(|panic| ShutdownError::ThreadPanicked(panic_message(panic)))?
-            .map_err(ShutdownError::Worker)
+        let writer_result = self.worker.take().map(|worker| {
+            worker
+                .join()
+                .map_err(|panic| ShutdownError::ThreadPanicked(panic_message(panic)))?
+                .map_err(ShutdownError::Worker)
+        });
+        let query_result = self.query_worker.take().map(|worker| {
+            worker
+                .join()
+                .map_err(|panic| ShutdownError::ThreadPanicked(panic_message(panic)))?
+                .map_err(ShutdownError::Worker)
+        });
+        writer_result.transpose()?;
+        query_result.transpose()?;
+        Ok(())
     }
 }
 
@@ -2588,11 +2883,18 @@ mod tests {
                  VALUES
                      (1, '0123456789abcdef0123456789abcdef', 'app_password',
                       'user@example.test', 'imap.example.test', 993);
+                 INSERT INTO folders
+                     (id, account_id, remote_key, name, role)
+                 VALUES (1, 1, 'inbox', 'Inbox', 'inbox');
                  INSERT INTO messages
                      (id, account_id, remote_key, received_at_ms)
-                 VALUES (1, 1, 'message', 0);",
+                 VALUES (1, 1, 'message', 0);
+                 INSERT INTO message_folders
+                     (message_id, folder_id, account_id)
+                 VALUES (1, 1, 1);",
             )
             .unwrap();
+        super::super::stats::rebuild_account(&connection, 1).unwrap();
     }
 
     fn seed_remote_intent(path: &std::path::Path) -> i64 {
@@ -2665,8 +2967,10 @@ mod tests {
         let connection = Connection::open_in_memory().unwrap();
         let client = DatabaseClient {
             requests: sender,
+            query_requests: None,
             admission: Arc::new(Mutex::new(true)),
             interrupt: Arc::new(connection.get_interrupt_handle()),
+            writer_interrupt: Arc::new(connection.get_interrupt_handle()),
             mailbox_control: Arc::new(MailboxQueryControl::default()),
             next_mailbox_gate: Arc::new(Mutex::new(None)),
             next_mailbox_long: Arc::new(AtomicBool::new(false)),
@@ -3037,8 +3341,10 @@ mod tests {
         let connection = Connection::open_in_memory().unwrap();
         let client = DatabaseClient {
             requests: sender,
+            query_requests: None,
             admission: Arc::new(Mutex::new(true)),
             interrupt: Arc::new(connection.get_interrupt_handle()),
+            writer_interrupt: Arc::new(connection.get_interrupt_handle()),
             mailbox_control: Arc::new(MailboxQueryControl::default()),
             next_mailbox_gate: Arc::new(Mutex::new(None)),
             next_mailbox_long: Arc::new(AtomicBool::new(false)),
@@ -3202,6 +3508,35 @@ mod tests {
         };
         assert_eq!(reply.result.unwrap().rows.len(), 0);
         runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn ui_mailbox_query_does_not_wait_for_the_writer_connection() {
+        let path = temporary_database_path();
+        seed_content_message(&path);
+        let (client, mut replies, runtime, info) =
+            spawn_target(Target::File(path.clone()), REQUEST_CAPACITY, REPLY_CAPACITY).unwrap();
+        assert_eq!(info.connection_count, 2);
+        assert_eq!(info.query_cache_kib, SQLITE_QUERY_CACHE_KIB as u32);
+        assert!(info.query_thread.is_some());
+        assert_ne!(info.query_thread, Some(info.actor_thread));
+
+        let (started_tx, started_rx) = bounded(1);
+        client.try_run_long_query(started_tx).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let started = Instant::now();
+        client
+            .try_query_mailbox(RequestId::new(1).unwrap(), Generation::new(0), empty_spec())
+            .unwrap();
+        let DbReply::Mailbox(reply) = receive_reply(&mut replies) else {
+            panic!("expected mailbox reply from the read actor");
+        };
+        assert_eq!(reply.result.unwrap().rows.len(), 1);
+        assert!(started.elapsed() < Duration::from_millis(250));
+
+        client.interrupt_queries();
+        runtime.shutdown().unwrap();
+        remove_database_files(&path);
     }
 
     #[test]
@@ -3707,8 +4042,10 @@ mod tests {
         let connection = Connection::open_in_memory().unwrap();
         let client = DatabaseClient {
             requests: sender,
+            query_requests: None,
             admission: Arc::new(Mutex::new(true)),
             interrupt: Arc::new(connection.get_interrupt_handle()),
+            writer_interrupt: Arc::new(connection.get_interrupt_handle()),
             mailbox_control: Arc::new(MailboxQueryControl::default()),
             next_mailbox_gate: Arc::new(Mutex::new(None)),
             next_mailbox_long: Arc::new(AtomicBool::new(false)),
@@ -3994,7 +4331,7 @@ mod tests {
     fn full_report_queue_returns_the_exact_submission() {
         let path = temporary_database_path();
         seed_remote_intent(&path);
-        let (client, mut replies, runtime, _info) =
+        let (client, _replies, runtime, _info) =
             spawn_target(Target::File(path.clone()), 1, REPLY_CAPACITY).unwrap();
         let claim = claimed_remote_intent(&client);
         let submission = RemoteReportSubmission::new(claim, RemoteReport::confirmed(None));
@@ -4002,9 +4339,7 @@ mod tests {
         let (started_tx, started_rx) = bounded(1);
         client.try_run_long_query(started_tx).unwrap();
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        client
-            .try_query_mailbox(RequestId::new(1).unwrap(), Generation::new(0), empty_spec())
-            .unwrap();
+        let queued_read = client.try_load_account(AccountId::new(1).unwrap()).unwrap();
 
         let failure = match client.try_report_remote(submission) {
             Ok(_) => panic!("a full request queue accepted a remote report"),
@@ -4014,10 +4349,7 @@ mod tests {
         assert_eq!(failure.reason(), SubmitError::Busy);
         assert!(std::ptr::eq(submission_pointer, failure.submission()));
         client.interrupt_queries();
-        let DbReply::Mailbox(reply) = receive_reply(&mut replies) else {
-            panic!("expected the queued mailbox reply");
-        };
-        reply.result.unwrap();
+        receive_oneshot(queued_read).unwrap();
         runtime.shutdown().unwrap();
         remove_database_files(&path);
     }
@@ -4280,8 +4612,10 @@ mod tests {
         let connection = Connection::open_in_memory().unwrap();
         let client = DatabaseClient {
             requests: sender,
+            query_requests: None,
             admission: Arc::new(Mutex::new(true)),
             interrupt: Arc::new(connection.get_interrupt_handle()),
+            writer_interrupt: Arc::new(connection.get_interrupt_handle()),
             mailbox_control: Arc::new(MailboxQueryControl::default()),
             next_mailbox_gate: Arc::new(Mutex::new(None)),
             next_mailbox_long: Arc::new(AtomicBool::new(false)),

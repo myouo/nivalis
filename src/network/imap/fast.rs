@@ -1,4 +1,9 @@
-use std::num::NonZeroU32;
+use std::{
+    future::{Future, poll_fn},
+    num::NonZeroU32,
+    pin::Pin,
+    time::Duration,
+};
 
 use bytes::{Bytes, BytesMut};
 use mail_protocol_core::{DecodeStatus, Decoder, ErrorKind, Limits};
@@ -10,6 +15,7 @@ use rustls::pki_types::ServerName;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
+    sync::oneshot,
     time::{Instant, timeout_at},
 };
 use tokio_rustls::{TlsConnector, client::TlsStream};
@@ -23,6 +29,8 @@ use super::{
 
 const READ_CHUNK_BYTES: usize = 16 * 1024;
 const MAX_TAG: u32 = 1_000_000;
+const IDLE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const IDLE_FINISH_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct ProtocolMailbox {
@@ -54,10 +62,113 @@ pub(super) struct ProtocolSession {
     next_tag: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ProtocolIdleOutcome {
+    Changed,
+    TimedOut,
+    Cancelled,
+}
+
 impl ProtocolSession {
     pub(super) fn supports_condstore(&self) -> bool {
         self.capabilities.contains(&Capability::CondStore)
             || self.capabilities.contains(&Capability::QResync)
+    }
+
+    pub(super) fn supports_idle(&self) -> bool {
+        self.capabilities.contains(&Capability::Idle)
+    }
+
+    #[cfg(any(test, feature = "bench-harness"))]
+    pub(super) fn retained_plaintext_buffer_bytes(&self) -> usize {
+        self.input.capacity().max(READ_CHUNK_BYTES) + self.read_buffer.len()
+    }
+
+    pub(super) async fn idle_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<bool, ImapInboxFetchFailure> {
+        Ok(matches!(
+            self.idle_until_cancellable(deadline, None).await?,
+            ProtocolIdleOutcome::Changed
+        ))
+    }
+
+    pub(super) async fn idle_until_cancellable(
+        &mut self,
+        deadline: Instant,
+        mut cancellation: Option<&mut oneshot::Receiver<()>>,
+    ) -> Result<ProtocolIdleOutcome, ImapInboxFetchFailure> {
+        if !self.supports_idle() {
+            return Err(ImapInboxFetchFailure::Protocol);
+        }
+        if let Some(cancellation) = cancellation.as_deref_mut() {
+            match cancellation.try_recv() {
+                Ok(()) | Err(oneshot::error::TryRecvError::Closed) => {
+                    return Ok(ProtocolIdleOutcome::Cancelled);
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {}
+            }
+        }
+        let handshake_deadline = deadline.min(Instant::now() + IDLE_HANDSHAKE_TIMEOUT);
+        let tag = self.send_command(b"IDLE", handshake_deadline).await?;
+        let mut changed = false;
+        loop {
+            let response = self.read_response(handshake_deadline).await?;
+            match &response {
+                Response::Continuation { .. } => break,
+                Response::Untagged { .. } => {
+                    changed |= idle_response_changed(&response)?;
+                }
+                Response::Tagged { .. } => return Err(ImapInboxFetchFailure::Protocol),
+                _ => return Err(ImapInboxFetchFailure::Protocol),
+            }
+        }
+
+        if changed {
+            self.finish_idle(tag, true).await?;
+            return Ok(ProtocolIdleOutcome::Changed);
+        }
+        loop {
+            let response = match cancellation.as_deref_mut() {
+                Some(cancellation) => {
+                    match self.read_response_or_cancel(deadline, cancellation).await? {
+                        IdleRead::Response(response) => Ok(response),
+                        IdleRead::Cancelled => {
+                            let changed = self.finish_idle(tag, false).await?;
+                            return Ok(if changed {
+                                ProtocolIdleOutcome::Changed
+                            } else {
+                                ProtocolIdleOutcome::Cancelled
+                            });
+                        }
+                    }
+                }
+                None => self.read_response(deadline).await,
+            };
+            match response {
+                Ok(response) => match &response {
+                    Response::Untagged { .. } => {
+                        if idle_response_changed(&response)? {
+                            changed = true;
+                            break;
+                        }
+                    }
+                    Response::Continuation { .. } | Response::Tagged { .. } => {
+                        return Err(ImapInboxFetchFailure::Protocol);
+                    }
+                    _ => return Err(ImapInboxFetchFailure::Protocol),
+                },
+                Err(ImapInboxFetchFailure::Timeout) => break,
+                Err(failure) => return Err(failure),
+            }
+        }
+        let changed = self.finish_idle(tag, changed).await?;
+        Ok(if changed {
+            ProtocolIdleOutcome::Changed
+        } else {
+            ProtocolIdleOutcome::TimedOut
+        })
     }
 
     pub(super) async fn examine_inbox(
@@ -230,6 +341,94 @@ impl ProtocolSession {
             Err(_) => Err(ImapInboxFetchFailure::Timeout),
         }
     }
+
+    async fn finish_idle(
+        &mut self,
+        tag: ProtocolTag,
+        mut changed: bool,
+    ) -> Result<bool, ImapInboxFetchFailure> {
+        let deadline = Instant::now() + IDLE_FINISH_TIMEOUT;
+        self.write_wire(b"DONE\r\n", deadline).await?;
+        loop {
+            let response = self.read_response(deadline).await?;
+            match &response {
+                Response::Tagged {
+                    tag: response_tag,
+                    status,
+                    ..
+                } if tag.matches(response_tag) => {
+                    return if *status == mail_protocol_imap::Status::Ok {
+                        Ok(changed)
+                    } else {
+                        Err(ImapInboxFetchFailure::Protocol)
+                    };
+                }
+                Response::Tagged { .. } | Response::Continuation { .. } => {
+                    return Err(ImapInboxFetchFailure::Protocol);
+                }
+                Response::Untagged { .. } => changed |= idle_response_changed(&response)?,
+                _ => return Err(ImapInboxFetchFailure::Protocol),
+            }
+        }
+    }
+
+    async fn read_response_or_cancel(
+        &mut self,
+        deadline: Instant,
+        cancellation: &mut oneshot::Receiver<()>,
+    ) -> Result<IdleRead, ImapInboxFetchFailure> {
+        let mut response = Box::pin(self.read_response(deadline));
+        poll_fn(|context| {
+            if Pin::new(&mut *cancellation).poll(context).is_ready() {
+                return std::task::Poll::Ready(Ok(IdleRead::Cancelled));
+            }
+            response
+                .as_mut()
+                .poll(context)
+                .map(|result| result.map(IdleRead::Response))
+        })
+        .await
+    }
+
+    async fn write_wire(
+        &mut self,
+        wire: &[u8],
+        deadline: Instant,
+    ) -> Result<(), ImapInboxFetchFailure> {
+        match timeout_at(deadline, self.io.write_all(wire)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(map_receive_io_error(&error)),
+            Err(_) => return Err(ImapInboxFetchFailure::Timeout),
+        }
+        match timeout_at(deadline, self.io.flush()).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(map_receive_io_error(&error)),
+            Err(_) => Err(ImapInboxFetchFailure::Timeout),
+        }
+    }
+}
+
+enum IdleRead {
+    Response(Response),
+    Cancelled,
+}
+
+fn idle_response_changed(response: &Response) -> Result<bool, ImapInboxFetchFailure> {
+    Ok(
+        match parse_untagged(response).map_err(map_protocol_error)? {
+            Some(
+                UntaggedData::Exists(_)
+                | UntaggedData::Recent(_)
+                | UntaggedData::Expunge(_)
+                | UntaggedData::Fetch { .. }
+                | UntaggedData::Vanished { .. },
+            ) => true,
+            Some(UntaggedData::Status(status)) if status.kind == StatusKind::Bye => {
+                return Err(ImapInboxFetchFailure::Offline);
+            }
+            _ => false,
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -299,6 +498,8 @@ pub(super) async fn open_protocol_session(
     {
         return Err(ImapInboxFetchFailure::Protocol);
     }
+    #[cfg(feature = "bench-harness")]
+    super::record_protocol_session_open();
     Ok(session)
 }
 

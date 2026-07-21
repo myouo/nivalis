@@ -2,7 +2,7 @@ use std::{error::Error, fmt};
 
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(crate) const LATEST_SCHEMA_VERSION: u32 = 14;
+pub(crate) const LATEST_SCHEMA_VERSION: u32 = 15;
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -66,6 +66,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 14,
         sql: include_str!("../../../migrations/0014_inbox_history_backfill.sql"),
+    },
+    Migration {
+        version: 15,
+        sql: include_str!("../../../migrations/0015_full_text_body_search.sql"),
     },
 ];
 
@@ -215,6 +219,8 @@ mod tests {
         "imap_message_locations",
         "message_content",
         "message_folders",
+        "message_search_backfill",
+        "message_search_documents",
         "message_tombstone_imap_locations",
         "message_tombstones",
         "messages",
@@ -402,9 +408,10 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("read message search schema");
-        assert!(message_search_sql.contains("content = 'messages'"));
-        assert!(message_search_sql.contains("content_rowid = 'id'"));
+        assert!(message_search_sql.contains("content = 'message_search_documents'"));
+        assert!(message_search_sql.contains("content_rowid = 'rowid'"));
         assert!(message_search_sql.contains("columnsize = 0"));
+        assert!(message_search_sql.contains("trigram case_sensitive 0"));
 
         let search_triggers: i64 = connection
             .query_row(
@@ -414,7 +421,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("count message search triggers");
-        assert_eq!(search_triggers, 3);
+        assert_eq!(search_triggers, 8);
 
         let stats_columns = connection
             .prepare("PRAGMA table_info(account_mailbox_stats)")
@@ -981,6 +988,62 @@ mod tests {
                 .unwrap(),
             ("1237".to_owned(), 1198, false)
         );
+    }
+
+    #[test]
+    fn v15_defers_existing_body_indexing_and_backfills_in_bounded_batches() {
+        let mut connection = memory_connection();
+        enable_foreign_keys(&connection).expect("enable foreign keys");
+        enable_recursive_triggers(&connection).expect("enable recursive triggers");
+        migrate_with(&mut connection, &MIGRATIONS[..14], 14).expect("create v14 schema");
+        insert_account(&connection, 1, "owner@example.test");
+        for id in 1..=40 {
+            insert_message(&connection, id, 1, &format!("message-{id}"));
+            connection
+                .execute(
+                    "UPDATE messages
+                        SET sender_name = 'Alice', subject = '季度项目计划'
+                      WHERE id = ?1",
+                    [id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO message_content
+                         (message_id, reader_excerpt, truncated, body_byte_count)
+                     VALUES (?1, '合同审核正文', 0, 18)",
+                    [id],
+                )
+                .unwrap();
+        }
+
+        migrate(&mut connection).expect("install deferred full-text indexing");
+        let indexed: i64 = connection
+            .query_row("SELECT count(*) FROM message_search_documents", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(indexed, 0);
+        assert!(!crate::store::sqlite::search::backfill_complete(&connection).unwrap());
+
+        assert!(!crate::store::sqlite::search::backfill_next_batch(&mut connection).unwrap());
+        let first_batch: i64 = connection
+            .query_row("SELECT count(*) FROM message_search_documents", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(first_batch, 16);
+        while !crate::store::sqlite::search::backfill_next_batch(&mut connection).unwrap() {}
+
+        let matches: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM message_search
+                  WHERE message_search MATCH '\"项目计划\" AND body : \"合同审核\"'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(matches, 40);
     }
 
     #[test]

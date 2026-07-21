@@ -231,6 +231,27 @@ impl SyncScheduler {
         true
     }
 
+    pub(super) fn promote(
+        &mut self,
+        account_id: AccountId,
+        generation: AccountGeneration,
+        now: Instant,
+    ) -> bool {
+        let Some(target) = self
+            .targets
+            .iter_mut()
+            .find(|target| target.matches(account_id, generation))
+        else {
+            return false;
+        };
+        if matches!(target.readiness, TargetReadiness::InFlight(_)) {
+            return false;
+        }
+        target.readiness = TargetReadiness::Waiting(now);
+        self.refresh_wake_deadline();
+        true
+    }
+
     fn issue_token(&mut self, target: &TargetState) -> Result<SyncToken, SchedulerError> {
         let nonce = self.next_nonce;
         self.next_nonce = nonce.checked_add(1).ok_or(SchedulerError::TokenExhausted)?;
@@ -429,6 +450,27 @@ mod tests {
             );
             current += Duration::from_secs(1);
         }
+    }
+
+    #[test]
+    fn idle_notification_promotes_only_the_matching_waiting_generation() {
+        let now = Instant::now();
+        let mut scheduler = SyncScheduler::new();
+        scheduler
+            .replace_targets([target(1, 1), target(2, 1)], now)
+            .unwrap();
+        let (_, first) = take_account(&mut scheduler, now);
+        assert!(scheduler.complete(first, SyncCompletion::Complete, now));
+        let (_, second) = take_account(&mut scheduler, now);
+
+        assert!(scheduler.promote(account(1), generation(1), now + Duration::from_secs(1)));
+        assert_eq!(
+            scheduler.wake_deadline(),
+            Some(now + Duration::from_secs(1))
+        );
+        assert!(!scheduler.promote(account(2), generation(1), now));
+        assert!(!scheduler.promote(account(1), generation(2), now));
+        assert!(scheduler.complete(second, SyncCompletion::Complete, now));
     }
 
     #[test]

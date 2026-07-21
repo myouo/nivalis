@@ -593,7 +593,7 @@ for ((run = 1; run <= runs; run++)); do
                 exit 1
             fi
         elif [[ "$stress_scenario" == "existing-account-sync" ]]; then
-            existing_account_sync_pattern='^NIVALIS_STRESS_RESULT scenario=existing-account-sync steps=1 manual_sync=1 timestamp=1 database=1 ui=1 elapsed_ms=(0|[1-9][0-9]*)$'
+            existing_account_sync_pattern='^NIVALIS_STRESS_RESULT scenario=existing-account-sync steps=1 local_first_screen=1 manual_sync=1 metadata=1 on_demand_body=1 database=1 ui=1 local_first_screen_elapsed_ms=(0|[1-9][0-9]*) metadata_elapsed_ms=(0|[1-9][0-9]*) body_elapsed_ms=(0|[1-9][0-9]*) protocol_session_opens=(0|[1-9][0-9]*) foreground_session_reuses=(0|[1-9][0-9]*) idle_cancellations=(0|[1-9][0-9]*) total_elapsed_ms=(0|[1-9][0-9]*)$'
             if [[ ! "$stress_result" =~ $existing_account_sync_pattern ]]; then
                 printf 'Existing-account-sync completion marker has an invalid format: %s\n' \
                     "$stress_result" >&2

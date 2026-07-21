@@ -33,7 +33,9 @@ use crate::credentials::Secret;
 
 mod fast;
 
-use fast::{ProtocolSession, ProtocolTag, map_protocol_error, open_protocol_session};
+use fast::{
+    ProtocolIdleOutcome, ProtocolSession, ProtocolTag, map_protocol_error, open_protocol_session,
+};
 
 const MAX_HOST_BYTES: usize = 253;
 const MAX_LOGIN_BYTES: usize = 320;
@@ -60,11 +62,44 @@ const MAX_ENVELOPE_NAME_BYTES: usize = 320;
 const MAX_ENVELOPE_MAILBOX_BYTES: usize = 320;
 const MAX_ENVELOPE_HOST_BYTES: usize = 253;
 const MAX_ENVELOPE_MESSAGE_ID_BYTES: usize = 998;
-const MAX_CACHED_INBOX_SESSIONS: usize = 8;
+const MAX_CACHED_INBOX_SESSIONS: usize = 10;
 const CACHED_INBOX_SESSION_TTL: Duration = Duration::from_secs(6 * 60);
 const CACHED_SESSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const IDLE_WAIT_TIMEOUT: Duration = Duration::from_secs(4 * 60 + 30);
 
 static PLATFORM_CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+
+#[cfg(feature = "bench-harness")]
+static PROTOCOL_SESSION_OPENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "bench-harness")]
+static FOREGROUND_SESSION_REUSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "bench-harness")]
+static IDLE_CANCELLATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "bench-harness")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ImapRuntimeCounters {
+    pub(crate) protocol_session_opens: u64,
+    pub(crate) foreground_session_reuses: u64,
+    pub(crate) idle_cancellations: u64,
+}
+
+#[cfg(feature = "bench-harness")]
+pub(crate) fn imap_runtime_counters() -> ImapRuntimeCounters {
+    use std::sync::atomic::Ordering;
+
+    ImapRuntimeCounters {
+        protocol_session_opens: PROTOCOL_SESSION_OPENS.load(Ordering::Relaxed),
+        foreground_session_reuses: FOREGROUND_SESSION_REUSES.load(Ordering::Relaxed),
+        idle_cancellations: IDLE_CANCELLATIONS.load(Ordering::Relaxed),
+    }
+}
+
+#[cfg(feature = "bench-harness")]
+fn record_protocol_session_open() {
+    PROTOCOL_SESSION_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
 
 pub(crate) struct ImapDiagnosticRequest {
     host: Box<str>,
@@ -113,6 +148,46 @@ pub(crate) struct ImapInboxFetchRequest {
     expected_uid_validity: Option<NonZeroU32>,
     history_cursor: Option<NonZeroU32>,
     history_complete: bool,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ImapIdleRequest {
+    host: Box<str>,
+    port: u16,
+    login: Box<str>,
+    uid_validity: NonZeroU32,
+}
+
+impl ImapIdleRequest {
+    pub(crate) fn new(
+        host: &str,
+        port: u16,
+        login: &str,
+        uid_validity: NonZeroU32,
+    ) -> Result<Self, ImapDiagnosticInputError> {
+        validate_endpoint(host, port, login)?;
+        Ok(Self {
+            host: host.into(),
+            port,
+            login: login.into(),
+            uid_validity,
+        })
+    }
+}
+
+impl fmt::Debug for ImapIdleRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ImapIdleRequest([REDACTED])")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImapIdleOutcome {
+    Changed,
+    TimedOut,
+    Cancelled,
+    Unavailable,
+    Disconnected(ImapInboxFetchFailure),
 }
 
 impl ImapInboxFetchRequest {
@@ -335,6 +410,14 @@ fn validate_connection_input(
     login: &str,
     secret: &Secret,
 ) -> Result<(), ImapDiagnosticInputError> {
+    validate_endpoint(host, port, login)?;
+    if std::str::from_utf8(secret.expose()).is_err() {
+        return Err(ImapDiagnosticInputError::SecretEncoding);
+    }
+    Ok(())
+}
+
+fn validate_endpoint(host: &str, port: u16, login: &str) -> Result<(), ImapDiagnosticInputError> {
     if host.is_empty()
         || host.len() > MAX_HOST_BYTES
         || host.trim() != host
@@ -347,9 +430,6 @@ fn validate_connection_input(
     }
     if login.is_empty() || login.len() > MAX_LOGIN_BYTES || login.trim() != login {
         return Err(ImapDiagnosticInputError::Login);
-    }
-    if std::str::from_utf8(secret.expose()).is_err() {
-        return Err(ImapDiagnosticInputError::SecretEncoding);
     }
     Ok(())
 }
@@ -683,6 +763,67 @@ pub(crate) async fn fetch_imap_message_content(
     fetch_imap_message_content_inner(request, connector, on_demand_limits(), true).await
 }
 
+pub(crate) async fn wait_for_cached_inbox_change(
+    request: ImapIdleRequest,
+    mut cancellation: oneshot::Receiver<()>,
+) -> ImapIdleOutcome {
+    let Some(mut session) = take_cached_inbox_session(
+        request.host.as_ref(),
+        request.port,
+        request.login.as_ref(),
+        request.uid_validity,
+    ) else {
+        return ImapIdleOutcome::Unavailable;
+    };
+    if !session.supports_idle() {
+        cache_inbox_session(
+            request.host.as_ref(),
+            request.port,
+            request.login.as_ref(),
+            request.uid_validity,
+            session,
+        );
+        return ImapIdleOutcome::Unavailable;
+    }
+    let outcome = session
+        .idle_until_cancellable(Instant::now() + IDLE_WAIT_TIMEOUT, Some(&mut cancellation))
+        .await;
+    match outcome {
+        Ok(outcome) => {
+            cache_inbox_session(
+                request.host.as_ref(),
+                request.port,
+                request.login.as_ref(),
+                request.uid_validity,
+                session,
+            );
+            match outcome {
+                ProtocolIdleOutcome::Changed => ImapIdleOutcome::Changed,
+                ProtocolIdleOutcome::TimedOut => ImapIdleOutcome::TimedOut,
+                ProtocolIdleOutcome::Cancelled => {
+                    #[cfg(feature = "bench-harness")]
+                    IDLE_CANCELLATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    ImapIdleOutcome::Cancelled
+                }
+            }
+        }
+        Err(failure) => ImapIdleOutcome::Disconnected(failure),
+    }
+}
+
+#[cfg(any(test, feature = "bench-harness"))]
+pub(crate) fn cached_inbox_session_resources() -> (usize, usize) {
+    CACHED_INBOX_SESSIONS.with_borrow(|sessions| {
+        (
+            sessions.len(),
+            sessions
+                .iter()
+                .map(|entry| entry.session.retained_plaintext_buffer_bytes())
+                .sum(),
+        )
+    })
+}
+
 fn on_demand_limits() -> InboxFetchLimits {
     InboxFetchLimits {
         timeout: INBOX_FETCH_TIMEOUT,
@@ -718,6 +859,8 @@ async fn fetch_imap_message_content_inner(
             request.uid_validity,
         )
     {
+        #[cfg(feature = "bench-harness")]
+        FOREGROUND_SESSION_REUSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match fetch_body(&mut session, request.uid, deadline, limits).await {
             Ok(content) => {
                 cache_inbox_session(
@@ -3225,6 +3368,146 @@ mod inbox_fetch_tests {
         }
     }
 
+    async fn spawn_idle_server() -> TestServer {
+        let (acceptor, connector) = test_tls();
+        let listener = TcpListener::bind((HOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let stream = acceptor.accept(tcp).await.unwrap();
+            let mut stream = BufReader::new(stream);
+            stream
+                .get_mut()
+                .write_all(b"* OK idle fixture ready\r\n")
+                .await
+                .unwrap();
+            let login = read_command(&mut stream).await.unwrap();
+            tagged(
+                &mut stream,
+                &login,
+                "OK [CAPABILITY IMAP4rev1 IDLE] authenticated",
+            )
+            .await;
+            let examine = read_command(&mut stream).await.unwrap();
+            stream
+                .get_mut()
+                .write_all(
+                    b"* 1 EXISTS\r\n* OK [UIDVALIDITY 777] epoch\r\n* OK [UIDNEXT 2] next\r\n",
+                )
+                .await
+                .unwrap();
+            tagged(&mut stream, &examine, "OK [READ-ONLY] selected").await;
+            let idle = read_command(&mut stream).await.unwrap();
+            stream
+                .get_mut()
+                .write_all(b"+ idling\r\n* 2 EXISTS\r\n")
+                .await
+                .unwrap();
+            let done = read_command(&mut stream).await.unwrap();
+            assert_eq!(done.as_ref(), "DONE");
+            tagged(&mut stream, &idle, "OK idle complete").await;
+            let logout = read_command(&mut stream).await.unwrap();
+            tagged(&mut stream, &logout, "OK logout complete").await;
+            vec![login, examine, idle, done, logout]
+        });
+        TestServer {
+            address,
+            connector,
+            task,
+        }
+    }
+
+    async fn spawn_idle_disconnect_server() -> TestServer {
+        let (acceptor, connector) = test_tls();
+        let listener = TcpListener::bind((HOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let stream = acceptor.accept(tcp).await.unwrap();
+            let mut stream = BufReader::new(stream);
+            stream
+                .get_mut()
+                .write_all(b"* OK idle disconnect fixture ready\r\n")
+                .await
+                .unwrap();
+            let login = read_command(&mut stream).await.unwrap();
+            tagged(
+                &mut stream,
+                &login,
+                "OK [CAPABILITY IMAP4rev1 IDLE] authenticated",
+            )
+            .await;
+            let examine = read_command(&mut stream).await.unwrap();
+            stream
+                .get_mut()
+                .write_all(
+                    b"* 1 EXISTS\r\n* OK [UIDVALIDITY 777] epoch\r\n* OK [UIDNEXT 2] next\r\n",
+                )
+                .await
+                .unwrap();
+            tagged(&mut stream, &examine, "OK [READ-ONLY] selected").await;
+            let idle = read_command(&mut stream).await.unwrap();
+            stream.get_mut().write_all(b"+ idling\r\n").await.unwrap();
+            stream.get_mut().shutdown().await.unwrap();
+            vec![login, examine, idle]
+        });
+        TestServer {
+            address,
+            connector,
+            task,
+        }
+    }
+
+    async fn spawn_cancellable_idle_server() -> (TestServer, oneshot::Receiver<()>) {
+        let (acceptor, connector) = test_tls();
+        let listener = TcpListener::bind((HOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (idle_started, started) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let stream = acceptor.accept(tcp).await.unwrap();
+            let mut stream = BufReader::new(stream);
+            stream
+                .get_mut()
+                .write_all(b"* OK cancellable idle fixture ready\r\n")
+                .await
+                .unwrap();
+            let login = read_command(&mut stream).await.unwrap();
+            tagged(
+                &mut stream,
+                &login,
+                "OK [CAPABILITY IMAP4rev1 IDLE] authenticated",
+            )
+            .await;
+            let examine = read_command(&mut stream).await.unwrap();
+            stream
+                .get_mut()
+                .write_all(
+                    b"* 1 EXISTS\r\n* OK [UIDVALIDITY 777] epoch\r\n* OK [UIDNEXT 2] next\r\n",
+                )
+                .await
+                .unwrap();
+            tagged(&mut stream, &examine, "OK [READ-ONLY] selected").await;
+            let idle = read_command(&mut stream).await.unwrap();
+            stream.get_mut().write_all(b"+ idling\r\n").await.unwrap();
+            let _ = idle_started.send(());
+            let done = read_command(&mut stream).await.unwrap();
+            assert_eq!(done.as_ref(), "DONE");
+            tagged(&mut stream, &idle, "OK idle cancelled").await;
+            let logout = read_command(&mut stream).await.unwrap();
+            tagged(&mut stream, &logout, "OK logout complete").await;
+            vec![login, examine, idle, done, logout]
+        });
+        (
+            TestServer {
+                address,
+                connector,
+                task,
+            },
+            started,
+        )
+    }
+
     async fn read_command(stream: &mut BufReader<ServerTlsStream<TcpStream>>) -> Option<Box<str>> {
         let mut command = String::new();
         match stream.read_line(&mut command).await {
@@ -3707,6 +3990,161 @@ mod inbox_fetch_tests {
                 commands
                     .iter()
                     .all(|command| !command.contains("BODY.PEEK"))
+            );
+        });
+    }
+
+    #[test]
+    fn idle_notification_reuses_one_selected_tls_session() {
+        run_async(async {
+            let server = spawn_idle_server().await;
+            let deadline = Instant::now() + TEST_TIMEOUT;
+            let mut session = open_protocol_session(
+                HOST,
+                server.address.port(),
+                LOGIN,
+                &Secret::new(PASSWORD.to_vec()).unwrap(),
+                server.connector.clone(),
+                deadline,
+                limits(),
+            )
+            .await
+            .unwrap();
+            let mailbox = session.examine_inbox(deadline).await.unwrap();
+            assert_eq!(mailbox.uid_validity, Some(UID_VALIDITY));
+            assert!(session.supports_idle());
+            assert!(session.idle_until(deadline).await.unwrap());
+            session.logout(deadline).await;
+
+            let commands = finish(server).await;
+            assert_eq!(
+                commands
+                    .iter()
+                    .filter(|command| command_name(command) == Some("LOGIN"))
+                    .count(),
+                1
+            );
+            assert_eq!(command_name(&commands[2]), Some("IDLE"));
+            assert_eq!(commands[3].as_ref(), "DONE");
+        });
+    }
+
+    #[test]
+    fn idle_watch_returns_its_session_to_the_bounded_cache() {
+        run_async(async {
+            let server = spawn_idle_server().await;
+            let deadline = Instant::now() + TEST_TIMEOUT;
+            let mut session = open_protocol_session(
+                HOST,
+                server.address.port(),
+                LOGIN,
+                &Secret::new(PASSWORD.to_vec()).unwrap(),
+                server.connector.clone(),
+                deadline,
+                limits(),
+            )
+            .await
+            .unwrap();
+            session.examine_inbox(deadline).await.unwrap();
+            let validity = NonZeroU32::new(UID_VALIDITY).unwrap();
+            cache_inbox_session(HOST, server.address.port(), LOGIN, validity, session);
+
+            let (cancel, cancelled) = oneshot::channel();
+            let outcome = wait_for_cached_inbox_change(
+                ImapIdleRequest::new(HOST, server.address.port(), LOGIN, validity).unwrap(),
+                cancelled,
+            )
+            .await;
+            drop(cancel);
+            assert_eq!(outcome, ImapIdleOutcome::Changed);
+            let (sessions, plaintext_buffers) = cached_inbox_session_resources();
+            assert_eq!(sessions, 1);
+            assert!(plaintext_buffers >= 32 * 1024);
+
+            let session =
+                take_cached_inbox_session(HOST, server.address.port(), LOGIN, validity).unwrap();
+            session.logout(deadline).await;
+            assert_eq!(cached_inbox_session_resources(), (0, 0));
+            finish(server).await;
+        });
+    }
+
+    #[test]
+    fn idle_disconnect_drops_the_broken_session_instead_of_leaking_it() {
+        run_async(async {
+            let server = spawn_idle_disconnect_server().await;
+            let deadline = Instant::now() + TEST_TIMEOUT;
+            let mut session = open_protocol_session(
+                HOST,
+                server.address.port(),
+                LOGIN,
+                &Secret::new(PASSWORD.to_vec()).unwrap(),
+                server.connector.clone(),
+                deadline,
+                limits(),
+            )
+            .await
+            .unwrap();
+            session.examine_inbox(deadline).await.unwrap();
+            let validity = NonZeroU32::new(UID_VALIDITY).unwrap();
+            cache_inbox_session(HOST, server.address.port(), LOGIN, validity, session);
+
+            let (cancel, cancelled) = oneshot::channel();
+            let outcome = wait_for_cached_inbox_change(
+                ImapIdleRequest::new(HOST, server.address.port(), LOGIN, validity).unwrap(),
+                cancelled,
+            )
+            .await;
+            drop(cancel);
+            assert_eq!(
+                outcome,
+                ImapIdleOutcome::Disconnected(ImapInboxFetchFailure::Offline)
+            );
+            assert_eq!(cached_inbox_session_resources(), (0, 0));
+            let commands = finish(server).await;
+            assert_eq!(commands.len(), 3);
+        });
+    }
+
+    #[test]
+    fn foreground_cancellation_returns_the_idling_session_to_the_hot_cache() {
+        run_async(async {
+            let (server, idle_started) = spawn_cancellable_idle_server().await;
+            let deadline = Instant::now() + TEST_TIMEOUT;
+            let mut session = open_protocol_session(
+                HOST,
+                server.address.port(),
+                LOGIN,
+                &Secret::new(PASSWORD.to_vec()).unwrap(),
+                server.connector.clone(),
+                deadline,
+                limits(),
+            )
+            .await
+            .unwrap();
+            session.examine_inbox(deadline).await.unwrap();
+            let validity = NonZeroU32::new(UID_VALIDITY).unwrap();
+            cache_inbox_session(HOST, server.address.port(), LOGIN, validity, session);
+            let (cancel, cancelled) = oneshot::channel();
+            let request =
+                ImapIdleRequest::new(HOST, server.address.port(), LOGIN, validity).unwrap();
+            let idle_task = tokio::spawn(wait_for_cached_inbox_change(request, cancelled));
+
+            idle_started.await.unwrap();
+            cancel.send(()).unwrap();
+            assert_eq!(idle_task.await.unwrap(), ImapIdleOutcome::Cancelled);
+            assert_eq!(cached_inbox_session_resources().0, 1);
+
+            let session =
+                take_cached_inbox_session(HOST, server.address.port(), LOGIN, validity).unwrap();
+            session.logout(deadline).await;
+            let commands = finish(server).await;
+            assert_eq!(
+                commands
+                    .iter()
+                    .filter(|command| command_name(command) == Some("LOGIN"))
+                    .count(),
+                1
             );
         });
     }
