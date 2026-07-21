@@ -28,8 +28,8 @@ export component LabeledTextField inherits Rectangle {
         Rectangle {
             height: root.multiline ? 98px : 34px;
             border-radius: 4px;
-            border-width: field.has-focus ? 2px : 1px;
-            border-color: root.error != "" ? Theme.error : field.has-focus ? Theme.primary : root.enabled ? Theme.outline : Theme.outline-variant;
+            border-width: 1px;
+            border-color: root.error != "" ? Theme.error : root.enabled ? Theme.outline : Theme.outline-variant;
             background: root.enabled ? Theme.surface : Theme.surface-container-high;
             field := TextInput {
                 x: 10px;
@@ -89,8 +89,6 @@ export component SettingsToggle inherits Rectangle {
 
     height: 58px;
     border-radius: 4px;
-    border-width: focus.has-focus ? 2px : 0px;
-    border-color: Theme.focus-ring;
     background: touch.pressed ? Theme.surface-container-highest : touch.has-hover ? Theme.surface-container-high : transparent;
 
     HorizontalLayout {

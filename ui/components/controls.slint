@@ -27,8 +27,8 @@ export component MButton inherits Rectangle {
         width: parent.width;
         height: 36px;
         border-radius: 4px;
-        border-width: focus.has-focus ? 2px : (root.variant == "outlined" || root.variant == "danger" ? 1px : 0px);
-        border-color: focus.has-focus ? Theme.focus-ring : root.variant == "danger" ? Theme.error : Theme.outline;
+        border-width: root.variant == "outlined" || root.variant == "danger" ? 1px : 0px;
+        border-color: root.variant == "danger" ? Theme.error : Theme.outline;
         background: !root.enabled ? Theme.surface-container-high :
             root.variant == "filled" ? (touch.pressed ? Theme.primary-pressed : touch.has-hover ? Theme.primary-hover : Theme.primary) :
             root.variant == "danger-filled" ? (touch.pressed ? Theme.error-pressed : touch.has-hover ? Theme.error-hover : Theme.error) :
@@ -126,8 +126,6 @@ export component MIconButton inherits Rectangle {
         width: compact-visual ? 28px : 32px;
         height: compact-visual ? 28px : 32px;
         border-radius: 4px;
-        border-width: focus.has-focus ? 2px : 0px;
-        border-color: Theme.focus-ring;
         background: root.selected ?
                 (touch.pressed ? Theme.primary-container-pressed : touch.has-hover ? Theme.primary-container-hover : Theme.primary-container) :
             root.inverse ?
@@ -188,8 +186,8 @@ export component FilterChip inherits Rectangle {
         width: parent.width;
         height: 36px;
         border-radius: 4px;
-        border-width: focus.has-focus ? 2px : 1px;
-        border-color: focus.has-focus ? Theme.focus-ring : root.selected ? Theme.primary : Theme.outline-variant;
+        border-width: 1px;
+        border-color: Theme.outline-variant;
         background: root.selected ? Theme.primary-container : touch.pressed ? Theme.surface-container-highest : touch.has-hover ? Theme.surface-container-high : Theme.surface;
         animate background { duration: Theme.motion-fast; easing: ease-out; }
     }

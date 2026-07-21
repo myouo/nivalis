@@ -752,7 +752,7 @@ export component SettingsOverlay inherits Rectangle {
             SettingsToggle {
                 icon: "contrast";
                 label: "High contrast";
-                description: "Strengthen text, outlines, and focus rings";
+                description: "Strengthen text and outlines";
                 checked <=> root.high-contrast;
                 toggled(value) => { Theme.high-contrast = value; }
             }
