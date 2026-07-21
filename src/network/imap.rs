@@ -14,6 +14,7 @@ use async_imap::{
     Client, Session,
     error::Error as ImapError,
     imap_proto::types::{Response, Status},
+    types::Capabilities,
 };
 use mail_parser::{HeaderName, MessageParser};
 use mail_protocol_imap::{
@@ -64,6 +65,8 @@ const MAX_ON_DEMAND_MESSAGE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_ON_DEMAND_SERVER_BYTES: usize = MAX_ON_DEMAND_MESSAGE_BYTES + 512 * 1024;
 const MAX_INTERNAL_DATE_BYTES: usize = 64;
 const MAX_METADATA_HEADER_BYTES: usize = 16 * 1024;
+const MAX_METADATA_PREVIEW_WIRE_BYTES: usize = 8 * 1024;
+const MAX_METADATA_PREVIEW_BYTES: usize = 2 * 1024;
 const MAX_ENVELOPE_DATE_BYTES: usize = 128;
 const MAX_ENVELOPE_SUBJECT_BYTES: usize = 998;
 const MAX_ENVELOPE_NAME_BYTES: usize = 320;
@@ -75,6 +78,12 @@ const MAX_CACHED_INBOX_SESSIONS_PER_ACCOUNT: usize = MAX_METADATA_CONNECTIONS;
 const CACHED_INBOX_SESSION_TTL: Duration = Duration::from_secs(6 * 60);
 const CACHED_SESSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const IDLE_WAIT_TIMEOUT: Duration = Duration::from_secs(4 * 60 + 30);
+const CLIENT_ID_COMMAND: &[u8] = concat!(
+    "ID (\"name\" \"Nivalis\" \"version\" \"",
+    env!("CARGO_PKG_VERSION"),
+    "\" \"vendor\" \"myouo\")"
+)
+.as_bytes();
 
 static PLATFORM_CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
 
@@ -329,6 +338,7 @@ pub(crate) struct ImapInboxMessage {
     pub(crate) flags: ImapInboxFlags,
     pub(crate) internal_date: Box<str>,
     pub(crate) envelope: ImapInboxEnvelope,
+    pub(crate) preview: Box<str>,
     pub(crate) declared_bytes: u32,
     pub(crate) content: ImapInboxContent,
 }
@@ -537,7 +547,8 @@ async fn diagnose_with_connector(
         limits.max_client_bytes,
     )
     .await?;
-    require_imap_capability(&mut session, login_capabilities, deadline).await?;
+    let capabilities = require_imap_capability(&mut session, login_capabilities, deadline).await?;
+    identify_client_if_supported(&mut session, &capabilities, deadline).await?;
 
     match timeout_at(deadline, session.examine("INBOX")).await {
         Ok(Ok(_)) => {}
@@ -750,9 +761,9 @@ async fn open_app_password_session(
 
 async fn require_imap_capability(
     session: &mut AuthenticatedSession,
-    login_capabilities: Option<async_imap::types::Capabilities>,
+    login_capabilities: Option<Capabilities>,
     deadline: Instant,
-) -> Result<(), ImapDiagnosticFailure> {
+) -> Result<Capabilities, ImapDiagnosticFailure> {
     let capabilities = match login_capabilities {
         Some(capabilities) => capabilities,
         None => match timeout_at(deadline, session.capabilities()).await {
@@ -767,13 +778,45 @@ async fn require_imap_capability(
         },
     };
     if capabilities.has_str("IMAP4rev1") || capabilities.has_str("IMAP4rev2") {
-        Ok(())
+        Ok(capabilities)
     } else {
         Err(failure(
             ImapDiagnosticStage::Capability,
             ImapDiagnosticFailureKind::Protocol,
         ))
     }
+}
+
+async fn identify_client_if_supported(
+    session: &mut AuthenticatedSession,
+    capabilities: &Capabilities,
+    deadline: Instant,
+) -> Result<(), ImapDiagnosticFailure> {
+    if !capabilities.has_str("ID") {
+        return Ok(());
+    }
+    match timeout_at(
+        deadline,
+        session.id([
+            ("name", Some("Nivalis")),
+            ("version", Some(env!("CARGO_PKG_VERSION"))),
+            ("vendor", Some("myouo")),
+        ]),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(failure(
+            ImapDiagnosticStage::Capability,
+            imap_failure_kind(&error, ImapDiagnosticStage::Capability),
+        )),
+        Err(_) => Err(timeout_failure(ImapDiagnosticStage::Capability)),
+    }
+}
+
+fn requires_client_id_before_mailbox(host: &str) -> bool {
+    host.trim_end_matches('.')
+        .eq_ignore_ascii_case("imap.163.com")
 }
 
 pub(crate) async fn fetch_canonical_inbox(
@@ -1152,7 +1195,8 @@ async fn fetch_canonical_inbox_inner(
     } else {
         None
     };
-    let (mut session, mailbox, prewarmed_sessions) = if let Some(mut cached) = cached_session {
+    let mut mailbox_from_status = false;
+    let (mut session, mut mailbox, prewarmed_sessions) = if let Some(mut cached) = cached_session {
         let probe_deadline = deadline.min(Instant::now() + CACHED_SESSION_PROBE_TIMEOUT);
         #[cfg(feature = "bench-harness")]
         let probe_started = Instant::now();
@@ -1164,7 +1208,10 @@ async fn fetch_canonical_inbox_inner(
             probe_started.elapsed().as_millis()
         );
         match probe_result {
-            Ok(mailbox) => (cached, mailbox, Vec::new()),
+            Ok(mailbox) => {
+                mailbox_from_status = true;
+                (cached, mailbox, Vec::new())
+            }
             Err(failure) if recoverable_cached_session_failure(failure) => {
                 if should_prewarm_metadata_pool {
                     let ((fresh, mailbox), sessions) = open_protocol_inbox_pool(
@@ -1219,6 +1266,31 @@ async fn fetch_canonical_inbox_inner(
         .await?;
         (fresh, mailbox, Vec::new())
     };
+    if !mailbox_from_status && mailbox.uid_next.and_then(NonZeroU32::new).is_none() {
+        let status = session.status_inbox(deadline).await?;
+        if let (Some(examined), Some(current)) = (mailbox.uid_validity, status.uid_validity)
+            && examined != current
+        {
+            return Err(ImapInboxFetchFailure::UidValidityChanged {
+                expected: examined,
+                actual: current,
+            });
+        }
+        mailbox.uid_validity = status.uid_validity.or(mailbox.uid_validity);
+        mailbox.uid_next = status.uid_next;
+    }
+    if mailbox.uid_next.and_then(NonZeroU32::new).is_none() {
+        let highest = session.uid_search(b"UID *", deadline).await?;
+        if highest.len() > 1 {
+            return Err(ImapInboxFetchFailure::Protocol);
+        }
+        mailbox.uid_next = Some(match highest.first().copied() {
+            Some(uid) => uid
+                .checked_add(1)
+                .ok_or(ImapInboxFetchFailure::ResourceLimit)?,
+            None => 1,
+        });
+    }
     let uid_validity = mailbox
         .uid_validity
         .and_then(NonZeroU32::new)
@@ -1288,6 +1360,7 @@ async fn fetch_canonical_inbox_inner(
                 flags: metadata.flags,
                 internal_date: metadata.internal_date,
                 envelope: metadata.envelope,
+                preview: metadata.preview,
                 declared_bytes: metadata.declared_bytes,
                 content: ImapInboxContent::NotFetched,
             })
@@ -1428,6 +1501,7 @@ async fn fetch_canonical_inbox_inner(
                 flags: metadata.flags,
                 internal_date: metadata.internal_date,
                 envelope: metadata.envelope,
+                preview: metadata.preview,
                 declared_bytes: metadata.declared_bytes,
                 content: ImapInboxContent::NotFetched,
             })
@@ -1603,6 +1677,7 @@ struct InboxMetadata {
     flags: ImapInboxFlags,
     internal_date: Box<str>,
     envelope: ImapInboxEnvelope,
+    preview: Box<str>,
     declared_bytes: u32,
 }
 
@@ -1759,7 +1834,7 @@ async fn fetch_metadata(
         .collect::<Vec<_>>()
         .join(",");
     let command = format!(
-        "UID FETCH {uid_set} (UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER.FIELDS (DATE FROM SUBJECT MESSAGE-ID)])"
+        "UID FETCH {uid_set} (UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER.FIELDS (DATE FROM SUBJECT MESSAGE-ID MIME-VERSION CONTENT-TYPE CONTENT-TRANSFER-ENCODING)] BODY.PEEK[TEXT]<0.{MAX_METADATA_PREVIEW_WIRE_BYTES}>)"
     );
     let id = session.run_command(command, deadline).await?;
     let mut messages = Vec::with_capacity(limits.max_messages);
@@ -1955,7 +2030,7 @@ async fn fetch_metadata_by_sequence_range(
         .and_then(|difference| difference.checked_add(1))
         .ok_or(ImapInboxFetchFailure::Protocol)?;
     let command = format!(
-        "FETCH {first_sequence}:{last_sequence} (UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER.FIELDS (DATE FROM SUBJECT MESSAGE-ID)])"
+        "FETCH {first_sequence}:{last_sequence} (UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER.FIELDS (DATE FROM SUBJECT MESSAGE-ID MIME-VERSION CONTENT-TYPE CONTENT-TRANSFER-ENCODING)] BODY.PEEK[TEXT]<0.{MAX_METADATA_PREVIEW_WIRE_BYTES}>)"
     );
     let id = session.run_command(command, deadline).await?;
     let mut messages = Vec::with_capacity(
@@ -2248,6 +2323,7 @@ async fn fetch_message_contents(
             flags: metadata.flags,
             internal_date: metadata.internal_date,
             envelope: metadata.envelope,
+            preview: metadata.preview,
             declared_bytes: metadata.declared_bytes,
             content,
         });
@@ -2504,6 +2580,7 @@ struct ProjectedFetch {
     declared_bytes: Option<u32>,
     envelope: Option<ImapInboxEnvelope>,
     metadata_headers: Option<Box<[u8]>>,
+    metadata_body_text: Option<Box<[u8]>>,
     body: Option<Box<[u8]>>,
 }
 
@@ -2591,6 +2668,21 @@ fn project_protocol_fetch_item(
                 set_once(&mut fetch.metadata_headers, bytes.as_ref().into())?;
             }
         }
+        FetchResponseItem::BodySection {
+            section,
+            origin,
+            data,
+        } if section.parts().next().is_none()
+            && section.text() == Some(FetchSectionText::Text)
+            && origin.is_none_or(|origin| origin == 0) =>
+        {
+            if let Some(bytes) = data.decoded() {
+                if bytes.len() > MAX_METADATA_PREVIEW_WIRE_BYTES {
+                    return Err(ImapInboxFetchFailure::ResourceLimit);
+                }
+                set_once(&mut fetch.metadata_body_text, bytes.as_ref().into())?;
+            }
+        }
         FetchResponseItem::BodySection { section, data, .. } if section.is_entire_message() => {
             if let Some(bytes) = data.decoded() {
                 set_once(&mut fetch.body, bytes.as_ref().into())?;
@@ -2610,6 +2702,10 @@ fn parse_metadata(fetch: ProjectedFetch) -> Result<InboxMetadata, ImapInboxFetch
     if fetch.body.is_some() {
         return Err(ImapInboxFetchFailure::Protocol);
     }
+    let preview = match (&fetch.metadata_headers, &fetch.metadata_body_text) {
+        (Some(headers), Some(body)) => project_metadata_preview(headers, body),
+        _ => Box::default(),
+    };
     let envelope = match (fetch.envelope, fetch.metadata_headers) {
         (Some(envelope), None) => envelope,
         (None, Some(headers)) => project_metadata_headers(&headers)?,
@@ -2623,10 +2719,33 @@ fn parse_metadata(fetch: ProjectedFetch) -> Result<InboxMetadata, ImapInboxFetch
         flags: fetch.flags.ok_or(ImapInboxFetchFailure::Protocol)?,
         internal_date: fetch.internal_date.ok_or(ImapInboxFetchFailure::Protocol)?,
         envelope,
+        preview,
         declared_bytes: fetch
             .declared_bytes
             .ok_or(ImapInboxFetchFailure::Protocol)?,
     })
+}
+
+fn project_metadata_preview(headers: &[u8], body: &[u8]) -> Box<str> {
+    let mut raw = Vec::with_capacity(headers.len().saturating_add(body.len()).saturating_add(4));
+    raw.extend_from_slice(headers);
+    if !headers.ends_with(b"\r\n\r\n") && !headers.ends_with(b"\n\n") {
+        if headers.ends_with(b"\r\n") {
+            raw.extend_from_slice(b"\r\n");
+        } else if headers.ends_with(b"\n") {
+            raw.extend_from_slice(b"\n");
+        } else {
+            raw.extend_from_slice(b"\r\n\r\n");
+        }
+    }
+    raw.extend_from_slice(body);
+
+    MessageParser::default()
+        .parse(&raw)
+        .and_then(|message| message.body_preview(MAX_METADATA_PREVIEW_BYTES))
+        .map(|preview| preview.trim().to_owned().into_boxed_str())
+        .filter(|preview| !preview.is_empty())
+        .unwrap_or_default()
 }
 
 fn project_metadata_headers(headers: &[u8]) -> Result<ImapInboxEnvelope, ImapInboxFetchFailure> {
@@ -3238,6 +3357,7 @@ mod tests {
 
     enum Script {
         Success,
+        ClientIdRequired,
         AuthenticationDenied,
         MailboxDenied,
         RawGreeting(Vec<u8>),
@@ -3367,9 +3487,17 @@ mod tests {
             .unwrap();
     }
 
-    async fn write_capabilities(stream: &mut TlsStream<TcpStream>, command: &str) {
+    async fn write_capabilities(
+        stream: &mut TlsStream<TcpStream>,
+        command: &str,
+        supports_id: bool,
+    ) {
         stream
-            .write_all(b"* CAPABILITY IMAP4rev1 IDLE\r\n")
+            .write_all(if supports_id {
+                b"* CAPABILITY IMAP4rev1 IDLE ID\r\n"
+            } else {
+                b"* CAPABILITY IMAP4rev1 IDLE\r\n"
+            })
             .await
             .unwrap();
         stream
@@ -3415,7 +3543,7 @@ mod tests {
                 let _ = stream.read(&mut byte).await;
                 return commands;
             }
-            Script::Success | Script::MailboxDenied => {}
+            Script::Success | Script::ClientIdRequired | Script::MailboxDenied => {}
             Script::RawGreeting(_) => unreachable!(),
         }
 
@@ -3424,8 +3552,28 @@ mod tests {
         if command_name(&capability) != Some("CAPABILITY") {
             panic!("expected CAPABILITY command");
         }
-        write_capabilities(stream, &capability).await;
+        write_capabilities(
+            stream,
+            &capability,
+            matches!(script, Script::ClientIdRequired),
+        )
+        .await;
         commands.push(capability);
+
+        if matches!(script, Script::ClientIdRequired) {
+            let client_id = required_command(stream).await;
+            assert_eq!(command_name(&client_id), Some("ID"));
+            assert!(client_id.contains("\"name\" \"Nivalis\""));
+            stream
+                .write_all(b"* ID (\"name\" \"Nivalis fixture\")\r\n")
+                .await
+                .unwrap();
+            stream
+                .write_all(&tagged_response(&client_id, "OK client identified"))
+                .await
+                .unwrap();
+            commands.push(client_id);
+        }
 
         let examine = required_command(stream).await;
         if command_name(&examine) != Some("EXAMINE") {
@@ -3502,6 +3650,30 @@ mod tests {
                 .filter_map(|command| command_name(command))
                 .collect();
             assert_eq!(names, ["LOGIN", "CAPABILITY", "EXAMINE", "LOGOUT"]);
+        });
+    }
+
+    #[test]
+    fn identifies_the_client_before_opening_a_provider_mailbox() {
+        run_async(async {
+            let server = spawn_server(Script::ClientIdRequired).await;
+            let result = diagnose_with_connector(
+                request(server.address.port()),
+                server.connector,
+                DiagnosticLimits::production(),
+            )
+            .await;
+            assert_eq!(result, Ok(()));
+
+            let commands = tokio::time::timeout(TEST_TIMEOUT, server.task)
+                .await
+                .unwrap()
+                .unwrap();
+            let names: Vec<_> = commands
+                .iter()
+                .filter_map(|command| command_name(command))
+                .collect();
+            assert_eq!(names, ["LOGIN", "CAPABILITY", "ID", "EXAMINE", "LOGOUT"]);
         });
     }
 
@@ -3736,6 +3908,16 @@ mod tests {
             ImapDiagnosticInputError::SecretEncoding
         );
     }
+
+    #[test]
+    fn identifies_163_before_mailbox_selection_without_suffix_confusion() {
+        assert!(requires_client_id_before_mailbox("imap.163.com"));
+        assert!(requires_client_id_before_mailbox("IMAP.163.COM."));
+        assert!(!requires_client_id_before_mailbox("imap.example.test"));
+        assert!(!requires_client_id_before_mailbox(
+            "imap.163.com.example.test"
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -3774,12 +3956,14 @@ mod inbox_fetch_tests {
     struct ServerPlan {
         uid_validity: Option<u32>,
         omit_uid_next: bool,
+        status_supplies_uid_next: bool,
         uid_next_override: Option<u32>,
         messages: Vec<FixtureMessage>,
         metadata_status: Option<&'static str>,
         extra_metadata: usize,
         omit_body_uid: bool,
         omit_status_response_text: bool,
+        require_client_id: bool,
         stall_body: Option<oneshot::Sender<()>>,
     }
 
@@ -3788,12 +3972,14 @@ mod inbox_fetch_tests {
             Self {
                 uid_validity: Some(UID_VALIDITY),
                 omit_uid_next: false,
+                status_supplies_uid_next: false,
                 uid_next_override: None,
                 messages,
                 metadata_status: None,
                 extra_metadata: 0,
                 omit_body_uid: false,
                 omit_status_response_text: false,
+                require_client_id: false,
                 stall_body: None,
             }
         }
@@ -3893,6 +4079,47 @@ mod inbox_fetch_tests {
         assert_eq!(envelope.from_host.as_ref(), b"example.test");
         assert_eq!(envelope.message_id.as_ref(), b"<encoded@example.test>");
         assert_eq!(envelope.date.as_ref(), b"Tue, 21 Jul 2026 08:15:30 +0800");
+    }
+
+    #[test]
+    fn metadata_preview_decodes_transfer_encoding_and_html() {
+        let quoted_printable_headers = b"Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n";
+        assert_eq!(
+            project_metadata_preview(
+                quoted_printable_headers,
+                b"=E9=82=AE=E4=BB=B6=E6=AD=A3=E6=96=87=E9=A2=84=E8=A7=88"
+            )
+            .as_ref(),
+            "邮件正文预览"
+        );
+
+        let html_headers = b"MIME-Version: 1.0\r\nContent-Type: text/html; charset=utf-8\r\n\r\n";
+        assert_eq!(
+            project_metadata_preview(
+                html_headers,
+                b"<html><body><p>Hello <strong>preview</strong>.</p></body></html>"
+            )
+            .as_ref(),
+            "Hello preview."
+        );
+
+        let base64_headers =
+            b"Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n";
+        assert_eq!(
+            project_metadata_preview(base64_headers, b"6YKu5Lu25q2j5paH6aKE6KeI").as_ref(),
+            "邮件正文预览"
+        );
+    }
+
+    #[test]
+    fn metadata_preview_extracts_text_from_multipart_body() {
+        let headers = b"MIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=preview-boundary\r\n\r\n";
+        let body = b"--preview-boundary\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nFast local preview.\r\n--preview-boundary\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>HTML fallback.</p>\r\n--preview-boundary--\r\n";
+
+        assert_eq!(
+            project_metadata_preview(headers, body).as_ref(),
+            "Fast local preview."
+        );
     }
 
     fn request(port: u16, expected_uid_validity: Option<u32>) -> ImapInboxFetchRequest {
@@ -4225,29 +4452,46 @@ mod inbox_fetch_tests {
         sequence: usize,
         message: &FixtureMessage,
     ) {
+        let body_offset = message
+            .raw
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map_or(message.raw.len(), |offset| offset + 4);
+        let body = &message.raw[body_offset
+            ..message
+                .raw
+                .len()
+                .min(body_offset + MAX_METADATA_PREVIEW_WIRE_BYTES)];
         let headers = format!(
-            "Date: Mon, 20 Jul 2026 12:00:00 +0000\r\nSubject: Message {}\r\nFrom: Sender {} <sender@example.test>\r\nMessage-ID: <{}@example.test>\r\n\r\n",
+            "Date: Mon, 20 Jul 2026 12:00:00 +0000\r\nSubject: Message {}\r\nFrom: Sender {} <sender@example.test>\r\nMessage-ID: <{}@example.test>\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n",
             message.uid, message.uid, message.uid,
         );
-        let response = format!(
-            "* {sequence} FETCH (UID {} FLAGS (\\Seen \\Flagged) INTERNALDATE \"20-Jul-2026 12:00:00 +0000\" RFC822.SIZE {} BODY[HEADER.FIELDS (DATE FROM SUBJECT MESSAGE-ID)] {{{}}}\r\n{})\r\n",
+        let response_head = format!(
+            "* {sequence} FETCH (UID {} FLAGS (\\Seen \\Flagged) INTERNALDATE \"20-Jul-2026 12:00:00 +0000\" RFC822.SIZE {} BODY[HEADER.FIELDS (DATE FROM SUBJECT MESSAGE-ID MIME-VERSION CONTENT-TYPE CONTENT-TRANSFER-ENCODING)] {{{}}}\r\n{} BODY[TEXT]<0> {{{}}}\r\n",
             message.uid,
             message.declared_bytes,
             headers.len(),
             headers,
+            body.len(),
         );
         stream
             .get_mut()
-            .write_all(response.as_bytes())
+            .write_all(response_head.as_bytes())
             .await
             .unwrap();
+        stream.get_mut().write_all(body).await.unwrap();
+        stream.get_mut().write_all(b")\r\n").await.unwrap();
     }
 
     async fn run_server(stream: ServerTlsStream<TcpStream>, mut plan: ServerPlan) -> Vec<Box<str>> {
         let mut stream = BufReader::new(stream);
         stream
             .get_mut()
-            .write_all(b"* OK receive fixture ready\r\n")
+            .write_all(if plan.require_client_id {
+                b"* OK [CAPABILITY IMAP4rev1 ID] receive fixture ready\r\n".as_slice()
+            } else {
+                b"* OK receive fixture ready\r\n".as_slice()
+            })
             .await
             .unwrap();
         let Some(login) = read_command(&mut stream).await else {
@@ -4257,15 +4501,32 @@ mod inbox_fetch_tests {
         tagged(
             &mut stream,
             &login,
-            if plan.omit_status_response_text {
+            if plan.require_client_id {
+                "OK [CAPABILITY IMAP4rev1 ID] authenticated"
+            } else if plan.omit_status_response_text {
                 "OK [CAPABILITY IMAP4rev1]"
             } else {
                 "OK [CAPABILITY IMAP4rev1] authenticated"
             },
         )
         .await;
+        let mut commands = vec![login];
+        if plan.require_client_id {
+            let Some(client_id) = read_command(&mut stream).await else {
+                return commands;
+            };
+            assert_eq!(command_name(&client_id), Some("ID"));
+            assert!(client_id.contains("\"name\" \"Nivalis\""));
+            stream
+                .get_mut()
+                .write_all(b"* ID (\"name\" \"Nivalis fixture\")\r\n")
+                .await
+                .unwrap();
+            tagged(&mut stream, &client_id, "OK client identified").await;
+            commands.push(client_id);
+        }
         let Some(examine) = read_command(&mut stream).await else {
-            return vec![login];
+            return commands;
         };
         assert_eq!(command_name(&examine), Some("EXAMINE"));
         let exists = plan.messages.len() + plan.extra_metadata;
@@ -4330,9 +4591,50 @@ mod inbox_fetch_tests {
             },
         )
         .await;
-        let mut commands = vec![login, examine];
+        commands.push(examine);
 
         let mut pending_metadata = None;
+        if plan.omit_uid_next {
+            let Some(status) = read_command(&mut stream).await else {
+                return commands;
+            };
+            assert_eq!(command_name(&status), Some("STATUS"));
+            let uid_next_status = if plan.status_supplies_uid_next {
+                format!(" UIDNEXT {uid_next}")
+            } else {
+                String::new()
+            };
+            stream
+                .get_mut()
+                .write_all(
+                    format!(
+                        "* STATUS INBOX (MESSAGES {exists} UIDVALIDITY {}{uid_next_status})\r\n",
+                        plan.uid_validity.unwrap_or(UID_VALIDITY)
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            tagged(&mut stream, &status, "OK status complete").await;
+            commands.push(status);
+            if !plan.status_supplies_uid_next {
+                let Some(highest_uid) = read_command(&mut stream).await else {
+                    return commands;
+                };
+                assert!(highest_uid.ends_with(" UID SEARCH UID *"));
+                if let Some(uid) = plan.messages.last().map(|message| message.uid) {
+                    stream
+                        .get_mut()
+                        .write_all(format!("* SEARCH {uid}\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                } else {
+                    stream.get_mut().write_all(b"* SEARCH\r\n").await.unwrap();
+                }
+                tagged(&mut stream, &highest_uid, "OK search complete").await;
+                commands.push(highest_uid);
+            }
+        }
         if !plan.messages.is_empty() {
             let Some(command) = read_command(&mut stream).await else {
                 return commands;
@@ -4648,6 +4950,7 @@ mod inbox_fetch_tests {
             }
             assert!(command.contains("UID FETCH"));
             assert!(command.contains("HEADER.FIELDS"));
+            assert!(command.contains("BODY.PEEK[TEXT]"));
             assert!(!command.contains("BODY.PEEK[]"));
             let requested_uids = command
                 .split_whitespace()
@@ -4705,7 +5008,7 @@ mod inbox_fetch_tests {
     }
 
     #[test]
-    fn metadata_sync_does_not_issue_body_fetches() {
+    fn metadata_sync_fetches_previews_without_full_messages() {
         run_async(async {
             let server = spawn_server(ServerPlan::messages(vec![
                 fixture(1, RAW_ONE),
@@ -4728,12 +5031,19 @@ mod inbox_fetch_tests {
                     .iter()
                     .all(|message| message.content == ImapInboxContent::NotFetched)
             );
+            assert_eq!(page.messages[0].preview.as_ref(), "Hello one.");
+            assert_eq!(page.messages[1].preview.as_ref(), "Hello two.");
             let commands = finish(server).await;
             assert!(
                 commands
                     .iter()
                     .all(|command| !command.contains("BODY.PEEK[]"))
             );
+            assert!(commands.iter().any(|command| {
+                command.contains(&format!(
+                    "BODY.PEEK[TEXT]<0.{MAX_METADATA_PREVIEW_WIRE_BYTES}>"
+                ))
+            }));
         });
     }
 
@@ -4926,6 +5236,11 @@ mod inbox_fetch_tests {
                 commands
                     .iter()
                     .all(|command| !command.contains("BODY.PEEK[]"))
+            );
+            assert!(
+                commands
+                    .iter()
+                    .any(|command| command.contains("BODY.PEEK[TEXT]"))
             );
         });
     }
@@ -5157,6 +5472,7 @@ mod inbox_fetch_tests {
             assert!(page.messages[0].flags.seen);
             assert!(page.messages[0].flags.flagged);
             assert_eq!(page.messages[0].envelope.subject.as_ref(), b"Message 1");
+            assert_eq!(page.messages[0].preview.as_ref(), "Hello one.");
             assert_eq!(
                 page.messages[0].content,
                 ImapInboxContent::Fetched(RAW_ONE.into())
@@ -5228,6 +5544,35 @@ mod inbox_fetch_tests {
             assert_eq!(page.messages.len(), 1);
             assert_eq!(page.messages[0].uid.get(), 1);
             finish(server).await;
+        });
+    }
+
+    #[test]
+    fn identifies_the_client_before_the_fast_provider_mailbox_pipeline() {
+        run_async(async {
+            let mut plan = ServerPlan::messages(vec![fixture(1, RAW_ONE)]);
+            plan.require_client_id = true;
+            let server = spawn_server(plan).await;
+
+            let page = fetch_canonical_inbox_with_connector(
+                request(server.address.port(), None),
+                server.connector.clone(),
+                limits(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(page.messages.len(), 1);
+            let commands = finish(server).await;
+            assert_eq!(
+                commands
+                    .iter()
+                    .filter_map(|command| command_name(command))
+                    .take(3)
+                    .collect::<Vec<_>>(),
+                ["LOGIN", "ID", "EXAMINE"]
+            );
         });
     }
 
@@ -5432,7 +5777,7 @@ mod inbox_fetch_tests {
     }
 
     #[test]
-    fn rejects_missing_uidvalidity_uidnext_or_changed_epoch() {
+    fn rejects_missing_uidvalidity_or_changed_epoch() {
         run_async(async {
             let mut missing_plan = ServerPlan::messages(vec![fixture(1, RAW_ONE)]);
             missing_plan.uid_validity = None;
@@ -5449,21 +5794,6 @@ mod inbox_fetch_tests {
             );
             finish(missing).await;
 
-            let mut missing_next_plan = ServerPlan::messages(vec![fixture(1, RAW_ONE)]);
-            missing_next_plan.omit_uid_next = true;
-            let missing_next = spawn_server(missing_next_plan).await;
-            assert_eq!(
-                fetch_canonical_inbox_with_connector(
-                    request(missing_next.address.port(), None),
-                    missing_next.connector.clone(),
-                    limits(),
-                    None,
-                )
-                .await,
-                Err(ImapInboxFetchFailure::MissingUidNext)
-            );
-            finish(missing_next).await;
-
             let changed = spawn_server(ServerPlan::messages(vec![fixture(1, RAW_ONE)])).await;
             assert_eq!(
                 fetch_canonical_inbox_with_connector(
@@ -5479,6 +5809,65 @@ mod inbox_fetch_tests {
                 })
             );
             finish(changed).await;
+        });
+    }
+
+    #[test]
+    fn recovers_missing_examine_uidnext_from_bounded_status() {
+        run_async(async {
+            let mut plan = ServerPlan::messages(vec![fixture(1, RAW_ONE)]);
+            plan.omit_uid_next = true;
+            plan.status_supplies_uid_next = true;
+            let server = spawn_server(plan).await;
+
+            let page = fetch_canonical_inbox_with_connector(
+                request(server.address.port(), None),
+                server.connector.clone(),
+                limits(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(page.uid_next.get(), 2);
+            assert_eq!(page.messages.len(), 1);
+            let commands = finish(server).await;
+            assert_eq!(
+                commands
+                    .iter()
+                    .filter_map(|command| command_name(command))
+                    .take(3)
+                    .collect::<Vec<_>>(),
+                ["LOGIN", "EXAMINE", "STATUS"]
+            );
+        });
+    }
+
+    #[test]
+    fn infers_missing_provider_uidnext_from_one_bounded_uid_search() {
+        run_async(async {
+            let mut plan = ServerPlan::messages(vec![fixture(41, RAW_ONE)]);
+            plan.omit_uid_next = true;
+            let server = spawn_server(plan).await;
+
+            let page = fetch_canonical_inbox_with_connector(
+                request(server.address.port(), None),
+                server.connector.clone(),
+                limits(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(page.uid_next.get(), 42);
+            assert_eq!(page.messages.len(), 1);
+            assert_eq!(page.messages[0].uid.get(), 41);
+            let commands = finish(server).await;
+            assert!(
+                commands
+                    .iter()
+                    .any(|command| command.ends_with(" UID SEARCH UID *"))
+            );
         });
     }
 

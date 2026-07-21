@@ -2,7 +2,7 @@ use std::{error::Error, fmt};
 
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(crate) const LATEST_SCHEMA_VERSION: u32 = 15;
+pub(crate) const LATEST_SCHEMA_VERSION: u32 = 16;
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -70,6 +70,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 15,
         sql: include_str!("../../../migrations/0015_full_text_body_search.sql"),
+    },
+    Migration {
+        version: 16,
+        sql: include_str!("../../../migrations/0016_restore_inbox_previews.sql"),
     },
 ];
 
@@ -969,7 +973,8 @@ mod tests {
             )
             .expect("seed truncated v13 inbox state");
 
-        migrate(&mut connection).expect("add bounded history backfill state");
+        migrate_with(&mut connection, &MIGRATIONS[..14], 14)
+            .expect("add bounded history backfill state");
 
         assert_eq!(
             connection
@@ -1044,6 +1049,95 @@ mod tests {
             )
             .unwrap();
         assert_eq!(matches, 40);
+    }
+
+    #[test]
+    fn v16_reopens_only_inboxes_with_uncached_empty_previews() {
+        let mut connection = memory_connection();
+        enable_foreign_keys(&connection).expect("enable foreign keys");
+        enable_recursive_triggers(&connection).expect("enable recursive triggers");
+        migrate_with(&mut connection, &MIGRATIONS[..15], 15).expect("create v15 schema");
+
+        for (account_id, folder_id, message_id) in [(1, 10, 100), (2, 20, 200)] {
+            insert_account(
+                &connection,
+                account_id,
+                &format!("owner-{account_id}@example.test"),
+            );
+            insert_folder(&connection, folder_id, account_id, "inbox", "inbox");
+            insert_message(
+                &connection,
+                message_id,
+                account_id,
+                &format!("message-{message_id}"),
+            );
+            connection
+                .execute(
+                    "INSERT INTO message_folders (message_id, folder_id, account_id)
+                     VALUES (?1, ?2, ?3)",
+                    params![message_id, folder_id, account_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO imap_message_locations
+                         (message_id, folder_id, account_id, uid_validity, uid,
+                          remote_seen, remote_flagged)
+                     VALUES (?1, ?2, ?3, 7, 42, 0, 0)",
+                    params![message_id, folder_id, account_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO sync_state
+                         (folder_id, uid_validity, change_cursor, history_cursor,
+                          history_complete)
+                     VALUES (?1, 7, '42', 12, 0)",
+                    [folder_id],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO message_content (message_id, reader_excerpt)
+                 VALUES (200, '')",
+                [],
+            )
+            .unwrap();
+
+        migrate(&mut connection).expect("schedule preview repair");
+
+        let affected = connection
+            .query_row(
+                "SELECT change_cursor, history_cursor, history_complete
+                 FROM sync_state WHERE folder_id = 10",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(affected, (None, None, false));
+
+        let unaffected = connection
+            .query_row(
+                "SELECT change_cursor, history_cursor, history_complete
+                 FROM sync_state WHERE folder_id = 20",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(unaffected, (Some("42".to_owned()), Some(12), false));
     }
 
     #[test]

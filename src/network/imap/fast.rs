@@ -22,9 +22,9 @@ use tokio_rustls::{TlsConnector, client::TlsStream};
 use zeroize::Zeroize;
 
 use super::{
-    BoundedIo, ImapDiagnosticFailureKind, ImapDiagnosticStage, ImapInboxFetchFailure,
-    InboxFetchLimits, Secret, failure, map_diagnostic_failure, map_receive_io_error,
-    tls_failure_kind,
+    BoundedIo, CLIENT_ID_COMMAND, ImapDiagnosticFailureKind, ImapDiagnosticStage,
+    ImapInboxFetchFailure, InboxFetchLimits, Secret, failure, map_diagnostic_failure,
+    map_receive_io_error, requires_client_id_before_mailbox, tls_failure_kind,
 };
 
 const READ_CHUNK_BYTES: usize = 16 * 1024;
@@ -78,6 +78,15 @@ impl ProtocolSession {
 
     pub(super) fn supports_idle(&self) -> bool {
         self.capabilities.contains(&Capability::Idle)
+    }
+
+    fn supports_client_identification(&self) -> bool {
+        self.capabilities.iter().any(|capability| {
+            matches!(
+                capability,
+                Capability::Other { token } if token.as_ref().eq_ignore_ascii_case(b"ID")
+            )
+        })
     }
 
     #[cfg(any(test, feature = "bench-harness"))]
@@ -522,6 +531,9 @@ pub(super) async fn open_protocol_session(
     if session.capabilities.is_empty() {
         session.load_capabilities(deadline).await?;
     }
+    if requires_client_id_before_mailbox(host) || session.supports_client_identification() {
+        session.identify_client(deadline).await?;
+    }
     session.require_imap_capability()?;
     #[cfg(feature = "bench-harness")]
     super::record_protocol_session_open();
@@ -543,11 +555,14 @@ pub(super) async fn open_protocol_inbox_session(
         connect_protocol_session(host, port, connector, deadline, limits).await?;
     #[cfg(feature = "bench-harness")]
     let transport_elapsed = open_started.elapsed();
+    let identify_before_mailbox =
+        requires_client_id_before_mailbox(host) || session.supports_client_identification();
     let mailbox = session
         .authenticate_and_examine(
             login.as_bytes(),
             secret.expose(),
             preauthenticated,
+            identify_before_mailbox,
             deadline,
         )
         .await?;
@@ -658,6 +673,7 @@ impl ProtocolSession {
         login: &[u8],
         secret: &[u8],
         preauthenticated: bool,
+        identify_before_mailbox: bool,
         deadline: Instant,
     ) -> Result<ProtocolMailbox, ImapInboxFetchFailure> {
         #[cfg(feature = "bench-harness")]
@@ -674,6 +690,11 @@ impl ProtocolSession {
         } else {
             None
         };
+        let client_id_tag = if identify_before_mailbox {
+            Some(self.send_command(CLIENT_ID_COMMAND, deadline).await?)
+        } else {
+            None
+        };
         let examine = if self.supports_condstore() {
             b"EXAMINE INBOX (CONDSTORE)".as_slice()
         } else {
@@ -683,9 +704,10 @@ impl ProtocolSession {
 
         let mut login_done = login_tag.is_none();
         let mut capability_done = capability_tag.is_none();
+        let mut client_id_done = client_id_tag.is_none();
         let mut examine_done = false;
         let mut mailbox = ProtocolMailbox::default();
-        while !(login_done && capability_done && examine_done) {
+        while !(login_done && capability_done && client_id_done && examine_done) {
             let response = self.read_response(deadline).await?;
             match &response {
                 Response::Tagged { tag, status, .. }
@@ -716,6 +738,19 @@ impl ProtocolSession {
                         return Err(ImapInboxFetchFailure::Protocol);
                     }
                     capability_done = true;
+                }
+                Response::Tagged { tag, status, .. }
+                    if client_id_tag
+                        .as_ref()
+                        .is_some_and(|expected| expected.matches(tag)) =>
+                {
+                    if *status != mail_protocol_imap::Status::Ok {
+                        return Err(match status {
+                            mail_protocol_imap::Status::No => ImapInboxFetchFailure::Permission,
+                            _ => ImapInboxFetchFailure::Protocol,
+                        });
+                    }
+                    client_id_done = true;
                 }
                 Response::Tagged { tag, status, .. } if examine_tag.matches(tag) => {
                     if *status != mail_protocol_imap::Status::Ok {
@@ -853,6 +888,28 @@ impl ProtocolSession {
                         Ok(())
                     } else {
                         Err(ImapInboxFetchFailure::Protocol)
+                    };
+                }
+                Response::Tagged { .. } => return Err(ImapInboxFetchFailure::Protocol),
+                _ => self.merge_capability_response(&response)?,
+            }
+        }
+    }
+
+    async fn identify_client(&mut self, deadline: Instant) -> Result<(), ImapInboxFetchFailure> {
+        let tag = self.send_command(CLIENT_ID_COMMAND, deadline).await?;
+        loop {
+            let response = self.read_response(deadline).await?;
+            match &response {
+                Response::Tagged {
+                    tag: response_tag,
+                    status,
+                    ..
+                } if tag.matches(response_tag) => {
+                    return match status {
+                        mail_protocol_imap::Status::Ok => Ok(()),
+                        mail_protocol_imap::Status::No => Err(ImapInboxFetchFailure::Permission),
+                        _ => Err(ImapInboxFetchFailure::Protocol),
                     };
                 }
                 Response::Tagged { .. } => return Err(ImapInboxFetchFailure::Protocol),

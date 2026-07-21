@@ -646,7 +646,7 @@ fn inbox_envelope(
         sender_name.as_bytes(),
         sender_address.as_bytes(),
         subject.as_bytes(),
-        b"",
+        message.preview.as_bytes(),
         received_at_ms,
         InboxFlags::new(message.flags.seen, message.flags.flagged),
         false,
@@ -875,6 +875,7 @@ first body v1\r\n";
                 date: b"Tue, 01 Jul 2025 13:30:00 +0000".as_slice().into(),
                 ..ImapInboxEnvelope::default()
             },
+            preview: Box::default(),
             declared_bytes: 0,
             content: ImapInboxContent::Fetched(Box::new([])),
         };
@@ -925,6 +926,7 @@ first body v1\r\n";
                         from_host: b"example.test".to_vec().into_boxed_slice(),
                         message_id: b"<one@example.test>".to_vec().into_boxed_slice(),
                     },
+                    preview: "streamed body".into(),
                     declared_bytes: u32::try_from(RAW_MESSAGE.len()).unwrap(),
                     content: ImapInboxContent::Fetched(RAW_MESSAGE.into()),
                 }]
@@ -950,6 +952,7 @@ first body v1\r\n";
                         subject: b"Oversized fixture".to_vec().into_boxed_slice(),
                         ..ImapInboxEnvelope::default()
                     },
+                    preview: Box::default(),
                     declared_bytes: (1024 * 1024) + 1,
                     content: ImapInboxContent::Oversized {
                         declared_bytes: (1024 * 1024) + 1,
@@ -987,6 +990,7 @@ first body v1\r\n";
                 subject: subject.into(),
                 ..ImapInboxEnvelope::default()
             },
+            preview: Box::default(),
             declared_bytes: u32::try_from(raw.len()).unwrap(),
             content: ImapInboxContent::Fetched(raw.into()),
         }
@@ -1080,7 +1084,7 @@ first body v1\r\n";
                         let page = reply.result.unwrap();
                         assert_eq!(page.rows.len(), 1);
                         assert_eq!(page.rows[0].subject.as_ref(), "staged subject");
-                        assert!(page.rows[0].preview.is_empty());
+                        assert_eq!(page.rows[0].preview.as_ref(), "streamed body");
                         assert!(!page.rows[0].has_attachment);
                         page.rows[0].id
                     }
