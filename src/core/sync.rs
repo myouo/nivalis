@@ -312,18 +312,35 @@ async fn run_inbox_sync(
     expected_generation: AccountGeneration,
     allow_history: bool,
 ) -> SyncInboxOutcome {
+    #[cfg(feature = "bench-harness")]
+    let sync_started = std::time::Instant::now();
     let configuration = match load_configuration(&database, account_id, expected_generation).await {
         Ok(configuration) => configuration,
         Err(outcome) => return outcome,
     };
+    #[cfg(feature = "bench-harness")]
+    eprintln!(
+        "NIVALIS_PERF sync_configuration_ms={}",
+        sync_started.elapsed().as_millis()
+    );
     let checkpoint = match load_checkpoint(&database, account_id, expected_generation).await {
         Ok(checkpoint) => checkpoint,
         Err(outcome) => return outcome,
     };
+    #[cfg(feature = "bench-harness")]
+    eprintln!(
+        "NIVALIS_PERF sync_checkpoint_ms={}",
+        sync_started.elapsed().as_millis()
+    );
     let secret = match load_credential(&credentials, &configuration.credential_key).await {
         Ok(secret) => secret,
         Err(outcome) => return outcome,
     };
+    #[cfg(feature = "bench-harness")]
+    eprintln!(
+        "NIVALIS_PERF sync_credential_ms={}",
+        sync_started.elapsed().as_millis()
+    );
     let first_uid = checkpoint
         .expected_cursor
         .map_or(1, |cursor| cursor.saturating_add(1));
@@ -351,6 +368,11 @@ async fn run_inbox_sync(
             return sync_failure(AccountWorkflowStage::FetchInbox, map_fetch_failure(failure));
         }
     };
+    #[cfg(feature = "bench-harness")]
+    eprintln!(
+        "NIVALIS_PERF sync_fetch_ms={}",
+        sync_started.elapsed().as_millis()
+    );
 
     let ImapInboxPage {
         uid_validity,
@@ -438,6 +460,11 @@ async fn run_inbox_sync(
         }
         Err(_) => return SyncInboxOutcome::DatabaseClosed,
     };
+    #[cfg(feature = "bench-harness")]
+    eprintln!(
+        "NIVALIS_PERF sync_stage_ms={}",
+        sync_started.elapsed().as_millis()
+    );
     let (staged_messages, ticket) = match stage {
         InboxStageOutcome::Staged {
             messages, ticket, ..
@@ -475,6 +502,11 @@ async fn run_inbox_sync(
     if !matches!(committed, InboxCursorOutcome::Committed { .. }) {
         return database_failure(AccountWorkflowStage::CommitInbox, FailureKind::Conflict);
     }
+    #[cfg(feature = "bench-harness")]
+    eprintln!(
+        "NIVALIS_PERF sync_commit_ms={}",
+        sync_started.elapsed().as_millis()
+    );
 
     SyncInboxOutcome::Synced {
         account_id,

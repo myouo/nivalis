@@ -8,8 +8,8 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use mail_protocol_core::{DecodeStatus, Decoder, ErrorKind, Limits};
 use mail_protocol_imap::{
-    Capability, CapabilitySet, Response, ResponseCode, ResponseDecoder, StatusKind, UntaggedData,
-    parse_untagged,
+    Capability, CapabilitySet, Response, ResponseCode, ResponseDecoder, StatusKind, StatusValue,
+    UntaggedData, parse_untagged,
 };
 use rustls::pki_types::ServerName;
 use tokio::{
@@ -204,6 +204,55 @@ impl ProtocolSession {
                             return Err(ImapInboxFetchFailure::Offline);
                         }
                         merge_status_code(status.code, &mut mailbox)?;
+                    }
+                    _ => {}
+                },
+            }
+        }
+    }
+
+    pub(super) async fn status_inbox(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<ProtocolMailbox, ImapInboxFetchFailure> {
+        let tag = self
+            .send_command(b"STATUS INBOX (MESSAGES UIDNEXT UIDVALIDITY)", deadline)
+            .await?;
+        let mut mailbox = ProtocolMailbox::default();
+        let mut received_status = false;
+        loop {
+            let response = self.read_response(deadline).await?;
+            match &response {
+                Response::Tagged {
+                    tag: response_tag,
+                    status,
+                    ..
+                } if tag.matches(response_tag) => {
+                    if *status != mail_protocol_imap::Status::Ok || !received_status {
+                        return Err(match status {
+                            mail_protocol_imap::Status::No => ImapInboxFetchFailure::Permission,
+                            _ => ImapInboxFetchFailure::Protocol,
+                        });
+                    }
+                    return Ok(mailbox);
+                }
+                Response::Tagged { .. } => return Err(ImapInboxFetchFailure::Protocol),
+                _ => match parse_untagged(&response).map_err(map_protocol_error)? {
+                    Some(UntaggedData::MailboxStatus(status)) => {
+                        for value in status.values() {
+                            match value {
+                                StatusValue::Messages(value) => mailbox.exists = value,
+                                StatusValue::UidNext(value) => mailbox.uid_next = Some(value),
+                                StatusValue::UidValidity(value) => {
+                                    mailbox.uid_validity = Some(value);
+                                }
+                                _ => {}
+                            }
+                        }
+                        received_status = true;
+                    }
+                    Some(UntaggedData::Status(status)) if status.kind == StatusKind::Bye => {
+                        return Err(ImapInboxFetchFailure::Offline);
                     }
                     _ => {}
                 },
@@ -488,8 +537,12 @@ pub(super) async fn open_protocol_inbox_session(
     deadline: Instant,
     limits: InboxFetchLimits,
 ) -> Result<(ProtocolSession, ProtocolMailbox), ImapInboxFetchFailure> {
+    #[cfg(feature = "bench-harness")]
+    let open_started = Instant::now();
     let (mut session, preauthenticated) =
         connect_protocol_session(host, port, connector, deadline, limits).await?;
+    #[cfg(feature = "bench-harness")]
+    let transport_elapsed = open_started.elapsed();
     let mailbox = session
         .authenticate_and_examine(
             login.as_bytes(),
@@ -500,7 +553,18 @@ pub(super) async fn open_protocol_inbox_session(
         .await?;
     session.require_imap_capability()?;
     #[cfg(feature = "bench-harness")]
-    super::record_protocol_session_open();
+    {
+        super::record_protocol_session_open();
+        eprintln!(
+            "NIVALIS_PERF imap_open transport_ms={} auth_examine_ms={} total_ms={}",
+            transport_elapsed.as_millis(),
+            open_started
+                .elapsed()
+                .saturating_sub(transport_elapsed)
+                .as_millis(),
+            open_started.elapsed().as_millis()
+        );
+    }
     Ok((session, mailbox))
 }
 
@@ -511,6 +575,8 @@ async fn connect_protocol_session(
     deadline: Instant,
     limits: InboxFetchLimits,
 ) -> Result<(ProtocolSession, bool), ImapInboxFetchFailure> {
+    #[cfg(feature = "bench-harness")]
+    let transport_started = Instant::now();
     let server_name =
         ServerName::try_from(host.to_owned()).map_err(|_| ImapInboxFetchFailure::Protocol)?;
     let tcp = match timeout_at(deadline, TcpStream::connect((host, port))).await {
@@ -526,6 +592,8 @@ async fn connect_protocol_session(
         }
         Err(_) => return Err(ImapInboxFetchFailure::Timeout),
     };
+    #[cfg(feature = "bench-harness")]
+    let tcp_elapsed = transport_started.elapsed();
     let _ = tcp.set_nodelay(true);
     let tls = match timeout_at(deadline, connector.connect(server_name, tcp)).await {
         Ok(Ok(stream)) => stream,
@@ -537,6 +605,8 @@ async fn connect_protocol_session(
         }
         Err(_) => return Err(ImapInboxFetchFailure::Timeout),
     };
+    #[cfg(feature = "bench-harness")]
+    let tls_elapsed = transport_started.elapsed();
     let codec_limits = Limits::new(
         64 * 1024,
         // Metadata sessions are cached and reused by the on-demand body path.
@@ -558,6 +628,17 @@ async fn connect_protocol_session(
         pending_idle_completion: None,
     };
     let preauthenticated = session.read_greeting(deadline).await?;
+    #[cfg(feature = "bench-harness")]
+    eprintln!(
+        "NIVALIS_PERF imap_transport tcp_ms={} tls_ms={} greeting_ms={} total_ms={}",
+        tcp_elapsed.as_millis(),
+        tls_elapsed.saturating_sub(tcp_elapsed).as_millis(),
+        transport_started
+            .elapsed()
+            .saturating_sub(tls_elapsed)
+            .as_millis(),
+        transport_started.elapsed().as_millis()
+    );
     Ok((session, preauthenticated))
 }
 
@@ -579,6 +660,10 @@ impl ProtocolSession {
         preauthenticated: bool,
         deadline: Instant,
     ) -> Result<ProtocolMailbox, ImapInboxFetchFailure> {
+        #[cfg(feature = "bench-harness")]
+        let authenticate_started = Instant::now();
+        #[cfg(feature = "bench-harness")]
+        let mut uid_next_logged = false;
         let login_tag = if preauthenticated {
             None
         } else {
@@ -616,6 +701,11 @@ impl ProtocolSession {
                         }
                         _ => return Err(ImapInboxFetchFailure::Protocol),
                     }
+                    #[cfg(feature = "bench-harness")]
+                    eprintln!(
+                        "NIVALIS_PERF imap_auth login_done_ms={}",
+                        authenticate_started.elapsed().as_millis()
+                    );
                 }
                 Response::Tagged { tag, status, .. }
                     if capability_tag
@@ -636,17 +726,37 @@ impl ProtocolSession {
                     }
                     merge_response_code(&response, &mut mailbox)?;
                     examine_done = true;
+                    #[cfg(feature = "bench-harness")]
+                    eprintln!(
+                        "NIVALIS_PERF imap_auth examine_done_ms={}",
+                        authenticate_started.elapsed().as_millis()
+                    );
                 }
                 Response::Tagged { .. } => return Err(ImapInboxFetchFailure::Protocol),
                 _ => {
                     self.merge_capability_response(&response)?;
                     match parse_untagged(&response).map_err(map_protocol_error)? {
-                        Some(UntaggedData::Exists(exists)) => mailbox.exists = exists,
+                        Some(UntaggedData::Exists(exists)) => {
+                            mailbox.exists = exists;
+                            #[cfg(feature = "bench-harness")]
+                            eprintln!(
+                                "NIVALIS_PERF imap_auth exists_ms={}",
+                                authenticate_started.elapsed().as_millis()
+                            );
+                        }
                         Some(UntaggedData::Status(status)) => {
                             if status.kind == StatusKind::Bye {
                                 return Err(ImapInboxFetchFailure::Offline);
                             }
                             merge_status_code(status.code, &mut mailbox)?;
+                            #[cfg(feature = "bench-harness")]
+                            if !uid_next_logged && mailbox.uid_next.is_some() {
+                                uid_next_logged = true;
+                                eprintln!(
+                                    "NIVALIS_PERF imap_auth uid_next_ms={}",
+                                    authenticate_started.elapsed().as_millis()
+                                );
+                            }
                         }
                         _ => {}
                     }

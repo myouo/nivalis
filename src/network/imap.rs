@@ -1141,7 +1141,16 @@ async fn fetch_canonical_inbox_inner(
     };
     let (mut session, mailbox, prewarmed_sessions) = if let Some(mut cached) = cached_session {
         let probe_deadline = deadline.min(Instant::now() + CACHED_SESSION_PROBE_TIMEOUT);
-        match cached.examine_inbox(probe_deadline).await {
+        #[cfg(feature = "bench-harness")]
+        let probe_started = Instant::now();
+        let probe_result = cached.status_inbox(probe_deadline).await;
+        #[cfg(feature = "bench-harness")]
+        eprintln!(
+            "NIVALIS_PERF metadata_cached_status result={:?} elapsed_ms={}",
+            probe_result.as_ref().map(|_| 1),
+            probe_started.elapsed().as_millis()
+        );
+        match probe_result {
             Ok(mailbox) => (cached, mailbox, Vec::new()),
             Err(failure) if recoverable_cached_session_failure(failure) => {
                 if should_prewarm_metadata_pool {
@@ -1924,6 +1933,10 @@ async fn fetch_metadata_by_sequence_range(
     deadline: Instant,
     limits: InboxFetchLimits,
 ) -> Result<Vec<InboxMetadata>, ImapInboxFetchFailure> {
+    #[cfg(feature = "bench-harness")]
+    let range_started = Instant::now();
+    #[cfg(feature = "bench-harness")]
+    let mut first_message_elapsed = None;
     let expected = last_sequence
         .checked_sub(first_sequence)
         .and_then(|difference| difference.checked_add(1))
@@ -1944,6 +1957,10 @@ async fn fetch_metadata_by_sequence_range(
             }
             ReceiveResponse::Done { .. } => return Err(ImapInboxFetchFailure::Protocol),
             ReceiveResponse::Fetch(fetch) => {
+                #[cfg(feature = "bench-harness")]
+                if first_message_elapsed.is_none() {
+                    first_message_elapsed = Some(range_started.elapsed());
+                }
                 if messages.len() == limits.max_messages {
                     return Err(ImapInboxFetchFailure::ResourceLimit);
                 }
@@ -1965,6 +1982,14 @@ async fn fetch_metadata_by_sequence_range(
     {
         return Err(ImapInboxFetchFailure::Protocol);
     }
+    #[cfg(feature = "bench-harness")]
+    eprintln!(
+        "NIVALIS_PERF metadata_sequence_range first={} last={} first_ms={} total_ms={}",
+        first_sequence,
+        last_sequence,
+        first_message_elapsed.unwrap_or_default().as_millis(),
+        range_started.elapsed().as_millis()
+    );
     Ok(messages)
 }
 
@@ -4367,6 +4392,22 @@ mod inbox_fetch_tests {
                 tagged(&mut stream, &command, "OK [READ-ONLY] selected").await;
                 continue;
             }
+            if command_name(&command) == Some("STATUS") {
+                let mut values = format!("MESSAGES {exists}");
+                if !plan.omit_uid_next {
+                    values.push_str(&format!(" UIDNEXT {uid_next}"));
+                }
+                if let Some(uid_validity) = plan.uid_validity {
+                    values.push_str(&format!(" UIDVALIDITY {uid_validity}"));
+                }
+                stream
+                    .get_mut()
+                    .write_all(format!("* STATUS INBOX ({values})\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                tagged(&mut stream, &command, "OK status complete").await;
+                continue;
+            }
             assert!(command.contains("UID FETCH"));
             if let Some(reached) = plan.stall_body.take() {
                 let _ = reached.send(());
@@ -4941,7 +4982,14 @@ mod inbox_fetch_tests {
                     .iter()
                     .filter(|command| command_name(command) == Some("EXAMINE"))
                     .count(),
-                2
+                1
+            );
+            assert_eq!(
+                commands
+                    .iter()
+                    .filter(|command| command_name(command) == Some("STATUS"))
+                    .count(),
+                1
             );
         });
     }

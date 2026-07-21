@@ -747,6 +747,7 @@ impl Controller {
                 request_id,
                 account_id: target.account_id,
                 expected_generation: target.expected_generation,
+                allow_history: true,
             }) {
             Ok(response) => response,
             Err(failure) => {
@@ -2587,6 +2588,7 @@ impl Controller {
                 request_id,
                 account_id: target.account_id,
                 expected_generation: target.expected_generation,
+                allow_history: false,
             }) {
             Ok(response) => response,
             Err(failure) => {

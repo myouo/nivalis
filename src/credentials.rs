@@ -472,18 +472,28 @@ fn run_worker(receiver: Receiver<Request>, factory: StoreFactory) {
         }
         let result = match store.as_ref() {
             Some(store) => execute(store, request.operation),
-            None => match factory() {
-                Ok(opened) => {
-                    store = Some(opened);
-                    execute(
-                        store
-                            .as_ref()
-                            .expect("credential store was installed before execution"),
-                        request.operation,
-                    )
+            None => {
+                #[cfg(feature = "bench-harness")]
+                let open_started = std::time::Instant::now();
+                let opened = factory();
+                #[cfg(feature = "bench-harness")]
+                eprintln!(
+                    "NIVALIS_PERF credential_store_open_elapsed_ms={}",
+                    open_started.elapsed().as_millis()
+                );
+                match opened {
+                    Ok(opened) => {
+                        store = Some(opened);
+                        execute(
+                            store
+                                .as_ref()
+                                .expect("credential store was installed before execution"),
+                            request.operation,
+                        )
+                    }
+                    Err(failure) => Err(failure),
                 }
-                Err(failure) => Err(failure),
-            },
+            }
         };
         if result
             .as_ref()
@@ -504,9 +514,16 @@ fn execute(store: &Arc<CredentialStore>, operation: CredentialOperation) -> Cred
             Ok(CredentialOutcome::Stored)
         }
         CredentialOperation::Load { locator } => {
+            #[cfg(feature = "bench-harness")]
+            let started = std::time::Instant::now();
             let bytes = entry(store, &locator)?
                 .get_secret()
                 .map_err(map_keyring_error)?;
+            #[cfg(feature = "bench-harness")]
+            eprintln!(
+                "NIVALIS_PERF credential_load_elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
             Secret::from_store(bytes).map(CredentialOutcome::Loaded)
         }
         CredentialOperation::Delete { locator } => {

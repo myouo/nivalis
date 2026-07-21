@@ -167,6 +167,7 @@ pub(crate) enum AccountOperation {
         request_id: RequestId,
         account_id: AccountId,
         expected_generation: AccountGeneration,
+        allow_history: bool,
     },
     FetchMessageContent {
         request_id: RequestId,
@@ -235,11 +236,13 @@ impl fmt::Debug for AccountOperation {
                 request_id,
                 account_id,
                 expected_generation,
+                allow_history,
             } => formatter
                 .debug_struct("SyncInbox")
                 .field("request_id", request_id)
                 .field("account_id", account_id)
                 .field("expected_generation", expected_generation)
+                .field("allow_history", allow_history)
                 .finish(),
             Self::FetchMessageContent {
                 request_id,
@@ -1373,6 +1376,7 @@ impl AccountWorkflows {
             AccountOperation::SyncInbox {
                 account_id,
                 expected_generation,
+                allow_history,
                 ..
             } => {
                 let Some(content_root) = self.content_root.clone() else {
@@ -1436,7 +1440,7 @@ impl AccountWorkflows {
                         content_root,
                         account_id,
                         expected_generation,
-                        true,
+                        allow_history,
                     )),
                 });
             }

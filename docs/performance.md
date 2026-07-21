@@ -35,6 +35,19 @@ The release `bench-harness` was run against a disposable, empty-index copy of a 
 
 The first-screen clock begins when the benchmark hook is installed immediately before the native event loop, so it includes local controller/database/UI projection but not binary loading or `AppWindow` construction. Public-network timings naturally vary with the provider. The cold pool and metadata phases are reported separately: the 50-message remote phase is at the 1.3-second target boundary, while a brand-new pool still pays the provider's 1.6-second connection floor in the background. The UI never waits for either phase. The foreground BODY request reuses the most recently synchronized selected session and does not pay another TCP/TLS/LOGIN handshake.
 
+### Cached-mailbox cold start
+
+The ordinary cold-start path was measured separately with 50 complete local summary rows, a valid UID cursor, no cached process-level IMAP session, and an uncached newest BODY. A foreground refresh now requests only the forward UID delta; it cannot consume the backward history cursor. Backward 50-row FETCH is reserved for an explicit waterfall-bottom request.
+
+| Gate | Run 1 | Run 2 | Run 3 | Median |
+| --- | ---: | ---: | ---: | ---: |
+| Locally operable first screen | 197ms | 91ms | 163ms | 163ms |
+| Core cold incremental sync through cursor commit | 1,598ms | 1,674ms | 1,428ms | 1,598ms |
+| Harness start through stable sync completion | 1,832ms | 1,802ms | 1,631ms | 1,802ms |
+| New IMAP sessions | 1 | 1 | 1 | 1 |
+
+All three release runs completed below the 1.9-second target. The core split was 0ms configuration, 0ms checkpoint, 7–9ms Secret Service setup/load, 1,407–1,643ms TCP/TLS/LOGIN/EXAMINE, and 1–2ms SQLite stage/commit. A selected cached session is refreshed with bounded `STATUS INBOX (MESSAGES UIDNEXT UIDVALIDITY)` rather than re-selecting the mailbox with another `EXAMINE`. The empty-index 50-row bootstrap remains the heavier ten-session path reported above; it is not repeated during an ordinary cold start.
+
 ## Resource bounds
 
 | Resource | Production bound |
@@ -55,7 +68,7 @@ The first-screen clock begins when the benchmark hook is installed immediately b
 | SQLite worker threads | 0 |
 | Search migration batch | 16 messages per idle transaction |
 
-The 32KiB connection figure covers Nivalis's two fixed 16KiB plaintext buffers. TCP, Rustls, allocator, kernel socket, certificate, and server-dependent state are additional and must be assessed with whole-process RSS/PSS measurements. A 24- to 50-message metadata page may use up to ten selected sessions, splitting 50 messages into ten five-message ranges. Those sessions are retained in the global LRU pool so a waterfall history request can use the 1.3-second warm path; work below 24 messages remains on one session. Foreground body and manual-sync work cancel the matching IDLE command and reclaim an authenticated selected session, with BODY reads preferring the most recently synchronized primary.
+The 32KiB connection figure covers Nivalis's two fixed 16KiB plaintext buffers. TCP, Rustls, allocator, kernel socket, certificate, and server-dependent state are additional and must be assessed with whole-process RSS/PSS measurements. A 24- to 50-message metadata page may use up to ten selected sessions, splitting 50 messages into ten five-message ranges. Those sessions are retained in the global LRU pool so a waterfall history request can use the 1.3-second warm path; work below 24 messages remains on one session. Foreground body and forward-sync work cancel the matching IDLE command and reclaim an authenticated selected session, with BODY reads preferring the most recently synchronized primary. Only the waterfall-bottom operation is allowed to advance the backward history cursor.
 
 Disconnected IDLE sessions are dropped, successful/time-limited/cancelled sessions return to the bounded cache, and every ready watch is removed with `swap_remove`. Tests fill all ten watch slots and exercise the disconnect path, so reconnect attempts cannot grow the watch vector or session cache.
 
