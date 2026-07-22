@@ -55,6 +55,7 @@ const OPEN_MESSAGE_SQL: &str = "
            m.unread, m.starred, m.has_attachment, coalesce(c.reader_excerpt, ''),
            coalesce(c.truncated, 0), coalesce(c.body_byte_count, 0), c.body_file_key,
            c.message_id IS NOT NULL
+             AND coalesce(c.render_version, 0) >= 2
              AND NOT (coalesce(c.truncated, 0) != 0 AND c.reader_excerpt = ?2)
       FROM messages AS m
       LEFT JOIN message_content AS c ON c.message_id = m.id
@@ -398,6 +399,7 @@ pub(super) fn open_message(
                         .get::<_, Option<String>>(12)?
                         .map(String::into_boxed_str),
                     content_available: row.get(13)?,
+                    body_is_html: false,
                 })
             },
         )
@@ -1135,6 +1137,27 @@ mod tests {
 
         assert!(!detail.content_available);
         assert!(detail.body_truncated);
+    }
+
+    #[test]
+    fn message_detail_refreshes_a_legacy_render_projection() {
+        let connection = seeded_connection(1);
+        connection
+            .execute(
+                "INSERT INTO message_content
+                 (message_id, reader_excerpt, truncated, body_byte_count, body_file_key,
+                  render_version)
+                 VALUES (1, 'old plain HTML projection', 0, 1200, 'body/1.txt', 1)",
+                [],
+            )
+            .unwrap();
+
+        let detail = open_message(&connection, MessageId::new(1).unwrap())
+            .unwrap()
+            .unwrap();
+
+        assert!(!detail.content_available);
+        assert!(!detail.body_is_html);
     }
 
     #[test]

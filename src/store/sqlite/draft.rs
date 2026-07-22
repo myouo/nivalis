@@ -288,7 +288,7 @@ pub(crate) fn update_draft(
         .execute(
             "UPDATE message_content
              SET reader_excerpt = ?2, truncated = 0,
-                 body_byte_count = ?3, body_file_key = ?4
+                 body_byte_count = ?3, body_file_key = ?4, render_version = 2
              WHERE message_id = ?1",
             params![
                 draft.message_id.get(),

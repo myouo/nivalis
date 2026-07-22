@@ -269,7 +269,9 @@ export component ReaderPane inherits Rectangle {
                         spacing: 10px;
                         MaterialIcon { name: "progress_activity"; width: 24px; size: 20px; icon-color: Theme.primary; }
                         Text {
-                            text: "Headers are ready. Fetching the body in the background…";
+                            text: root.selected-mail.body == ""
+                                ? "Headers are ready. Fetching the body in the background…"
+                                : "Showing cached text while refreshing HTML formatting…";
                             color: Theme.on-surface-variant;
                             font-family: Theme.body-font;
                             font-size: 11px;
@@ -305,29 +307,39 @@ export component ReaderPane inherits Rectangle {
                     }
                 }
 
-                if !root.detail-content-pending && root.detail-content-error == "": VerticalLayout {
+                if root.selected-mail.body != ""
+                    || (!root.detail-content-pending && root.detail-content-error == ""): VerticalLayout {
                     padding-left: 2px;
                     padding-right: 2px;
                     padding-top: 4px;
                     padding-bottom: 4px;
                     vertical-stretch: 0;
 
-                    body-text := Text {
-                        text: root.selected-mail.body == ""
-                            ? "This message has no plain-text content."
-                            : root.selected-mail.body;
-                        color: root.selected-mail.body == "" ? Theme.on-surface-variant : Theme.on-surface;
+                    if root.selected-mail.body == "": Text {
+                        text: "This message has no readable content.";
+                        color: Theme.on-surface-variant;
                         font-family: Theme.body-font;
                         font-size: 14px;
-                        font-weight: 400;
-                        font-italic: root.selected-mail.body == "";
-                        // Character wrapping is the safe fallback for long URLs and
-                        // generated tokens that have no word boundaries.
-                        wrap: char-wrap;
+                        font-italic: true;
+                        wrap: word-wrap;
                         horizontal-alignment: left;
                         vertical-alignment: top;
                         horizontal-stretch: 1;
                         vertical-stretch: 0;
+                    }
+
+                    if root.selected-mail.body != "": StyledText {
+                        text: root.selected-mail.styled-body;
+                        default-color: Theme.on-surface;
+                        default-font-family: Theme.body-font;
+                        default-font-size: 14px;
+                        link-color: Theme.primary;
+                        horizontal-alignment: left;
+                        vertical-alignment: top;
+                        horizontal-stretch: 1;
+                        vertical-stretch: 0;
+                        // Deliberately leave link-clicked unhandled: mail content is
+                        // a preview and cannot navigate the application or browser.
                     }
                 }
 

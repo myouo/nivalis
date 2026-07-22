@@ -1215,22 +1215,24 @@ fn hydrate_message_body(
     let Ok(Some(detail)) = &mut reply.result else {
         return;
     };
-    if !detail.content_available {
-        return;
-    }
     let Some(staging) = staging else {
         return;
     };
     let Some(stored_key) = detail.body_file_key.as_deref() else {
-        detail.body_truncated = true;
+        if detail.content_available {
+            detail.body_truncated = true;
+        }
         return;
     };
     let Ok(file_key) = FileKey::parse(stored_key) else {
         detail.body_truncated = true;
         return;
     };
-    match staging.read_body_text(&file_key) {
-        Ok(body) => detail.reader_excerpt = body,
+    match staging.read_body(&file_key) {
+        Ok(body) => {
+            detail.reader_excerpt = body.text;
+            detail.body_is_html = body.is_html;
+        }
         Err(_) => detail.body_truncated = true,
     }
 }
@@ -1514,7 +1516,8 @@ mod tests {
                 body_truncated: false,
                 body_byte_count: body.len() as u64,
                 body_file_key: Some(stored_key),
-                content_available: true,
+                content_available: false,
+                body_is_html: false,
             })),
         };
 

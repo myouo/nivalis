@@ -140,6 +140,7 @@ impl MailRecord {
 
     fn to_detail(&self) -> MailDetail {
         let (body, body_truncated) = bounded_text(&self.body, BODY_PREVIEW_MAX_CHARS);
+        let styled_body = slint::StyledText::from_plain_text(body.as_str());
         MailDetail {
             id: encode_entity_id(self.id),
             sender: self.sender.clone(),
@@ -147,6 +148,7 @@ impl MailRecord {
             initials: self.initials.clone(),
             subject: self.subject.clone(),
             body,
+            styled_body,
             body_truncated,
             date: self.date.clone(),
             folder: self.folder.name().into(),

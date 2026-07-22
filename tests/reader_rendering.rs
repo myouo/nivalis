@@ -22,6 +22,7 @@ fn long_unbroken_reader_content_renders_at_desktop_and_compact_widths() {
         email: "render@example.test".into(),
         initials: "RR".into(),
         subject: "Long body rendering remains constrained to the reader pane".into(),
+        styled_body: slint::StyledText::from_plain_text(&body),
         body: body.into(),
         body_truncated: false,
         date: "2026-07-20 13:00 UTC".into(),

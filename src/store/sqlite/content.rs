@@ -484,7 +484,8 @@ fn finalize_content_in_transaction(
                  reader_excerpt = excluded.reader_excerpt,
                  truncated = excluded.truncated,
                  body_byte_count = excluded.body_byte_count,
-                 body_file_key = excluded.body_file_key",
+                 body_file_key = excluded.body_file_key,
+                 render_version = 2",
             params![
                 reservation.message_id.get(),
                 record.reader_excerpt.as_ref(),

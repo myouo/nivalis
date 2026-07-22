@@ -19,6 +19,7 @@ const MAX_MEDIA_TYPE_BYTES: usize = 255;
 const MAX_DISPOSITION_BYTES: usize = 64;
 pub(crate) const LEGACY_SAFETY_LIMIT_MESSAGE: &str = "This message could not be rendered because its content exceeds the local safety limits. It was kept in the mailbox so synchronization can continue.";
 const SAFETY_LIMIT_MESSAGE: &str = "This message is too large or complex to render safely. It remains available through the provider, and synchronization can continue.";
+const HTML_MARKDOWN_PREFIX: &str = "\u{001e}nivalis-html-markdown-v1\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ContentLimits {
@@ -443,6 +444,12 @@ pub(crate) struct ContentStaging {
     outbound: PathBuf,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ReaderBody {
+    pub(crate) text: Box<str>,
+    pub(crate) is_html: bool,
+}
+
 impl ContentStaging {
     pub(crate) fn open(root: PathBuf) -> Result<Self, StorageError> {
         #[cfg(not(unix))]
@@ -527,7 +534,7 @@ impl ContentStaging {
         Ok(file)
     }
 
-    pub(crate) fn read_body_text(&self, key: &FileKey) -> Result<Box<str>, StorageError> {
+    pub(crate) fn read_body(&self, key: &FileKey) -> Result<ReaderBody, StorageError> {
         let operation = StorageOperation::OpenPublished;
         if key.kind() != FileKind::Body {
             return Err(StorageError::invalid(operation));
@@ -549,12 +556,21 @@ impl ContentStaging {
                 kind: io::ErrorKind::FileTooLarge,
             });
         }
-        String::from_utf8(bytes)
-            .map(String::into_boxed_str)
-            .map_err(|_| StorageError {
-                operation,
-                kind: io::ErrorKind::InvalidData,
+        let stored = String::from_utf8(bytes).map_err(|_| StorageError {
+            operation,
+            kind: io::ErrorKind::InvalidData,
+        })?;
+        if let Some(markdown) = stored.strip_prefix(HTML_MARKDOWN_PREFIX) {
+            Ok(ReaderBody {
+                text: markdown.into(),
+                is_html: true,
             })
+        } else {
+            Ok(ReaderBody {
+                text: stored.into_boxed_str(),
+                is_html: false,
+            })
+        }
     }
 
     pub(crate) fn remove_published_file(
@@ -929,12 +945,25 @@ pub(crate) fn prepare_content(
         .filter(|date| date.is_valid())
         .and_then(|date| date.to_timestamp().checked_mul(1_000));
 
-    let (body, body_byte_count, body_truncated) = extract_bounded_body(&message, limits);
-    let preview = bounded_prefix(&body, limits.preview_bytes).trim().into();
-    let reader_excerpt = bounded_prefix(&body, limits.reader_excerpt_bytes).into();
+    let body = extract_bounded_body(&message, limits);
+    let preview = bounded_prefix(&body.plain, limits.preview_bytes)
+        .trim()
+        .into();
+    let reader_excerpt = bounded_prefix(&body.plain, limits.reader_excerpt_bytes).into();
+    let stored_body = if body.is_html {
+        let mut stored = String::with_capacity(HTML_MARKDOWN_PREFIX.len() + body.display.len());
+        stored.push_str(HTML_MARKDOWN_PREFIX);
+        stored.push_str(&body.display);
+        stored
+    } else {
+        body.display
+    };
     // A zero-byte body still gives every durable reservation one physical row.
-    let staged_body =
-        Some(staging.stage_reader(FileKind::Body, body.as_bytes(), limits.stored_body_bytes)?);
+    let staged_body = Some(staging.stage_reader(
+        FileKind::Body,
+        stored_body.as_bytes(),
+        limits.stored_body_bytes,
+    )?);
 
     let mut attachments = Vec::with_capacity(message.attachments.len());
     for (ordinal, part_id) in message.attachments.iter().copied().enumerate() {
@@ -1003,8 +1032,8 @@ pub(crate) fn prepare_content(
             received_at_ms,
             preview,
             reader_excerpt,
-            body_truncated,
-            body_byte_count,
+            body_truncated: body.truncated,
+            body_byte_count: body.source_bytes,
         },
         body: staged_body,
         attachments: attachments.into_boxed_slice(),
@@ -1484,12 +1513,81 @@ fn validate_local_part_graph(
     Ok(depths)
 }
 
-fn extract_bounded_body(message: &Message<'_>, limits: ContentLimits) -> (String, u64, bool) {
+struct ExtractedBody {
+    plain: String,
+    display: String,
+    source_bytes: u64,
+    truncated: bool,
+    is_html: bool,
+}
+
+fn extract_bounded_body(message: &Message<'_>, limits: ContentLimits) -> ExtractedBody {
+    let has_html = message
+        .html_body
+        .iter()
+        .any(|&part_id| matches!(message.parts[part_id as usize].body, PartType::Html(_)));
+    if has_html && limits.stored_body_bytes > HTML_MARKDOWN_PREFIX.len() {
+        let (plain, _, _) = if message.text_body.is_empty() {
+            extract_plain_parts(message, &message.html_body, limits)
+        } else {
+            extract_plain_parts(message, &message.text_body, limits)
+        };
+        let maximum = limits
+            .stored_body_bytes
+            .saturating_sub(HTML_MARKDOWN_PREFIX.len());
+        let mut markdown = HtmlMarkdownBuilder::new(maximum);
+        let mut source_bytes = 0_u64;
+        let mut truncated = false;
+        for &part_id in &message.html_body {
+            let part = &message.parts[part_id as usize];
+            let PartType::Html(html) = &part.body else {
+                truncated = true;
+                continue;
+            };
+            source_bytes =
+                source_bytes.saturating_add(u64::try_from(html.len()).unwrap_or(u64::MAX));
+            if markdown.is_full() {
+                truncated = true;
+                continue;
+            }
+            markdown.separate_part();
+            let html_limit = limits.decoded_part_bytes.min(html.len());
+            let bounded_html = bounded_prefix(html, html_limit);
+            if bounded_html.len() != html.len() {
+                truncated = true;
+            }
+            markdown.append_html(bounded_html);
+        }
+        let (display, markdown_truncated) = markdown.finish();
+        return ExtractedBody {
+            plain,
+            display,
+            source_bytes,
+            truncated: truncated || markdown_truncated,
+            is_html: true,
+        };
+    }
+
     let body_ids = if message.text_body.is_empty() {
         message.html_body.as_slice()
     } else {
         message.text_body.as_slice()
     };
+    let (plain, source_bytes, truncated) = extract_plain_parts(message, body_ids, limits);
+    ExtractedBody {
+        display: plain.clone(),
+        plain,
+        source_bytes,
+        truncated,
+        is_html: false,
+    }
+}
+
+fn extract_plain_parts(
+    message: &Message<'_>,
+    body_ids: &[u32],
+    limits: ContentLimits,
+) -> (String, u64, bool) {
     let mut body = BoundedBody::new(limits);
     let mut source_bytes = 0_u64;
     for &part_id in body_ids {
@@ -1523,6 +1621,488 @@ fn extract_bounded_body(message: &Message<'_>, limits: ContentLimits) -> (String
         }
     }
     (body.output, source_bytes, body.truncated)
+}
+
+#[derive(Debug)]
+struct InlineSpan {
+    tag: Box<str>,
+    close: Box<str>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ListState {
+    ordered: bool,
+    next: usize,
+}
+
+struct HtmlMarkdownBuilder {
+    output: String,
+    maximum: usize,
+    reserved_closing_bytes: usize,
+    inline: Vec<InlineSpan>,
+    lists: Vec<ListState>,
+    pending_space: bool,
+    truncated: bool,
+}
+
+impl HtmlMarkdownBuilder {
+    fn new(maximum: usize) -> Self {
+        Self {
+            output: String::with_capacity(maximum.min(8 * 1024)),
+            maximum,
+            reserved_closing_bytes: 0,
+            inline: Vec::with_capacity(8),
+            lists: Vec::with_capacity(4),
+            pending_space: false,
+            truncated: false,
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.output
+            .len()
+            .saturating_add(self.reserved_closing_bytes)
+            >= self.maximum
+    }
+
+    fn separate_part(&mut self) {
+        self.paragraph();
+    }
+
+    fn append_html(&mut self, html: &str) {
+        let mut position = 0;
+        while position < html.len() && !self.is_full() {
+            let Some(relative_start) = html[position..].find('<') else {
+                self.append_text(&html[position..]);
+                break;
+            };
+            let start = position + relative_start;
+            self.append_text(&html[position..start]);
+            if html[start..].starts_with("<!--") {
+                position = html[start + 4..]
+                    .find("-->")
+                    .map_or(html.len(), |end| start + 4 + end + 3);
+                continue;
+            }
+            let Some(end) = find_html_tag_end(html, start + 1) else {
+                self.append_text(&html[start..]);
+                break;
+            };
+            let raw_tag = &html[start + 1..end];
+            let Some(tag) = ParsedHtmlTag::parse(raw_tag) else {
+                position = end + 1;
+                continue;
+            };
+            if !tag.closing && is_suppressed_html_tag(tag.name.as_str()) {
+                let needle = format!("</{}", tag.name);
+                let rest = &html[end + 1..];
+                position = find_ascii_case_insensitive(rest.as_bytes(), needle.as_bytes()).map_or(
+                    html.len(),
+                    |offset| {
+                        let close_start = end + 1 + offset;
+                        find_html_tag_end(html, close_start + 2)
+                            .map_or(html.len(), |close_end| close_end + 1)
+                    },
+                );
+                continue;
+            }
+            self.handle_tag(tag);
+            position = end + 1;
+        }
+    }
+
+    fn handle_tag(&mut self, tag: ParsedHtmlTag<'_>) {
+        let name = tag.name.as_str();
+        if tag.closing {
+            match name {
+                "b" | "strong" | "em" | "i" | "u" | "s" | "strike" | "del" | "code" | "a" => {
+                    self.close_inline(name)
+                }
+                "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "blockquote" => {
+                    self.close_inline(name);
+                    self.paragraph();
+                }
+                "p" | "div" | "section" | "article" | "header" | "footer" | "main" | "address"
+                | "pre" => self.paragraph(),
+                "li" | "tr" => self.line_break(),
+                "ul" | "ol" => {
+                    self.lists.pop();
+                    self.paragraph();
+                }
+                "table" => self.paragraph(),
+                _ => {}
+            }
+            return;
+        }
+
+        match name {
+            "br" => self.line_break(),
+            "p" | "div" | "section" | "article" | "header" | "footer" | "main" | "address"
+            | "pre" => self.paragraph(),
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                self.paragraph();
+                self.open_inline(name, "**", "**");
+            }
+            "blockquote" => {
+                self.paragraph();
+                self.open_inline(name, "*", "*");
+            }
+            "b" | "strong" => self.open_inline(name, "**", "**"),
+            "em" | "i" => self.open_inline(name, "*", "*"),
+            "u" => self.open_inline(name, "<u>", "</u>"),
+            "s" | "strike" | "del" => self.open_inline(name, "~~", "~~"),
+            "code" => self.open_inline(name, "`", "`"),
+            "a" => {
+                if let Some(target) = html_attribute(tag.attributes, "href")
+                    .and_then(|value| safe_link_target(&value))
+                {
+                    self.open_inline(name, "[", &format!("]({target})"));
+                }
+            }
+            "ul" | "ol" => {
+                self.paragraph();
+                if self.lists.len() < 8 {
+                    self.lists.push(ListState {
+                        ordered: name == "ol",
+                        next: 1,
+                    });
+                } else {
+                    self.truncated = true;
+                }
+            }
+            "li" => {
+                self.line_break();
+                let depth = self.lists.len().saturating_sub(1).min(7);
+                let prefix = if let Some(list) = self.lists.last_mut() {
+                    if list.ordered {
+                        let prefix = format!("{}. ", list.next);
+                        list.next = list.next.saturating_add(1);
+                        prefix
+                    } else {
+                        "- ".to_owned()
+                    }
+                } else {
+                    "- ".to_owned()
+                };
+                self.push_fragment(&"  ".repeat(depth));
+                self.push_fragment(&prefix);
+            }
+            "table" => self.paragraph(),
+            "tr" => self.line_break(),
+            "td" | "th" => {
+                if !self.output.ends_with('\n') && !self.output.is_empty() {
+                    self.push_fragment(" · ");
+                }
+            }
+            "img" => {
+                if let Some(alt) = html_attribute(tag.attributes, "alt") {
+                    let alt = alt.trim();
+                    if !alt.is_empty() {
+                        self.pending_space = true;
+                        self.open_inline("img", "*", "*");
+                        self.append_text("Image: ");
+                        self.append_text(alt);
+                        self.close_inline("img");
+                        self.pending_space = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        if tag.self_closing {
+            self.close_inline(name);
+        }
+    }
+
+    fn append_text(&mut self, raw: &str) {
+        if raw.is_empty() {
+            return;
+        }
+        let leading_space = raw.chars().next().is_some_and(char::is_whitespace);
+        let trailing_space = raw.chars().next_back().is_some_and(char::is_whitespace);
+        self.pending_space |= leading_space;
+        let decoded = mail_parser::decoders::html::html_to_text(raw);
+        for character in decoded.chars() {
+            if character.is_whitespace() {
+                self.pending_space = true;
+                continue;
+            }
+            if character.is_control() {
+                self.truncated = true;
+                continue;
+            }
+            self.flush_pending_space();
+            if matches!(
+                character,
+                '\\' | '*' | '_' | '[' | ']' | '<' | '>' | '~' | '`'
+            ) && !self.push_fragment("\\")
+            {
+                return;
+            }
+            let mut encoded = [0; 4];
+            if !self.push_fragment(character.encode_utf8(&mut encoded)) {
+                return;
+            }
+        }
+        self.pending_space |= trailing_space;
+    }
+
+    fn open_inline(&mut self, tag: &str, open: &str, close: &str) {
+        if self.inline.len() >= 32 {
+            self.truncated = true;
+            return;
+        }
+        self.flush_pending_space();
+        let required = open.len().saturating_add(close.len());
+        if self
+            .output
+            .len()
+            .saturating_add(self.reserved_closing_bytes)
+            .saturating_add(required)
+            > self.maximum
+        {
+            self.truncated = true;
+            return;
+        }
+        self.output.push_str(open);
+        self.reserved_closing_bytes += close.len();
+        self.inline.push(InlineSpan {
+            tag: tag.into(),
+            close: close.into(),
+        });
+    }
+
+    fn close_inline(&mut self, tag: &str) {
+        let Some(position) = self
+            .inline
+            .iter()
+            .rposition(|span| span.tag.as_ref() == tag)
+        else {
+            return;
+        };
+        while self.inline.len() > position {
+            let span = self.inline.pop().expect("inline stack is non-empty");
+            self.reserved_closing_bytes =
+                self.reserved_closing_bytes.saturating_sub(span.close.len());
+            self.output.push_str(&span.close);
+        }
+    }
+
+    fn flush_pending_space(&mut self) {
+        if self.pending_space && !self.output.is_empty() && !self.output.ends_with([' ', '\n']) {
+            self.push_fragment(" ");
+        }
+        self.pending_space = false;
+    }
+
+    fn line_break(&mut self) {
+        self.pending_space = false;
+        while self.output.ends_with(' ') {
+            self.output.pop();
+        }
+        if !self.output.is_empty() && !self.output.ends_with('\n') {
+            self.push_fragment("\n");
+        }
+    }
+
+    fn paragraph(&mut self) {
+        self.pending_space = false;
+        while self.output.ends_with(' ') {
+            self.output.pop();
+        }
+        if !self.output.is_empty() {
+            if !self.output.ends_with('\n') {
+                self.push_fragment("\n\n");
+            } else if !self.output.ends_with("\n\n") {
+                self.push_fragment("\n");
+            }
+        }
+    }
+
+    fn push_fragment(&mut self, fragment: &str) -> bool {
+        if self
+            .output
+            .len()
+            .saturating_add(self.reserved_closing_bytes)
+            .saturating_add(fragment.len())
+            > self.maximum
+        {
+            self.truncated = true;
+            false
+        } else {
+            self.output.push_str(fragment);
+            true
+        }
+    }
+
+    fn finish(mut self) -> (String, bool) {
+        self.pending_space = false;
+        while let Some(span) = self.inline.pop() {
+            self.reserved_closing_bytes =
+                self.reserved_closing_bytes.saturating_sub(span.close.len());
+            self.output.push_str(&span.close);
+        }
+        while self.output.ends_with(char::is_whitespace) {
+            self.output.pop();
+        }
+        (self.output, self.truncated)
+    }
+}
+
+struct ParsedHtmlTag<'a> {
+    name: String,
+    attributes: &'a str,
+    closing: bool,
+    self_closing: bool,
+}
+
+impl<'a> ParsedHtmlTag<'a> {
+    fn parse(raw: &'a str) -> Option<Self> {
+        let mut value = raw.trim();
+        if value.starts_with(['!', '?']) {
+            return None;
+        }
+        let closing = value.starts_with('/');
+        if closing {
+            value = value[1..].trim_start();
+        }
+        let name_end = value
+            .find(|character: char| !(character.is_ascii_alphanumeric() || character == '-'))
+            .unwrap_or(value.len());
+        if name_end == 0 {
+            return None;
+        }
+        let (name, attributes) = value.split_at(name_end);
+        Some(Self {
+            name: name.to_ascii_lowercase(),
+            attributes,
+            closing,
+            self_closing: raw.trim_end().ends_with('/'),
+        })
+    }
+}
+
+fn find_html_tag_end(html: &str, start: usize) -> Option<usize> {
+    let mut quote = None;
+    for (offset, character) in html[start..].char_indices() {
+        match (quote, character) {
+            (Some(expected), value) if value == expected => quote = None,
+            (None, '\'' | '"') => quote = Some(character),
+            (None, '>') => return Some(start + offset),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn is_suppressed_html_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "head"
+            | "style"
+            | "script"
+            | "template"
+            | "iframe"
+            | "object"
+            | "embed"
+            | "svg"
+            | "canvas"
+            | "form"
+            | "noscript"
+    )
+}
+
+fn html_attribute(attributes: &str, wanted: &str) -> Option<String> {
+    let bytes = attributes.as_bytes();
+    let mut position = 0;
+    while position < bytes.len() {
+        while position < bytes.len()
+            && (bytes[position].is_ascii_whitespace() || bytes[position] == b'/')
+        {
+            position += 1;
+        }
+        let name_start = position;
+        while position < bytes.len()
+            && (bytes[position].is_ascii_alphanumeric()
+                || matches!(bytes[position], b'-' | b'_' | b':'))
+        {
+            position += 1;
+        }
+        if name_start == position {
+            position += 1;
+            continue;
+        }
+        let name = &attributes[name_start..position];
+        while position < bytes.len() && bytes[position].is_ascii_whitespace() {
+            position += 1;
+        }
+        if position >= bytes.len() || bytes[position] != b'=' {
+            continue;
+        }
+        position += 1;
+        while position < bytes.len() && bytes[position].is_ascii_whitespace() {
+            position += 1;
+        }
+        let (value_start, value_end) =
+            if position < bytes.len() && matches!(bytes[position], b'\'' | b'"') {
+                let quote = bytes[position];
+                position += 1;
+                let start = position;
+                while position < bytes.len() && bytes[position] != quote {
+                    position += 1;
+                }
+                let end = position;
+                position = position.saturating_add(1).min(bytes.len());
+                (start, end)
+            } else {
+                let start = position;
+                while position < bytes.len()
+                    && !bytes[position].is_ascii_whitespace()
+                    && bytes[position] != b'/'
+                {
+                    position += 1;
+                }
+                (start, position)
+            };
+        if name.eq_ignore_ascii_case(wanted) {
+            return Some(mail_parser::decoders::html::html_to_text(
+                &attributes[value_start..value_end],
+            ));
+        }
+    }
+    None
+}
+
+fn safe_link_target(value: &str) -> Option<String> {
+    let value = value.trim();
+    if !(value
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+        || value
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+        || value
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("mailto:")))
+    {
+        return None;
+    }
+    let mut target = String::with_capacity(value.len().min(512));
+    for character in value.chars() {
+        if target.len() >= 512
+            || character.is_control()
+            || matches!(character, '<' | '>' | '"' | '\'')
+        {
+            continue;
+        }
+        match character {
+            ' ' => target.push_str("%20"),
+            '(' => target.push_str("%28"),
+            ')' => target.push_str("%29"),
+            _ => target.push(character),
+        }
+    }
+    (!target.is_empty()).then_some(target)
 }
 
 struct BoundedBody {
@@ -2374,11 +2954,12 @@ this attachment is not a valid eml, sorry!\r\n\
             part(PartType::Text(Cow::Borrowed("two"))),
         ]);
         message.text_body = vec![1, 2];
-        let (body, source_bytes, truncated) =
-            extract_bounded_body(&message, ContentLimits::default());
-        assert_eq!(body, "one\ntwo");
-        assert_eq!(source_bytes, 6);
-        assert!(!truncated);
+        let body = extract_bounded_body(&message, ContentLimits::default());
+        assert_eq!(body.plain, "one\ntwo");
+        assert_eq!(body.display, "one\ntwo");
+        assert_eq!(body.source_bytes, 6);
+        assert!(!body.truncated);
+        assert!(!body.is_html);
 
         let raw = b"Subject: legacy html\r\n\
 Content-Type: text/html; charset=windows-1252\r\n\
@@ -2398,6 +2979,62 @@ Content-Transfer-Encoding: quoted-printable\r\n\
         let stored = fs::read_to_string(path).unwrap();
         assert!(stored.contains("café"));
         assert!(stored.contains("next"));
+        drop(published);
+        remove_root(&root);
+    }
+
+    #[test]
+    fn html_body_is_cached_as_safe_native_styled_text() {
+        let raw = b"From: Sender <sender@example.test>\r\n\
+Subject: Styled message\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/alternative; boundary=alt\r\n\
+\r\n\
+--alt\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+\r\n\
+Plain fallback for search and list preview.\r\n\
+--alt\r\n\
+Content-Type: text/html; charset=utf-8\r\n\
+\r\n\
+<HTML><HEAD><style>body { display: none }</style></HEAD><BODY>\
+<H1>Release notes</H1><P>Hello <STRONG>bold</STRONG> and <EM>italic</EM>.</P>\
+<UL><LI>First</LI><LI><A href='https://example.test/a(b)'>Second</A></LI></UL>\
+<P><A href='javascript:alert(1)'>Unsafe link text</A>\
+<IMG src='https://tracker.example/pixel' alt='Status image'></P>\
+<script>window.location='https://attacker.example'</script></BODY></HTML>\r\n\
+--alt--\r\n";
+        let root = temporary_root("safe-html");
+        let staging = ContentStaging::open(root.clone()).unwrap();
+        let published = prepare_content(raw, &staging, ContentLimits::default())
+            .unwrap()
+            .publish()
+            .unwrap();
+        let record = published.record();
+        assert_eq!(
+            record.preview.as_ref(),
+            "Plain fallback for search and list preview."
+        );
+
+        let body = staging
+            .read_body(record.body_file_key.as_ref().unwrap())
+            .unwrap();
+        assert!(body.is_html);
+        assert!(body.text.contains("**Release notes**"));
+        assert!(body.text.contains("**bold**"));
+        assert!(body.text.contains("*italic*"));
+        assert!(body.text.contains("https://example.test/a%28b%29"));
+        assert!(
+            body.text.contains("Image: Status image"),
+            "unexpected markdown: {}",
+            body.text
+        );
+        assert!(body.text.contains("Unsafe link text"));
+        assert!(!body.text.contains("javascript:"));
+        assert!(!body.text.contains("tracker.example"));
+        assert!(!body.text.contains("attacker.example"));
+        assert!(slint::StyledText::from_markdown(&body.text).is_ok());
+
         drop(published);
         remove_root(&root);
     }

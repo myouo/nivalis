@@ -169,13 +169,22 @@ impl AccountCatalog {
         let subject = display_subject(detail.subject);
         let date = format_utc(detail.received_at_ms)?;
 
+        let body = boxed_string(detail.reader_excerpt);
+        let styled_body = if detail.body_is_html {
+            slint::StyledText::from_markdown(body.as_str())
+                .unwrap_or_else(|_| slint::StyledText::from_plain_text(body.as_str()))
+        } else {
+            slint::StyledText::from_plain_text(body.as_str())
+        };
+
         Ok(MailDetail {
             id,
             sender,
             email: boxed_string(detail.sender_address),
             initials,
             subject,
-            body: boxed_string(detail.reader_excerpt),
+            body,
+            styled_body,
             body_truncated: detail.body_truncated,
             date,
             folder: folder.into(),
@@ -808,6 +817,7 @@ mod tests {
                     body_byte_count: 80_000,
                     body_file_key: Some("body-key".into()),
                     content_available: true,
+                    body_is_html: false,
                 },
                 "Archive",
             )
@@ -818,6 +828,39 @@ mod tests {
         assert!(detail.starred);
         assert!(detail.has_attachment);
         assert!(detail.body_truncated);
+    }
+
+    #[test]
+    fn detail_projects_safe_html_markdown_as_native_styled_text() {
+        let catalog = catalog_with([1]);
+        let markdown = "Hello **bold** and [safe link](https://example.test)";
+        let detail = catalog
+            .project_detail(
+                MessageDetail {
+                    id: MessageId::new(8).unwrap(),
+                    account_id: 1,
+                    sender_name: "Reader".into(),
+                    sender_address: "reader@example.test".into(),
+                    subject: "Styled details".into(),
+                    received_at_ms: 0,
+                    unread: false,
+                    starred: false,
+                    has_attachment: false,
+                    reader_excerpt: markdown.into(),
+                    body_truncated: false,
+                    body_byte_count: markdown.len() as u64,
+                    body_file_key: Some("body-key".into()),
+                    content_available: true,
+                    body_is_html: true,
+                },
+                "Inbox",
+            )
+            .unwrap();
+
+        assert_eq!(
+            detail.styled_body,
+            slint::StyledText::from_markdown(markdown).unwrap()
+        );
     }
 
     #[test]

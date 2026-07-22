@@ -725,6 +725,7 @@ pub(super) fn load_imap_message_content_target(
         .query_row(
             "SELECT location.uid_validity, location.uid,
                     content.message_id IS NOT NULL
+                      AND coalesce(content.render_version, 0) >= 2
                       AND NOT (coalesce(content.truncated, 0) != 0
                                AND content.reader_excerpt = ?3)
              FROM messages AS message

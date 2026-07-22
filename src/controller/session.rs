@@ -1106,6 +1106,7 @@ mod tests {
             body_byte_count: 4,
             body_file_key: None,
             content_available: true,
+            body_is_html: false,
         }
     }
 

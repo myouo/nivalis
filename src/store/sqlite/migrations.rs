@@ -2,7 +2,7 @@ use std::{error::Error, fmt};
 
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(crate) const LATEST_SCHEMA_VERSION: u32 = 19;
+pub(crate) const LATEST_SCHEMA_VERSION: u32 = 20;
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -86,6 +86,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 19,
         sql: include_str!("../../../migrations/0019_remote_inbox_totals.sql"),
+    },
+    Migration {
+        version: 20,
+        sql: include_str!("../../../migrations/0020_html_body_rendering.sql"),
     },
 ];
 
@@ -1222,7 +1226,56 @@ mod tests {
             )
             .unwrap();
         assert_eq!(values, (7, 3, None, None));
-        assert_eq!(schema_version(&connection), 19);
+        assert_eq!(
+            schema_version(&connection),
+            i64::from(LATEST_SCHEMA_VERSION)
+        );
+    }
+
+    #[test]
+    fn v20_marks_legacy_bodies_for_refresh_and_defaults_new_bodies_to_current() {
+        let mut connection = memory_connection();
+        migrate_with(&mut connection, &MIGRATIONS[..19], 19).expect("create v19 schema");
+        insert_account(&connection, 1, "owner@example.test");
+        insert_message(&connection, 100, 1, "legacy-message");
+        connection
+            .execute(
+                "INSERT INTO message_content (message_id, reader_excerpt)
+                 VALUES (100, 'legacy plain projection')",
+                [],
+            )
+            .unwrap();
+
+        migrate(&mut connection).expect("add HTML rendering version");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT render_version FROM message_content WHERE message_id = 100",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+
+        insert_message(&connection, 101, 1, "current-message");
+        connection
+            .execute(
+                "INSERT INTO message_content (message_id, reader_excerpt)
+                 VALUES (101, 'current projection')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT render_version FROM message_content WHERE message_id = 101",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
