@@ -4,7 +4,7 @@
 
 Nivalis Mail will be a reliable, multi-account desktop mail client built with Rust, Slint, and Skia. It must receive, search, read, organize, compose, and send real mail without a WebView while keeping its release working set predictable.
 
-The reference Linux release gate is a warm-idle RSS below 90 MiB, with 50 MiB as the target at 1200x900 using the default Skia software renderer. Settled RSS, PSS, RSS+Swap, and PSS+SwapPss after a bounded workload must remain below twice their pre-workload baselines. A milestone cannot inherit an earlier memory result when it activates a previously unmeasured dependency or execution path.
+The reference Linux low-memory release gate is a warm-idle RSS below 90 MiB, with 50 MiB as the target at 1200x900 using explicitly selected Skia software rendering (`NIVALIS_RENDERER=skia-software`). The interactive default uses GPU Skia to prioritize scrolling and animation latency. Settled RSS, PSS, RSS+Swap, and PSS+SwapPss after a bounded workload must remain below twice their pre-workload baselines. A milestone cannot inherit an earlier memory result when it activates a previously unmeasured dependency or execution path.
 
 ## Delivery rules
 

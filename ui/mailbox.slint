@@ -38,7 +38,7 @@ export component MailRow inherits Rectangle {
         border-width: 1px;
         border-color: Theme.outline-variant;
         background: root.selected ? Theme.primary-container : row-touch.pressed ? Theme.surface-container-highest : row-touch.has-hover ? Theme.surface-container-high : root.mail.unread ? Theme.surface-container-low : Theme.surface;
-        animate background { duration: Theme.motion-fast; easing: ease-out; }
+        animate background { duration: Theme.motion-fast; easing: cubic-bezier(0.2, 0, 0, 1); }
     }
     if root.selected: Rectangle { x: 6px; y: 28px; width: 3px; height: 24px; border-radius: 2px; background: Theme.primary; }
 

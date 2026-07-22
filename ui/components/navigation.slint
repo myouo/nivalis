@@ -26,6 +26,7 @@ export component NavDestination inherits Rectangle {
         height: 36px;
         border-radius: 4px;
         background: selected ? Theme.primary-container : touch.pressed ? Theme.surface-container-highest : touch.has-hover ? Theme.surface-container-high : transparent;
+        animate background { duration: Theme.motion-fast; easing: cubic-bezier(0.2, 0, 0, 1); }
     }
     if root.selected: Rectangle { x: 0; y: 16px; width: 3px; height: 16px; border-radius: 2px; background: Theme.primary; }
     MaterialIcon {
@@ -106,7 +107,7 @@ export component WideNavItem inherits Rectangle {
         height: 40px;
         border-radius: 4px;
         background: selected ? Theme.primary-container : touch.pressed ? Theme.surface-container-highest : touch.has-hover ? Theme.surface-container-high : transparent;
-        animate background { duration: Theme.motion-fast; easing: ease-out; }
+        animate background { duration: Theme.motion-fast; easing: cubic-bezier(0.2, 0, 0, 1); }
     }
     if root.selected: Rectangle { x: 0; y: 16px; width: 3px; height: 16px; border-radius: 2px; background: Theme.primary; }
 

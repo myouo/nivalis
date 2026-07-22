@@ -26,10 +26,10 @@ cargo build --profile performance     # opt-level=3, maximum active throughput
 cargo build --profile release-size    # opt-level=z, minimum binary/RSS
 ```
 
-The default low-memory profile uses Skia CPU rasterization with partial rendering and a native softbuffer surface. GPU-accelerated Skia remains available for animation-heavy or unusually large workloads:
+The default renderer uses GPU-accelerated Skia for fluid scrolling and interaction animation. If GPU initialization is unavailable, Slint automatically falls back to its software Skia surface. CPU rasterization can also be selected explicitly for compatibility or low-memory measurements:
 
 ```bash
-NIVALIS_RENDERER=skia cargo run --release
+NIVALIS_RENDERER=skia-software cargo run --release
 ```
 
 ## Local quality gates

@@ -90,6 +90,7 @@ export component SettingsToggle inherits Rectangle {
     height: 58px;
     border-radius: 4px;
     background: touch.pressed ? Theme.surface-container-highest : touch.has-hover ? Theme.surface-container-high : transparent;
+    animate background { duration: Theme.motion-fast; easing: cubic-bezier(0.2, 0, 0, 1); }
 
     HorizontalLayout {
         padding-left: 10px;
@@ -110,6 +111,8 @@ export component SettingsToggle inherits Rectangle {
             border-width: root.checked ? 0px : 1px;
             border-color: Theme.outline;
             background: root.checked ? Theme.primary : Theme.surface-container-highest;
+            animate background { duration: Theme.motion-medium; easing: cubic-bezier(0.2, 0, 0, 1); }
+            animate border-color { duration: Theme.motion-medium; easing: cubic-bezier(0.2, 0, 0, 1); }
             Rectangle {
                 x: root.checked ? 18px : 3px;
                 y: 3px;
@@ -117,7 +120,7 @@ export component SettingsToggle inherits Rectangle {
                 height: 14px;
                 border-radius: 7px;
                 background: root.checked ? Theme.on-primary : Theme.on-surface-variant;
-                animate x { duration: Theme.motion-medium; easing: ease-out; }
+                animate x { duration: Theme.motion-medium; easing: cubic-bezier(0.2, 0, 0, 1); }
             }
         }
     }

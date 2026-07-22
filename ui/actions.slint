@@ -12,9 +12,10 @@ export component ReaderAction inherits Rectangle {
     forward-focus: focus;
 
     width: 64px;
-    height: 68px;
+    height: 60px;
     border-radius: 4px;
     background: !root.enabled || root.busy ? transparent : touch.pressed ? Theme.surface-container-highest : touch.has-hover ? Theme.surface-container-high : transparent;
+    animate background { duration: Theme.motion-fast; easing: cubic-bezier(0.2, 0, 0, 1); }
     accessible-role: button;
     accessible-label: root.busy ? root.label + ", loading" : !root.enabled && root.disabled-reason != "" ? root.disabled-reason : root.label;
     accessible-enabled: root.enabled && !root.busy;
@@ -22,7 +23,7 @@ export component ReaderAction inherits Rectangle {
 
     MaterialIcon {
         x: (parent.width - 20px) / 2;
-        y: 9px;
+        y: 7px;
         width: 20px;
         height: 20px;
         name: root.busy ? "progress_activity" : root.icon;
@@ -31,13 +32,13 @@ export component ReaderAction inherits Rectangle {
     }
     Text {
         x: 3px;
-        y: 31px;
+        y: 28px;
         width: parent.width - 6px;
-        height: 27px;
+        height: 22px;
         text: root.label;
         color: !root.enabled || root.busy ? Theme.outline : root.danger ? Theme.error : Theme.on-surface;
         font-family: Theme.body-font;
-        font-size: 9px;
+        font-size: 10px;
         font-weight: 400;
         horizontal-alignment: center;
         vertical-alignment: center;
@@ -87,7 +88,7 @@ export component ComposeAction inherits Rectangle {
         background: !root.enabled ? Theme.surface-container-high :
             touch.pressed ? Theme.primary-pressed :
             touch.has-hover ? Theme.primary-hover : Theme.primary;
-        animate background { duration: Theme.motion-fast; easing: ease-out; }
+        animate background { duration: Theme.motion-fast; easing: cubic-bezier(0.2, 0, 0, 1); }
     }
 
     if root.compact: MaterialIcon {

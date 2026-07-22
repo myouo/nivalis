@@ -54,7 +54,10 @@ export global Theme {
     out property <string> body-font: "Noto Sans";
     out property <string> icon-font: "Material Symbols Rounded";
 
-    out property <duration> motion-fast: reduced-motion ? 0ms : 90ms;
-    out property <duration> motion-medium: reduced-motion ? 0ms : 160ms;
-    out property <duration> motion-slow: reduced-motion ? 0ms : 200ms;
+    // 120ms gives a 60 Hz display enough frames to interpolate cleanly while
+    // keeping hover feedback immediate. Layout-affecting properties must not
+    // use these tokens; they are reserved for paint-only micro-interactions.
+    out property <duration> motion-fast: reduced-motion ? 0ms : 120ms;
+    out property <duration> motion-medium: reduced-motion ? 0ms : 180ms;
+    out property <duration> motion-slow: reduced-motion ? 0ms : 220ms;
 }

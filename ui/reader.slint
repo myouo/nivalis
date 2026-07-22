@@ -63,17 +63,16 @@ export component ReaderPane inherits Rectangle {
     if !root.detail-loading && !root.detail-error && root.selected-id != "": VerticalLayout {
         spacing: 0px;
 
+        // Match the desktop mailbox's 62px title row plus 50px search row.
+        // The action controls occupy the lower part of this shared header, so
+        // the reader scroll area begins on the same line as the message list.
         Rectangle {
-            height: root.compact-layout ? 0px : 120px;
-            visible: !root.compact-layout;
+            height: root.compact-layout ? 60px : 112px;
             background: Theme.surface;
-        }
-
-        Rectangle {
-            height: 68px;
-            if !root.compact-layout: Rectangle { y: 0; width: parent.width; height: 1px; background: Theme.outline-variant; }
             Rectangle { y: parent.height - 1px; width: parent.width; height: 1px; background: Theme.outline-variant; }
             HorizontalLayout {
+                y: root.compact-layout ? 0px : parent.height - 60px;
+                height: 60px;
                 padding-left: 6px;
                 padding-right: 6px;
                 spacing: 0px;
@@ -88,7 +87,7 @@ export component ReaderPane inherits Rectangle {
                     clicked => { root.archive(root.selected-id); }
                 }
                 if root.window-width >= 1000px: ReaderAction {
-                    width: 76px;
+                    width: 78px;
                     label: "Mark unread";
                     icon: "mark_email_unread";
                     enabled: root.mail-actions-enabled;
@@ -96,7 +95,7 @@ export component ReaderPane inherits Rectangle {
                     disabled-reason: "Mark unread is unavailable while mail is read-only";
                     clicked => { root.mark-unread(root.selected-id); }
                 }
-                Rectangle { width: 1px; height: 32px; background: Theme.outline-variant; }
+                Rectangle { width: 1px; height: 28px; background: Theme.outline-variant; }
                 ReaderAction {
                     width: 64px;
                     icon: "delete";
@@ -121,26 +120,27 @@ export component ReaderPane inherits Rectangle {
             VerticalLayout {
                 width: reader-scroll.visible-width;
                 alignment: start;
-                padding-left: root.compact-layout ? 18px : 22px;
-                padding-right: root.compact-layout ? 18px : 28px;
-                padding-top: 18px;
+                padding-left: root.compact-layout ? 18px : 24px;
+                padding-right: root.compact-layout ? 18px : 24px;
+                padding-top: 16px;
                 padding-bottom: 28px;
-                spacing: 12px;
+                spacing: 10px;
 
                 HorizontalLayout {
                     spacing: 8px;
+                    alignment: center;
                     Text {
                         text: root.selected-mail.subject;
                         color: Theme.on-surface;
                         font-family: Theme.body-font;
-                        font-size: 22px;
+                        font-size: 20px;
                         font-weight: 500;
                         wrap: word-wrap;
                         horizontal-stretch: 1;
                     }
                     Rectangle {
-                        width: 54px;
-                        height: 24px;
+                        width: 56px;
+                        height: 22px;
                         border-radius: 4px;
                         border-width: 1px;
                         border-color: Theme.outline-variant;
@@ -153,22 +153,22 @@ export component ReaderPane inherits Rectangle {
                         selected: root.selected-mail.starred;
                         enabled: root.mail-actions-enabled;
                         busy: root.mutation-loading;
+                        compact-visual: true;
                         clicked => { root.toggle-star(root.selected-id); }
                     }
-                    MIconButton { icon: "more_horiz"; label: "More message actions"; clicked => { root.message-menu-open = true; } }
                 }
 
                 HorizontalLayout {
-                    height: 60px;
+                    height: 54px;
                     spacing: 10px;
                     VerticalLayout {
-                        width: 42px;
-                        height: 60px;
+                        width: 38px;
+                        height: 54px;
                         alignment: center;
                         AccountAvatar {
                             initials: root.selected-mail.initials;
                             avatar-color: root.selected-mail.avatar-color;
-                            avatar-size: 42px;
+                            avatar-size: 38px;
                         }
                     }
                     VerticalLayout {
@@ -247,7 +247,7 @@ export component ReaderPane inherits Rectangle {
                 if !root.detail-content-pending && root.detail-content-error == "": VerticalLayout {
                     padding-left: 2px;
                     padding-right: 2px;
-                    padding-top: 8px;
+                    padding-top: 4px;
                     padding-bottom: 4px;
                     vertical-stretch: 0;
 

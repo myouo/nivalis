@@ -18,6 +18,7 @@ export component TitleBarButton inherits Rectangle {
     height: 40px;
     background: touch.pressed ? (danger ? Theme.error-pressed : Theme.surface-container-highest) :
         touch.has-hover ? (danger ? Theme.error : Theme.surface-container-high) : transparent;
+    animate background { duration: Theme.motion-fast; easing: cubic-bezier(0.2, 0, 0, 1); }
     accessible-role: button;
     accessible-label: label;
     accessible-action-default => { root.clicked(); }
@@ -67,6 +68,7 @@ export component AccountSwitcher inherits Rectangle {
         border-width: 1px;
         border-color: Theme.outline-variant;
         background: touch.pressed ? Theme.surface-container-highest : touch.has-hover ? Theme.surface-container-high : Theme.surface-container-low;
+        animate background { duration: Theme.motion-fast; easing: cubic-bezier(0.2, 0, 0, 1); }
     }
     HorizontalLayout {
         padding-left: 9px;
@@ -124,6 +126,7 @@ export component AccountMenuRow inherits Rectangle {
     height: 58px;
     border-radius: 4px;
     background: selected ? Theme.primary-container : touch.pressed ? Theme.surface-container-highest : touch.has-hover ? Theme.surface-container-high : transparent;
+    animate background { duration: Theme.motion-fast; easing: cubic-bezier(0.2, 0, 0, 1); }
 
     HorizontalLayout {
         padding-left: 9px;
@@ -255,7 +258,6 @@ export component NavigationPane inherits Rectangle {
     background: Theme.background;
     accessible-role: navigation;
     accessible-label: "Mailboxes and accounts";
-    animate width { duration: Theme.motion-slow; easing: ease-out; }
 
     if root.wide: VerticalLayout {
         padding-left: 9px;

@@ -35,8 +35,8 @@ export component MButton inherits Rectangle {
             root.variant == "tonal" ? (touch.pressed ? Theme.secondary-container-pressed : touch.has-hover ? Theme.secondary-container-hover : Theme.secondary-container) :
             root.variant == "inverse" ? (touch.pressed ? Theme.inverse-surface-pressed : touch.has-hover ? Theme.inverse-surface-hover : transparent) :
             touch.pressed ? Theme.surface-container-highest : touch.has-hover ? Theme.surface-container-high : transparent;
-        animate background { duration: Theme.motion-fast; easing: ease-out; }
-        animate border-color { duration: Theme.motion-fast; easing: ease-out; }
+        animate background { duration: Theme.motion-fast; easing: cubic-bezier(0.2, 0, 0, 1); }
+        animate border-color { duration: Theme.motion-fast; easing: cubic-bezier(0.2, 0, 0, 1); }
 
         HorizontalLayout {
             padding-left: 12px;
@@ -131,7 +131,7 @@ export component MIconButton inherits Rectangle {
             root.inverse ?
                 (touch.pressed ? Theme.inverse-surface-pressed : touch.has-hover ? Theme.inverse-surface-hover : transparent) :
             touch.pressed ? Theme.surface-container-highest : touch.has-hover ? Theme.surface-container-high : transparent;
-        animate background { duration: Theme.motion-fast; easing: ease-out; }
+        animate background { duration: Theme.motion-fast; easing: cubic-bezier(0.2, 0, 0, 1); }
     }
 
     MaterialIcon {
@@ -189,7 +189,7 @@ export component FilterChip inherits Rectangle {
         border-width: 1px;
         border-color: Theme.outline-variant;
         background: root.selected ? Theme.primary-container : touch.pressed ? Theme.surface-container-highest : touch.has-hover ? Theme.surface-container-high : Theme.surface;
-        animate background { duration: Theme.motion-fast; easing: ease-out; }
+        animate background { duration: Theme.motion-fast; easing: cubic-bezier(0.2, 0, 0, 1); }
     }
 
     HorizontalLayout {
