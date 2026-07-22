@@ -36,8 +36,9 @@ use super::sync::production_imap_inbox_fetch;
 use super::{
     scheduler::{SchedulerError, SyncCompletion, SyncScheduler, SyncToken},
     sync::{
-        FetchMessageContentFuture, FetchMessageContentOutcome, ImapInboxFetchProbe,
-        SyncInboxFuture, SyncInboxOutcome, start_inbox_sync, start_message_content_fetch,
+        FetchMessageContentFuture, FetchMessageContentOutcome, FetchMessagePreviewsFuture,
+        FetchMessagePreviewsOutcome, ImapInboxFetchProbe, SyncInboxFuture, SyncInboxOutcome,
+        start_inbox_sync, start_message_content_fetch, start_message_preview_fetch,
     },
 };
 
@@ -320,6 +321,11 @@ pub(crate) enum AccountSyncStatus {
         has_more: bool,
         historical: bool,
     },
+    PreviewsUpdated {
+        account_id: AccountId,
+        generation: AccountGeneration,
+        updated: u8,
+    },
     Failed(AccountOperationFailure),
 }
 
@@ -495,6 +501,12 @@ pub(crate) enum AccountWorkflowOutcome {
         account_id: AccountId,
         generation: AccountGeneration,
     },
+    MessagePreviewsFetched {
+        account_id: AccountId,
+        generation: AccountGeneration,
+        updated: u8,
+        has_more: bool,
+    },
     RemovalPending {
         account_id: AccountId,
         generation: AccountGeneration,
@@ -564,6 +576,18 @@ impl fmt::Debug for AccountWorkflowOutcome {
                 .field("message_id", message_id)
                 .field("account_id", account_id)
                 .field("generation", generation)
+                .finish(),
+            Self::MessagePreviewsFetched {
+                account_id,
+                generation,
+                updated,
+                has_more,
+            } => formatter
+                .debug_struct("MessagePreviewsFetched")
+                .field("account_id", account_id)
+                .field("generation", generation)
+                .field("updated", updated)
+                .field("has_more", has_more)
                 .finish(),
             Self::RemovalPending {
                 account_id,
@@ -1172,6 +1196,8 @@ pub(super) struct AccountWorkflows {
     scheduler: SyncScheduler,
     auto_sync: AutoSyncState,
     background_status: Option<AccountSyncStatus>,
+    preview_queue: VecDeque<(AccountId, AccountGeneration)>,
+    history_queue: VecDeque<(AccountId, AccountGeneration)>,
     idle_watches: Vec<IdleWatch>,
 }
 
@@ -1215,6 +1241,8 @@ impl AccountWorkflows {
                 AutoSyncState::Disabled
             },
             background_status: None,
+            preview_queue: VecDeque::with_capacity(MAX_IDLE_WATCHES),
+            history_queue: VecDeque::with_capacity(MAX_IDLE_WATCHES),
             idle_watches: Vec::with_capacity(MAX_IDLE_WATCHES),
         }
     }
@@ -1226,9 +1254,10 @@ impl AccountWorkflows {
     pub(super) fn can_start_user_operation(&self) -> bool {
         matches!(self.recovery, RecoveryState::Complete)
             && (self.active.is_none()
-                || self.active.as_ref().is_some_and(|active| {
-                    active.reply.is_none() && matches!(active.state, ActiveTaskState::Syncing(_))
-                }))
+                || self
+                    .active
+                    .as_ref()
+                    .is_some_and(ActiveTask::is_preemptible_background))
     }
 
     pub(super) fn start_user_operation(
@@ -1237,13 +1266,35 @@ impl AccountWorkflows {
         reply: oneshot::Sender<AccountOperationReply>,
     ) -> Result<(), AccountDriverError> {
         debug_assert!(self.can_start_user_operation());
-        if self.active.as_ref().is_some_and(|active| {
-            active.reply.is_none() && matches!(active.state, ActiveTaskState::Syncing(_))
-        }) {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(ActiveTask::is_preemptible_background)
+        {
             let interrupted = self
                 .active
                 .take()
                 .expect("preemptible background sync is active");
+            let interrupted_history = interrupted.reply.is_none()
+                && interrupted.sync_token.is_none()
+                && matches!(&interrupted.state, ActiveTaskState::Syncing(_));
+            if matches!(
+                &interrupted.state,
+                ActiveTaskState::FetchingMessagePreviews(_)
+            ) && let (Some(account_id), Some(generation)) = (
+                interrupted.identity.account_id,
+                interrupted.identity.generation,
+            ) {
+                self.queue_preview_fetch(account_id, generation);
+            }
+            if interrupted_history
+                && let (Some(account_id), Some(generation)) = (
+                    interrupted.identity.account_id,
+                    interrupted.identity.generation,
+                )
+            {
+                self.queue_history_fetch(account_id, generation);
+            }
             if let Some(token) = interrupted.sync_token {
                 let _ = self
                     .scheduler
@@ -1547,14 +1598,46 @@ impl AccountWorkflows {
                 }
                 Poll::Ready(Ok(TaskProgress::Finished(outcome))) => {
                     let mut active = self.active.take().expect("active account task was polled");
+                    let was_background_preview = active.reply.is_none()
+                        && matches!(&active.state, ActiveTaskState::FetchingMessagePreviews(_));
+                    let was_background_history = active.reply.is_none()
+                        && active.sync_token.is_none()
+                        && matches!(&active.state, ActiveTaskState::Syncing(_));
                     let reload_targets = outcome_changes_sync_targets(&outcome);
+                    let preview_work = match &outcome {
+                        AccountWorkflowOutcome::InboxSynced {
+                            account_id,
+                            generation,
+                            ..
+                        } => Some((*account_id, *generation, None)),
+                        AccountWorkflowOutcome::MessagePreviewsFetched {
+                            account_id,
+                            generation,
+                            updated,
+                            has_more,
+                        } => Some((*account_id, *generation, Some((*updated, *has_more)))),
+                        _ => None,
+                    };
                     let idle_watch = match &outcome {
                         AccountWorkflowOutcome::InboxSynced {
                             account_id,
                             generation,
+                            historical,
+                            has_more,
                             idle,
                             ..
-                        } => Some((*account_id, *generation, idle.clone())),
+                        } if !historical || !has_more => {
+                            Some((*account_id, *generation, idle.clone()))
+                        }
+                        _ => None,
+                    };
+                    let history_work = match &outcome {
+                        AccountWorkflowOutcome::InboxSynced {
+                            account_id,
+                            generation,
+                            has_more: true,
+                            ..
+                        } => Some((*account_id, *generation)),
                         _ => None,
                     };
                     if let Some(token) = active.sync_token {
@@ -1565,6 +1648,37 @@ impl AccountWorkflows {
                             self.background_status =
                                 Some(project_background_sync(outcome.clone(), active.identity));
                         }
+                    }
+                    if let Some((account_id, generation, preview_result)) = preview_work {
+                        match preview_result {
+                            None => self.queue_preview_fetch(account_id, generation),
+                            Some((updated, has_more)) => {
+                                if has_more {
+                                    self.queue_preview_fetch(account_id, generation);
+                                }
+                                if updated > 0 {
+                                    self.background_status =
+                                        Some(AccountSyncStatus::PreviewsUpdated {
+                                            account_id,
+                                            generation,
+                                            updated,
+                                        });
+                                }
+                            }
+                        }
+                    }
+                    if let Some((account_id, generation)) = history_work {
+                        self.queue_history_fetch(account_id, generation);
+                    }
+                    if was_background_history {
+                        self.background_status =
+                            Some(project_background_sync(outcome.clone(), active.identity));
+                    }
+                    if was_background_preview
+                        && matches!(&outcome, AccountWorkflowOutcome::Failed { .. })
+                    {
+                        self.background_status =
+                            Some(project_background_sync(outcome.clone(), active.identity));
                     }
                     if let Some((account_id, generation, request)) = idle_watch {
                         self.register_idle_watch(account_id, generation, request);
@@ -1710,8 +1824,89 @@ impl AccountWorkflows {
                 context.waker().wake_by_ref();
                 Poll::Ready(Ok(()))
             }
-            RecoveryState::Complete => self.poll_auto_sync(context),
+            RecoveryState::Complete => match self.poll_auto_sync(context) {
+                ready @ Poll::Ready(_) => ready,
+                Poll::Pending if self.start_next_preview_fetch() => {
+                    context.waker().wake_by_ref();
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Pending if self.start_next_history_fetch() => {
+                    context.waker().wake_by_ref();
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Pending => Poll::Pending,
+            },
         }
+    }
+
+    fn queue_preview_fetch(&mut self, account_id: AccountId, generation: AccountGeneration) {
+        if self
+            .preview_queue
+            .iter()
+            .any(|queued| queued.0 == account_id && queued.1 == generation)
+        {
+            return;
+        }
+        if self.preview_queue.len() == MAX_IDLE_WATCHES {
+            self.preview_queue.pop_back();
+        }
+        self.preview_queue.push_back((account_id, generation));
+    }
+
+    fn start_next_preview_fetch(&mut self) -> bool {
+        let Some((account_id, generation)) = self.preview_queue.pop_front() else {
+            return false;
+        };
+        self.active = Some(ActiveTask {
+            identity: Identity::new(account_id, generation),
+            reply: None,
+            sync_token: None,
+            state: ActiveTaskState::FetchingMessagePreviews(start_message_preview_fetch(
+                self.database.clone(),
+                self.credentials.clone(),
+                account_id,
+                generation,
+            )),
+        });
+        true
+    }
+
+    fn queue_history_fetch(&mut self, account_id: AccountId, generation: AccountGeneration) {
+        if self
+            .history_queue
+            .iter()
+            .any(|queued| queued.0 == account_id && queued.1 == generation)
+        {
+            return;
+        }
+        if self.history_queue.len() == MAX_IDLE_WATCHES {
+            self.history_queue.pop_back();
+        }
+        self.history_queue.push_back((account_id, generation));
+    }
+
+    fn start_next_history_fetch(&mut self) -> bool {
+        let Some(content_root) = self.content_root.clone() else {
+            return false;
+        };
+        let Some((account_id, generation)) = self.history_queue.pop_front() else {
+            return false;
+        };
+        self.active = Some(ActiveTask {
+            identity: Identity::new(account_id, generation),
+            reply: None,
+            sync_token: None,
+            state: ActiveTaskState::Syncing(start_inbox_sync(
+                self.database.clone(),
+                self.credentials.clone(),
+                self.inbox_fetch_probe,
+                content_root,
+                account_id,
+                generation,
+                true,
+            )),
+        });
+        true
     }
 
     fn request_sync_target_reload(&mut self) {
@@ -2008,6 +2203,7 @@ struct ActiveTask {
 enum ActiveTaskState {
     Syncing(SyncInboxFuture),
     FetchingMessageContent(FetchMessageContentFuture),
+    FetchingMessagePreviews(FetchMessagePreviewsFuture),
     LoadingRetry {
         account_id: AccountId,
         expected_generation: AccountGeneration,
@@ -2046,6 +2242,14 @@ enum ActiveTaskState {
 }
 
 impl ActiveTask {
+    fn is_preemptible_background(&self) -> bool {
+        self.reply.is_none()
+            && matches!(
+                &self.state,
+                ActiveTaskState::Syncing(_) | ActiveTaskState::FetchingMessagePreviews(_)
+            )
+    }
+
     fn start_workflow(
         request: AccountWorkflowRequest,
         identity: Identity,
@@ -2074,6 +2278,7 @@ impl ActiveTask {
             ActiveTaskState::ProbingDiagnostic { .. }
                 | ActiveTaskState::Syncing(_)
                 | ActiveTaskState::FetchingMessageContent(_)
+                | ActiveTaskState::FetchingMessagePreviews(_)
         ) && let Some(user) = self.reply.as_mut()
             && user.reply.poll_closed(context).is_ready()
         {
@@ -2132,6 +2337,31 @@ impl ActiveTask {
                     })))
                 }
                 Poll::Ready(FetchMessageContentOutcome::DatabaseClosed) => {
+                    Poll::Ready(Err(AccountDriverError::DatabaseClosed))
+                }
+            },
+            ActiveTaskState::FetchingMessagePreviews(fetch) => match fetch.as_mut().poll(context) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(FetchMessagePreviewsOutcome::Fetched {
+                    account_id,
+                    generation,
+                    updated,
+                    has_more,
+                }) => Poll::Ready(Ok(TaskProgress::Finished(
+                    AccountWorkflowOutcome::MessagePreviewsFetched {
+                        account_id,
+                        generation,
+                        updated,
+                        has_more,
+                    },
+                ))),
+                Poll::Ready(FetchMessagePreviewsOutcome::Failed { stage, failure }) => {
+                    Poll::Ready(Ok(TaskProgress::Finished(AccountWorkflowOutcome::Failed {
+                        stage,
+                        failure,
+                    })))
+                }
+                Poll::Ready(FetchMessagePreviewsOutcome::DatabaseClosed) => {
                     Poll::Ready(Err(AccountDriverError::DatabaseClosed))
                 }
             },
@@ -2907,6 +3137,16 @@ fn project_outcome(
             message_id,
             account_id,
             generation,
+        }),
+        AccountWorkflowOutcome::MessagePreviewsFetched {
+            account_id,
+            generation,
+            ..
+        } => Err(AccountOperationFailure {
+            account_id: Some(account_id),
+            generation: Some(generation),
+            stage: AccountWorkflowStage::FetchInbox,
+            kind: AccountWorkflowFailureKind::UnexpectedReply,
         }),
         AccountWorkflowOutcome::RemovalPending {
             account_id,

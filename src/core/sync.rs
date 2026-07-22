@@ -16,13 +16,15 @@ use crate::{
     },
     network::imap::{
         ImapIdleRequest, ImapInboxFetchFailure, ImapInboxFetchRequest, ImapInboxMessage,
-        ImapInboxPage, ImapMessageContentFetchRequest, fetch_cached_imap_message_content,
-        fetch_canonical_inbox_metadata, fetch_imap_message_content,
+        ImapInboxPage, ImapMessageContentFetchRequest, ImapPreviewFetchRequest,
+        fetch_cached_imap_message_content, fetch_canonical_inbox_metadata,
+        fetch_imap_message_content, fetch_imap_message_previews,
     },
     store::sqlite::{
         AccountAuthKind, AccountGeneration, AccountId, AccountLifecycle, AccountRecord,
         ContentImportSubmission, DatabaseClient, DatabaseSubmitError, FailureKind,
-        ImapMessageContentTargetOutcome, InboxCheckpointOutcome, InboxCursorCommit,
+        ImapMessageContentTargetOutcome, ImapPreviewApplyOutcome, ImapPreviewBatch,
+        ImapPreviewTargetsOutcome, ImapPreviewUpdate, InboxCheckpointOutcome, InboxCursorCommit,
         InboxCursorOutcome, InboxEnvelope, InboxFlags, InboxReceivePage, InboxStageOutcome,
         MessageId,
     },
@@ -40,6 +42,8 @@ pub(super) type ImapInboxFetchProbe = fn(ImapInboxFetchRequest) -> ImapInboxFetc
 pub(super) type SyncInboxFuture = Pin<Box<dyn Future<Output = SyncInboxOutcome> + 'static>>;
 pub(super) type FetchMessageContentFuture =
     Pin<Box<dyn Future<Output = FetchMessageContentOutcome> + 'static>>;
+pub(super) type FetchMessagePreviewsFuture =
+    Pin<Box<dyn Future<Output = FetchMessagePreviewsOutcome> + 'static>>;
 
 pub(super) fn production_imap_inbox_fetch(request: ImapInboxFetchRequest) -> ImapInboxFetchFuture {
     Box::pin(fetch_canonical_inbox_metadata(request))
@@ -73,6 +77,198 @@ pub(super) enum FetchMessageContentOutcome {
         failure: AccountWorkflowFailureKind,
     },
     DatabaseClosed,
+}
+
+pub(super) enum FetchMessagePreviewsOutcome {
+    Fetched {
+        account_id: AccountId,
+        generation: AccountGeneration,
+        updated: u8,
+        has_more: bool,
+    },
+    Failed {
+        stage: AccountWorkflowStage,
+        failure: AccountWorkflowFailureKind,
+    },
+    DatabaseClosed,
+}
+
+pub(super) fn start_message_preview_fetch(
+    database: DatabaseClient,
+    credentials: CredentialClient,
+    account_id: AccountId,
+    expected_generation: AccountGeneration,
+) -> FetchMessagePreviewsFuture {
+    Box::pin(run_message_preview_fetch(
+        database,
+        credentials,
+        account_id,
+        expected_generation,
+    ))
+}
+
+async fn run_message_preview_fetch(
+    database: DatabaseClient,
+    credentials: CredentialClient,
+    account_id: AccountId,
+    expected_generation: AccountGeneration,
+) -> FetchMessagePreviewsOutcome {
+    let targets = match database.try_load_imap_preview_targets(account_id, expected_generation) {
+        Ok(receiver) => match receiver.await {
+            Ok(Ok(ImapPreviewTargetsOutcome::Current(targets))) => targets,
+            Ok(Ok(ImapPreviewTargetsOutcome::Stale | ImapPreviewTargetsOutcome::NotFound)) => {
+                return preview_failure(
+                    AccountWorkflowStage::LoadMessageTarget,
+                    AccountWorkflowFailureKind::Database(FailureKind::Conflict),
+                );
+            }
+            Ok(Err(failure)) => {
+                return preview_failure(
+                    AccountWorkflowStage::LoadMessageTarget,
+                    AccountWorkflowFailureKind::Database(failure.kind),
+                );
+            }
+            Err(_) => return FetchMessagePreviewsOutcome::DatabaseClosed,
+        },
+        Err(DatabaseSubmitError::Busy) => {
+            return preview_failure(
+                AccountWorkflowStage::LoadMessageTarget,
+                AccountWorkflowFailureKind::Busy,
+            );
+        }
+        Err(DatabaseSubmitError::Closed) => return FetchMessagePreviewsOutcome::DatabaseClosed,
+    };
+    if targets.messages.is_empty() {
+        return FetchMessagePreviewsOutcome::Fetched {
+            account_id,
+            generation: expected_generation,
+            updated: 0,
+            has_more: false,
+        };
+    }
+    let Some(uid_validity) = targets.uid_validity else {
+        return preview_failure(
+            AccountWorkflowStage::LoadMessageTarget,
+            AccountWorkflowFailureKind::Database(FailureKind::Conflict),
+        );
+    };
+    let configuration = match load_configuration(&database, account_id, expected_generation).await {
+        Ok(configuration) => configuration,
+        Err(outcome) => return preview_outcome_from_sync(outcome),
+    };
+    let secret = match load_credential(&credentials, &configuration.credential_key).await {
+        Ok(secret) => secret,
+        Err(outcome) => return preview_outcome_from_sync(outcome),
+    };
+    let uids = targets
+        .messages
+        .iter()
+        .map(|target| target.uid)
+        .collect::<Vec<_>>();
+    let request = match ImapPreviewFetchRequest::new(
+        &configuration.imap_host,
+        configuration.imap_port,
+        &configuration.login_name,
+        secret,
+        uid_validity,
+        &uids,
+    ) {
+        Ok(request) => request,
+        Err(_) => {
+            return preview_failure(
+                AccountWorkflowStage::FetchInbox,
+                AccountWorkflowFailureKind::InboxSync(InboxSyncFailureKind::Protocol),
+            );
+        }
+    };
+    let previews = match fetch_imap_message_previews(request).await {
+        Ok(previews) => previews,
+        Err(failure) => {
+            return preview_failure(
+                AccountWorkflowStage::FetchInbox,
+                AccountWorkflowFailureKind::InboxSync(map_fetch_failure(failure)),
+            );
+        }
+    };
+    let mut updates = Vec::with_capacity(previews.len());
+    for preview in &previews {
+        let update = match ImapPreviewUpdate::new(preview.uid.get(), preview.text.as_bytes()) {
+            Ok(update) => update,
+            Err(_) => {
+                return preview_failure(
+                    AccountWorkflowStage::StageInbox,
+                    AccountWorkflowFailureKind::InboxSync(InboxSyncFailureKind::Protocol),
+                );
+            }
+        };
+        updates.push(update);
+    }
+    if updates.is_empty() {
+        return FetchMessagePreviewsOutcome::Fetched {
+            account_id,
+            generation: expected_generation,
+            updated: 0,
+            has_more: false,
+        };
+    }
+    let batch = match ImapPreviewBatch::new(account_id, expected_generation, uid_validity, updates)
+    {
+        Ok(batch) => batch,
+        Err(_) => {
+            return preview_failure(
+                AccountWorkflowStage::StageInbox,
+                AccountWorkflowFailureKind::InboxSync(InboxSyncFailureKind::Protocol),
+            );
+        }
+    };
+    let applied = match database.try_apply_imap_previews(Box::new(batch)) {
+        Ok(receiver) => match receiver.await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(failure)) => {
+                return preview_failure(
+                    AccountWorkflowStage::StageInbox,
+                    AccountWorkflowFailureKind::Database(failure.kind),
+                );
+            }
+            Err(_) => return FetchMessagePreviewsOutcome::DatabaseClosed,
+        },
+        Err(DatabaseSubmitError::Busy) => {
+            return preview_failure(
+                AccountWorkflowStage::StageInbox,
+                AccountWorkflowFailureKind::Busy,
+            );
+        }
+        Err(DatabaseSubmitError::Closed) => return FetchMessagePreviewsOutcome::DatabaseClosed,
+    };
+    match applied {
+        ImapPreviewApplyOutcome::Updated { count } => FetchMessagePreviewsOutcome::Fetched {
+            account_id,
+            generation: expected_generation,
+            updated: count,
+            has_more: targets.has_more && count > 0,
+        },
+        ImapPreviewApplyOutcome::Stale => preview_failure(
+            AccountWorkflowStage::StageInbox,
+            AccountWorkflowFailureKind::Database(FailureKind::Conflict),
+        ),
+    }
+}
+
+fn preview_outcome_from_sync(outcome: SyncInboxOutcome) -> FetchMessagePreviewsOutcome {
+    match outcome {
+        SyncInboxOutcome::Failed { stage, failure } => {
+            FetchMessagePreviewsOutcome::Failed { stage, failure }
+        }
+        SyncInboxOutcome::DatabaseClosed => FetchMessagePreviewsOutcome::DatabaseClosed,
+        SyncInboxOutcome::Synced { .. } => unreachable!("preview helpers cannot finish inbox sync"),
+    }
+}
+
+fn preview_failure(
+    stage: AccountWorkflowStage,
+    failure: AccountWorkflowFailureKind,
+) -> FetchMessagePreviewsOutcome {
+    FetchMessagePreviewsOutcome::Failed { stage, failure }
 }
 
 pub(super) fn start_message_content_fetch(
@@ -378,6 +574,7 @@ async fn run_inbox_sync(
     let ImapInboxPage {
         uid_validity,
         uid_next: _,
+        remote_message_count,
         scanned_through_uid,
         next_uid,
         bootstrap_history,
@@ -386,7 +583,7 @@ async fn run_inbox_sync(
     } = fetched;
     let bootstrap = bootstrap_history.is_some();
     let historical = history_page.is_some();
-    let has_more = next_uid.is_some()
+    let mut has_more = next_uid.is_some()
         || bootstrap_history.is_some_and(|history| !history.complete)
         || history_page.is_some_and(|history| !history.complete)
         || (history_page.is_none()
@@ -448,6 +645,7 @@ async fn run_inbox_sync(
             );
         }
     };
+    let receive_page = receive_page.with_remote_message_count(remote_message_count);
     let stage = match database.try_stage_inbox(Box::new(receive_page)) {
         Ok(receiver) => match receiver.await {
             Ok(Ok(outcome)) => outcome,
@@ -474,6 +672,7 @@ async fn run_inbox_sync(
             return database_failure(AccountWorkflowStage::StageInbox, FailureKind::Conflict);
         }
     };
+    has_more |= ticket.history_pending();
 
     let imported = u8::try_from(staged_messages.len())
         .expect("bounded inbox metadata pages fit in an imported count");
@@ -648,6 +847,7 @@ fn inbox_envelope(
         subject.as_bytes(),
         message.preview.as_bytes(),
         received_at_ms,
+        u64::from(message.declared_bytes),
         InboxFlags::new(message.flags.seen, message.flags.flagged),
         false,
     )
@@ -853,6 +1053,167 @@ Content-Type: text/plain; charset=utf-8\r\n\
 \r\n\
 first body v1\r\n";
 
+    #[cfg(feature = "bench-harness")]
+    #[test]
+    #[ignore = "requires an explicit database copy and the matching platform credential"]
+    fn real_account_preview_diagnostic() {
+        let database_path = std::env::var_os("NIVALIS_REAL_PREVIEW_DB")
+            .map(PathBuf::from)
+            .expect("NIVALIS_REAL_PREVIEW_DB must name an isolated database copy");
+        let account_id = std::env::var("NIVALIS_REAL_PREVIEW_ACCOUNT_ID")
+            .expect("NIVALIS_REAL_PREVIEW_ACCOUNT_ID must be set")
+            .parse::<i64>()
+            .ok()
+            .and_then(|value| crate::store::sqlite::AccountId::new(value).ok())
+            .expect("real preview account id must be positive");
+        let (database, _replies, database_runtime, _) =
+            sqlite::spawn(database_path).expect("open the isolated diagnostic database");
+        let (credential_client, credential_runtime) = credentials::spawn();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("create real preview diagnostic runtime");
+        let (updated_total, completed) = runtime.block_on(async {
+            let record = database
+                .try_load_account(account_id)
+                .expect("submit account lookup")
+                .await
+                .expect("receive account lookup")
+                .expect("load account");
+            let crate::store::sqlite::AccountRecord::Configured(configuration) = record else {
+                panic!("real preview account is not configured");
+            };
+            let mut updated_total = 0_u32;
+            for _ in 0..64 {
+                let outcome = tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    run_message_preview_fetch(
+                        database.clone(),
+                        credential_client.clone(),
+                        account_id,
+                        configuration.generation,
+                    ),
+                )
+                .await
+                .expect("real preview diagnostic timed out");
+                match outcome {
+                    FetchMessagePreviewsOutcome::Fetched {
+                        updated, has_more, ..
+                    } => {
+                        updated_total += u32::from(updated);
+                        if !has_more {
+                            return (updated_total, true);
+                        }
+                    }
+                    FetchMessagePreviewsOutcome::Failed { stage, failure } => {
+                        panic!("real preview fetch failed at {stage:?}: {failure:?}");
+                    }
+                    FetchMessagePreviewsOutcome::DatabaseClosed => {
+                        panic!("real preview diagnostic database closed");
+                    }
+                }
+            }
+            (updated_total, false)
+        });
+        assert!(
+            updated_total > 0,
+            "provider returned no usable preview rows"
+        );
+        assert!(
+            completed,
+            "preview hydration did not converge in 64 batches"
+        );
+        credential_runtime.shutdown().unwrap();
+        database_runtime.shutdown().unwrap();
+    }
+
+    #[cfg(feature = "bench-harness")]
+    #[test]
+    #[ignore = "requires an explicit database copy and the matching platform credential"]
+    fn real_account_full_body_preview_diagnostic() {
+        let database_path = std::env::var_os("NIVALIS_REAL_PREVIEW_DB")
+            .map(PathBuf::from)
+            .expect("NIVALIS_REAL_PREVIEW_DB must name an isolated database copy");
+        let account_id = std::env::var("NIVALIS_REAL_PREVIEW_ACCOUNT_ID")
+            .expect("NIVALIS_REAL_PREVIEW_ACCOUNT_ID must be set")
+            .parse::<i64>()
+            .ok()
+            .and_then(|value| crate::store::sqlite::AccountId::new(value).ok())
+            .expect("real preview account id must be positive");
+        let uids = std::env::var("NIVALIS_REAL_PREVIEW_UIDS")
+            .expect("NIVALIS_REAL_PREVIEW_UIDS must be set")
+            .split(',')
+            .map(|uid| uid.parse::<u32>().expect("diagnostic UID must be a u32"))
+            .collect::<Vec<_>>();
+        let (database, _replies, database_runtime, _) =
+            sqlite::spawn(database_path).expect("open the isolated diagnostic database");
+        let (credential_client, credential_runtime) = credentials::spawn();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("create real body diagnostic runtime");
+        runtime.block_on(async {
+            let record = database
+                .try_load_account(account_id)
+                .expect("submit account lookup")
+                .await
+                .expect("receive account lookup")
+                .expect("load account");
+            let crate::store::sqlite::AccountRecord::Configured(configuration) = record else {
+                panic!("real body diagnostic account is not configured");
+            };
+            let checkpoint = match load_checkpoint(
+                &database,
+                account_id,
+                configuration.generation,
+            )
+            .await
+            {
+                Ok(checkpoint) => checkpoint,
+                Err(_) => panic!("load IMAP checkpoint"),
+            };
+            let uid_validity = checkpoint.uid_validity.expect("account has UIDVALIDITY");
+            for uid in uids {
+                let secret = match load_credential(
+                    &credential_client,
+                    &configuration.credential_key,
+                )
+                .await
+                {
+                    Ok(secret) => secret,
+                    Err(_) => panic!("load diagnostic credential"),
+                };
+                let request = ImapMessageContentFetchRequest::new(
+                    &configuration.imap_host,
+                    configuration.imap_port,
+                    &configuration.login_name,
+                    secret,
+                    uid_validity,
+                    uid,
+                )
+                .expect("create full-body diagnostic request");
+                let raw = fetch_imap_message_content(request)
+                    .await
+                    .expect("fetch diagnostic message body");
+                let message = MessageParser::default()
+                    .parse(&raw)
+                    .expect("parse diagnostic message body");
+                let preview = message.body_preview(2 * 1024);
+                eprintln!(
+                    "NIVALIS_PERF full_body_preview uid={uid} raw_bytes={} text_parts={} html_parts={} preview_bytes={}",
+                    raw.len(),
+                    message.text_body.len(),
+                    message.html_body.len(),
+                    preview.as_ref().map_or(0, |preview| preview.len())
+                );
+            }
+        });
+        credential_runtime.shutdown().unwrap();
+        database_runtime.shutdown().unwrap();
+    }
+
     #[test]
     fn envelope_fallback_decodes_encoded_words_and_prefers_message_date() {
         assert_eq!(
@@ -904,6 +1265,7 @@ first body v1\r\n";
             Ok(ImapInboxPage {
                 uid_validity: NonZeroU32::new(7).unwrap(),
                 uid_next: NonZeroU32::new(3).unwrap(),
+                remote_message_count: 2,
                 scanned_through_uid: NonZeroU32::new(1),
                 next_uid: NonZeroU32::new(2),
                 bootstrap_history: None,
@@ -940,6 +1302,7 @@ first body v1\r\n";
             Ok(ImapInboxPage {
                 uid_validity: NonZeroU32::new(7).unwrap(),
                 uid_next: NonZeroU32::new(2).unwrap(),
+                remote_message_count: 1,
                 scanned_through_uid: NonZeroU32::new(1),
                 next_uid: None,
                 bootstrap_history: None,
@@ -968,6 +1331,7 @@ first body v1\r\n";
             Ok(ImapInboxPage {
                 uid_validity: NonZeroU32::new(7).unwrap(),
                 uid_next: NonZeroU32::new(3).unwrap(),
+                remote_message_count: 2,
                 scanned_through_uid: NonZeroU32::new(2),
                 next_uid: None,
                 bootstrap_history: None,

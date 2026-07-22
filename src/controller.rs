@@ -7,9 +7,9 @@ use self::session::{
 use crate::core::{
     AccountConfigDraft, AccountDirectoryLoadError, AccountOperation, AccountOperationFailure,
     AccountOperationResponseError, AccountOperationSubmitError, AccountOperationSuccess,
-    AccountSetupMode, AccountSyncStatus, AccountWorkflowFailureKind, COMPOSE_BODY_BYTE_LIMIT,
-    COMPOSE_SUBJECT_BYTE_LIMIT, COMPOSE_TO_FIELD_BYTE_LIMIT, ComposeDraftIdentity,
-    ComposeDraftInput, ComposeFailure, ComposeFailureKind, ComposeOperation,
+    AccountSetupMode, AccountSyncStatus, AccountWorkflowFailureKind, AccountWorkflowStage,
+    COMPOSE_BODY_BYTE_LIMIT, COMPOSE_SUBJECT_BYTE_LIMIT, COMPOSE_TO_FIELD_BYTE_LIMIT,
+    ComposeDraftIdentity, ComposeDraftInput, ComposeFailure, ComposeFailureKind, ComposeOperation,
     ComposeOperationResponseError, ComposeOperationSubmitError, ComposeSuccess, CoreHandle, Event,
     EventReceiver, InboxSyncFailureKind, MailboxLoadError, MessageId, MessageLoadError,
     MutationSubmitError, OutboxCancelOutcome, OutboxDriverFault, OutboxErrorClass, OutboxState,
@@ -35,6 +35,8 @@ use std::{
 };
 
 const SYNC_REFRESH_COALESCE: Duration = Duration::from_millis(50);
+// Keep this synchronized with MailRow.height in ui/mailbox.slint.
+const MAILBOX_ROW_HEIGHT_PX: f32 = 80.0;
 
 pub(crate) fn install(
     ui: &AppWindow,
@@ -86,7 +88,6 @@ struct Controller {
     sync_refresh_timer: Rc<Timer>,
     pending_sync_refresh: Cell<Option<bool>>,
     remote_history_more: Cell<bool>,
-    remote_append_pending: Cell<bool>,
     snackbar_timer: Rc<Timer>,
 }
 
@@ -174,7 +175,6 @@ impl Controller {
             sync_refresh_timer: Rc::new(Timer::default()),
             pending_sync_refresh: Cell::new(None),
             remote_history_more: Cell::new(false),
-            remote_append_pending: Cell::new(false),
             snackbar_timer: Rc::new(Timer::default()),
         }
     }
@@ -434,8 +434,19 @@ impl Controller {
                     && self.state.borrow().can_load_remote_history()
                 {
                     self.remote_history_more.set(has_more);
+                    if historical && imported > 0 {
+                        // The silent worker only extends SQLite. Make the new
+                        // tail navigable, but leave the live model and viewport
+                        // untouched until the user reaches it.
+                        let tail_available =
+                            self.state.borrow_mut().enable_remote_tail_navigation();
+                        if tail_available && let Some(ui) = self.ui.upgrade() {
+                            ui.set_mailbox_has_more(true);
+                        }
+                    }
                 }
-                if let Some(ui) = self.ui.upgrade()
+                if !historical
+                    && let Some(ui) = self.ui.upgrade()
                     && !foreground_feedback_active(&ui)
                 {
                     ui.set_status_text(
@@ -445,6 +456,7 @@ impl Controller {
                 let refresh_visible_mailbox = self.ui.upgrade().is_some_and(|ui| {
                     should_refresh_synced_mailbox(
                         imported,
+                        historical,
                         self.state.borrow().shows_inbox_sync_updates(),
                         ui.get_mailbox_loading(),
                         ui.get_mailbox_loading_more(),
@@ -452,6 +464,27 @@ impl Controller {
                 });
                 if refresh_visible_mailbox {
                     self.schedule_sync_refresh(historical);
+                }
+            }
+            AccountSyncStatus::PreviewsUpdated {
+                account_id,
+                updated,
+                ..
+            } => {
+                if updated == 0
+                    || !self.sync_status_is_visible(account_id)
+                    || !self.state.borrow().shows_inbox_sync_updates()
+                {
+                    return;
+                }
+                let can_refresh = self
+                    .ui
+                    .upgrade()
+                    .is_some_and(|ui| !ui.get_mailbox_loading() && !ui.get_mailbox_loading_more());
+                if can_refresh {
+                    // Preview hydration never changes ordering. Refresh the
+                    // current waterfall window instead of jumping to page one.
+                    self.schedule_sync_refresh(true);
                 }
             }
             AccountSyncStatus::Failed(failure) => {
@@ -624,7 +657,11 @@ impl Controller {
             return;
         };
         let state = self.state.borrow();
-        if effect != MailboxCommitEffect::Preserve || self.mail_model.row_count() <= 50 {
+        if !matches!(
+            effect,
+            MailboxCommitEffect::Preserve | MailboxCommitEffect::Reconcile { .. }
+        ) || self.mail_model.row_count() <= 50
+        {
             debug_assert_eq!(next_cursor, state.next_cursor());
         }
         let has_more = state.next_cursor().is_some()
@@ -637,6 +674,22 @@ impl Controller {
         let selected_to_refresh = (effect == MailboxCommitEffect::Preserve)
             .then(|| self.selected_reader_key())
             .flatten();
+        let reconcile_scroll = match effect {
+            MailboxCommitEffect::Reconcile {
+                remove_front,
+                prepend,
+            } => self
+                .ui
+                .upgrade()
+                .map(|ui| {
+                    (
+                        ui.get_mailbox_scroll_y(),
+                        prepend as isize - remove_front as isize,
+                    )
+                })
+                .filter(|(position, _)| position.is_finite()),
+            _ => None,
+        };
         match effect {
             MailboxCommitEffect::Replace => {
                 self.clear_reader();
@@ -652,11 +705,36 @@ impl Controller {
                     self.mail_model.push(row);
                 }
             }
+            MailboxCommitEffect::Reconcile {
+                remove_front,
+                prepend,
+            } => {
+                for _ in 0..remove_front.min(self.mail_model.row_count()) {
+                    self.mail_model.remove(0);
+                }
+                for (index, row) in rows.iter().take(prepend).cloned().enumerate() {
+                    self.mail_model.insert(index, row);
+                }
+                for row in rows.into_iter().skip(prepend) {
+                    let Some(index) = (prepend..self.mail_model.row_count()).find(|index| {
+                        self.mail_model
+                            .row_data(*index)
+                            .is_some_and(|visible| visible.id == row.id)
+                    }) else {
+                        continue;
+                    };
+                    self.mail_model.set_row_data(index, row);
+                }
+            }
             MailboxCommitEffect::Preserve => {
-                for (index, row) in rows.into_iter().enumerate() {
-                    if index >= self.mail_model.row_count() {
-                        break;
-                    }
+                for row in rows {
+                    let Some(index) = (0..self.mail_model.row_count()).find(|index| {
+                        self.mail_model
+                            .row_data(*index)
+                            .is_some_and(|visible| visible.id == row.id)
+                    }) else {
+                        continue;
+                    };
                     self.mail_model.set_row_data(index, row);
                 }
             }
@@ -664,6 +742,16 @@ impl Controller {
         let loaded_count = self.mail_model.row_count();
         self.apply_stats(stats);
         if let Some(ui) = self.ui.upgrade() {
+            if effect == MailboxCommitEffect::Replace {
+                ui.set_mailbox_scroll_y(0.0);
+            } else if let Some((position, row_delta)) = reconcile_scroll {
+                let anchored = if position < -0.5 {
+                    (position - row_delta as f32 * MAILBOX_ROW_HEIGHT_PX).min(0.0)
+                } else {
+                    0.0
+                };
+                set_mailbox_scroll_after_reconcile(&ui, anchored);
+            }
             ui.set_mailbox_loading(false);
             ui.set_mailbox_has_more(has_more);
             ui.set_mailbox_loading_more(false);
@@ -698,13 +786,6 @@ impl Controller {
             && visible_summary_state(self.mail_model.as_ref(), key).is_some()
         {
             self.select_message(key.encode());
-        }
-        if self.remote_append_pending.replace(false) {
-            if self.state.borrow_mut().enable_remote_tail_navigation() {
-                self.submit_mailbox_navigation(MailboxIntent::Append);
-            } else {
-                self.finish_history_load_without_refresh();
-            }
         }
     }
 
@@ -777,10 +858,21 @@ impl Controller {
                         controller.remote_history_more.set(has_more);
                         controller.issue_accounts();
                         if historical {
-                            controller.remote_append_pending.set(true);
-                            controller.refresh_after_historical_sync();
+                            // Extend from the current visible tail. A first-page
+                            // refresh here rebuilds layout and makes a bottomed
+                            // out ListView visibly rebound before the append.
+                            if imported > 0
+                                && controller
+                                    .state
+                                    .borrow_mut()
+                                    .enable_remote_tail_navigation()
+                            {
+                                controller.submit_mailbox_navigation(MailboxIntent::Append);
+                            } else {
+                                controller.finish_history_load_without_refresh();
+                            }
                         } else if imported > 0 {
-                            controller.refresh_after_mutation();
+                            controller.refresh_mailbox_in_place();
                         } else {
                             controller.finish_history_load_without_refresh();
                         }
@@ -890,7 +982,6 @@ impl Controller {
     }
 
     fn fail_navigation(&self, error: UserError) {
-        self.remote_append_pending.set(false);
         if self.state.borrow().mutation_refresh_pending() {
             self.fail_mailbox(error);
             self.sync_mutation_ui();
@@ -1050,7 +1141,6 @@ impl Controller {
         // of making the reader wait behind up to 50 remote headers.
         if let Some(task) = self.history_task.borrow_mut().take() {
             task.abort();
-            self.remote_append_pending.set(false);
             if let Some(ui) = self.ui.upgrade() {
                 ui.set_mailbox_loading_more(false);
             }
@@ -1362,7 +1452,7 @@ impl Controller {
         self.submit_mailbox_navigation(MailboxIntent::First);
     }
 
-    fn refresh_after_historical_sync(&self) {
+    fn refresh_mailbox_in_place(&self) {
         self.pending_mailbox.borrow_mut().take();
         self.submit_mailbox_navigation(MailboxIntent::Refresh);
     }
@@ -1388,10 +1478,8 @@ impl Controller {
                 .is_some_and(|ui| ui.get_mailbox_loading() || ui.get_mailbox_loading_more());
             if busy {
                 controller.schedule_sync_refresh(historical);
-            } else if historical {
-                controller.refresh_after_historical_sync();
             } else {
-                controller.refresh_after_mutation();
+                controller.refresh_mailbox_in_place();
             }
         });
     }
@@ -1501,7 +1589,6 @@ impl Controller {
         if let Some(task) = self.history_task.borrow_mut().take() {
             task.abort();
         }
-        self.remote_append_pending.set(false);
         self.remote_history_more
             .set(self.state.borrow().can_load_remote_history());
         if let Some(ui) = self.ui.upgrade() {
@@ -2295,7 +2382,7 @@ impl Controller {
                     ui.set_status_text("Message sent".into());
                     show_snackbar(&ui, "Message sent", false, &self.snackbar_timer);
                     self.issue_accounts();
-                    self.reload_mailbox();
+                    self.refresh_mailbox_in_place();
                 }
             },
             OutboxStatus::Fault { kind, .. } => {
@@ -2627,11 +2714,7 @@ impl Controller {
                         // A foreground sync has exactly one completion and should
                         // become visible immediately. The 50ms coalescing window
                         // remains reserved for bursty background IDLE events.
-                        if historical {
-                            controller.refresh_after_historical_sync();
-                        } else {
-                            controller.refresh_after_mutation();
-                        }
+                        controller.refresh_mailbox_in_place();
                         controller.issue_accounts();
                     }
                     Err(failure) => {
@@ -3166,11 +3249,13 @@ struct MutationSuccessFeedback {
 fn sync_success_feedback(imported: u8, has_more: bool) -> String {
     match (imported, has_more) {
         (0, false) => "Inbox is up to date".to_owned(),
-        (0, true) => "More messages are available; scroll down to load them".to_owned(),
+        (0, true) => "Older mail is syncing in the background".to_owned(),
         (1, false) => "Imported 1 new message".to_owned(),
-        (1, true) => "Imported 1 new message; scroll down for more".to_owned(),
+        (1, true) => "Imported 1 new message; older mail is syncing in the background".to_owned(),
         (count, false) => format!("Imported {count} new messages"),
-        (count, true) => format!("Imported {count} new messages; scroll down for more"),
+        (count, true) => {
+            format!("Imported {count} new messages; older mail is syncing in the background")
+        }
     }
 }
 
@@ -3180,21 +3265,24 @@ fn background_sync_feedback(imported: u8, has_more: bool, historical: bool) -> S
     }
     match (imported, has_more) {
         (0, false) => "Mail history is fully synced".to_owned(),
-        (0, true) => "Older messages are available; scroll down to load them".to_owned(),
+        (0, true) => "Older mail is still syncing in the background".to_owned(),
         (1, false) => "Downloaded the last older message".to_owned(),
-        (1, true) => "Downloaded 1 older message; scroll down for more".to_owned(),
+        (1, true) => "Downloaded 1 older message; background sync is continuing".to_owned(),
         (count, false) => format!("Downloaded the last {count} older messages"),
-        (count, true) => format!("Downloaded {count} older messages; scroll down for more"),
+        (count, true) => {
+            format!("Downloaded {count} older messages; background sync is continuing")
+        }
     }
 }
 
 fn should_refresh_synced_mailbox(
-    imported: u8,
+    _imported: u8,
+    historical: bool,
     shows_inbox_updates: bool,
     mailbox_loading: bool,
     mailbox_loading_more: bool,
 ) -> bool {
-    imported > 0 && shows_inbox_updates && !mailbox_loading && !mailbox_loading_more
+    !historical && shows_inbox_updates && !mailbox_loading && !mailbox_loading_more
 }
 
 fn mutation_success_feedback(intent: MutationIntent) -> MutationSuccessFeedback {
@@ -3669,7 +3757,7 @@ fn account_response_error(_error: AccountOperationResponseError) -> UserError {
 
 fn account_operation_error(failure: AccountOperationFailure) -> UserError {
     match failure.kind {
-        AccountWorkflowFailureKind::InboxSync(kind) => inbox_sync_error(kind),
+        AccountWorkflowFailureKind::InboxSync(kind) => inbox_sync_error(kind, failure.stage),
         AccountWorkflowFailureKind::Diagnostic(kind) => account_diagnostic_error(kind),
         AccountWorkflowFailureKind::Credential(_) => UserError {
             title: "App password is unavailable",
@@ -3687,10 +3775,9 @@ fn account_operation_error(failure: AccountOperationFailure) -> UserError {
             title: "Account is no longer available",
             detail: "Refresh the account list and choose another account.",
         },
-        AccountWorkflowFailureKind::Database(FailureKind::ResourceLimit) => UserError {
-            title: "Account limit reached",
-            detail: "Remove an unused account or reduce its local data before trying again.",
-        },
+        AccountWorkflowFailureKind::Database(FailureKind::ResourceLimit) => {
+            database_resource_limit_error(failure.stage)
+        }
         AccountWorkflowFailureKind::Database(FailureKind::Database)
         | AccountWorkflowFailureKind::Database(FailureKind::Migration) => UserError {
             title: "Local account data is unavailable",
@@ -3711,7 +3798,46 @@ fn foreground_feedback_active(ui: &AppWindow) -> bool {
         || ui.get_composer_loading()
 }
 
-fn inbox_sync_error(kind: InboxSyncFailureKind) -> UserError {
+fn set_mailbox_scroll_after_reconcile(ui: &AppWindow, position: f32) {
+    ui.set_mailbox_scroll_y(position);
+    let weak = ui.as_weak();
+    Timer::single_shot(Duration::ZERO, move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.set_mailbox_scroll_y(position);
+        }
+    });
+}
+
+fn database_resource_limit_error(stage: AccountWorkflowStage) -> UserError {
+    match stage {
+        AccountWorkflowStage::PersistLocator => UserError {
+            title: "Account limit reached",
+            detail: "Nivalis already has the maximum supported number of configured accounts. Remove an unused account before adding another one.",
+        },
+        AccountWorkflowStage::LoadInboxCheckpoint
+        | AccountWorkflowStage::StageInbox
+        | AccountWorkflowStage::CommitInbox => UserError {
+            title: "Local Inbox sync state needs repair",
+            detail: "Nivalis stopped before committing because the cached IMAP cursor or one sync batch exceeded its safety boundary. Restart Nivalis to apply the local repair, then sync again. Do not remove the account or delete mail; this is not an account-count or disk-space error.",
+        },
+        AccountWorkflowStage::ImportContent => UserError {
+            title: "Message import bookkeeping reached a safety limit",
+            detail: "The message remains on the server, but Nivalis could not safely commit its local content record. Restart Nivalis and open the message again. Removing the account will not fix this error.",
+        },
+        AccountWorkflowStage::BeginRemoval
+        | AccountWorkflowStage::ConfirmRemoval
+        | AccountWorkflowStage::PurgeRemoval => UserError {
+            title: "Account cleanup paused at a safety limit",
+            detail: "Restart Nivalis and retry removing the account. Its remaining local cleanup work is bounded and can continue safely after restart.",
+        },
+        _ => UserError {
+            title: "Local account operation reached a safety limit",
+            detail: "Nivalis stopped this local operation before committing unsafe data. Restart the app and try the same action again; removing mail or accounts is not required unless the message explicitly says the account limit was reached.",
+        },
+    }
+}
+
+fn inbox_sync_error(kind: InboxSyncFailureKind, stage: AccountWorkflowStage) -> UserError {
     match kind {
         InboxSyncFailureKind::Authentication => UserError {
             title: "Inbox sign-in was rejected",
@@ -3737,9 +3863,15 @@ fn inbox_sync_error(kind: InboxSyncFailureKind) -> UserError {
             title: "Server response was not supported",
             detail: "The connection succeeded, but Nivalis could not safely process the IMAP response. Update Nivalis and sync Inbox again; if it continues, report a provider compatibility issue.",
         },
+        InboxSyncFailureKind::ResourceLimit if stage == AccountWorkflowStage::ParseContent => {
+            UserError {
+                title: "Message structure exceeds the reader safety limit",
+                detail: "Nivalis kept the message metadata but did not parse an unusually large or deeply nested MIME structure. Read or move that message with your provider's web app, then try again.",
+            }
+        }
         InboxSyncFailureKind::ResourceLimit => UserError {
-            title: "Inbox response exceeds a safety limit",
-            detail: "Move the oversized message out of Inbox with your provider's web app, then sync again.",
+            title: "IMAP data exceeds a protocol safety limit",
+            detail: "The server returned a response, header set, UID range, or message larger than this sync operation accepts. This is not a local account-capacity error. Try syncing again; if it repeats, inspect the newest messages with your provider's web app.",
         },
         InboxSyncFailureKind::Cancelled => UserError {
             title: "Inbox sync was cancelled",
@@ -4048,6 +4180,29 @@ mod tests {
                      );",
                 )
                 .expect("seed dirty controller fixture");
+        }
+
+        fn insert_newest_inbox_message(&self, id: i64) {
+            let connection = Connection::open(&self.path).expect("open controller fixture");
+            connection
+                .execute_batch(&format!(
+                    "PRAGMA foreign_keys = ON;
+                     BEGIN IMMEDIATE;
+                     INSERT INTO messages (
+                         id, account_id, remote_key, sender_name, sender_address,
+                         subject, preview, received_at_ms
+                     ) VALUES (
+                         {id}, 1, 'background-{id}', 'Background sender',
+                         'background@example.test', 'New background message',
+                         'Already cached', 1700001000000
+                     );
+                     INSERT INTO message_folders (message_id, folder_id, account_id)
+                     VALUES ({id}, 1, 1);
+                     COMMIT;"
+                ))
+                .expect("insert newest cached message");
+            sqlite::rebuild_account_stats_for_test(&connection, 1)
+                .expect("refresh newest message statistics");
         }
 
         fn seed_failed_outbox(&self) -> (i64, PathBuf) {
@@ -4427,25 +4582,26 @@ mod tests {
         assert_eq!(sync_success_feedback(0, false), "Inbox is up to date");
         assert_eq!(
             sync_success_feedback(0, true),
-            "More messages are available; scroll down to load them"
+            "Older mail is syncing in the background"
         );
         assert_eq!(sync_success_feedback(1, false), "Imported 1 new message");
         assert_eq!(
             sync_success_feedback(16, true),
-            "Imported 16 new messages; scroll down for more"
+            "Imported 16 new messages; older mail is syncing in the background"
         );
         assert_eq!(
             background_sync_feedback(16, true, true),
-            "Downloaded 16 older messages; scroll down for more"
+            "Downloaded 16 older messages; background sync is continuing"
         );
         assert_eq!(
             background_sync_feedback(0, false, true),
             "Mail history is fully synced"
         );
-        assert!(should_refresh_synced_mailbox(1, true, false, false));
-        assert!(should_refresh_synced_mailbox(16, true, false, false));
-        assert!(!should_refresh_synced_mailbox(0, true, false, false));
-        assert!(!should_refresh_synced_mailbox(16, true, false, true));
+        assert!(should_refresh_synced_mailbox(1, false, true, false, false));
+        assert!(should_refresh_synced_mailbox(16, false, true, false, false));
+        assert!(should_refresh_synced_mailbox(0, false, true, false, false));
+        assert!(!should_refresh_synced_mailbox(16, false, true, false, true));
+        assert!(!should_refresh_synced_mailbox(16, true, true, false, false));
     }
 
     #[test]
@@ -4538,7 +4694,7 @@ mod tests {
         ];
 
         for (kind, next_step) in cases {
-            let error = inbox_sync_error(kind);
+            let error = inbox_sync_error(kind, AccountWorkflowStage::FetchInbox);
             assert!(!error.title.is_empty());
             assert!(
                 error.detail.contains(next_step),
@@ -4547,9 +4703,59 @@ mod tests {
             );
         }
 
-        let protocol = inbox_sync_error(InboxSyncFailureKind::Protocol);
+        let protocol = inbox_sync_error(
+            InboxSyncFailureKind::Protocol,
+            AccountWorkflowStage::FetchInbox,
+        );
         assert!(protocol.detail.contains("connection succeeded"));
         assert!(!protocol.detail.contains("selected port"));
+    }
+
+    #[test]
+    fn account_resource_errors_are_classified_by_the_failing_stage() {
+        let sync_state = account_operation_error(AccountOperationFailure {
+            account_id: Some(crate::store::sqlite::AccountId::new(1).unwrap()),
+            generation: Some(crate::store::sqlite::AccountGeneration::new(1).unwrap()),
+            stage: AccountWorkflowStage::StageInbox,
+            kind: AccountWorkflowFailureKind::Database(FailureKind::ResourceLimit),
+        });
+        assert_eq!(sync_state.title, "Local Inbox sync state needs repair");
+        assert!(sync_state.detail.contains("not an account-count"));
+        assert!(!sync_state.detail.contains("Remove an unused account"));
+
+        let account_capacity = account_operation_error(AccountOperationFailure {
+            account_id: None,
+            generation: None,
+            stage: AccountWorkflowStage::PersistLocator,
+            kind: AccountWorkflowFailureKind::Database(FailureKind::ResourceLimit),
+        });
+        assert_eq!(account_capacity.title, "Account limit reached");
+        assert!(account_capacity.detail.contains("configured accounts"));
+
+        let protocol_limit = account_operation_error(AccountOperationFailure {
+            account_id: Some(crate::store::sqlite::AccountId::new(1).unwrap()),
+            generation: Some(crate::store::sqlite::AccountGeneration::new(1).unwrap()),
+            stage: AccountWorkflowStage::FetchInbox,
+            kind: AccountWorkflowFailureKind::InboxSync(InboxSyncFailureKind::ResourceLimit),
+        });
+        assert_eq!(
+            protocol_limit.title,
+            "IMAP data exceeds a protocol safety limit"
+        );
+        assert!(
+            protocol_limit
+                .detail
+                .contains("not a local account-capacity")
+        );
+
+        let mime_limit = inbox_sync_error(
+            InboxSyncFailureKind::ResourceLimit,
+            AccountWorkflowStage::ParseContent,
+        );
+        assert_eq!(
+            mime_limit.title,
+            "Message structure exceeds the reader safety limit"
+        );
     }
 
     #[test]
@@ -4612,14 +4818,26 @@ mod tests {
         assert!(harness.ui.get_mailbox_has_more());
         assert!(model_contains(&harness.ui, "51"));
 
+        harness.ui.set_mailbox_scroll_y(-160.0);
         harness.ui.invoke_load_more_mail();
         harness.drive_until("continuous mailbox append", |ui| mailbox_ready(ui, 51));
         assert!(model_contains(&harness.ui, "1"));
         assert!(model_contains(&harness.ui, "51"));
         assert!(!harness.ui.get_mailbox_has_more());
+        assert_eq!(harness.ui.get_mailbox_scroll_y(), -160.0);
+
+        database.insert_newest_inbox_message(52);
+        harness.controller.refresh_mailbox_in_place();
+        harness.drive_until("background first-page reconcile", |ui| {
+            mailbox_ready(ui, 52)
+        });
+        slint::platform::update_timers_and_animations();
+        assert!(model_contains(&harness.ui, "52"));
+        assert!(model_contains(&harness.ui, "1"));
+        assert_eq!(harness.ui.get_mailbox_scroll_y(), -240.0);
 
         harness.ui.invoke_switch_account("1".into());
-        harness.drive_until("single-account mailbox", |ui| mailbox_ready(ui, 1));
+        harness.drive_until("single-account mailbox", |ui| mailbox_ready(ui, 2));
         assert_eq!(harness.ui.get_active_account_id().as_str(), "1");
         assert!(harness.ui.get_compose_enabled());
         assert!(model_contains(&harness.ui, "1"));
@@ -4668,7 +4886,7 @@ mod tests {
 
         harness.ui.invoke_delete_mail("49".into());
         harness.drive_until("Trash mutation refresh", |ui| {
-            mailbox_ready(ui, 49) && !model_contains(ui, "49") && ui.get_snackbar_can_undo()
+            mailbox_ready(ui, 50) && !model_contains(ui, "49") && ui.get_snackbar_can_undo()
         });
         harness.ui.invoke_undo_delete();
         harness.drive_until("Trash undo refresh", |ui| {
@@ -4677,7 +4895,7 @@ mod tests {
 
         harness.ui.invoke_delete_mail("48".into());
         harness.drive_until("permanent-delete setup", |ui| {
-            mailbox_ready(ui, 49) && !model_contains(ui, "48")
+            mailbox_ready(ui, 50) && !model_contains(ui, "48")
         });
         harness.ui.invoke_filter_folder("Trash".into());
         harness.drive_until("Trash folder", |ui| mailbox_ready(ui, 1));

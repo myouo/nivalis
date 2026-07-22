@@ -74,6 +74,7 @@ export component AppWindow inherits Window {
     in property <bool> mailbox-loading: false;
     in property <bool> mailbox-has-more: false;
     in property <bool> mailbox-loading-more: false;
+    in-out property <float> mailbox-scroll-y: 0;
     in property <bool> mailbox-error: false;
     in property <string> mailbox-error-title: "";
     in property <string> mailbox-error-detail: "";
@@ -377,6 +378,7 @@ export component AppWindow inherits Window {
                                 mailbox-loading: root.mailbox-loading;
                                 mailbox-has-more: root.mailbox-has-more;
                                 mailbox-loading-more: root.mailbox-loading-more;
+                                scroll-y <=> root.mailbox-scroll-y;
                                 mailbox-error: root.mailbox-error;
                                 mailbox-error-title: root.mailbox-error-title;
                                 mailbox-error-detail: root.mailbox-error-detail;

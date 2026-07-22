@@ -78,10 +78,11 @@ pub(crate) use outbox::{
 };
 #[allow(unused_imports)]
 pub(crate) use sync::{
-    ImapMessageContentTarget, ImapMessageContentTargetOutcome, InboxCheckpoint,
-    InboxCheckpointOutcome, InboxCursorCommit, InboxCursorOutcome, InboxCursorTicket,
-    InboxEnvelope, InboxFlags, InboxReceivePage, InboxStageOutcome, InboxValidationError,
-    StagedInboxMessage,
+    ImapMessageContentTarget, ImapMessageContentTargetOutcome, ImapPreviewApplyOutcome,
+    ImapPreviewBatch, ImapPreviewTarget, ImapPreviewTargets, ImapPreviewTargetsOutcome,
+    ImapPreviewUpdate, InboxCheckpoint, InboxCheckpointOutcome, InboxCursorCommit,
+    InboxCursorOutcome, InboxCursorTicket, InboxEnvelope, InboxFlags, InboxReceivePage,
+    InboxStageOutcome, InboxValidationError, StagedInboxMessage,
 };
 
 #[cfg(test)]

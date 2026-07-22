@@ -73,6 +73,7 @@ export component MailRow inherits Rectangle {
         }
 
         VerticalLayout {
+            alignment: center;
             spacing: 1px;
             horizontal-stretch: 1;
             HorizontalLayout {
@@ -91,15 +92,17 @@ export component MailRow inherits Rectangle {
                 Text { text: root.mail.time; color: Theme.on-surface-variant; font-family: Theme.body-font; font-size: 10px; vertical-alignment: center; }
             }
             Text {
+                height: 17px;
                 text: root.mail.subject;
                 color: Theme.on-surface;
                 font-family: Theme.body-font;
                 font-size: 12px;
                 font-weight: root.mail.unread ? 700 : 400;
                 overflow: elide;
+                vertical-alignment: center;
             }
             HorizontalLayout {
-                height: 18px;
+                height: 17px;
                 spacing: 5px;
                 if root.show-account: Text {
                     text: root.mail.account-label;
@@ -150,6 +153,7 @@ export component MailboxPane inherits Rectangle {
     in property <bool> mailbox-loading: false;
     in property <bool> mailbox-has-more: false;
     in property <bool> mailbox-loading-more: false;
+    in-out property <float> scroll-y: 0;
     in property <bool> mailbox-error: false;
     in property <string> mailbox-error-title: "";
     in property <string> mailbox-error-detail: "";
@@ -332,10 +336,12 @@ export component MailboxPane inherits Rectangle {
         }
 
         if !root.show-loading && !root.mailbox-error && root.mails.length > 0: mail-list := ListView {
+            viewport-y: root.scroll-y * 1px;
             accessible-role: list;
             accessible-label: root.active-folder + " messages";
             accessible-item-count: root.mails.length;
             changed viewport-y => {
+                root.scroll-y = self.viewport-y / 1px;
                 if (root.mailbox-has-more && !root.mailbox-loading-more
                     && -self.viewport-y + self.visible-height + 480px >= self.viewport-height) {
                     root.load-more-mail();

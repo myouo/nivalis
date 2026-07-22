@@ -1002,6 +1002,8 @@ fn merge_status_code(
 pub(super) fn map_protocol_error(
     error: mail_protocol_core::ProtocolError,
 ) -> ImapInboxFetchFailure {
+    #[cfg(feature = "bench-harness")]
+    eprintln!("NIVALIS_PERF imap_protocol_error kind={:?}", error.kind());
     match error.kind() {
         ErrorKind::LineTooLong
         | ErrorKind::FrameTooLarge

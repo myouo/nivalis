@@ -451,6 +451,8 @@ fn finalize_content_in_transaction(
                  sender_address = ?4,
                  subject = ?5,
                  preview = ?6,
+                 preview_state = CASE WHEN ?6 = '' THEN 'empty' ELSE 'available' END,
+                 preview_version = 1,
                  received_at_ms = COALESCE(?7, received_at_ms),
                  has_attachment = ?8
              WHERE id = ?1 AND account_id = ?2 AND content_generation = ?9",

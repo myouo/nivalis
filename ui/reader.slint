@@ -58,8 +58,6 @@ export component ReaderPane inherits Rectangle {
         title: "Select a message";
         detail: "Choose a conversation from the inbox to read it here.";
         icon: "mail";
-        action-label: "Go to inbox";
-        action => { root.filter-folder("Inbox"); root.detail-open = false; }
     }
 
     if !root.detail-loading && !root.detail-error && root.selected-id != "": VerticalLayout {

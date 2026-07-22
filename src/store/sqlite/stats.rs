@@ -191,7 +191,8 @@ pub(super) fn query_mailbox_stats(
         .prepare(
             "SELECT a.id, s.account_id, s.inbox_total, s.inbox_unread,
                     s.starred_total, s.sent_total, s.drafts_total,
-                    s.archive_total, s.trash_total, s.dirty
+                    s.archive_total, s.trash_total, s.dirty,
+                    s.remote_inbox_total
              FROM accounts AS a
              LEFT JOIN account_mailbox_stats AS s ON s.account_id = a.id
              WHERE a.state NOT IN ('removing_credentials', 'removing_cache')
@@ -219,6 +220,7 @@ pub(super) fn query_mailbox_stats(
                 row.get::<_, i64>(0)?,
                 values,
                 row.get::<_, Option<bool>>(9)?,
+                row.get::<_, Option<i64>>(10)?,
             ))
         })
         .map_err(DbFailure::database)?;
@@ -234,9 +236,11 @@ pub(super) fn query_mailbox_stats(
     }
 
     let mut total = [0_u64; COUNTER_COUNT];
+    let mut all_remote_inbox_total = Some(0_u64);
     let mut account_unread = Vec::with_capacity(accounts.len());
     let mut selected = None;
-    for (account_id, raw_values, dirty) in accounts {
+    let mut selected_remote_inbox_total = None;
+    for (account_id, raw_values, dirty, raw_remote_inbox_total) in accounts {
         let raw_values = raw_values
             .ok_or_else(|| DbFailure::conflict("mail account is missing its statistics row"))?;
         if dirty != Some(false) {
@@ -245,6 +249,20 @@ pub(super) fn query_mailbox_stats(
             ));
         }
         let values = convert_counts(raw_values)?;
+        let remote_inbox_total = raw_remote_inbox_total
+            .map(|value| {
+                u64::try_from(value)
+                    .map_err(|_| DbFailure::database("remote Inbox total is negative"))
+            })
+            .transpose()?;
+        all_remote_inbox_total = match (all_remote_inbox_total, remote_inbox_total) {
+            (Some(total), Some(value)) => Some(
+                total
+                    .checked_add(value)
+                    .ok_or_else(|| DbFailure::resource_limit("remote Inbox total overflow"))?,
+            ),
+            _ => None,
+        };
         for (sum, value) in total.iter_mut().zip(values) {
             *sum = sum
                 .checked_add(value)
@@ -256,6 +274,7 @@ pub(super) fn query_mailbox_stats(
         });
         if spec.account.database_id() == Some(account_id) {
             selected = Some(values);
+            selected_remote_inbox_total = remote_inbox_total;
         }
     }
 
@@ -265,8 +284,12 @@ pub(super) fn query_mailbox_stats(
             selected.ok_or_else(|| DbFailure::not_found("mail account no longer exists"))?
         }
     };
+    let remote_inbox_total = match spec.account {
+        AccountScope::All => all_remote_inbox_total,
+        AccountScope::Account(_) => selected_remote_inbox_total,
+    };
     let selected_total = spec.search.is_none().then(|| match spec.folder {
-        FolderScope::Inbox => scoped[INBOX_TOTAL],
+        FolderScope::Inbox => remote_inbox_total.unwrap_or(scoped[INBOX_TOTAL]),
         FolderScope::Unread => scoped[INBOX_UNREAD],
         FolderScope::Starred => scoped[STARRED_TOTAL],
         FolderScope::Sent => scoped[SENT_TOTAL],
@@ -558,5 +581,44 @@ mod tests {
         );
         let stats = query_mailbox_stats(&connection, &inbox).unwrap();
         assert_eq!(stats.account_unread.len(), MAX_ACCOUNT_STATS);
+    }
+
+    #[test]
+    fn inbox_totals_prefer_hot_remote_counts_without_changing_local_unread_counts() {
+        let connection = database();
+        connection
+            .execute(
+                "UPDATE account_mailbox_stats
+                 SET remote_inbox_total = CASE account_id WHEN 1 THEN 10 ELSE 20 END,
+                     remote_inbox_total_updated_at_ms = 2_000",
+                [],
+            )
+            .unwrap();
+        let account = PageSpec::new(
+            AccountScope::account(1).unwrap(),
+            FolderScope::Inbox,
+            None,
+            PageBoundary::First,
+            50,
+        )
+        .unwrap();
+        let all = PageSpec::new(
+            AccountScope::All,
+            FolderScope::Inbox,
+            None,
+            PageBoundary::First,
+            50,
+        )
+        .unwrap();
+
+        let account_stats = query_mailbox_stats(&connection, &account).unwrap();
+        assert_eq!(account_stats.selected_total, Some(10));
+        assert_eq!(account_stats.inbox_unread, 1);
+        assert_eq!(
+            query_mailbox_stats(&connection, &all)
+                .unwrap()
+                .selected_total,
+            Some(30)
+        );
     }
 }

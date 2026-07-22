@@ -55,6 +55,7 @@ pub(crate) enum MailboxCommitEffect {
     Replace,
     Append,
     Extend { from: usize },
+    Reconcile { remove_front: usize, prepend: usize },
     Preserve,
 }
 
@@ -592,14 +593,42 @@ impl ReadSession {
                     }
                 } else if self.visible_ids.starts_with(&commit.visible_ids) {
                     MailboxCommitEffect::Preserve
+                } else if let Some((prepend, remove_front)) =
+                    refresh_alignment(&commit.visible_ids, &self.visible_ids)
+                {
+                    let mut visible_ids = Vec::with_capacity(
+                        prepend.saturating_add(self.visible_ids.len() - remove_front),
+                    );
+                    visible_ids.extend_from_slice(&commit.visible_ids[..prepend]);
+                    visible_ids.extend_from_slice(&self.visible_ids[remove_front..]);
+                    if self
+                        .selected
+                        .is_some_and(|selected| !visible_ids.contains(&selected))
+                    {
+                        self.selected = None;
+                        self.detail_request = None;
+                    }
+                    self.visible_ids = visible_ids.into_boxed_slice();
+                    MailboxCommitEffect::Reconcile {
+                        remove_front,
+                        prepend,
+                    }
                 } else {
-                    self.visible_ids = commit.visible_ids;
-                    self.tail_cursor = commit.tail_cursor;
-                    self.next_cursor = commit.next_cursor;
-                    self.page_number = commit.page_number;
-                    self.selected = None;
-                    self.detail_request = None;
-                    MailboxCommitEffect::Replace
+                    // A bounded first-page refresh may have no overlap after a
+                    // large remote burst. Keep the already loaded waterfall
+                    // intact; replacing it with 50 rows would strand a reader
+                    // who is browsing deep in the list.
+                    if self.visible_ids.len() > usize::from(PAGE_SIZE) {
+                        MailboxCommitEffect::Preserve
+                    } else {
+                        self.visible_ids = commit.visible_ids;
+                        self.tail_cursor = commit.tail_cursor;
+                        self.next_cursor = commit.next_cursor;
+                        self.page_number = commit.page_number;
+                        self.selected = None;
+                        self.detail_request = None;
+                        MailboxCommitEffect::Replace
+                    }
                 }
             }
         };
@@ -848,6 +877,23 @@ impl ReadSession {
         self.latest_mailbox_request = None;
         self.detail_request = None;
     }
+}
+
+fn refresh_alignment(refreshed: &[MessageId], visible: &[MessageId]) -> Option<(usize, usize)> {
+    for (refreshed_index, refreshed_id) in refreshed.iter().enumerate() {
+        for (visible_index, visible_id) in visible.iter().enumerate() {
+            if refreshed_id != visible_id {
+                continue;
+            }
+            let overlap = (refreshed.len() - refreshed_index).min(visible.len() - visible_index);
+            if refreshed[refreshed_index..refreshed_index + overlap]
+                == visible[visible_index..visible_index + overlap]
+            {
+                return Some((refreshed_index, visible_index));
+            }
+        }
+    }
+    None
 }
 
 fn mutation_outcome_matches(intent: MutationIntent, outcome: &MutationOutcome) -> bool {
@@ -1269,6 +1315,76 @@ mod tests {
         );
         assert_eq!(session.visible_ids.len(), 51);
         assert_eq!(session.next_cursor(), Some(cursor(51)));
+        assert_eq!(session.page_number(), 2);
+    }
+
+    #[test]
+    fn foreground_refresh_reconciles_new_rows_without_collapsing_a_long_waterfall() {
+        let first = (1..=50).collect::<Vec<_>>();
+        let second = (51..=100).collect::<Vec<_>>();
+        let mut session = ReadSession::new();
+        session.issue_first_mailbox().unwrap();
+        commit_reply(
+            &mut session,
+            &mailbox_reply_with_cursors(1, 1, &first, None, Some(50)),
+        );
+        session.issue_more_mailbox().unwrap();
+        commit_reply(
+            &mut session,
+            &mailbox_reply_with_cursors(2, 1, &second, Some(51), Some(100)),
+        );
+        session.select_message(EntityKey::new(60).unwrap()).unwrap();
+
+        let mut refreshed = vec![201, 202];
+        refreshed.extend(1..=48);
+        session.issue_mailbox_refresh().unwrap();
+        let reply = mailbox_reply_with_cursors(4, 1, &refreshed, None, Some(48));
+        let acceptance = session.match_mailbox_reply(&reply).unwrap();
+        assert_eq!(
+            session.commit_mailbox(acceptance.stage(reply.result.as_ref().unwrap()).unwrap()),
+            Some(MailboxCommitEffect::Reconcile {
+                remove_front: 0,
+                prepend: 2,
+            })
+        );
+        assert_eq!(session.visible_ids.len(), 102);
+        assert_eq!(session.visible_ids[0], MessageId::new(201).unwrap());
+        assert_eq!(session.visible_ids[1], MessageId::new(202).unwrap());
+        assert_eq!(session.visible_ids[2], MessageId::new(1).unwrap());
+        assert_eq!(session.visible_ids[101], MessageId::new(100).unwrap());
+        assert_eq!(session.selected(), MessageId::new(60).ok());
+        assert_eq!(session.next_cursor(), Some(cursor(100)));
+        assert_eq!(session.page_number(), 2);
+    }
+
+    #[test]
+    fn non_overlapping_refresh_never_replaces_a_long_waterfall() {
+        let first = (1..=50).collect::<Vec<_>>();
+        let second = (51..=100).collect::<Vec<_>>();
+        let mut session = ReadSession::new();
+        session.issue_first_mailbox().unwrap();
+        commit_reply(
+            &mut session,
+            &mailbox_reply_with_cursors(1, 1, &first, None, Some(50)),
+        );
+        session.issue_more_mailbox().unwrap();
+        commit_reply(
+            &mut session,
+            &mailbox_reply_with_cursors(2, 1, &second, Some(51), Some(100)),
+        );
+
+        let refreshed = (201..=250).collect::<Vec<_>>();
+        session.issue_mailbox_refresh().unwrap();
+        let reply = mailbox_reply_with_cursors(3, 1, &refreshed, None, Some(250));
+        let acceptance = session.match_mailbox_reply(&reply).unwrap();
+        assert_eq!(
+            session.commit_mailbox(acceptance.stage(reply.result.as_ref().unwrap()).unwrap()),
+            Some(MailboxCommitEffect::Preserve)
+        );
+        assert_eq!(session.visible_ids.len(), 100);
+        assert_eq!(session.visible_ids[0], MessageId::new(1).unwrap());
+        assert_eq!(session.visible_ids[99], MessageId::new(100).unwrap());
+        assert_eq!(session.next_cursor(), Some(cursor(100)));
         assert_eq!(session.page_number(), 2);
     }
 

@@ -2,7 +2,7 @@ use std::{error::Error, fmt};
 
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(crate) const LATEST_SCHEMA_VERSION: u32 = 16;
+pub(crate) const LATEST_SCHEMA_VERSION: u32 = 19;
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -74,6 +74,18 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 16,
         sql: include_str!("../../../migrations/0016_restore_inbox_previews.sql"),
+    },
+    Migration {
+        version: 17,
+        sql: include_str!("../../../migrations/0017_layered_message_fetch.sql"),
+    },
+    Migration {
+        version: 18,
+        sql: include_str!("../../../migrations/0018_repair_preview_sync_cursor.sql"),
+    },
+    Migration {
+        version: 19,
+        sql: include_str!("../../../migrations/0019_remote_inbox_totals.sql"),
     },
 ];
 
@@ -258,6 +270,8 @@ mod tests {
         "archive_total",
         "trash_total",
         "dirty",
+        "remote_inbox_total",
+        "remote_inbox_total_updated_at_ms",
     ];
 
     fn memory_connection() -> Connection {
@@ -469,6 +483,7 @@ mod tests {
                 "idx_messages_account_time".to_owned(),
                 "idx_messages_global_time".to_owned(),
                 "idx_messages_legacy_reconcile_pending".to_owned(),
+                "idx_messages_missing_preview".to_owned(),
                 "idx_messages_starred".to_owned(),
                 "idx_messages_unread".to_owned(),
                 "idx_local_drafts_updated".to_owned(),
@@ -1052,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn v16_reopens_only_inboxes_with_uncached_empty_previews() {
+    fn v18_repairs_only_the_cursor_reopened_by_v16() {
         let mut connection = memory_connection();
         enable_foreign_keys(&connection).expect("enable foreign keys");
         enable_recursive_triggers(&connection).expect("enable recursive triggers");
@@ -1105,7 +1120,8 @@ mod tests {
             )
             .unwrap();
 
-        migrate(&mut connection).expect("schedule preview repair");
+        migrate_with(&mut connection, &MIGRATIONS[..16], 16)
+            .expect("schedule the legacy preview repair");
 
         let affected = connection
             .query_row(
@@ -1138,6 +1154,75 @@ mod tests {
             )
             .unwrap();
         assert_eq!(unaffected, (Some("42".to_owned()), Some(12), false));
+
+        migrate(&mut connection).expect("repair the cursor from durable IMAP locations");
+        let repaired = connection
+            .query_row(
+                "SELECT change_cursor, history_cursor, history_complete
+                 FROM sync_state WHERE folder_id = 10",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(repaired, (Some("42".to_owned()), Some(41), false));
+
+        let still_unaffected = connection
+            .query_row(
+                "SELECT change_cursor, history_cursor, history_complete
+                 FROM sync_state WHERE folder_id = 20",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(still_unaffected, unaffected);
+    }
+
+    #[test]
+    fn v19_adds_unknown_remote_inbox_totals_without_changing_local_statistics() {
+        let mut connection = memory_connection();
+        migrate_with(&mut connection, &MIGRATIONS[..18], 18).expect("create v18 schema");
+        insert_account(&connection, 1, "owner@example.test");
+        connection
+            .execute(
+                "UPDATE account_mailbox_stats
+                 SET inbox_total = 7, inbox_unread = 3
+                 WHERE account_id = 1",
+                [],
+            )
+            .unwrap();
+
+        migrate(&mut connection).expect("add durable remote Inbox totals");
+
+        let values = connection
+            .query_row(
+                "SELECT inbox_total, inbox_unread, remote_inbox_total,
+                        remote_inbox_total_updated_at_ms
+                 FROM account_mailbox_stats WHERE account_id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(values, (7, 3, None, None));
+        assert_eq!(schema_version(&connection), 19);
     }
 
     #[test]
@@ -2516,7 +2601,11 @@ mod tests {
             .expect("the maximum signed SQLite count is valid");
         assert_eq!(mailbox_stats(&connection, 1), [i64::MAX; 7]);
 
-        for column in MAILBOX_STATS_COLUMNS {
+        for column in MAILBOX_STATS_COLUMNS
+            .iter()
+            .copied()
+            .filter(|column| *column != "remote_inbox_total_updated_at_ms")
+        {
             let error = connection
                 .execute(
                     &format!("UPDATE account_mailbox_stats SET {column} = -1 WHERE account_id = 1"),

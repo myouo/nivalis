@@ -1383,8 +1383,9 @@ mod tests {
         },
         network::{
             imap::{
-                ImapDiagnosticFailure, ImapDiagnosticRequest, ImapInboxFetchFailure,
-                ImapInboxFetchRequest, ImapInboxPage,
+                ImapBootstrapHistory, ImapDiagnosticFailure, ImapDiagnosticRequest,
+                ImapHistoryPage, ImapInboxContent, ImapInboxEnvelope, ImapInboxFetchFailure,
+                ImapInboxFetchRequest, ImapInboxFlags, ImapInboxMessage, ImapInboxPage,
             },
             smtp::{
                 SmtpDataFence, SmtpSubmissionCancellation, SmtpSubmissionFailure,
@@ -1497,6 +1498,8 @@ mod tests {
     static AUTO_SYNC_PROBE_CALLS: AtomicUsize = AtomicUsize::new(0);
     static AUTO_SYNC_PROBE_ACTIVE: AtomicUsize = AtomicUsize::new(0);
     static AUTO_SYNC_PROBE_PEAK: AtomicUsize = AtomicUsize::new(0);
+    static FULL_HISTORY_PROBE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static FULL_HISTORY_REQUESTED: AtomicBool = AtomicBool::new(false);
 
     struct PendingDiagnostic;
 
@@ -1543,6 +1546,7 @@ mod tests {
         ImapInboxPage {
             uid_validity: NonZeroU32::new(41).unwrap(),
             uid_next: NonZeroU32::new(uid_next).unwrap(),
+            remote_message_count: 0,
             scanned_through_uid: scanned_through_uid.and_then(NonZeroU32::new),
             next_uid: next_uid.and_then(NonZeroU32::new),
             bootstrap_history: None,
@@ -1563,6 +1567,65 @@ mod tests {
                 1 => Err(ImapInboxFetchFailure::Offline),
                 2 => Ok(empty_inbox_page(1, None, None)),
                 _ => panic!("automatic sync issued more than one immediate probe per account"),
+            }
+        })
+    }
+
+    fn history_message(uid: u32) -> ImapInboxMessage {
+        ImapInboxMessage {
+            uid: NonZeroU32::new(uid).unwrap(),
+            flags: ImapInboxFlags::default(),
+            internal_date: "20-Jul-2026 12:00:00 +0000".into(),
+            envelope: ImapInboxEnvelope {
+                subject: format!("History {uid}").into_bytes().into_boxed_slice(),
+                ..ImapInboxEnvelope::default()
+            },
+            preview: format!("Preview {uid}").into_boxed_str(),
+            declared_bytes: 128,
+            content: ImapInboxContent::NotFetched,
+        }
+    }
+
+    fn full_history_fetch(
+        request: ImapInboxFetchRequest,
+    ) -> crate::core::sync::ImapInboxFetchFuture {
+        let call = FULL_HISTORY_PROBE_CALLS.fetch_add(1, Ordering::AcqRel);
+        Box::pin(async move {
+            match call {
+                0 => {
+                    assert!(!request.requests_history());
+                    Ok(ImapInboxPage {
+                        uid_validity: NonZeroU32::new(41).unwrap(),
+                        uid_next: NonZeroU32::new(3).unwrap(),
+                        remote_message_count: 2,
+                        scanned_through_uid: NonZeroU32::new(2),
+                        next_uid: None,
+                        bootstrap_history: Some(ImapBootstrapHistory {
+                            next_cursor: NonZeroU32::new(1),
+                            complete: false,
+                        }),
+                        history_page: None,
+                        messages: vec![history_message(2)].into_boxed_slice(),
+                    })
+                }
+                1 => {
+                    FULL_HISTORY_REQUESTED.store(request.requests_history(), Ordering::Release);
+                    Ok(ImapInboxPage {
+                        uid_validity: NonZeroU32::new(41).unwrap(),
+                        uid_next: NonZeroU32::new(3).unwrap(),
+                        remote_message_count: 2,
+                        scanned_through_uid: NonZeroU32::new(2),
+                        next_uid: None,
+                        bootstrap_history: None,
+                        history_page: Some(ImapHistoryPage {
+                            expected_cursor: NonZeroU32::new(1).unwrap(),
+                            next_cursor: None,
+                            complete: true,
+                        }),
+                        messages: vec![history_message(1)].into_boxed_slice(),
+                    })
+                }
+                _ => panic!("full history hydration issued an extra fetch"),
             }
         })
     }
@@ -1830,6 +1893,98 @@ mod tests {
         drop(events);
         remove_database_files(&path);
         fs::remove_dir_all(content_root).unwrap();
+    }
+
+    #[test]
+    fn automatic_sync_silently_converges_the_complete_history() {
+        const CREDENTIAL: &str = "dddddddddddddddddddddddddddddddd";
+
+        FULL_HISTORY_PROBE_CALLS.store(0, Ordering::Release);
+        FULL_HISTORY_REQUESTED.store(false, Ordering::Release);
+        let path = temporary_database_path();
+        let content_root = path.with_extension("full-history-content");
+        remove_database_files(&path);
+        let _ = fs::remove_dir_all(&content_root);
+
+        let database = sqlite::spawn(path.clone()).unwrap();
+        let account = create_auto_sync_account(&database.0, CREDENTIAL, "History");
+        let store: Arc<CredentialStore> =
+            keyring_core::mock::Store::new().expect("create shared credential store");
+        let credential_parts = credentials::spawn_with_test_factory(move || Ok(Arc::clone(&store)));
+        let stored = wait_for(
+            credential_parts
+                .0
+                .try_submit(CredentialOperation::Store {
+                    locator: CredentialLocator::parse(CREDENTIAL).unwrap(),
+                    secret: Secret::new(b"full-history-secret".to_vec()).unwrap(),
+                })
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(stored, CredentialOutcome::Stored));
+
+        let (core, mut events, runtime) = spawn_with_sync_components(
+            EVENT_CAPACITY,
+            database,
+            credential_parts,
+            successful_diagnostic,
+            full_history_fetch,
+            production_smtp_submit,
+            Some(content_root.clone()),
+            true,
+        )
+        .unwrap();
+        let statuses = wait_for(async {
+            let mut statuses = Vec::with_capacity(2);
+            while statuses.len() < 2 {
+                match events.recv().await {
+                    Some(Event::AccountSyncStatus(AccountSyncStatus::Synced {
+                        account_id,
+                        imported,
+                        has_more,
+                        historical,
+                        ..
+                    })) if account_id == account.account_id => {
+                        statuses.push((imported, has_more, historical));
+                    }
+                    Some(_) => {}
+                    None => panic!("core event stream closed before history hydration completed"),
+                }
+            }
+            statuses
+        });
+
+        assert_eq!(statuses, vec![(1, true, false), (1, false, true)]);
+        assert_eq!(FULL_HISTORY_PROBE_CALLS.load(Ordering::Acquire), 2);
+        assert!(FULL_HISTORY_REQUESTED.load(Ordering::Acquire));
+
+        runtime.shutdown().unwrap();
+        drop(core);
+        drop(events);
+        let stored = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT stats.remote_inbox_total, stats.inbox_total,
+                        state.history_complete
+                 FROM account_mailbox_stats AS stats
+                 JOIN folders AS folder ON folder.account_id = stats.account_id
+                 JOIN sync_state AS state ON state.folder_id = folder.id
+                 WHERE stats.account_id = ?1 AND folder.role = 'inbox'",
+                [account.account_id.get()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(stored, (2, 2, true));
+
+        remove_database_files(&path);
+        let _ = fs::remove_dir_all(content_root);
     }
 
     fn diagnostic_fixture(

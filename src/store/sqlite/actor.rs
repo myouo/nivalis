@@ -57,10 +57,11 @@ use super::{
     },
     search::{backfill_complete, backfill_next_batch},
     sync::{
-        ActiveImapAccountFence, ImapMessageContentTargetOutcome, InboxCheckpointOutcome,
-        InboxCursorCommit, InboxCursorOutcome, InboxReceivePage, InboxStageOutcome,
-        active_imap_account_fence, commit_inbox_cursor, load_imap_message_content_target,
-        load_inbox_checkpoint, stage_inbox_page,
+        ActiveImapAccountFence, ImapMessageContentTargetOutcome, ImapPreviewApplyOutcome,
+        ImapPreviewBatch, ImapPreviewTargetsOutcome, InboxCheckpointOutcome, InboxCursorCommit,
+        InboxCursorOutcome, InboxReceivePage, InboxStageOutcome, active_imap_account_fence,
+        apply_imap_preview_batch, commit_inbox_cursor, load_imap_message_content_target,
+        load_imap_preview_targets, load_inbox_checkpoint, stage_inbox_page,
     },
 };
 
@@ -224,6 +225,15 @@ enum Request {
         account_id: AccountId,
         expected_generation: AccountGeneration,
         reply: oneshot::Sender<Result<ImapMessageContentTargetOutcome, DbFailure>>,
+    },
+    LoadImapPreviewTargets {
+        account_id: AccountId,
+        expected_generation: AccountGeneration,
+        reply: oneshot::Sender<Result<ImapPreviewTargetsOutcome, DbFailure>>,
+    },
+    ApplyImapPreviews {
+        batch: Box<ImapPreviewBatch>,
+        reply: oneshot::Sender<Result<ImapPreviewApplyOutcome, DbFailure>>,
     },
     LoadPendingCredentialRemovals {
         reply: oneshot::Sender<PendingCredentialRemovalReply>,
@@ -443,6 +453,29 @@ impl DatabaseClient {
             expected_generation,
             reply,
         })?;
+        Ok(receiver)
+    }
+
+    pub(crate) fn try_load_imap_preview_targets(
+        &self,
+        account_id: AccountId,
+        expected_generation: AccountGeneration,
+    ) -> Result<oneshot::Receiver<Result<ImapPreviewTargetsOutcome, DbFailure>>, SubmitError> {
+        let (reply, receiver) = oneshot::channel();
+        self.try_submit(Request::LoadImapPreviewTargets {
+            account_id,
+            expected_generation,
+            reply,
+        })?;
+        Ok(receiver)
+    }
+
+    pub(crate) fn try_apply_imap_previews(
+        &self,
+        batch: Box<ImapPreviewBatch>,
+    ) -> Result<oneshot::Receiver<Result<ImapPreviewApplyOutcome, DbFailure>>, SubmitError> {
+        let (reply, receiver) = oneshot::channel();
+        self.try_submit(Request::ApplyImapPreviews { batch, reply })?;
         Ok(receiver)
     }
 
@@ -1639,6 +1672,26 @@ fn run_actor(
                 }
                 continue;
             }
+            Request::LoadImapPreviewTargets {
+                account_id,
+                expected_generation,
+                reply,
+            } => {
+                if !reply.is_closed() {
+                    let _ = reply.send(load_imap_preview_targets(
+                        &connection,
+                        account_id,
+                        expected_generation,
+                    ));
+                }
+                continue;
+            }
+            Request::ApplyImapPreviews { batch, reply } => {
+                let _write_guard = lock_write_gate(&control.write_gate);
+                let result = apply_imap_preview_batch(&mut connection, &batch);
+                let _ = reply.send(result);
+                continue;
+            }
             Request::LoadPendingCredentialRemovals { reply } => {
                 if !reply.is_closed() {
                     let _ = reply.send(load_pending_credential_removals(&connection));
@@ -2207,6 +2260,16 @@ fn drain_accepted_writes(
                 }
                 let _ = reply.send(result);
             }
+            Request::ApplyImapPreviews { batch, reply } => {
+                let _write_guard = lock_write_gate(write_gate);
+                let result = apply_imap_preview_batch(connection, &batch);
+                if first_failure.is_none()
+                    && let Err(failure) = &result
+                {
+                    first_failure = Some(failure.clone());
+                }
+                let _ = reply.send(result);
+            }
             Request::ImportContent { submission, reply } => {
                 let result = execute_content_import(connection, submission, write_gate);
                 if first_failure.is_none()
@@ -2762,6 +2825,7 @@ mod tests {
                     b"Actor inbox",
                     b"Bounded preview",
                     1_700_000_000_000,
+                    0,
                     InboxFlags::new(false, true),
                     false,
                 )

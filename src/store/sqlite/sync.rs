@@ -12,6 +12,8 @@ const MAX_RECEIVE_PAGE: usize = 50;
 const MAX_SENDER_BYTES: usize = 320;
 const MAX_SUBJECT_BYTES: usize = 998;
 const MAX_PREVIEW_BYTES: usize = 2_048;
+pub(crate) const MAX_PREVIEW_FETCH_BATCH: usize = 50;
+pub(crate) const CURRENT_PREVIEW_VERSION: u32 = 1;
 const MIN_TIMESTAMP_MS: i64 = -62_135_596_800_000;
 const MAX_TIMESTAMP_MS: i64 = 253_402_300_799_999;
 const INBOX_REMOTE_KEY: &str = "inbox";
@@ -44,6 +46,91 @@ pub(crate) enum ImapMessageContentTargetOutcome {
     AlreadyAvailable,
     Stale,
     NotFound,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ImapPreviewTarget {
+    pub(crate) uid: u32,
+    pub(crate) remote_byte_count: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ImapPreviewTargets {
+    pub(crate) uid_validity: Option<u32>,
+    pub(crate) messages: Box<[ImapPreviewTarget]>,
+    pub(crate) has_more: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ImapPreviewTargetsOutcome {
+    Current(ImapPreviewTargets),
+    Stale,
+    NotFound,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ImapPreviewUpdate {
+    uid: u32,
+    preview: Box<str>,
+}
+
+impl ImapPreviewUpdate {
+    pub(crate) fn new(uid: u32, preview: &[u8]) -> Result<Self, InboxValidationError> {
+        if uid == 0 {
+            return Err(InboxValidationError::Uid);
+        }
+        Ok(Self {
+            uid,
+            preview: validate_text("preview", preview, MAX_PREVIEW_BYTES)?,
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ImapPreviewBatch {
+    account_id: AccountId,
+    expected_generation: AccountGeneration,
+    uid_validity: u32,
+    preview_version: u32,
+    updates: Box<[ImapPreviewUpdate]>,
+}
+
+impl ImapPreviewBatch {
+    pub(crate) fn new(
+        account_id: AccountId,
+        expected_generation: AccountGeneration,
+        uid_validity: u32,
+        updates: Vec<ImapPreviewUpdate>,
+    ) -> Result<Self, InboxValidationError> {
+        if uid_validity == 0 {
+            return Err(InboxValidationError::UidValidity);
+        }
+        if updates.len() > MAX_PREVIEW_FETCH_BATCH {
+            return Err(InboxValidationError::PageSize {
+                found: updates.len(),
+                maximum: MAX_PREVIEW_FETCH_BATCH,
+            });
+        }
+        let mut unique = HashSet::with_capacity(updates.len());
+        for update in &updates {
+            if !unique.insert(update.uid) {
+                return Err(InboxValidationError::DuplicateUid(update.uid));
+            }
+        }
+        Ok(Self {
+            account_id,
+            expected_generation,
+            uid_validity,
+            preview_version: CURRENT_PREVIEW_VERSION,
+            updates: updates.into_boxed_slice(),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImapPreviewApplyOutcome {
+    Updated { count: u8 },
+    Stale,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +176,7 @@ pub(crate) struct InboxEnvelope {
     subject: Box<str>,
     preview: Box<str>,
     received_at_ms: i64,
+    remote_byte_count: u64,
     flags: InboxFlags,
     has_attachment: bool,
 }
@@ -102,6 +190,7 @@ impl InboxEnvelope {
         subject: &[u8],
         preview: &[u8],
         received_at_ms: i64,
+        remote_byte_count: u64,
         flags: InboxFlags,
         has_attachment: bool,
     ) -> Result<Self, InboxValidationError> {
@@ -116,6 +205,7 @@ impl InboxEnvelope {
             subject: validate_text("subject", subject, MAX_SUBJECT_BYTES)?,
             preview: validate_text("preview", preview, MAX_PREVIEW_BYTES)?,
             received_at_ms,
+            remote_byte_count,
             flags,
             has_attachment,
         })
@@ -131,6 +221,7 @@ pub(crate) struct InboxReceivePage {
     account_id: AccountId,
     expected_generation: AccountGeneration,
     uid_validity: u32,
+    remote_message_count: Option<u32>,
     progress: InboxReceiveProgress,
     messages: Box<[InboxEnvelope]>,
 }
@@ -253,6 +344,7 @@ impl InboxReceivePage {
             account_id,
             expected_generation,
             uid_validity,
+            remote_message_count: None,
             progress: InboxReceiveProgress::Forward {
                 expected_cursor,
                 scanned_through_uid,
@@ -308,6 +400,7 @@ impl InboxReceivePage {
             account_id,
             expected_generation,
             uid_validity,
+            remote_message_count: None,
             progress: InboxReceiveProgress::History {
                 expected_cursor,
                 expected_history_cursor,
@@ -356,6 +449,11 @@ impl InboxReceivePage {
     pub(crate) fn messages(&self) -> &[InboxEnvelope] {
         &self.messages
     }
+
+    pub(crate) fn with_remote_message_count(mut self, count: u32) -> Self {
+        self.remote_message_count = Some(count);
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -380,6 +478,7 @@ pub(crate) struct InboxCursorTicket {
     account_id: AccountId,
     expected_generation: AccountGeneration,
     uid_validity: u32,
+    remote_message_count: Option<u32>,
     progress: InboxReceiveProgress,
 }
 
@@ -406,6 +505,22 @@ impl InboxCursorTicket {
             InboxReceiveProgress::History {
                 expected_cursor, ..
             } => Some(expected_cursor),
+        }
+    }
+
+    pub(crate) fn history_pending(&self) -> bool {
+        match self.progress {
+            InboxReceiveProgress::Forward {
+                bootstrap_history: Some(history),
+                ..
+            } => !history.complete,
+            InboxReceiveProgress::History {
+                history_complete, ..
+            } => !history_complete,
+            InboxReceiveProgress::Forward {
+                bootstrap_history: None,
+                ..
+            } => false,
         }
     }
 }
@@ -652,6 +767,140 @@ pub(super) fn load_imap_message_content_target(
     ))
 }
 
+pub(super) fn load_imap_preview_targets(
+    connection: &Connection,
+    account_id: AccountId,
+    expected_generation: AccountGeneration,
+) -> Result<ImapPreviewTargetsOutcome, DbFailure> {
+    match active_imap_account_fence(connection, account_id, expected_generation)? {
+        ActiveImapAccountFence::Current => {}
+        ActiveImapAccountFence::Stale => return Ok(ImapPreviewTargetsOutcome::Stale),
+        ActiveImapAccountFence::NotFound => return Ok(ImapPreviewTargetsOutcome::NotFound),
+    }
+
+    let query_limit = i64::try_from(MAX_PREVIEW_FETCH_BATCH + 1)
+        .map_err(|_| DbFailure::resource_limit("preview target limit is invalid"))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT location.uid_validity, location.uid, message.remote_byte_count
+             FROM messages AS message
+             JOIN imap_message_locations AS location
+               ON location.message_id = message.id
+              AND location.account_id = message.account_id
+             JOIN folders AS folder
+               ON folder.id = location.folder_id
+              AND folder.account_id = location.account_id
+              AND folder.role = 'inbox'
+             JOIN sync_state AS state
+               ON state.folder_id = folder.id
+              AND state.uid_validity = location.uid_validity
+             WHERE message.account_id = ?1
+               AND message.preview_state = 'missing'
+             ORDER BY message.received_at_ms DESC, message.id DESC
+             LIMIT ?2",
+        )
+        .map_err(DbFailure::database)?;
+    let mapped = statement
+        .query_map(params![account_id.get(), query_limit], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(DbFailure::database)?;
+    let mut uid_validity = None;
+    let mut messages = Vec::with_capacity(MAX_PREVIEW_FETCH_BATCH + 1);
+    for row in mapped {
+        let (raw_uid_validity, raw_uid, raw_bytes) = row.map_err(DbFailure::database)?;
+        let current_uid_validity = u32::try_from(raw_uid_validity)
+            .ok()
+            .filter(|value| *value != 0)
+            .ok_or_else(|| DbFailure::database("stored preview UIDVALIDITY is invalid"))?;
+        if uid_validity
+            .replace(current_uid_validity)
+            .is_some_and(|previous| previous != current_uid_validity)
+        {
+            return Err(DbFailure::conflict(
+                "preview targets span multiple UIDVALIDITY generations",
+            ));
+        }
+        let uid = u32::try_from(raw_uid)
+            .ok()
+            .filter(|value| *value != 0)
+            .ok_or_else(|| DbFailure::database("stored preview UID is invalid"))?;
+        let remote_byte_count = u64::try_from(raw_bytes)
+            .map_err(|_| DbFailure::database("stored remote message size is invalid"))?;
+        messages.push(ImapPreviewTarget {
+            uid,
+            remote_byte_count,
+        });
+    }
+    let has_more = messages.len() > MAX_PREVIEW_FETCH_BATCH;
+    messages.truncate(MAX_PREVIEW_FETCH_BATCH);
+    Ok(ImapPreviewTargetsOutcome::Current(ImapPreviewTargets {
+        uid_validity,
+        messages: messages.into_boxed_slice(),
+        has_more,
+    }))
+}
+
+pub(super) fn apply_imap_preview_batch(
+    connection: &mut Connection,
+    batch: &ImapPreviewBatch,
+) -> Result<ImapPreviewApplyOutcome, DbFailure> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(DbFailure::database)?;
+    if !account_fence_matches(&transaction, batch.account_id, batch.expected_generation)? {
+        return Ok(ImapPreviewApplyOutcome::Stale);
+    }
+
+    let mut updated = 0_usize;
+    for update in &batch.updates {
+        updated = updated
+            .checked_add(
+                transaction
+                    .execute(
+                        "UPDATE messages
+                         SET preview = ?4,
+                             preview_state = CASE WHEN ?4 = '' THEN 'empty' ELSE 'available' END,
+                             preview_version = ?5
+                         WHERE id = (
+                             SELECT location.message_id
+                             FROM imap_message_locations AS location
+                             JOIN folders AS folder
+                               ON folder.id = location.folder_id
+                              AND folder.account_id = location.account_id
+                              AND folder.role = 'inbox'
+                             JOIN sync_state AS state
+                               ON state.folder_id = folder.id
+                              AND state.uid_validity = location.uid_validity
+                             WHERE location.account_id = ?1
+                               AND location.uid_validity = ?2
+                               AND location.uid = ?3
+                             LIMIT 1
+                         )
+                           AND account_id = ?1
+                           AND preview_state = 'missing'",
+                        params![
+                            batch.account_id.get(),
+                            i64::from(batch.uid_validity),
+                            i64::from(update.uid),
+                            update.preview.as_ref(),
+                            i64::from(batch.preview_version),
+                        ],
+                    )
+                    .map_err(DbFailure::database)?,
+            )
+            .ok_or_else(|| DbFailure::resource_limit("preview update count overflow"))?;
+    }
+    transaction.commit().map_err(DbFailure::database)?;
+    let count = u8::try_from(updated)
+        .map_err(|_| DbFailure::resource_limit("preview update count exceeds its bound"))?;
+    Ok(ImapPreviewApplyOutcome::Updated { count })
+}
+
 pub(super) fn stage_inbox_page(
     connection: &mut Connection,
     page: &InboxReceivePage,
@@ -751,6 +1000,7 @@ fn stage_messages(
         )?,
     }
     stats::rebuild_account(transaction, page.account_id.get())?;
+    let progress = repair_incomplete_remote_history(transaction, folder_id, page)?;
     Ok(InboxStageOutcome::Staged {
         messages: staged.into_boxed_slice(),
         tombstoned,
@@ -758,8 +1008,69 @@ fn stage_messages(
             account_id: page.account_id,
             expected_generation: page.expected_generation,
             uid_validity: page.uid_validity,
-            progress: page.progress,
+            remote_message_count: page.remote_message_count,
+            progress,
         },
+    })
+}
+
+fn repair_incomplete_remote_history(
+    transaction: &Transaction<'_>,
+    folder_id: i64,
+    page: &InboxReceivePage,
+) -> Result<InboxReceiveProgress, DbFailure> {
+    let InboxReceiveProgress::Forward {
+        expected_cursor,
+        scanned_through_uid,
+        bootstrap_history: None,
+    } = page.progress
+    else {
+        return Ok(page.progress);
+    };
+    let Some(remote_message_count) = page.remote_message_count else {
+        return Ok(page.progress);
+    };
+    let (history_complete, local_inbox_total, oldest_uid) = transaction
+        .query_row(
+            "SELECT state.history_complete, stats.inbox_total,
+                    min(location.uid)
+             FROM sync_state AS state
+             JOIN folders AS folder ON folder.id = state.folder_id
+             JOIN account_mailbox_stats AS stats ON stats.account_id = folder.account_id
+             LEFT JOIN imap_message_locations AS location
+               ON location.folder_id = folder.id
+              AND location.uid_validity = state.uid_validity
+             WHERE state.folder_id = ?1
+             GROUP BY state.folder_id",
+            [folder_id],
+            |row| {
+                Ok((
+                    row.get::<_, bool>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )
+        .map_err(DbFailure::database)?;
+    let local_inbox_total = u64::try_from(local_inbox_total)
+        .map_err(|_| DbFailure::database("local Inbox total is negative"))?;
+    if !history_complete || u64::from(remote_message_count) <= local_inbox_total {
+        return Ok(page.progress);
+    }
+    let history_cursor = oldest_uid
+        .and_then(|uid| u32::try_from(uid).ok())
+        .and_then(|uid| uid.checked_sub(1))
+        .filter(|uid| *uid != 0);
+    let Some(history_cursor) = history_cursor else {
+        return Ok(page.progress);
+    };
+    Ok(InboxReceiveProgress::Forward {
+        expected_cursor,
+        scanned_through_uid,
+        bootstrap_history: Some(InboxHistoryProgress {
+            cursor: Some(history_cursor),
+            complete: false,
+        }),
     })
 }
 
@@ -871,6 +1182,26 @@ pub(super) fn commit_inbox_cursor(
     .map_err(DbFailure::database)?;
     if changed != 1 {
         return Ok(InboxCursorOutcome::Stale);
+    }
+    if let Some(remote_message_count) = commit.ticket.remote_message_count {
+        let updated = transaction
+            .execute(
+                "UPDATE account_mailbox_stats
+                 SET remote_inbox_total = ?2,
+                     remote_inbox_total_updated_at_ms = ?3
+                 WHERE account_id = ?1",
+                params![
+                    commit.ticket.account_id.get(),
+                    i64::from(remote_message_count),
+                    commit.last_sync_at_ms,
+                ],
+            )
+            .map_err(DbFailure::database)?;
+        if updated != 1 {
+            return Err(DbFailure::conflict(
+                "mail account is missing its remote Inbox total",
+            ));
+        }
     }
     transaction.commit().map_err(DbFailure::database)?;
     Ok(InboxCursorOutcome::Committed {
@@ -1121,8 +1452,11 @@ fn upsert_message(
                     .execute(
                         "INSERT INTO messages
                          (account_id, remote_key, sender_name, sender_address, subject, preview,
-                          received_at_ms, unread, starred, has_attachment)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                          received_at_ms, unread, starred, has_attachment, preview_state,
+                          preview_version, remote_byte_count)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                                 CASE WHEN ?6 = '' THEN 'missing' ELSE 'available' END,
+                                 CASE WHEN ?6 = '' THEN 0 ELSE ?11 END, ?12)",
                         params![
                             account_id.get(),
                             remote_key,
@@ -1134,6 +1468,10 @@ fn upsert_message(
                             !message.flags.seen(),
                             message.flags.flagged(),
                             message.has_attachment,
+                            i64::from(CURRENT_PREVIEW_VERSION),
+                            i64::try_from(message.remote_byte_count).map_err(|_| {
+                                DbFailure::resource_limit("remote message size exceeds SQLite")
+                            })?,
                         ],
                     )
                     .map_err(DbFailure::database)?;
@@ -1207,13 +1545,20 @@ fn update_envelope(
                      ) THEN subject ELSE ?5 END,
                  preview = CASE WHEN EXISTS (
                          SELECT 1 FROM message_content WHERE message_id = ?1
-                     ) THEN preview ELSE ?6 END,
+                     ) OR ?6 = '' THEN preview ELSE ?6 END,
+                 preview_state = CASE WHEN EXISTS (
+                         SELECT 1 FROM message_content WHERE message_id = ?1
+                     ) OR ?6 = '' THEN preview_state ELSE 'available' END,
+                 preview_version = CASE WHEN EXISTS (
+                         SELECT 1 FROM message_content WHERE message_id = ?1
+                     ) OR ?6 = '' THEN preview_version ELSE ?9 END,
                  received_at_ms = CASE WHEN EXISTS (
                          SELECT 1 FROM message_content WHERE message_id = ?1
                      ) THEN received_at_ms ELSE ?7 END,
                  has_attachment = CASE WHEN EXISTS (
                          SELECT 1 FROM message_content WHERE message_id = ?1
-                     ) THEN has_attachment ELSE ?8 END
+                     ) THEN has_attachment ELSE ?8 END,
+                 remote_byte_count = ?10
              WHERE id = ?1 AND account_id = ?2",
             params![
                 message_id,
@@ -1224,6 +1569,10 @@ fn update_envelope(
                 message.preview.as_ref(),
                 message.received_at_ms,
                 message.has_attachment,
+                i64::from(CURRENT_PREVIEW_VERSION),
+                i64::try_from(message.remote_byte_count).map_err(|_| {
+                    DbFailure::resource_limit("remote message size exceeds SQLite")
+                })?,
             ],
         )
         .map_err(DbFailure::database)
@@ -1399,7 +1748,23 @@ mod tests {
             subject.as_bytes(),
             b"A bounded preview",
             1_700_000_000_000 + i64::from(uid),
+            0,
             flags,
+            false,
+        )
+        .unwrap()
+    }
+
+    fn missing_preview_envelope(uid: u32) -> InboxEnvelope {
+        InboxEnvelope::new(
+            uid,
+            b"Ada",
+            b"ada@example.test",
+            format!("Message {uid}").as_bytes(),
+            b"",
+            1_700_000_000_000 + i64::from(uid),
+            u64::from(uid) * 100,
+            InboxFlags::new(false, false),
             false,
         )
         .unwrap()
@@ -1490,6 +1855,73 @@ mod tests {
             &InboxCursorCommit::new(ticket, timestamp).unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn cursor_commit_hot_updates_the_durable_remote_inbox_total() {
+        let mut connection = connection();
+        let page = page(
+            None,
+            UID_VALIDITY,
+            vec![envelope(1, "One", InboxFlags::new(false, false))],
+        )
+        .with_remote_message_count(12_345);
+
+        assert_eq!(
+            stage_content_and_commit(&mut connection, &page, 2_000),
+            InboxCursorOutcome::Committed {
+                scanned_through_uid: Some(1)
+            }
+        );
+        let stored = connection
+            .query_row(
+                "SELECT remote_inbox_total, remote_inbox_total_updated_at_ms
+                 FROM account_mailbox_stats WHERE account_id = 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (12_345, 2_000));
+    }
+
+    #[test]
+    fn hot_remote_total_reopens_a_falsely_completed_history_cursor() {
+        let mut connection = connection();
+        let bootstrap = InboxReceivePage::new_bootstrap(
+            account_id(),
+            generation(GENERATION),
+            UID_VALIDITY,
+            Some(6),
+            None,
+            true,
+            vec![
+                envelope(5, "Five", InboxFlags::new(false, false)),
+                envelope(6, "Six", InboxFlags::new(false, false)),
+            ],
+        )
+        .unwrap();
+        assert!(matches!(
+            stage_content_and_commit(&mut connection, &bootstrap, 2_000),
+            InboxCursorOutcome::Committed { .. }
+        ));
+        assert_eq!(history_state(&connection), (Some("6".into()), None, true));
+
+        let probe =
+            scanned_page(Some(6), UID_VALIDITY, Some(6), Vec::new()).with_remote_message_count(5);
+        let (_, ticket) = stage_parts(stage_inbox_page(&mut connection, &probe).unwrap());
+        assert!(ticket.history_pending());
+        assert!(matches!(
+            commit_inbox_cursor(
+                &mut connection,
+                &InboxCursorCommit::new(ticket, 3_000).unwrap()
+            )
+            .unwrap(),
+            InboxCursorOutcome::Committed { .. }
+        ));
+        assert_eq!(
+            history_state(&connection),
+            (Some("6".into()), Some(4), false)
+        );
     }
 
     #[test]
@@ -1597,6 +2029,7 @@ mod tests {
                 b"",
                 b"",
                 0,
+                0,
                 InboxFlags::new(false, false),
                 false,
             ),
@@ -1609,6 +2042,7 @@ mod tests {
                 b"",
                 b"",
                 b"",
+                0,
                 0,
                 InboxFlags::new(false, false),
                 false,
@@ -1624,6 +2058,7 @@ mod tests {
                 b"",
                 &vec![b'x'; MAX_SUBJECT_BYTES + 1],
                 b"",
+                0,
                 0,
                 InboxFlags::new(false, false),
                 false,
@@ -1641,6 +2076,7 @@ mod tests {
                 b"",
                 b"",
                 i64::MAX,
+                0,
                 InboxFlags::new(false, false),
                 false,
             ),
@@ -1846,6 +2282,101 @@ mod tests {
             )
             .unwrap(),
             ImapMessageContentTargetOutcome::Stale
+        );
+    }
+
+    #[test]
+    fn preview_discovery_is_bounded_recent_first_and_records_definitive_empty() {
+        let mut connection = connection();
+        let messages = (1..=50).map(missing_preview_envelope).collect();
+        let (_, ticket) = stage_parts(
+            stage_inbox_page(&mut connection, &page(None, UID_VALIDITY, messages)).unwrap(),
+        );
+        commit_inbox_cursor(
+            &mut connection,
+            &InboxCursorCommit::new(ticket, 2_000).unwrap(),
+        )
+        .unwrap();
+        let (_, ticket) = stage_parts(
+            stage_inbox_page(
+                &mut connection,
+                &page(Some(50), UID_VALIDITY, vec![missing_preview_envelope(51)]),
+            )
+            .unwrap(),
+        );
+        commit_inbox_cursor(
+            &mut connection,
+            &InboxCursorCommit::new(ticket, 2_001).unwrap(),
+        )
+        .unwrap();
+
+        let ImapPreviewTargetsOutcome::Current(first) =
+            load_imap_preview_targets(&connection, account_id(), generation(GENERATION)).unwrap()
+        else {
+            panic!("current preview targets");
+        };
+        assert_eq!(first.uid_validity, Some(UID_VALIDITY));
+        assert_eq!(first.messages.len(), MAX_PREVIEW_FETCH_BATCH);
+        assert!(first.has_more);
+        assert_eq!(first.messages[0].uid, 51);
+        assert_eq!(first.messages[0].remote_byte_count, 5_100);
+        assert_eq!(first.messages.last().unwrap().uid, 2);
+
+        let updates = first
+            .messages
+            .iter()
+            .map(|target| {
+                ImapPreviewUpdate::new(target.uid, format!("Preview {}", target.uid).as_bytes())
+                    .unwrap()
+            })
+            .collect();
+        let batch =
+            ImapPreviewBatch::new(account_id(), generation(GENERATION), UID_VALIDITY, updates)
+                .unwrap();
+        assert_eq!(
+            apply_imap_preview_batch(&mut connection, &batch).unwrap(),
+            ImapPreviewApplyOutcome::Updated { count: 50 }
+        );
+
+        let ImapPreviewTargetsOutcome::Current(second) =
+            load_imap_preview_targets(&connection, account_id(), generation(GENERATION)).unwrap()
+        else {
+            panic!("remaining preview target");
+        };
+        assert_eq!(
+            second.messages.as_ref(),
+            [ImapPreviewTarget {
+                uid: 1,
+                remote_byte_count: 100,
+            }]
+        );
+        assert!(!second.has_more);
+        let empty = ImapPreviewBatch::new(
+            account_id(),
+            generation(GENERATION),
+            UID_VALIDITY,
+            vec![ImapPreviewUpdate::new(1, b"").unwrap()],
+        )
+        .unwrap();
+        assert_eq!(
+            apply_imap_preview_batch(&mut connection, &empty).unwrap(),
+            ImapPreviewApplyOutcome::Updated { count: 1 }
+        );
+        let states = connection
+            .prepare(
+                "SELECT preview_state, count(*) FROM messages
+                 GROUP BY preview_state ORDER BY preview_state",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            states,
+            vec![("available".to_owned(), 50), ("empty".to_owned(), 1)]
         );
     }
 

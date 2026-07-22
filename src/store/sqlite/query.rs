@@ -32,13 +32,17 @@ const ACCOUNT_DIRECTORY_SQL: &str = "
      LIMIT ?1";
 
 const MAILBOX_SELECT: &str = "
-    SELECT m.id, m.account_id, m.sender_name, m.sender_address, m.subject, m.preview,
+    SELECT m.id, m.account_id, m.sender_name, m.sender_address, m.subject,
+           CASE WHEN m.preview_state = 'empty' AND m.preview = ''
+                THEN 'No text preview available' ELSE m.preview END,
            m.received_at_ms, m.unread, m.starred, m.has_attachment
       FROM messages AS m
      WHERE ";
 
 const MAILBOX_SEARCH_SELECT: &str = "
-    SELECT m.id, m.account_id, m.sender_name, m.sender_address, m.subject, m.preview,
+    SELECT m.id, m.account_id, m.sender_name, m.sender_address, m.subject,
+           CASE WHEN m.preview_state = 'empty' AND m.preview = ''
+                THEN 'No text preview available' ELSE m.preview END,
            m.received_at_ms, m.unread, m.starred, m.has_attachment
       FROM message_search
       JOIN messages AS m ON m.id = message_search.rowid
@@ -518,6 +522,34 @@ mod tests {
         let spec =
             PageSpec::new(AccountScope::All, FolderScope::Inbox, None, boundary, limit).unwrap();
         query_mailbox(connection, &spec).unwrap()
+    }
+
+    #[test]
+    fn mailbox_distinguishes_pending_and_confirmed_empty_previews() {
+        let connection = seeded_connection(2);
+        connection
+            .execute(
+                "UPDATE messages
+                    SET preview = '', preview_state = 'empty'
+                  WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE messages
+                    SET preview = '', preview_state = 'missing'
+                  WHERE id = 2",
+                [],
+            )
+            .unwrap();
+
+        let page = inbox_page(&connection, PageBoundary::First, 50);
+        let empty = page.rows.iter().find(|row| row.id.get() == 1).unwrap();
+        let pending = page.rows.iter().find(|row| row.id.get() == 2).unwrap();
+
+        assert_eq!(empty.preview.as_ref(), "No text preview available");
+        assert!(pending.preview.is_empty());
     }
 
     fn message_ids(page: &MailboxPage) -> Vec<i64> {
