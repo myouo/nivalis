@@ -6,43 +6,36 @@ export component ReaderAction inherits Rectangle {
     in property <string> label;
     in property <string> disabled-reason: "";
     in property <bool> danger: false;
+    in property <bool> selected: false;
     in property <bool> enabled: true;
     in property <bool> busy: false;
     callback clicked;
     forward-focus: focus;
 
-    width: 64px;
-    height: 60px;
+    width: 32px;
+    height: 32px;
     border-radius: 4px;
-    background: !root.enabled || root.busy ? transparent : touch.pressed ? Theme.surface-container-highest : touch.has-hover ? Theme.surface-container-high : transparent;
+    border-width: 1px;
+    border-color: focus.has-focus ? Theme.primary : root.danger && touch.has-hover ? Theme.error : Theme.outline-variant;
+    background: !root.enabled || root.busy ? Theme.surface-container-low :
+        root.selected ? (touch.pressed ? Theme.primary-container-pressed : touch.has-hover ? Theme.primary-container-hover : Theme.primary-container) :
+        touch.pressed ? Theme.surface-container-highest : touch.has-hover ? Theme.surface-container-high : Theme.surface;
     animate background { duration: Theme.motion-fast; easing: cubic-bezier(0.2, 0, 0, 1); }
+    animate border-color { duration: Theme.motion-fast; easing: cubic-bezier(0.2, 0, 0, 1); }
     accessible-role: button;
     accessible-label: root.busy ? root.label + ", loading" : !root.enabled && root.disabled-reason != "" ? root.disabled-reason : root.label;
     accessible-enabled: root.enabled && !root.busy;
     accessible-action-default => { if (root.enabled && !root.busy) { root.clicked(); } }
 
     MaterialIcon {
-        x: (parent.width - 20px) / 2;
-        y: 7px;
-        width: 20px;
-        height: 20px;
+        x: (parent.width - 18px) / 2;
+        y: (parent.height - 18px) / 2;
+        width: 18px;
+        height: 18px;
         name: root.busy ? "progress_activity" : root.icon;
-        size: 17px;
-        icon-color: !root.enabled || root.busy ? Theme.outline : root.danger ? Theme.error : Theme.on-surface-variant;
-    }
-    Text {
-        x: 3px;
-        y: 28px;
-        width: parent.width - 6px;
-        height: 22px;
-        text: root.label;
-        color: !root.enabled || root.busy ? Theme.outline : root.danger ? Theme.error : Theme.on-surface;
-        font-family: Theme.body-font;
-        font-size: 10px;
-        font-weight: 400;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-        overflow: elide;
+        size: 15px;
+        icon-color: !root.enabled || root.busy ? Theme.outline :
+            root.selected ? Theme.primary : root.danger && touch.has-hover ? Theme.error : Theme.on-surface-variant;
     }
 
     focus := FocusScope {
