@@ -7,6 +7,8 @@ use rusqlite::{
     types::{Type, Value},
 };
 
+use crate::content::LEGACY_SAFETY_LIMIT_MESSAGE;
+
 use super::domain::{
     AccountDirectory, AccountSummaryDto, DbFailure, FolderScope, MAX_ACCOUNT_STATS, MailSummaryDto,
     MailboxPage, MessageDetail, MessageId, PageBoundary, PageCursor, PageSpec,
@@ -53,6 +55,7 @@ const OPEN_MESSAGE_SQL: &str = "
            m.unread, m.starred, m.has_attachment, coalesce(c.reader_excerpt, ''),
            coalesce(c.truncated, 0), coalesce(c.body_byte_count, 0), c.body_file_key,
            c.message_id IS NOT NULL
+             AND NOT (coalesce(c.truncated, 0) != 0 AND c.reader_excerpt = ?2)
       FROM messages AS m
       LEFT JOIN message_content AS c ON c.message_id = m.id
      WHERE m.id = ?1";
@@ -367,29 +370,37 @@ pub(super) fn open_message(
     id: MessageId,
 ) -> Result<Option<MessageDetail>, DbFailure> {
     connection
-        .query_row(OPEN_MESSAGE_SQL, [id.get()], |row| {
-            let byte_count: i64 = row.get(11)?;
-            Ok(MessageDetail {
-                id: MessageId::from_database(row.get(0)?),
-                account_id: row.get(1)?,
-                sender_name: row.get::<_, String>(2)?.into_boxed_str(),
-                sender_address: row.get::<_, String>(3)?.into_boxed_str(),
-                subject: row.get::<_, String>(4)?.into_boxed_str(),
-                received_at_ms: row.get(5)?,
-                unread: row.get(6)?,
-                starred: row.get(7)?,
-                has_attachment: row.get(8)?,
-                reader_excerpt: row.get::<_, String>(9)?.into_boxed_str(),
-                body_truncated: row.get(10)?,
-                body_byte_count: u64::try_from(byte_count).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(11, Type::Integer, Box::new(error))
-                })?,
-                body_file_key: row
-                    .get::<_, Option<String>>(12)?
-                    .map(String::into_boxed_str),
-                content_available: row.get(13)?,
-            })
-        })
+        .query_row(
+            OPEN_MESSAGE_SQL,
+            rusqlite::params![id.get(), LEGACY_SAFETY_LIMIT_MESSAGE],
+            |row| {
+                let byte_count: i64 = row.get(11)?;
+                Ok(MessageDetail {
+                    id: MessageId::from_database(row.get(0)?),
+                    account_id: row.get(1)?,
+                    sender_name: row.get::<_, String>(2)?.into_boxed_str(),
+                    sender_address: row.get::<_, String>(3)?.into_boxed_str(),
+                    subject: row.get::<_, String>(4)?.into_boxed_str(),
+                    received_at_ms: row.get(5)?,
+                    unread: row.get(6)?,
+                    starred: row.get(7)?,
+                    has_attachment: row.get(8)?,
+                    reader_excerpt: row.get::<_, String>(9)?.into_boxed_str(),
+                    body_truncated: row.get(10)?,
+                    body_byte_count: u64::try_from(byte_count).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            11,
+                            Type::Integer,
+                            Box::new(error),
+                        )
+                    })?,
+                    body_file_key: row
+                        .get::<_, Option<String>>(12)?
+                        .map(String::into_boxed_str),
+                    content_available: row.get(13)?,
+                })
+            },
+        )
         .optional()
         .map_err(DbFailure::database)
 }
@@ -1104,6 +1115,26 @@ mod tests {
         assert!(detail.body_truncated);
         assert_eq!(detail.body_byte_count, 70_000);
         assert!(detail.content_available);
+    }
+
+    #[test]
+    fn message_detail_refreshes_a_legacy_safety_placeholder() {
+        let connection = seeded_connection(1);
+        connection
+            .execute(
+                "INSERT INTO message_content
+                 (message_id, reader_excerpt, truncated, body_byte_count, body_file_key)
+                 VALUES (1, ?1, 1, 488133, 'body/1.txt')",
+                [LEGACY_SAFETY_LIMIT_MESSAGE],
+            )
+            .unwrap();
+
+        let detail = open_message(&connection, MessageId::new(1).unwrap())
+            .unwrap()
+            .unwrap();
+
+        assert!(!detail.content_available);
+        assert!(detail.body_truncated);
     }
 
     #[test]

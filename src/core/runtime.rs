@@ -17,11 +17,11 @@ use super::{
     sync::{ImapInboxFetchProbe, production_imap_inbox_fetch},
 };
 use crate::{
-    content::{ContentStaging, StorageError},
+    content::{ContentStaging, FileKey, StorageError},
     credentials::{self, CredentialClient, CredentialRuntime},
     store::sqlite::{
         self, DatabaseClient, DatabaseInfo, DatabaseReplies, DatabaseRuntime, DatabaseSubmitError,
-        DbReply, MutationOutcome,
+        DbReply, MessageDetail, MutationOutcome, Tagged,
     },
 };
 use std::{
@@ -607,7 +607,7 @@ async fn run_core(
                     .await;
                 }
             }
-            CoreInput::Database(DbReply::Message(reply)) => {
+            CoreInput::Database(DbReply::Message(mut reply)) => {
                 let key = MessageRequestKey {
                     request_id: reply.request_id,
                     generation: reply.generation,
@@ -615,6 +615,7 @@ async fn run_core(
                 match message.complete(key) {
                     MessageCompletion::Ignore => {}
                     MessageCompletion::Publish => {
+                        hydrate_message_body(staging.as_deref(), &mut reply);
                         if !send_event(&events, &mut shutdown, Event::MessageLoaded(reply)).await {
                             return finish_accepted_work(
                                 &mut commands,
@@ -1207,6 +1208,33 @@ enum MessageCompletion {
     Dispatch(MessageQuery),
 }
 
+fn hydrate_message_body(
+    staging: Option<&ContentStaging>,
+    reply: &mut Tagged<Option<MessageDetail>>,
+) {
+    let Ok(Some(detail)) = &mut reply.result else {
+        return;
+    };
+    if !detail.content_available {
+        return;
+    }
+    let Some(staging) = staging else {
+        return;
+    };
+    let Some(stored_key) = detail.body_file_key.as_deref() else {
+        detail.body_truncated = true;
+        return;
+    };
+    let Ok(file_key) = FileKey::parse(stored_key) else {
+        detail.body_truncated = true;
+        return;
+    };
+    match staging.read_body_text(&file_key) {
+        Ok(body) => detail.reader_excerpt = body,
+        Err(_) => detail.body_truncated = true,
+    }
+}
+
 fn submit_message(
     database: &DatabaseClient,
     schedule: &mut MessageSchedule,
@@ -1443,6 +1471,60 @@ mod tests {
             Generation::new(generation),
             MessageId::new(message_id).unwrap(),
         )
+    }
+
+    #[test]
+    fn message_hydration_reads_the_complete_published_body() {
+        let root = temporary_database_path().with_extension("reader-body");
+        let _ = fs::remove_dir_all(&root);
+        let staging = ContentStaging::open(root.clone()).unwrap();
+        let body = format!(
+            "Visible beginning\n{}\nVisible ending",
+            "正文".repeat(40_000)
+        );
+        let staged = staging
+            .stage_reader(
+                crate::content::FileKind::Body,
+                body.as_bytes(),
+                crate::content::ContentLimits::default().stored_body_bytes,
+            )
+            .unwrap();
+        let mut published = staged.publish().unwrap();
+        let stored_key: Box<str> = published.key().as_str().into();
+        published.retain();
+        let excerpt: Box<str> = body
+            .chars()
+            .take(10_000)
+            .collect::<String>()
+            .into_boxed_str();
+        let mut reply = Tagged {
+            request_id: RequestId::new(1).unwrap(),
+            generation: Generation::new(1),
+            result: Ok(Some(MessageDetail {
+                id: MessageId::new(1).unwrap(),
+                account_id: 1,
+                sender_name: "Sender".into(),
+                sender_address: "sender@example.test".into(),
+                subject: "Complete body".into(),
+                received_at_ms: 1,
+                unread: false,
+                starred: false,
+                has_attachment: false,
+                reader_excerpt: excerpt,
+                body_truncated: false,
+                body_byte_count: body.len() as u64,
+                body_file_key: Some(stored_key),
+                content_available: true,
+            })),
+        };
+
+        hydrate_message_body(Some(&staging), &mut reply);
+
+        let detail = reply.result.unwrap().unwrap();
+        assert_eq!(detail.reader_excerpt.as_ref(), body);
+        assert!(!detail.body_truncated);
+        drop(published);
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn mutation_request(request_id: u64, generation: u64, message_id: i64) -> MutationRequest {

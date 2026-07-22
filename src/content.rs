@@ -17,6 +17,8 @@ const MAX_ADDRESS_BYTES: usize = 320;
 const MAX_CONTENT_ID_BYTES: usize = 998;
 const MAX_MEDIA_TYPE_BYTES: usize = 255;
 const MAX_DISPOSITION_BYTES: usize = 64;
+pub(crate) const LEGACY_SAFETY_LIMIT_MESSAGE: &str = "This message could not be rendered because its content exceeds the local safety limits. It was kept in the mailbox so synchronization can continue.";
+const SAFETY_LIMIT_MESSAGE: &str = "This message is too large or complex to render safely. It remains available through the provider, and synchronization can continue.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ContentLimits {
@@ -291,9 +293,7 @@ impl UnrenderableContentReason {
             Self::Malformed => {
                 "This message could not be rendered because its MIME content is malformed. It was kept in the mailbox so synchronization can continue."
             }
-            Self::SafetyLimit => {
-                "This message could not be rendered because its content exceeds the local safety limits. It was kept in the mailbox so synchronization can continue."
-            }
+            Self::SafetyLimit => SAFETY_LIMIT_MESSAGE,
         }
     }
 }
@@ -525,6 +525,36 @@ impl ContentStaging {
             return Err(StorageError::invalid(operation));
         }
         Ok(file)
+    }
+
+    pub(crate) fn read_body_text(&self, key: &FileKey) -> Result<Box<str>, StorageError> {
+        let operation = StorageOperation::OpenPublished;
+        if key.kind() != FileKind::Body {
+            return Err(StorageError::invalid(operation));
+        }
+        let maximum = ContentLimits::default().stored_body_bytes;
+        let read_limit = maximum.checked_add(1).ok_or(StorageError {
+            operation,
+            kind: io::ErrorKind::FileTooLarge,
+        })?;
+        let mut file = self.open_file(key)?;
+        let mut bytes = Vec::with_capacity(maximum.min(IO_BUFFER_BYTES));
+        Read::by_ref(&mut file)
+            .take(read_limit as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|error| StorageError::new(operation, &error))?;
+        if bytes.len() > maximum {
+            return Err(StorageError {
+                operation,
+                kind: io::ErrorKind::FileTooLarge,
+            });
+        }
+        String::from_utf8(bytes)
+            .map(String::into_boxed_str)
+            .map_err(|_| StorageError {
+                operation,
+                kind: io::ErrorKind::InvalidData,
+            })
     }
 
     pub(crate) fn remove_published_file(
@@ -1145,21 +1175,15 @@ fn count_blank_sections(raw: &[u8], maximum: usize) -> Result<usize, MimeError> 
 
 fn transfer_allocation_budget(raw: &[u8], maximum: usize) -> Result<usize, MimeError> {
     const HEADER: &[u8] = b"content-transfer-encoding:";
-    let mut total = 0_usize;
-    let mut offset = 0_usize;
-    while let Some(position) = find_ascii_case_insensitive(&raw[offset..], HEADER) {
-        let absolute = offset + position;
-        let remaining = raw.len().saturating_sub(absolute);
-        let reservation = remaining.saturating_div(4).saturating_mul(3);
-        total = total.checked_add(reservation).ok_or(limit_error(
-            MimeResource::ParserAllocationBytes,
-            usize::MAX,
-            maximum,
-        ))?;
-        check_limit(MimeResource::ParserAllocationBytes, total, maximum)?;
-        offset = absolute.saturating_add(HEADER.len());
+    if find_ascii_case_insensitive(raw, HEADER).is_none() {
+        return Ok(0);
     }
-    Ok(total)
+    // Encoded MIME bodies occupy disjoint ranges of the raw message. Charging
+    // every transfer-encoding header for the complete remaining suffix makes a
+    // normal multipart message look quadratic and incorrectly rejects complex
+    // HTML notifications. Decoding can retain at most the raw payload size.
+    check_limit(MimeResource::ParserAllocationBytes, raw.len(), maximum)?;
+    Ok(raw.len())
 }
 
 fn count_ascii_occurrences(raw: &[u8], needle: &[u8]) -> usize {
@@ -2016,6 +2040,13 @@ AQIDBA==\r\n\
                 ..
             })
         ));
+
+        let mut multipart_headers = b"Content-Transfer-Encoding: base64\r\n".repeat(256);
+        multipart_headers.extend_from_slice(&vec![b'x'; 1024]);
+        assert_eq!(
+            transfer_allocation_budget(&multipart_headers, usize::MAX).unwrap(),
+            multipart_headers.len()
+        );
     }
 
     #[test]

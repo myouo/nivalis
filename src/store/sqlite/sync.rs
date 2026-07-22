@@ -2,6 +2,8 @@ use std::{collections::HashSet, str};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
+use crate::content::LEGACY_SAFETY_LIMIT_MESSAGE;
+
 use super::{
     account::AccountGeneration,
     domain::{AccountId, DbFailure, MessageId},
@@ -723,6 +725,8 @@ pub(super) fn load_imap_message_content_target(
         .query_row(
             "SELECT location.uid_validity, location.uid,
                     content.message_id IS NOT NULL
+                      AND NOT (coalesce(content.truncated, 0) != 0
+                               AND content.reader_excerpt = ?3)
              FROM messages AS message
              JOIN imap_message_locations AS location
                ON location.message_id = message.id
@@ -737,7 +741,11 @@ pub(super) fn load_imap_message_content_target(
              LEFT JOIN message_content AS content ON content.message_id = message.id
              WHERE message.id = ?1 AND message.account_id = ?2
              LIMIT 1",
-            params![message_id.get(), account_id.get()],
+            params![
+                message_id.get(),
+                account_id.get(),
+                LEGACY_SAFETY_LIMIT_MESSAGE
+            ],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
@@ -2272,6 +2280,27 @@ mod tests {
             )
             .unwrap(),
             ImapMessageContentTargetOutcome::AlreadyAvailable
+        );
+        connection
+            .execute(
+                "UPDATE message_content
+                 SET reader_excerpt = ?2, truncated = 1
+                 WHERE message_id = ?1",
+                params![staged[0].message_id.get(), LEGACY_SAFETY_LIMIT_MESSAGE],
+            )
+            .unwrap();
+        assert_eq!(
+            load_imap_message_content_target(
+                &connection,
+                staged[0].message_id,
+                account_id(),
+                generation(GENERATION),
+            )
+            .unwrap(),
+            ImapMessageContentTargetOutcome::Current(ImapMessageContentTarget {
+                uid_validity: UID_VALIDITY,
+                uid: 9,
+            })
         );
         assert_eq!(
             load_imap_message_content_target(
