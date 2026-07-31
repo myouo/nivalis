@@ -1,0 +1,93 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "nivalis",
+  "main": "./worker/index.ts",
+  "compatibility_date": "2026-07-24",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": true
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "nivalis",
+      "database_id": "5feaa0c9-f5bb-4431-a544-854a189678f6",
+      "migrations_dir": "./migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "IMAGES_BUCKET",
+      "bucket_name": "nivalis-images"
+    }
+  ],
+  "images": {
+    "binding": "IMAGES"
+  },
+  "cache": {
+    "enabled": true
+  },
+  "ratelimits": [
+    {
+      "name": "SESSION_RATE_LIMITER",
+      "namespace_id": "24072501",
+      "simple": {
+        "limit": 20,
+        "period": 60
+      }
+    },
+    {
+      "name": "UPLOAD_USER_RATE_LIMITER",
+      "namespace_id": "24072502",
+      "simple": {
+        "limit": 10,
+        "period": 60
+      }
+    },
+    {
+      "name": "UPLOAD_IP_RATE_LIMITER",
+      "namespace_id": "24072503",
+      "simple": {
+        "limit": 30,
+        "period": 60
+      }
+    }
+  ],
+  "vars": {
+    "ADMIN_ORIGIN": "https://img.nivalis.is",
+    "PUBLIC_IMAGE_ORIGIN": "https://simg.nivalis.is",
+    "ZONE_ID": "0251c0efdec8869f7e975d52a51e46fd",
+    "MAX_UPLOAD_BYTES": "26214400",
+    "MAX_OWNER_STORAGE_BYTES": "1073741824",
+    "MAX_OWNER_IMAGES": "500"
+  },
+  "routes": [
+    {
+      "pattern": "img.nivalis.is",
+      "custom_domain": true
+    },
+    {
+      "pattern": "simg.nivalis.is",
+      "custom_domain": true
+    }
+  ],
+  "workers_dev": false,
+  "preview_urls": false,
+  "triggers": {
+    "crons": ["15 3 * * *"]
+  },
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "head_sampling_rate": 1
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.05
+    }
+  },
+  "upload_source_maps": true,
+  "keep_vars": true
+}

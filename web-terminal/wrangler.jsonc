@@ -1,0 +1,14 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "nivalis-terminal",
+  "pages_build_output_dir": "./out",
+  "compatibility_date": "2026-07-29",
+  "d1_databases": [
+    {
+      "binding": "VISITS_DB",
+      "database_name": "nivalis-terminal-visits",
+      "database_id": "81afdd29-eded-43e0-8d4e-e3fb064f913a",
+      "migrations_dir": "migrations"
+    }
+  ]
+}

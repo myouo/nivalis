@@ -1,0 +1,47 @@
+{
+  "name": "nivalis",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -b --pretty false",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "cf:typegen": "wrangler types",
+    "db:migrate:local": "wrangler d1 migrations apply nivalis --local",
+    "db:migrate:remote": "wrangler d1 migrations apply nivalis --remote",
+    "deploy": "npm run build && wrangler deploy -c dist/nivalis/wrangler.json",
+    "deploy:dry": "npm run build && wrangler deploy --dry-run -c dist/nivalis/wrangler.json",
+    "check:startup": "wrangler check startup -c dist/nivalis/wrangler.json"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "latest",
+    "hono": "latest",
+    "lucide-react": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "react-router-dom": "latest",
+    "zod": "latest"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "latest",
+    "@cloudflare/vitest-pool-workers": "latest",
+    "@cloudflare/workers-types": "latest",
+    "@tailwindcss/vite": "latest",
+    "@testing-library/jest-dom": "latest",
+    "@testing-library/react": "latest",
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "@vitejs/plugin-react": "latest",
+    "jsdom": "latest",
+    "tailwindcss": "latest",
+    "typescript": "latest",
+    "vite": "latest",
+    "vitest": "latest",
+    "wrangler": "latest"
+  }
+}
