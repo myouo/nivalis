@@ -2,7 +2,7 @@
 
 一个面向公开匿名使用的 Cloudflare 原生图床：每个浏览器拥有独立图库，图片链接公开与私密并存，原图始终保存在私有 R2 桶中。
 
-![Nivalis interface](./docs/interface.svg)
+![Nivalis 图库界面](./docs/interface.png)
 
 ## 已实现
 
