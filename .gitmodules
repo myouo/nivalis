@@ -1,0 +1,3 @@
+[submodule "Floe"]
+	path = music_player
+	url = https://github.com/myouo/Floe.git
