@@ -7,6 +7,7 @@ import {
 } from "../api";
 import type { UploadQueueItem } from "../types";
 import { useI18n } from "../i18n";
+import { MAX_IMAGE_BYTES } from "../../shared/limits";
 
 const ACCEPTED_TYPES = new Set([
   "image/jpeg",
@@ -15,7 +16,6 @@ const ACCEPTED_TYPES = new Set([
   "image/avif",
   "image/gif",
 ]);
-const MAX_BYTES = 25 * 1024 * 1024;
 const CONCURRENCY = 3;
 
 interface UseUploadQueueOptions {
@@ -115,7 +115,7 @@ export function useUploadQueue({ onUploaded }: UseUploadQueueOptions) {
       const nextItems = incoming.map<UploadQueueItem>((file) => {
         const error = !ACCEPTED_TYPES.has(file.type)
           ? t("upload.unsupported")
-          : file.size > MAX_BYTES
+          : file.size > MAX_IMAGE_BYTES
             ? t("upload.tooLarge")
             : undefined;
         return {

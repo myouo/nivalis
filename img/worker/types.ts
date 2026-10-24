@@ -24,6 +24,7 @@ export interface ImageRow {
   id: string;
   owner_id: string;
   object_key: string;
+  storage_backend: "r2" | "telegram";
   sha256: string;
   original_name: string;
   slug: string;

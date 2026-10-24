@@ -18,10 +18,11 @@ Nivalis 采用匿名浏览器会话，不要求注册、邮箱或第三方登录
 ```jsonc
 {
   "vars": {
+    "IMAGE_STORAGE": "telegram",
     "ADMIN_ORIGIN": "https://img.nivalis.is",
     "PUBLIC_IMAGE_ORIGIN": "https://simg.nivalis.is",
     "ZONE_ID": "域名所在 Zone 的 ID",
-    "MAX_UPLOAD_BYTES": "26214400",
+    "MAX_UPLOAD_BYTES": "20971520",
     "MAX_OWNER_STORAGE_BYTES": "1073741824",
     "MAX_OWNER_IMAGES": "500"
   },
@@ -38,7 +39,7 @@ Nivalis 采用匿名浏览器会话，不要求注册、邮箱或第三方登录
 }
 ```
 
-默认额度为每个匿名浏览器 500 张、1 GiB，单张最大 25 MiB。`ratelimits` 中还配置了会话创建、单浏览器上传和来源地址上传三组限流；可以按实际成本预算调整。
+默认额度为每个匿名浏览器 500 张、1 GiB，单张最大 20 MiB。已有超过 20 MiB 的图片继续保留在 R2。`ratelimits` 中还配置了会话创建、单浏览器上传和来源地址上传三组限流；可以按实际成本预算调整。
 
 修改配置后执行：
 
@@ -79,19 +80,23 @@ npx wrangler r2 bucket create nivalis-images
 npm run deploy
 ```
 
-交互式写入两个 Secret：
+按 [Telegram 存储指南](./telegram.md) 创建私有频道与 Bot，然后交互式写入 Secret：
 
 ```bash
 npx wrangler secret put SHARE_SIGNING_KEY
 npx wrangler secret put CF_API_TOKEN
+npx wrangler secret put TELEGRAM_BOT_TOKEN
+npx wrangler secret put TELEGRAM_CHAT_ID
 ```
 
 - `SHARE_SIGNING_KEY`：粘贴至少 32 个随机字符。
 - `CF_API_TOKEN`：粘贴上一步创建的 Cache Purge Token。
+- `TELEGRAM_BOT_TOKEN`：BotFather 创建的专用 Bot Token。
+- `TELEGRAM_CHAT_ID`：私有频道的数字 ID，通常以 `-100` 开头。
 
 命令会安全提示输入值；不要把值放在命令参数、脚本或 Git 中。
 
-先应用远端迁移，再部署代码。不要交换顺序，因为新代码依赖匿名所有权字段：
+先备份并应用远端迁移，再部署代码。新代码依赖匿名所有权与存储路由字段：
 
 ```bash
 npm run db:migrate:remote
@@ -138,7 +143,7 @@ npx wrangler d1 export nivalis --remote --output nivalis-backup.sql
 npx wrangler dev --test-scheduled
 ```
 
-定时任务每天 03:15 UTC 执行，删除超过 24 小时未完成的上传和进入回收站超过 30 天的图片。
+定时任务每天 03:15 UTC 执行，移除超过 24 小时未完成的上传和进入回收站超过 30 天的图片，清理对应 R2 文件。TG 消息超过 Bot API 删除窗口时会保留清理记录，详见 [Telegram 存储指南](./telegram.md)。
 
 ## 参考
 

@@ -1,4 +1,5 @@
 import type { ImageRow } from "./types";
+import { deleteStoredImage } from "./storage";
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -17,12 +18,16 @@ export async function cleanupExpiredImages(env: Env): Promise<void> {
     return;
   }
 
-  await env.IMAGES_BUCKET.delete(result.results.map((image) => image.object_key));
-  await env.DB.batch(
-    result.results.map((image) =>
-      env.DB.prepare("DELETE FROM images WHERE id = ?").bind(image.id),
-    ),
-  );
+  let count = 0;
+  for (const image of result.results) {
+    try {
+      await deleteStoredImage(env, image);
+      await env.DB.prepare("DELETE FROM images WHERE id = ?").bind(image.id).run();
+      count += 1;
+    } catch {
+      console.error(JSON.stringify({ message: "Expired image cleanup deferred", imageId: image.id }));
+    }
+  }
   await env.DB.prepare(
     "DELETE FROM tags WHERE NOT EXISTS (SELECT 1 FROM image_tags WHERE tag_id = tags.id)",
   ).run();
@@ -30,7 +35,7 @@ export async function cleanupExpiredImages(env: Env): Promise<void> {
   console.log(
     JSON.stringify({
       message: "expired images cleaned",
-      count: result.results.length,
+      count,
     }),
   );
 }

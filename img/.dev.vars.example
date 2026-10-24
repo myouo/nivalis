@@ -1,3 +1,5 @@
 # Local-only values. Copy this file to .dev.vars before `npm run dev`.
 SHARE_SIGNING_KEY=replace-with-at-least-32-random-characters
 CF_API_TOKEN=
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=

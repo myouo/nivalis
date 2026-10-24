@@ -1,6 +1,7 @@
 import type { Context } from "hono";
 import { verifyShareSignature } from "./crypto";
 import { getImageById } from "./db";
+import { getStoredImage, headStoredImage, parseByteRange } from "./storage";
 import {
   IMAGE_VARIANTS,
   isImageVariant,
@@ -119,15 +120,20 @@ async function serveOriginal(
   transformBypassed = false,
 ): Promise<Response> {
   const range = context.req.header("Range");
+  const etag = `"${image.sha256}"`;
+  if (context.req.header("If-None-Match") === etag) {
+    const headers = baseHeaders(image, mode);
+    headers.set("ETag", etag);
+    return new Response(null, { status: 304, headers });
+  }
   if (context.req.method === "HEAD") {
-    const object = await context.env.IMAGES_BUCKET.head(image.object_key);
+    const object = await headStoredImage(context.env, image);
     if (!object) {
       return notFound();
     }
     const headers = baseHeaders(image, mode);
-    object.writeHttpMetadata(headers);
     headers.set("Content-Type", image.mime_type);
-    headers.set("ETag", object.httpEtag);
+    headers.set("ETag", etag);
     headers.set("Accept-Ranges", "bytes");
     headers.set("Content-Length", String(object.size));
     if (transformBypassed) {
@@ -136,36 +142,29 @@ async function serveOriginal(
     return new Response(null, { status: 200, headers });
   }
 
-  const object = await context.env.IMAGES_BUCKET.get(
-    image.object_key,
-    range ? { range: context.req.raw.headers } : undefined,
+  const parsedRange = range ? parseByteRange(range, image.byte_size) : undefined;
+  if (range && !parsedRange) {
+    const headers = baseHeaders(image, mode);
+    headers.set("Content-Range", `bytes */${image.byte_size}`);
+    return new Response(null, { status: 416, headers });
+  }
+  const object = await getStoredImage(
+    context.env, image, parsedRange ?? undefined, context.executionCtx,
   );
   if (!object) {
     return notFound();
   }
 
   const headers = baseHeaders(image, mode);
-  object.writeHttpMetadata(headers);
   headers.set("Content-Type", image.mime_type);
-  headers.set("ETag", object.httpEtag);
+  headers.set("ETag", etag);
   headers.set("Accept-Ranges", "bytes");
   if (transformBypassed) {
     headers.set("X-Nivalis-Transform", "bypassed-size");
   }
 
-  if (context.req.header("If-None-Match") === object.httpEtag) {
-    return new Response(null, { status: 304, headers });
-  }
-
   if (range && object.range) {
-    const offset =
-      "suffix" in object.range
-        ? Math.max(0, object.size - object.range.suffix)
-        : (object.range.offset ?? 0);
-    const length =
-      "suffix" in object.range
-        ? Math.min(object.range.suffix, object.size)
-        : (object.range.length ?? object.size - offset);
+    const { offset, length } = object.range;
     headers.set("Content-Range", `bytes ${offset}-${offset + length - 1}/${object.size}`);
     headers.set("Content-Length", String(length));
   } else {
@@ -191,7 +190,7 @@ async function serveVariant(
   }
 
   if (context.req.method === "HEAD") {
-    const object = await context.env.IMAGES_BUCKET.head(image.object_key);
+    const object = await headStoredImage(context.env, image);
     if (!object) {
       return notFound();
     }
@@ -212,7 +211,7 @@ async function serveVariant(
     return new Response(null, { status: 200, headers });
   }
 
-  const object = await context.env.IMAGES_BUCKET.get(image.object_key);
+  const object = await getStoredImage(context.env, image, undefined, context.executionCtx);
   if (!object) {
     return notFound();
   }
@@ -247,7 +246,7 @@ async function serveVariant(
   headers.set("Vary", "Accept");
   headers.set(
     "ETag",
-    `"${object.etag}-${variant}-${format}-${shareFormat === "webp" ? webpQuality : 82}"`,
+    `"${image.sha256}-${variant}-${format}-${shareFormat === "webp" ? webpQuality : 82}"`,
   );
 
   return new Response(result.body, {

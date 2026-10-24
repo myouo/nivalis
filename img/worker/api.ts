@@ -1,6 +1,9 @@
 import { Hono } from "hono";
 import { z } from "zod";
+import { MAX_IMAGE_BYTES, readBoundedBody, sha256Hex } from "../shared/limits";
+import { TelegramApiError } from "../shared/telegram";
 import { purgeImageCache } from "./cache";
+import { deleteStoredImage, putStoredImage } from "./storage";
 import {
   createShareSignature,
   createUlid,
@@ -114,7 +117,7 @@ api.post("/uploads", async (context) => {
     );
   }
 
-  const maxBytes = Number(context.env.MAX_UPLOAD_BYTES);
+  const maxBytes = Math.min(Number(context.env.MAX_UPLOAD_BYTES), MAX_IMAGE_BYTES);
   if (parsed.data.size > maxBytes) {
     return context.json(
       {
@@ -193,7 +196,7 @@ api.post("/uploads", async (context) => {
         409,
       );
     }
-    await context.env.IMAGES_BUCKET.delete(existing.object_key);
+    await deleteStoredImage(context.env, existing);
     await context.env.DB.prepare("DELETE FROM images WHERE id = ?")
       .bind(existing.id)
       .run();
@@ -316,53 +319,54 @@ api.put("/uploads/:id", async (context) => {
     );
   }
 
+  const uploadStartedAt = Date.now();
+  const claimed = await context.env.DB.prepare(
+    `UPDATE images SET upload_started_at = ?
+     WHERE id = ? AND status = 'uploading'
+       AND (upload_started_at IS NULL OR upload_started_at < ?)
+     RETURNING id`,
+  ).bind(uploadStartedAt, image.id, uploadStartedAt - 10 * 60 * 1000).first();
+  if (!claimed) {
+    return context.json({ code: "UPLOAD_IN_PROGRESS", message: "相同图片已有一个上传任务正在进行。" }, 409);
+  }
+
   try {
-    await context.env.IMAGES_BUCKET.put(
-      image.object_key,
-      context.req.raw.body,
-      {
-        httpMetadata: {
-          contentType: image.mime_type,
-          contentDisposition: `inline; filename="${image.slug}"`,
-          cacheControl: "public, max-age=31536000, immutable",
-        },
-        customMetadata: {
-          originalName: image.original_name,
-          sha256: image.sha256,
-        },
-      },
-    );
+    const maxBytes = Math.min(Number(context.env.MAX_UPLOAD_BYTES), MAX_IMAGE_BYTES);
+    const bytes = await readBoundedBody(context.req.raw.body!, maxBytes);
+    if (bytes.byteLength !== image.byte_size || (await sha256Hex(bytes)) !== image.sha256) {
+      await deleteStoredImage(context.env, image);
+      await context.env.DB.prepare("DELETE FROM images WHERE id = ?").bind(image.id).run();
+      return context.json({ code: "UPLOAD_MISMATCH", message: "上传内容的大小或校验值与图片信息不一致。" }, 400);
+    }
+    const backend = await putStoredImage(context.env, image, bytes);
 
     let width: number | null = null;
     let height: number | null = null;
-    if (image.byte_size <= 20 * 1024 * 1024) {
-      const stored = await context.env.IMAGES_BUCKET.get(image.object_key);
-      if (stored) {
-        try {
-          const info = await context.env.IMAGES.info(stored.body);
-          if ("width" in info) {
-            width = info.width;
-            height = info.height;
-          }
-        } catch (error) {
-          console.warn(
-            JSON.stringify({
-              message: "image metadata inspection skipped",
-              imageId: image.id,
-              error: error instanceof Error ? error.message : String(error),
-            }),
-          );
+    if (image.byte_size <= MAX_IMAGE_BYTES) {
+      try {
+        const info = await context.env.IMAGES.info(new Response(bytes).body!);
+        if ("width" in info) {
+          width = info.width;
+          height = info.height;
         }
+      } catch (error) {
+        console.warn(
+          JSON.stringify({
+            message: "image metadata inspection skipped",
+            imageId: image.id,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
       }
     }
 
     const updatedAt = Date.now();
     await context.env.DB.prepare(
       `UPDATE images
-       SET status = 'active', width = ?, height = ?, updated_at = ?
+       SET status = 'active', storage_backend = ?, width = ?, height = ?, updated_at = ?
        WHERE id = ? AND status = 'uploading'`,
     )
-      .bind(width, height, updatedAt, image.id)
+      .bind(backend, width, height, updatedAt, image.id)
       .run();
     const uploaded = await getOwnedImageById(
       context.env.DB,
@@ -386,10 +390,17 @@ api.put("/uploads/:id", async (context) => {
       201,
     );
   } catch (error) {
-    await context.env.IMAGES_BUCKET.delete(image.object_key);
+    await deleteStoredImage(context.env, image);
     await context.env.DB.prepare("DELETE FROM images WHERE id = ?")
       .bind(image.id)
       .run();
+    if (error instanceof RangeError) {
+      return context.json({ code: "FILE_TOO_LARGE", message: "单张图片不能超过 20 MB。" }, 413);
+    }
+    if (error instanceof TelegramApiError && error.errorCode === 429) {
+      context.header("Retry-After", String(error.retryAfter || 5));
+      return context.json({ code: "UPLOAD_RATE_LIMITED", message: "上传过于频繁，请稍后重试。" }, 429);
+    }
     throw error;
   }
 });
@@ -732,7 +743,7 @@ api.delete("/images/:id", async (context) => {
     );
   }
   await purgeImageCache(context.req.raw, context.env, image);
-  await context.env.IMAGES_BUCKET.delete(image.object_key);
+  await deleteStoredImage(context.env, image);
   await context.env.DB.prepare("DELETE FROM images WHERE id = ?")
     .bind(image.id)
     .run();

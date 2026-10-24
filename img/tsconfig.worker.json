@@ -6,12 +6,13 @@
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "resolveJsonModule": true,
+    "allowImportingTsExtensions": true,
     "allowJs": false,
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "skipLibCheck": true,
     "noEmit": true,
-    "types": ["./worker-configuration.d.ts", "@cloudflare/workers-types"]
+    "types": ["./worker-configuration.d.ts", "@cloudflare/workers-types", "node"]
   },
   "include": ["worker", "tests/worker"]
 }

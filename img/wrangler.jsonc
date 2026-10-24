@@ -56,12 +56,16 @@
     }
   ],
   "vars": {
+    "IMAGE_STORAGE": "telegram",
     "ADMIN_ORIGIN": "https://img.nivalis.is",
     "PUBLIC_IMAGE_ORIGIN": "https://simg.nivalis.is",
     "ZONE_ID": "0251c0efdec8869f7e975d52a51e46fd",
-    "MAX_UPLOAD_BYTES": "26214400",
+    "MAX_UPLOAD_BYTES": "20971520",
     "MAX_OWNER_STORAGE_BYTES": "1073741824",
     "MAX_OWNER_IMAGES": "500"
+  },
+  "secrets": {
+    "required": ["SHARE_SIGNING_KEY", "CF_API_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]
   },
   "routes": [
     {
